@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>__TITLE__</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='4' cy='4' r='2.2' fill='%23555'/><circle cx='4' cy='12' r='2.2' fill='%23555'/><circle cx='12' cy='12' r='2.2' fill='%23999'/><path d='M4 4v8M4 9h5a3 3 0 013 3' stroke='%23777' fill='none' stroke-width='1.4'/></svg>">
+<link rel="stylesheet" href="__ASSET__style.css">
+</head>
+<body>
+
+<header id="top">
+  <h1 id="brand">__TITLE__</h1>
+  <div class="grow">
+    <input id="search" type="search" placeholder="搜索 id / 标题 / 正文 / 标签   （按 / 聚焦）" autocomplete="off" spellcheck="false">
+    <span id="hits" class="mono"></span>
+  </div>
+  <button id="btn-new" title="从选中节点派生新步骤（n）">＋ 新步骤</button>
+  <button id="btn-token" title="设置写入令牌">🔒</button>
+  <span id="live" class="dot" title="实时连接"></span>
+</header>
+
+<div id="warnbar" hidden></div>
+
+<main>
+  <section id="left">
+    <div id="scroller">
+      <div id="track">
+        <svg id="rails" xmlns="http://www.w3.org/2000/svg" width="0" height="0" aria-hidden="true"></svg>
+        <div id="rows"></div>
+      </div>
+      <p id="empty" hidden>还没有任何步骤。点右上角 <b>＋ 新步骤</b> 开始，或用 <code>python trace_cli.py new --title "..."</code>。</p>
+    </div>
+    <footer id="legend">
+      <span><i class="lg done"></i>done 实线实心</span>
+      <span><i class="lg wip"></i>wip 虚线空心</span>
+      <span><i class="lg dead"></i>dead 点线方块</span>
+    </footer>
+  </section>
+
+  <section id="detail" tabindex="-1">
+    <div class="placeholder">选一个步骤看详情。<br><span class="mono">↑ ↓</span> 移动 · <span class="mono">n</span> 新建 · <span class="mono">e</span> 编辑 · <span class="mono">/</span> 搜索</div>
+  </section>
+</main>
+
+<dialog id="dlg-new">
+  <form method="dialog">
+    <h2>新建步骤</h2>
+    <label>派生自 <input id="nf-parent" class="mono" readonly></label>
+    <label>标题 <input id="nf-title" maxlength="200" required placeholder="一行说清这一步在干什么"></label>
+    <div class="row2">
+      <label>状态
+        <select id="nf-status">
+          <option value="wip">wip — 在做</option>
+          <option value="done">done — 有结论</option>
+          <option value="dead">dead — 此路不通</option>
+        </select>
+      </label>
+      <label>日期 <input id="nf-date" class="mono" type="date"></label>
+    </div>
+    <label>commit <input id="nf-commit" class="mono" placeholder="可留空"></label>
+    <label>正文 <textarea id="nf-body" rows="12" spellcheck="false"></textarea></label>
+    <p class="hint">「为什么」是整个系统里唯一无法自动生成的字段——日志能自动存，commit 能自动记，只有「我当时为什么决定试这个」必须你写。</p>
+    <menu>
+      <button value="cancel">取消</button>
+      <button id="nf-ok" value="ok" class="primary">创建</button>
+    </menu>
+  </form>
+</dialog>
+
+<script id="forest-data" type="application/json">__DATA__</script>
+<script>window.TRACE_BASE = "__BASE__"; window.TRACE_MODE = "__MODE__";</script>
+<script src="__ASSET__md.js"></script>
+<script src="__ASSET__app.js"></script>
+</body>
+</html>

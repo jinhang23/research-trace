@@ -1,0 +1,30 @@
+[Unit]
+Description=trace — 科研记录与溯源
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trace
+Group=trace
+WorkingDirectory=/srv/trace
+ExecStart=/srv/trace/.venv/bin/python trace_cli.py serve --host 127.0.0.1 --port 8100 --log-level warning
+Restart=always
+RestartSec=3
+
+Environment=PYTHONUNBUFFERED=1
+# git push 需要 ~/.ssh 与 ~/.gitconfig。把 HOME 指到 /srv/trace，
+# 这样 ProtectHome 可以保持开启，同时 git 仍然能读到凭据。
+Environment=HOME=/srv/trace
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/srv/trace
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,4 @@
+# 全部依赖就这两个。内核（trace_core.py）连这两个都不需要——它只用标准库，
+# 所以 check / build / 单元测试在任何裸 Python 3.10+ 上都能跑。
+fastapi>=0.110
+uvicorn>=0.27

@@ -1,0 +1,41 @@
+# Caddy 自动申请并续期 HTTPS 证书。把 trace.example.com 换成你的域名，
+# 并把 DNS A 记录指到这台机器。
+
+trace.example.com {
+	encode zstd gzip
+
+	# 站点只在不可猜的 /t/<space>/ 路径下存在。其余路径一律 404，
+	# 连"这里有个东西"都不告诉访问者。
+	handle /t/* {
+		reverse_proxy 127.0.0.1:8100 {
+			# SSE 必须关掉缓冲，否则实时推送会被 Caddy 攒在缓冲区里
+			flush_interval -1
+		}
+	}
+
+	handle /robots.txt {
+		reverse_proxy 127.0.0.1:8100
+	}
+
+	handle /healthz {
+		reverse_proxy 127.0.0.1:8100
+	}
+
+	handle {
+		respond 404
+	}
+
+	header {
+		# "读公开但 URL 不可猜"只有在爬虫永远看不到这个路径时才成立
+		X-Robots-Tag "noindex, nofollow, noarchive"
+		# 防止访问者点击外链时把带 space 的 URL 泄漏到 Referer 头里
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	log {
+		output file /var/log/caddy/trace.log
+		# 访问日志里会有完整 URL（含 space），按机密文件对待
+		format json
+	}
+}

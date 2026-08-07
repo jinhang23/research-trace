@@ -1,0 +1,13 @@
+# 含 space 与 token，绝不入库
+config.json
+
+# 编译产物是文件系统的纯函数，随时可以删掉重建
+dist/
+
+# 跨 session 的私人工作笔记，留在本地
+claude_logs/
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
