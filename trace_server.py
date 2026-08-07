@@ -5,6 +5,13 @@
 效果完全等价——这是把"实时交互"叠加到"纯文件即数据库"上而不破坏后者的关键。
 
 SSE 推的是"版本变了，重新编译"信号，不是增量 patch（保持 P3：编译而非同步）。
+
+路径布局：
+    projects/<slug>/project.md
+    projects/<slug>/steps/<id>_<slug>/note.md
+URL：
+    /t/<space>/                 项目索引
+    /t/<space>/p/<slug>/        某个项目
 """
 
 from __future__ import annotations
@@ -19,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
 
 import trace_core as core
 import trace_write as W
@@ -34,7 +41,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "title": "科研溯源",
     "space": "",
     "token": "",
-    "steps_dir": "steps",
+    "data_dir": ".",
     "git": {"enabled": False, "remote": "origin", "branch": "main", "debounce": 45},
 }
 
@@ -48,6 +55,7 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
                 cfg[k].update(v)
             else:
                 cfg[k] = v
+    cfg.pop("steps_dir", None)  # 旧字段，已被 projects/ 布局取代
     return cfg
 
 
@@ -63,34 +71,51 @@ def make_config(title: str = "科研溯源") -> dict[str, Any]:
 
 
 class State:
-    """唯一可变状态：版本号 + 编译缓存。两者都可以随时丢弃重算。"""
+    """唯一可变状态：版本号 + 每个项目的编译缓存。两者都可以随时丢弃重算。"""
 
-    def __init__(self, steps_dir: Path) -> None:
-        self.steps_dir = steps_dir
+    def __init__(self, root: Path) -> None:
+        self.root = root
         self.version = 0
-        self.sig = ""
-        self._cache: dict[str, Any] | None = None
-        self._cache_sig = ""
+        self.sigs: dict[str, str] = {}
+        self._cache: dict[str, tuple[str, dict[str, Any]]] = {}
         self.refresh()
 
+    def _sig(self, slug: str) -> str:
+        return core.signature(core.steps_dir_of(self.root, slug))
+
     def refresh(self) -> bool:
-        sig = core.signature(self.steps_dir)
-        if sig != self.sig:
-            self.sig = sig
+        sigs = {p.slug: self._sig(p.slug) for p in core.scan_projects(self.root)}
+        if sigs != self.sigs:
+            self.sigs = sigs
             self.version += 1
             return True
         return False
 
-    def forest(self) -> dict[str, Any]:
-        if self._cache is None or self._cache_sig != self.sig:
-            self._cache = core.compile_forest(self.steps_dir)
-            self._cache_sig = self.sig
-        out = dict(self._cache)
+    def forest(self, slug: str) -> dict[str, Any]:
+        sig = self.sigs.get(slug) or self._sig(slug)
+        hit = self._cache.get(slug)
+        if hit is None or hit[0] != sig:
+            hit = (sig, core.compile_forest(core.steps_dir_of(self.root, slug)))
+            self._cache[slug] = hit
+        out = dict(hit[1])
         out["version"] = self.version
+        out["project"] = slug
         return out
 
-    def by_id(self) -> dict[str, Any]:
-        return {s["id"]: s for s in self.forest()["steps"]}
+    def projects(self) -> list[dict[str, Any]]:
+        out = []
+        for p in core.scan_projects(self.root):
+            f = self.forest(p.slug)
+            counts = {"wip": 0, "done": 0, "dead": 0}
+            for s in f["steps"]:
+                counts[s["status"]] = counts.get(s["status"], 0) + 1
+            d = p.to_dict()
+            d["steps"] = len(f["steps"])
+            d["counts"] = counts
+            d["warnings"] = len(f["warnings"])
+            d["latest"] = max((s["date"] for s in f["steps"] if s["date"]), default="")
+            out.append(d)
+        return out
 
 
 # ---------------------------------------------------------------- 应用
@@ -98,16 +123,18 @@ class State:
 
 def create_app(config: dict[str, Any] | None = None) -> FastAPI:
     cfg = config or load_config()
-    steps_dir = (ROOT / cfg["steps_dir"]).resolve()
-    steps_dir.mkdir(parents=True, exist_ok=True)
+    data_root = (ROOT / cfg.get("data_dir", ".")).resolve()
+    migrated = core.ensure_layout(data_root)
 
     space = (cfg.get("space") or "").strip("/")
     base = f"/t/{space}" if space else ""
     token = cfg.get("token") or ""
 
-    state = State(steps_dir)
+    state = State(data_root)
+    # 同步的是**数据目录**而不是代码目录。data_dir 指向别处时（推荐做法：
+    # 代码仓公开、数据仓私有），要 commit 的是那个数据仓。
     git = GitSync(
-        ROOT,
+        data_root,
         enabled=bool(cfg["git"].get("enabled")),
         remote=cfg["git"].get("remote", "origin"),
         branch=cfg["git"].get("branch", "main"),
@@ -126,6 +153,8 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        if migrated:
+            print(f"[trace] 已把旧的 steps/ 迁移到 projects/{migrated}/steps/")
         task = asyncio.create_task(poller())
         try:
             yield
@@ -137,13 +166,14 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
     app.state.core = state
     app.state.git = git
     app.state.base = base
+    app.state.data_root = data_root
 
     # ---- 通用 --------------------------------------------------------
 
     @app.middleware("http")
     async def no_index(request: Request, call_next):
         resp = await call_next(request)
-        # "读公开但 URL 不可猜"只有在爬虫永远看不到这个路径时才成立。
+        # "读公开但 URL 不可猜"只有在爬虫永远看不到这个路径时才成立
         resp.headers["X-Robots-Tag"] = "noindex, nofollow, noarchive"
         return resp
 
@@ -155,10 +185,8 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
     def require_token(request: Request) -> None:
         if not token:
             return  # 未配置 token（本地开发）时不拦
-        supplied = ""
         auth = request.headers.get("authorization", "")
-        if auth.lower().startswith("bearer "):
-            supplied = auth[7:].strip()
+        supplied = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
         supplied = supplied or request.headers.get("x-trace-token", "").strip()
         if not (supplied and hmac.compare_digest(supplied, token)):
             raise PermissionError
@@ -180,9 +208,25 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             raise W.WriteError("请求体必须是 JSON 对象")
         return payload
 
+    def sd(project: str) -> Path:
+        return W.resolve_project(data_root, project)
+
     def touched(ids: list[str]) -> None:
         state.refresh()
         git.touch(ids)
+
+    def page(project: str) -> Response:
+        html = (WEB / "index.html").read_text(encoding="utf-8")
+        html = (
+            html.replace("__ASSET__", f"{base}/static/")
+            .replace("__BASE__", base)
+            .replace("__TITLE__", cfg.get("title", "科研溯源"))
+            .replace("__MODE__", "server")
+            .replace("__PROJECT__", project)
+            .replace("__DATA__", "")
+            .replace("__PROJECTS__", "")
+        )
+        return Response(html, media_type="text/html; charset=utf-8")
 
     # ---- 根路径 ------------------------------------------------------
 
@@ -198,15 +242,14 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
 
     @app.get(base + "/", include_in_schema=False)
     async def index() -> Response:
-        html = (WEB / "index.html").read_text(encoding="utf-8")
-        html = (
-            html.replace("__ASSET__", f"{base}/static/")
-            .replace("__BASE__", base)
-            .replace("__TITLE__", cfg.get("title", "科研溯源"))
-            .replace("__MODE__", "server")
-            .replace("__DATA__", "")
-        )
-        return Response(html, media_type="text/html; charset=utf-8")
+        ps = core.scan_projects(data_root)
+        if len(ps) == 1:
+            return RedirectResponse(f"{base}/p/{ps[0].slug}/", status_code=302)
+        return page("")
+
+    @app.get(base + "/p/{project}/", include_in_schema=False)
+    async def project_page(project: str) -> Response:
+        return page(project)
 
     @app.get(base + "/static/{name}", include_in_schema=False)
     async def static(name: str) -> Response:
@@ -218,23 +261,47 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
         media, _ = mimetypes.guess_type(p.name)
         return Response(p.read_bytes(), media_type=(media or "application/octet-stream"))
 
-    @app.get(base + "/files/{sid}/{relpath:path}", include_in_schema=False)
-    async def files(sid: str, relpath: str) -> Response:
-        by_id = W.load(steps_dir)
-        target = W.resolve_attachment(steps_dir, by_id, sid, relpath)
+    @app.get(base + "/p/{project}/files/{sid}/{relpath:path}", include_in_schema=False)
+    async def files(project: str, sid: str, relpath: str) -> Response:
+        steps = sd(project)
+        target = W.resolve_attachment(steps, W.load(steps), sid, relpath)
         if not target.is_file():
             return PlainTextResponse("not found", status_code=404)
         return FileResponse(target)
 
+    # ---- 项目 --------------------------------------------------------
+
+    @app.get(base + "/api/projects")
+    async def api_projects() -> JSONResponse:
+        return JSONResponse({"projects": state.projects(), "version": state.version})
+
+    @app.post(base + "/api/projects")
+    async def api_create_project(request: Request) -> JSONResponse:
+        require_token(request)
+        payload = await body_json(request)
+        p = W.create_project(data_root, payload.get("name", ""))
+        touched([f"project:{p.slug}"])
+        return JSONResponse(p.to_dict(), status_code=201)
+
+    @app.patch(base + "/api/projects/{project}")
+    async def api_rename_project(project: str, request: Request) -> JSONResponse:
+        require_token(request)
+        payload = await body_json(request)
+        p = W.rename_project(data_root, project, payload.get("name", ""))
+        touched([f"project:{p.slug}"])
+        return JSONResponse(p.to_dict())
+
     # ---- 读 API ------------------------------------------------------
 
-    @app.get(base + "/api/forest")
-    async def api_forest() -> JSONResponse:
-        return JSONResponse(state.forest())
+    @app.get(base + "/api/p/{project}/forest")
+    async def api_forest(project: str) -> JSONResponse:
+        sd(project)
+        return JSONResponse(state.forest(project))
 
-    @app.get(base + "/api/steps/{sid}")
-    async def api_step(sid: str) -> JSONResponse:
-        forest = state.forest()
+    @app.get(base + "/api/p/{project}/steps/{sid}")
+    async def api_step(project: str, sid: str) -> JSONResponse:
+        sd(project)
+        forest = state.forest(project)
         idx = {s["id"]: s for s in forest["steps"]}
         if sid not in idx:
             return JSONResponse({"error": f"步骤 {sid} 不存在"}, status_code=404)
@@ -249,11 +316,13 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
 
     @app.get(base + "/api/status")
     async def api_status() -> JSONResponse:
+        ps = state.projects()
         return JSONResponse(
             {
                 "title": cfg.get("title"),
                 "version": state.version,
-                "steps": len(state.forest()["steps"]),
+                "projects": len(ps),
+                "steps": sum(p["steps"] for p in ps),
                 "git": git.last,
                 "write_protected": bool(token),
             }
@@ -280,12 +349,12 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
 
     # ---- 写 API ------------------------------------------------------
 
-    @app.post(base + "/api/steps")
-    async def api_create(request: Request) -> JSONResponse:
+    @app.post(base + "/api/p/{project}/steps")
+    async def api_create(project: str, request: Request) -> JSONResponse:
         require_token(request)
         payload = await body_json(request)
         step, created = W.create_step(
-            steps_dir,
+            sd(project),
             parent=payload.get("parent"),
             title=payload.get("title", ""),
             status=payload.get("status", core.DEFAULT_STATUS),
@@ -297,32 +366,31 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             tags=payload.get("tags"),
         )
         if created:
-            touched([step.id])
+            touched([f"{project}/{step.id}"])
         out = step.to_dict()
         out["created"] = created
         return JSONResponse(out, status_code=201 if created else 200)
 
-    @app.patch(base + "/api/steps/{sid}")
-    async def api_update(sid: str, request: Request) -> JSONResponse:
+    @app.patch(base + "/api/p/{project}/steps/{sid}")
+    async def api_update(project: str, sid: str, request: Request) -> JSONResponse:
         require_token(request)
         payload = await body_json(request)
-        step = W.update_step(steps_dir, sid, payload)
-        touched([sid])
+        step = W.update_step(sd(project), sid, payload)
+        touched([f"{project}/{sid}"])
         return JSONResponse(step.to_dict())
 
-    @app.put(base + "/api/steps/{sid}/files/{relpath:path}")
-    async def api_attach(sid: str, relpath: str, request: Request) -> JSONResponse:
+    @app.put(base + "/api/p/{project}/steps/{sid}/files/{relpath:path}")
+    async def api_attach(project: str, sid: str, relpath: str, request: Request) -> JSONResponse:
         require_token(request)
-        data = await request.body()
-        info = W.attach_file(steps_dir, sid, relpath, data)
-        touched([sid])
+        info = W.attach_file(sd(project), sid, relpath, await request.body())
+        touched([f"{project}/{sid}"])
         return JSONResponse(info, status_code=201)
 
-    @app.delete(base + "/api/steps/{sid}/files/{relpath:path}")
-    async def api_detach(sid: str, relpath: str, request: Request) -> JSONResponse:
+    @app.delete(base + "/api/p/{project}/steps/{sid}/files/{relpath:path}")
+    async def api_detach(project: str, sid: str, relpath: str, request: Request) -> JSONResponse:
         require_token(request)
-        W.delete_file(steps_dir, sid, relpath)
-        touched([sid])
+        W.delete_file(sd(project), sid, relpath)
+        touched([f"{project}/{sid}"])
         return JSONResponse({"ok": True})
 
     @app.post(base + "/api/sync")

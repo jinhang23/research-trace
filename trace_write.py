@@ -19,14 +19,20 @@ from typing import Any
 
 from trace_core import (
     NOTE_NAME,
+    PROJECT_NOTE,
     STATUSES,
     DEFAULT_STATUS,
+    Project,
     Step,
     build_children,
     id_key,
     fmt_id,
+    project_dir,
+    projects_root,
     scan,
+    scan_projects,
     split_id,
+    steps_dir_of,
     validate,
 )
 
@@ -68,6 +74,62 @@ def slugify(title: str) -> str:
     if len(s) > MAX_SLUG:
         s = s[:MAX_SLUG].rstrip("-")
     return s or "step"
+
+
+# ---------------------------------------------------------------- 项目
+
+
+def resolve_project(root: Path, slug: str) -> Path:
+    """把 URL 里的项目名解析成 steps 目录。顺带挡掉路径穿越。"""
+    slug = (slug or "").strip().strip("/")
+    if not slug or "/" in slug or "\\" in slug or slug.startswith("."):
+        raise WriteError(f"非法项目名: {slug!r}")
+    d = steps_dir_of(root, slug)
+    if not d.parent.is_dir():
+        raise NotFound(f"项目 {slug} 不存在")
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def create_project(root: Path, name: str) -> Project:
+    name = _clean_line(name)
+    if not name:
+        raise WriteError("项目名不能为空")
+    base = slugify(name)
+    existing = {p.slug for p in scan_projects(root)}
+    slug, n = base, 2
+    while slug in existing:
+        slug, n = f"{base}-{n}", n + 1
+
+    d = project_dir(root, slug)
+    if d.exists():
+        raise Conflict(f"项目目录已存在: {slug}")
+    (d / "steps").mkdir(parents=True)
+    (d / PROJECT_NOTE).write_text(
+        f"---\nname: {name}\n---\n\n", encoding="utf-8", newline="\n"
+    )
+    return Project(slug=slug, name=name)
+
+
+def rename_project(root: Path, slug: str, name: str) -> Project:
+    """只改显示名。**目录名（= URL 里的 slug）不动**——改了会让所有已发出的链接失效。"""
+    name = _clean_line(name)
+    if not name:
+        raise WriteError("项目名不能为空")
+    d = project_dir(root, slug)
+    if not d.is_dir():
+        raise NotFound(f"项目 {slug} 不存在")
+    note = d / PROJECT_NOTE
+    body = ""
+    if note.is_file():
+        from trace_core import parse_note
+
+        _meta, body, _w = parse_note(note.read_text(encoding="utf-8", errors="replace"))
+    note.write_text(f"---\nname: {name}\n---\n\n{body}\n".rstrip() + "\n", encoding="utf-8", newline="\n")
+    return Project(slug=slug, name=name, body=body)
+
+
+# ---------------------------------------------------------------- 步骤
 
 
 def load(steps_dir: Path) -> dict[str, Step]:

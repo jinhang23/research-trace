@@ -1,6 +1,6 @@
 # 部署到你的域名
 
-架构：`steps/` 的唯一工作副本在服务器上，debounce 后自动 `git commit && git push`
+架构：`projects/` 的唯一工作副本在服务器上，debounce 后自动 `git commit && git push`
 到私有仓库。你在本地 `git pull` 拿到的就是完整、可 grep、可 diff 的文件树——
 这是 G4（删掉所有程序，剩下的文件仍然可读）在"上了服务器"之后的兑现方式。
 
@@ -8,14 +8,34 @@
 
 ---
 
+## 0. 先分清两个仓库
+
+**代码仓**（可以公开）和**数据仓**（必须私有）是两回事，别混在一起：
+
+| | 内容 | 可见性 |
+|---|---|---|
+| 代码仓 | `trace_*.py` · `web/` · `tests/` · `deploy/` | 随你 |
+| 数据仓 | `projects/<项目>/steps/**` | **私有** |
+
+`config.json` 的 `data_dir` 决定数据仓在哪，自动 git 同步同步的也是那个目录。
+把 `data_dir` 留成默认的 `"."`、同时 `origin` 又指向公开的代码仓，
+你的科研笔记会被自动推到公开仓库上——这是最容易踩的坑。
+
 ## 1. 服务器准备
 
 ```bash
 sudo useradd -r -m -d /srv/trace -s /usr/sbin/nologin trace
-sudo -u trace git clone <你的私有仓库> /srv/trace
+sudo -u trace git clone <代码仓> /srv/trace
+sudo -u trace git clone <私有数据仓> /srv/trace-data
 cd /srv/trace
 sudo -u trace python3 -m venv .venv
 sudo -u trace .venv/bin/pip install -r requirements.txt
+```
+
+然后在 `config.json` 里指过去：
+
+```json
+{ "data_dir": "../trace-data", "git": { "enabled": true, "remote": "origin", "branch": "main" } }
 ```
 
 ## 2. 初始化
@@ -36,10 +56,13 @@ sudo -u trace .venv/bin/python trace_cli.py init --title "你的项目名"
 ```bash
 sudo -u trace ssh-keygen -t ed25519 -f /srv/trace/.ssh/id_ed25519 -N ""
 sudo -u trace ssh-keyscan github.com >> /srv/trace/.ssh/known_hosts
-# 把 /srv/trace/.ssh/id_ed25519.pub 加到仓库的 Deploy Key（勾选写权限）
-sudo -u trace git -C /srv/trace config user.email "trace@你的域名"
-sudo -u trace git -C /srv/trace config user.name  "trace"
+# 把 /srv/trace/.ssh/id_ed25519.pub 加到**数据仓**的 Deploy Key（勾选写权限）
+sudo -u trace git -C /srv/trace-data config user.email "trace@你的域名"
+sudo -u trace git -C /srv/trace-data config user.name  "trace"
 ```
+
+自动同步 commit 的是 `data_dir` 指向的那个仓库（这里是 `/srv/trace-data`），
+所以 user.name / user.email 要配在它上面。
 
 `trace.service` 里把 `HOME` 指到 `/srv/trace`，所以 git 能读到上面这些，
 同时 `ProtectHome=true` 仍然生效。
@@ -91,6 +114,6 @@ curl -s https://你的域名/t/<space>/api/status | jq
 
 ## 换机器 / 灾难恢复
 
-`steps/` 是全部内容，且已经在 git 里。换机器就是：clone 仓库 → 装依赖 →
+`projects/` 是全部内容，且已经在私有数据仓里。换机器就是：clone 两个仓库 → 装依赖 →
 把旧的 `config.json` 拷过去（保持 space 和 token 不变，已有链接继续有效）→
 起服务。不需要导出、迁移、或者任何数据库操作。

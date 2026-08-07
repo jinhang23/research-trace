@@ -24,7 +24,8 @@ ProtectHome=true
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
-ReadWritePaths=/srv/trace
+# 代码目录 + data_dir 指向的数据目录，两个都要可写
+ReadWritePaths=/srv/trace /srv/trace-data
 
 [Install]
 WantedBy=multi-user.target

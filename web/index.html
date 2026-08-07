@@ -5,16 +5,19 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <title>__TITLE__</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='4' cy='4' r='2.2' fill='%23555'/><circle cx='4' cy='12' r='2.2' fill='%23555'/><circle cx='12' cy='12' r='2.2' fill='%23999'/><path d='M4 4v8M4 9h5a3 3 0 013 3' stroke='%23777' fill='none' stroke-width='1.4'/></svg>">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='3' r='2.2' fill='%23777'/><circle cx='4' cy='13' r='2.2' fill='%23999'/><circle cx='12' cy='13' r='2.2' fill='%23555'/><path d='M8 5v3M8 8h4v3M8 8H4v3' stroke='%23888' fill='none' stroke-width='1.4'/></svg>">
 <link rel="stylesheet" href="__ASSET__style.css">
 </head>
 <body>
 
 <header id="top">
-  <h1 id="brand">__TITLE__</h1>
+  <select id="proj" title="切换项目"></select>
   <div class="grow">
     <input id="search" type="search" placeholder="搜索 id / 标题 / 正文 / 标签   （按 / 聚焦）" autocomplete="off" spellcheck="false">
     <span id="hits" class="mono"></span>
+  </div>
+  <div class="seg" id="viewtoggle">
+    <button data-view="graph" title="图视图">图</button><button data-view="list" title="列表视图">列表</button>
   </div>
   <button id="btn-new" title="从选中节点派生新步骤（n）">＋ 新步骤</button>
   <button id="btn-token" title="设置写入令牌">🔒</button>
@@ -23,19 +26,34 @@
 
 <div id="warnbar" hidden></div>
 
-<main>
+<!-- 项目索引：没有选中项目时显示 -->
+<section id="home" hidden>
+  <div class="home-head">
+    <h1>__TITLE__</h1>
+    <button id="btn-newproj" class="primary">＋ 新建项目</button>
+  </div>
+  <div id="cards"></div>
+</section>
+
+<main id="main" hidden>
   <section id="left">
     <div id="scroller">
-      <div id="track">
+      <!-- 图视图：SVG 画边，HTML 卡片叠在上面（文本截断/hover 都好做） -->
+      <div id="diagram" hidden>
+        <svg id="dedges" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"></svg>
+        <div id="dnodes"></div>
+      </div>
+      <!-- 列表视图：轨道 SVG + 定高行，两者靠固定行高对齐 -->
+      <div id="track" hidden>
         <svg id="rails" xmlns="http://www.w3.org/2000/svg" width="0" height="0" aria-hidden="true"></svg>
         <div id="rows"></div>
       </div>
-      <p id="empty" hidden>还没有任何步骤。点右上角 <b>＋ 新步骤</b> 开始，或用 <code>python trace_cli.py new --title "..."</code>。</p>
+      <p id="empty" hidden>这个项目还没有步骤。点右上角 <b>＋ 新步骤</b> 开始。</p>
     </div>
     <footer id="legend">
       <span><i class="lg done"></i>done 实线实心</span>
       <span><i class="lg wip"></i>wip 虚线空心</span>
-      <span><i class="lg dead"></i>dead 点线方块</span>
+      <span><i class="lg dead"></i>dead 点线断头</span>
     </footer>
   </section>
 
@@ -70,7 +88,8 @@
 </dialog>
 
 <script id="forest-data" type="application/json">__DATA__</script>
-<script>window.TRACE_BASE = "__BASE__"; window.TRACE_MODE = "__MODE__";</script>
+<script id="projects-data" type="application/json">__PROJECTS__</script>
+<script>window.TRACE_BASE = "__BASE__"; window.TRACE_MODE = "__MODE__"; window.TRACE_PROJECT = "__PROJECT__";</script>
 <script src="__ASSET__md.js"></script>
 <script src="__ASSET__app.js"></script>
 </body>

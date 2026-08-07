@@ -64,7 +64,21 @@ html, body {
   padding: 8px 14px; border-bottom: 1px solid var(--rule);
   background: var(--panel); position: sticky; top: 0; z-index: 5;
 }
-#brand { font-size: 14px; font-weight: 600; margin: 0; white-space: nowrap; }
+#proj {
+  font: inherit; font-weight: 600; max-width: 220px;
+  padding: 5px 8px; border: 1px solid var(--rule); border-radius: 5px;
+  background: var(--bg); color: var(--ink); cursor: pointer;
+}
+
+/* 视图切换：图 / 列表 */
+.seg { display: flex; border: 1px solid var(--rule); border-radius: 5px; overflow: hidden; flex: 0 0 auto; }
+.seg button { border: 0; border-radius: 0; padding: 5px 11px; font-size: 12.5px; }
+.seg button + button { border-left: 1px solid var(--rule); }
+.seg button.on { background: var(--accent); color: #fff; }
+
+body.home-mode #top .grow,
+body.home-mode #viewtoggle,
+body.home-mode #btn-new { display: none; }
 #top .grow { flex: 1; display: flex; align-items: center; gap: 8px; min-width: 0; }
 #search {
   flex: 1; min-width: 0; padding: 5px 9px;
@@ -247,6 +261,77 @@ dialog menu { display: flex; justify-content: flex-end; gap: 8px; padding: 0; ma
   max-width: 44ch; line-height: 1.6;
 }
 .toast.err { border-color: var(--dead); color: var(--dead); }
+
+/* ---------------------------------------------------------------- 图视图 */
+
+/* 边画在 SVG 上，节点是叠在上面的 HTML 卡片——这样文本截断、hover、
+   焦点态都用原生 CSS 就能做，不必和 foreignObject 搏斗。 */
+#diagram { position: relative; }
+#dedges { position: absolute; left: 0; top: 0; pointer-events: none; }
+#dnodes { position: absolute; left: 0; top: 0; }
+
+#dedges .dedge { fill: none; stroke-width: 1.7; }
+#dedges .dedge.s-done { stroke: var(--done); }
+#dedges .dedge.s-wip  { stroke: var(--wip);  stroke-dasharray: 5 3.5; }
+#dedges .dedge.s-dead { stroke: var(--dead); stroke-dasharray: 1.5 3.5; stroke-linecap: round; }
+#dedges .darrow.s-done { fill: var(--done); }
+#dedges .darrow.s-wip  { fill: var(--wip); }
+#dedges .darrow.s-dead { fill: var(--dead); }
+#dedges .faded { opacity: .24; }
+
+.card {
+  position: absolute; box-sizing: border-box; overflow: hidden; cursor: pointer;
+  padding: 6px 9px; border-radius: 6px; background: var(--panel);
+  border: 1.5px solid var(--rule); outline: none;
+  transition: box-shadow .12s, transform .12s;
+}
+/* status 走线型（和边一致），不单独用颜色承载信息 */
+.card.s-done { border-style: solid;  border-color: var(--done); }
+.card.s-wip  { border-style: dashed; border-color: var(--wip); }
+.card.s-dead { border-style: dotted; border-color: var(--dead); background: var(--hi); }
+.card:hover { box-shadow: 0 3px 12px rgba(0,0,0,.14); }
+.card:focus-visible { box-shadow: 0 0 0 2px var(--accent); }
+.card.sel { box-shadow: 0 0 0 2.5px var(--accent), 0 4px 14px rgba(0,0,0,.16); }
+.card.faded { opacity: .3; }
+.card.miss  { opacity: .16; }
+
+.card .chead {
+  display: flex; align-items: center; gap: 5px; margin-bottom: 3px;
+  font-family: var(--mono); font-size: 10.5px; color: var(--muted); white-space: nowrap;
+}
+.card .cid { font-weight: 700; color: var(--ink); letter-spacing: .02em; }
+.card .cst { padding: 0 4px; border-radius: 2px; font-size: 9.5px; }
+.card.s-done .cst { color: var(--done); }
+.card.s-wip  .cst { color: var(--wip); }
+.card.s-dead .cst { color: var(--dead); }
+.card .cdate { margin-left: auto; }
+.card .ctitle {
+  font-size: 12.5px; line-height: 1.42; max-height: 2.84em;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.card.s-dead .ctitle { text-decoration: line-through; text-decoration-thickness: 1px; opacity: .8; }
+
+/* ---------------------------------------------------------------- 项目索引 */
+
+#home { padding: 26px 30px 60px; overflow: auto; height: calc(100% - 41px); }
+.home-head { display: flex; align-items: center; gap: 14px; margin-bottom: 20px; }
+.home-head h1 { font-size: 18px; margin: 0; flex: 1; }
+#cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(258px, 1fr)); gap: 14px; }
+.pcard {
+  display: block; text-decoration: none; color: inherit;
+  border: 1px solid var(--rule); border-radius: 8px; padding: 14px 16px; background: var(--panel);
+  transition: box-shadow .12s, border-color .12s;
+}
+.pcard:hover { border-color: var(--accent); box-shadow: 0 3px 14px rgba(0,0,0,.10); }
+.pcard h2 { font-size: 15px; margin: 0 0 10px; font-weight: 600; }
+.pbar { display: flex; height: 6px; border-radius: 3px; overflow: hidden; gap: 1.5px; margin-bottom: 9px; }
+.pbar i { display: block; }
+.pbar .sg-done { background: var(--done); }
+.pbar .sg-wip { background: var(--wip); }
+.pbar .sg-dead { background: var(--dead); }
+.pbar .sg-empty { background: var(--rule); }
+.pmeta { font-size: 11px; color: var(--muted); }
+.pwarn { margin-top: 6px; font-size: 11px; color: var(--wip); }
 
 @media (max-width: 900px) {
   main { flex-direction: column; height: auto; }

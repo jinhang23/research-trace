@@ -22,12 +22,24 @@ from pathlib import Path
 from typing import Any, Iterable
 
 NOTE_NAME = "note.md"
+PROJECT_NOTE = "project.md"
+PROJECTS_DIR = "projects"
+STEPS_DIR = "steps"
 STATUSES = ("wip", "done", "dead")
 DEFAULT_STATUS = "wip"
 
-# 行高与轨道宽在前端也要用到同一组数字，放在这里作为唯一来源。
+# 列表视图：行高与轨道宽。前端要用同一组数字，这里是唯一来源。
+# 行高必须固定——轨道 SVG 和行文本是两套坐标系，只靠它对齐。
 ROW_H = 28
 LANE_W = 14
+
+# 图视图：节点卡片尺寸与间距。
+NODE_W = 176
+NODE_H = 58
+H_GAP = 20      # 同层相邻节点
+V_GAP = 38      # 层与层之间
+TREE_GAP = 56   # 不同的树之间
+PAD = 24
 
 _ID_RE = re.compile(r"^(\d+)([a-z]*)$")
 _DIRNAME_RE = re.compile(r"^(\d+[a-z]*)_(.*)$")
@@ -96,6 +108,77 @@ class Step:
 
 def warn(level: str, code: str, message: str, where: str = "") -> dict[str, str]:
     return {"level": level, "code": code, "message": message, "where": where}
+
+
+@dataclass
+class Project:
+    slug: str
+    name: str = ""
+    body: str = ""
+    created: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"slug": self.slug, "name": self.name or self.slug, "body": self.body, "created": self.created}
+
+
+# ---------------------------------------------------------------- 项目
+
+
+def projects_root(root: Path) -> Path:
+    return root / PROJECTS_DIR
+
+
+def project_dir(root: Path, slug: str) -> Path:
+    return root / PROJECTS_DIR / slug
+
+
+def steps_dir_of(root: Path, slug: str) -> Path:
+    return root / PROJECTS_DIR / slug / STEPS_DIR
+
+
+def ensure_layout(root: Path, default_slug: str = "default") -> str | None:
+    """把旧的单项目布局（root/steps/）一次性迁移到 root/projects/<slug>/steps/。
+
+    做成一次性迁移而不是"两种布局都支持"，是为了之后只有一条代码路径——
+    双路径正是上一代系统出 bug 的形状。
+    """
+    legacy = root / STEPS_DIR
+    base = projects_root(root)
+    if legacy.is_dir() and not base.exists():
+        target = base / default_slug
+        target.mkdir(parents=True)
+        legacy.rename(target / STEPS_DIR)
+        return default_slug
+    base.mkdir(parents=True, exist_ok=True)
+    return None
+
+
+def scan_projects(root: Path) -> list[Project]:
+    """项目 = projects/ 下的一个目录。project.md 可有可无。"""
+    base = projects_root(root)
+    out: list[Project] = []
+    if not base.is_dir():
+        return out
+    for d in sorted(base.iterdir(), key=lambda p: p.name):
+        if not d.is_dir() or d.name.startswith("."):
+            continue
+        meta: dict[str, str] = {}
+        body = ""
+        note = d / PROJECT_NOTE
+        if note.is_file():
+            try:
+                meta, body, _ = parse_note(note.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                pass
+        out.append(
+            Project(
+                slug=d.name,
+                name=(meta.get("name") or d.name).strip(),
+                body=body,
+                created=(meta.get("created") or "").strip(),
+            )
+        )
+    return out
 
 
 # ---------------------------------------------------------------- parse
@@ -429,6 +512,89 @@ def compute_lanes(
     return lane, end
 
 
+# ---------------------------------------------------------------- 树布局
+
+
+def compute_tree(
+    by_id: dict[str, Step], children: dict[str, list[str]], order: list[str]
+) -> dict[str, Any]:
+    """Reingold–Tilford 紧凑树布局，自上而下。纯函数，可直接对着期望坐标写断言。
+
+    做法是经典的两件事：
+      1) 后序遍历。叶子放在本层下一个空位；内部节点居中于它的子节点。
+      2) 如果居中后的位置会撞上本层左边已有的节点，就把**整棵子树**右移，
+         而不是只挪父节点——只挪父节点会让它不再居中于子节点。
+
+    `next_x[d]` 记录第 d 层下一个可用的左边界，这是"不重叠"的唯一保证。
+    不同的树之间留 TREE_GAP，并且在所有层上都隔开，避免两棵树互相穿插。
+    """
+    if not order:
+        return {"nodes": {}, "w": PAD * 2, "h": PAD * 2, "node_w": NODE_W, "node_h": NODE_H,
+                "h_gap": H_GAP, "v_gap": V_GAP, "pad": PAD}
+
+    depth: dict[str, int] = {}
+    for sid in order:  # order 是前序，父一定排在子之前
+        p = by_id[sid].parent
+        depth[sid] = 0 if p is None else depth[p] + 1
+
+    x: dict[str, float] = {}
+    next_x: dict[int, float] = {}
+
+    def shift_subtree(sid: str, delta: float) -> None:
+        stack = list(children.get(sid, ()))
+        while stack:
+            n = stack.pop()
+            x[n] += delta
+            d = depth[n]
+            next_x[d] = max(next_x.get(d, float(PAD)), x[n] + NODE_W + H_GAP)
+            stack.extend(children.get(n, ()))
+
+    def place(sid: str) -> None:
+        d = depth[sid]
+        floor_ = next_x.get(d, float(PAD))
+        kids = children.get(sid, [])
+        if not kids:
+            x[sid] = floor_
+        else:
+            desired = (x[kids[0]] + x[kids[-1]]) / 2
+            if desired >= floor_:
+                x[sid] = desired
+            else:
+                x[sid] = floor_
+                shift_subtree(sid, floor_ - desired)  # 整棵子树右移，父仍居中于子
+        next_x[d] = x[sid] + NODE_W + H_GAP
+
+    roots = [sid for sid in order if by_id[sid].parent is None]
+    for root in roots:
+        stack: list[tuple[str, bool]] = [(root, False)]
+        while stack:  # 迭代后序，避免深链撞上 Python 递归上限
+            sid, done = stack.pop()
+            if done:
+                place(sid)
+            else:
+                stack.append((sid, True))
+                for c in reversed(children.get(sid, ())):
+                    stack.append((c, False))
+        # 让下一棵树在所有层上都躲开这一棵，两棵树不会互相穿插
+        edge = max(next_x.values()) + TREE_GAP - H_GAP
+        for d in list(next_x):
+            next_x[d] = edge
+        next_x[0] = edge
+
+    max_depth = max(depth.values())
+    nodes = {sid: {"x": round(x[sid], 2), "y": PAD + depth[sid] * (NODE_H + V_GAP), "depth": depth[sid]} for sid in order}
+    return {
+        "nodes": nodes,
+        "w": round(max(v["x"] for v in nodes.values()) + NODE_W + PAD, 2),
+        "h": PAD * 2 + (max_depth + 1) * NODE_H + max_depth * V_GAP,
+        "node_w": NODE_W,
+        "node_h": NODE_H,
+        "h_gap": H_GAP,
+        "v_gap": V_GAP,
+        "pad": PAD,
+    }
+
+
 # ---------------------------------------------------------------- backlinks
 
 
@@ -486,6 +652,7 @@ def compile_forest(steps_dir: Path, with_files: bool = True) -> dict[str, Any]:
         "order": order,
         "lanes": {sid: lane[sid] for sid in order},
         "lane_count": (max(lane.values()) + 1) if lane else 0,
+        "tree": compute_tree(by_id, children, order),
         "warnings": w_scan + w_val,
         "row_h": ROW_H,
         "lane_w": LANE_W,

@@ -3,7 +3,7 @@
 把科研过程记录成一棵**只追加的步骤树**：每个节点自带代码、日志、产物，和一句
 "我为什么要做这一步"。从任何一个结果都能一路回溯到最初的问题。
 
-人和 agent 都能写：人在网页上写，agent 走 REST API。
+多项目并行。人和 agent 都能写：人在网页上写，agent 走 REST API。
 
 ---
 
@@ -11,21 +11,32 @@
 
 ```bash
 pip install -r requirements.txt
-python trace_cli.py init                       # 生成 config.json（含访问路径与写入令牌）
-python trace_cli.py new --title "基线复现"      # 新建第一步
-python trace_cli.py serve                      # 起服务，终端会打印访问地址
+python trace_cli.py init                            # 生成 config.json（含访问路径与写入令牌）
+python trace_cli.py new-project --name "我的课题"
+python trace_cli.py serve                           # 起服务，终端会打印访问地址
 ```
 
 浏览器打开打印出来的地址，点右上角 🔒 把令牌存进浏览器，就能建步骤、改正文、拖文件了。
 
-键盘：`↑↓` 移动 · `n` 从选中节点派生 · `e` 编辑 · `/` 搜索 · `Ctrl+Enter` 保存
+键盘：`↑↓` 移动 · `g` 切换图/列表 · `n` 从选中节点派生 · `e` 编辑 · `/` 搜索 · `Ctrl+Enter` 保存
+
+## 两个视图
+
+**图** —— 自上而下的树，节点是卡片。看结构：哪里分了叉、哪条是主线、哪条断了。
+用 Reingold–Tilford 紧凑布局，父节点永远居中于它的子节点。
+
+**列表** —— git graph 那样的轨道图 + 定高行。看全貌：几百步时用它扫和搜最快。
+主线恒在轨道 0，选主线用的是"这一支还要往下延伸多远"，不是"哪个子节点 id 最小"——
+最早尝试的那条支往往是后来废掉的那条。
+
+两个视图共用同一份数据和同一套选中逻辑。布局都是纯函数算好的，视图只负责画。
 
 ---
 
 ## 四条范式（所有设计都从这里推出来）
 
-**P1 · 纯文件即数据库.** 一个 step = 一个目录，目录里的 `note.md` 是唯一权威。
-没有数据库、没有中心索引、没有 manifest。父子关系写在各自的 note 里。
+**P1 · 纯文件即数据库.** 一个项目 = 一个目录，一个 step = 一个目录，`note.md` 是唯一权威。
+没有数据库、没有中心索引、没有 manifest。
 
 > 于是不存在"索引和实际内容不一致"这种状态。新建一步就是新建一个目录——
 > 不需要注册。你可以直接 `mkdir` + `vim note.md`，页面五秒内自己跟上。
@@ -34,6 +45,7 @@ python trace_cli.py serve                      # 起服务，终端会打印访�
 可变的只有 `status` 和正文。改 `id` / `parent` 的 API 请求一律 409。
 
 > 这是溯源能成立的前提：笔记里写的"见 002b"、论文脚注里的引用，永远有效。
+> 项目的 slug 同理——改显示名不动目录名，已经发出去的链接不会失效。
 
 **P3 · 编译，而不是同步.** 视图是文件系统的纯函数。构建无状态、幂等、可随时删掉重来。
 实时推送推的是"版本变了，重新编译"信号，不是增量 patch。
@@ -41,7 +53,7 @@ python trace_cli.py serve                      # 起服务，终端会打印访�
 **P4 · 失败是一等公民.** `dead` 不是错误状态，是一种结论。死胡同在图上必须可见，
 不能折叠、不能默认隐藏，而且不能只靠"变灰"表达——变灰的语义是"不相关"，不是"结论为否"。
 
-**最硬的约束是"没有这个工具也能读"。** 删掉全部程序后，`grep -r "放弃" steps/`
+**最硬的约束是"没有这个工具也能读"。** 删掉全部程序后，`grep -r "放弃" projects/`
 仍然能查到你半年前为什么放弃了某条路。和这条冲突的设计一律否决。
 
 ---
@@ -50,19 +62,29 @@ python trace_cli.py serve                      # 起服务，终端会打印访�
 
 ```
 trace/
-├── trace_core.py     纯函数内核：scan/parse/validate/order/lanes/compile（零依赖）
+├── trace_core.py     纯函数内核：scan/parse/validate/order/lanes/tree/compile（零依赖）
 ├── trace_write.py    唯一写入路径 —— CLI / 网页 / agent API 全走这里
 ├── trace_server.py   FastAPI：路由 + SSE + 鉴权
 ├── trace_git.py      debounce 自动 commit + push
-├── trace_cli.py      init / new / check / build / serve / url
+├── trace_cli.py      init / projects / new-project / new / check / build / serve / url
 ├── web/              index.html · app.js · md.js · style.css（无构建步骤，不引 CDN）
-├── tests/            45 个断言，pytest tests
-├── steps/            ← 你的数据（仓库里自带 7 步示例，数字均为虚构，删掉即可）
+├── tests/            73 个断言，pytest tests
+├── projects/         ← 你的数据（仓库里自带一个示例项目，数字均为虚构，删掉即可）
+│   └── <slug>/
+│       ├── project.md            可选，只有一个 name 字段
+│       └── steps/<id>_<slug>/note.md + 任意文件
 └── deploy/           Caddyfile · systemd unit · 部署说明
 ```
 
 只有一个函数会创建 `note.md`。上一代系统的 bug 根源就是存在第二条写入路径
 （绕过 API 直接写库），导致父子关系只写进了一半的地方。这里用结构杜绝。
+
+**代码仓和数据仓建议分开。** `config.json` 里的 `data_dir` 指向哪，`projects/` 就在哪，
+自动 git 同步也就同步哪个目录。公开这份代码、把数据放进另一个私有仓库：
+
+```json
+{ "data_dir": "../trace-data", "git": { "enabled": true, "remote": "origin" } }
+```
 
 ## note.md 格式
 
@@ -102,17 +124,7 @@ front-matter 用手写解析器而不是 YAML：`title: 试了 3:1 采样` 在 Y
 
 三位数字，分叉时加字母后缀：`003` 派生出 `004` / `004b` / `004c`。
 兄弟共享数字，一眼看得出兄弟关系，而且**任何已有 id 都不会因为后来多出一个兄弟而改名**。
-
-## 图怎么读
-
-- 主线永远在最左边的轨道 0。选主线用的是"这一支还要往下延伸多远"，
-  不是"哪个子节点 id 最小"——最早尝试的那条支往往是后来废掉的那条。
-- 轨道会被回收：一条支结束后，它的轨道让给后面的支。轨道总数只取决于
-  最大同时活跃的分支数，和步骤总数无关。
-- 线型（实线/虚线/点线）承载 status，不透明度承载"是否在选中的祖先链上"。
-  颜色只作线型的补强，打印和色盲都能读。
-- 搜索**只 dim 不 hide**。隐藏行会让行号不连续、破坏轨道对齐，也破坏图的形状——
-  而图的形状本身就是信息（"这里分了三条支"）。搜索是为了定位，不是过滤。
+每个项目的 id 各自从 001 开始，互不影响。
 
 ---
 
@@ -122,17 +134,19 @@ Base = `/t/<space>`。读公开，写要 `Authorization: Bearer <token>`。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/forest` | 全量：steps（含 lane/row/children/backlinks/files）+ warnings |
-| GET | `/api/steps/{id}` | 单步 + `lineage`（到根的完整路径） |
+| GET | `/api/projects` | 项目列表 + 各自的步骤数与状态分布 |
+| POST | `/api/projects` | 建项目 `{name}` |
+| GET | `/api/p/{项目}/forest` | 全量：steps（含 lane/row/children/backlinks/files）+ tree + warnings |
+| GET | `/api/p/{项目}/steps/{id}` | 单步 + `lineage`（到根的完整路径） |
 | GET | `/api/events` | SSE，推 `{version}` |
-| POST | `/api/steps` | 建步骤。带 `key` 则幂等——重试不会产生重复 |
-| PATCH | `/api/steps/{id}` | 改 status/title/body/date/commit/author/tags |
-| PUT | `/api/steps/{id}/files/{path}` | 上传附件（raw body） |
+| POST | `/api/p/{项目}/steps` | 建步骤。带 `key` 则幂等——重试不会产生重复 |
+| PATCH | `/api/p/{项目}/steps/{id}` | 改 status/title/body/date/commit/author/tags |
+| PUT | `/api/p/{项目}/steps/{id}/files/{path}` | 上传附件（raw body） |
 
 ```python
 import json, urllib.request
 req = urllib.request.Request(
-    f"{BASE}/api/steps", method="POST",
+    f"{BASE}/api/p/{PROJECT}/steps", method="POST",
     data=json.dumps({
         "parent": "004", "title": "去重后重训所有模型", "status": "wip",
         "author": "agent:claude", "key": "dedup-rerun-v1",   # 幂等键，重试不会产生重复步骤
@@ -143,18 +157,24 @@ step = json.load(urllib.request.urlopen(req))
 ```
 
 Claude Code 用户：`~/.claude/skills/research-trace/SKILL.md` 已写好接入规则，
-设好 `TRACE_URL` 和 `TRACE_TOKEN` 两个环境变量即可。
+设好 `TRACE_URL`、`TRACE_TOKEN`、`TRACE_PROJECT` 三个环境变量即可。
 
 ## 命令
 
 ```bash
-python trace_cli.py check                 # 校验不变量，打印警告
-python trace_cli.py build --out dist      # 静态导出，file:// 可直接打开，断网可用
-python trace_cli.py url                   # 打印访问地址与令牌
-python -m pytest tests                    # 45 个断言
+python trace_cli.py projects                      # 列出项目
+python trace_cli.py new-project --name "课题名"
+python trace_cli.py new -P <项目> --title "..."    # 新建一步
+python trace_cli.py check [-P <项目>]              # 校验不变量，打印警告
+python trace_cli.py build --out dist              # 静态导出，file:// 可直接打开，断网可用
+python trace_cli.py url                           # 打印访问地址与令牌
+python -m pytest tests                            # 73 个断言
 ```
 
 `build` 的产物是确定性的：同样的输入两次构建逐字节一致，所以 `dist/` 直接 gitignore。
+
+旧的单项目布局（根目录下的 `steps/`）会在第一次运行时自动迁移到
+`projects/default/steps/`，一次性完成，之后只有一条代码路径。
 
 ## 残缺输入
 
@@ -168,6 +188,7 @@ python -m pytest tests                    # 45 个断言
 | 缺 `status` / 未知 `status` | 回退 `wip` + 警告 |
 | 目录名 id ≠ front-matter id | 以 front-matter 为准 + 警告 |
 | 目录里没有 `note.md` | 静默跳过（允许临时目录共存） |
+| 项目目录里没有 `project.md` | 用目录名当项目名——目录就是项目 |
 
 警告显示在页面顶栏，从不阻塞构建。
 
@@ -178,6 +199,7 @@ python -m pytest tests                    # 45 个断言
 ## 刻意不做的
 
 多人协作与并发编辑 · 自动捕获（不 hook shell / git / 文件系统）· 重跑与复现执行 ·
-大文件版本管理 · 全文索引服务（`grep` 就够）。
+大文件版本管理 · 全文索引服务（`grep` 就够）· 拖拽自由布局（布局一旦手工摆放，
+就不再是文件系统的纯函数了）。
 
 它们都会把"没有这个工具也能读"变成一句空话。
