@@ -488,3 +488,21 @@ dialog menu { display: flex; justify-content: flex-end; gap: 8px; padding: 0; ma
   #scroller { max-height: 46vh; }
   #detail { padding: 16px; }
 }
+
+/* ---------------------------------------------------------------- 项目洞察 */
+
+/* 不属于任何单独一步的沉淀。没选步骤时详情面板就是它，也是打开项目的落地页。 */
+.insights {
+  border: 1px solid var(--rule); border-radius: 8px;
+  padding: 18px 22px 20px; background: var(--panel); margin-bottom: 18px;
+}
+.insights > .title { margin-top: 0; }
+.insights .acts { margin-top: 14px; }
+.insights .prose { margin-top: 4px; }
+.insights .prose h2 {
+  font-size: 13px; letter-spacing: .04em; color: var(--muted);
+  border-bottom: 0; margin: 1.5em 0 .3em; padding: 0;
+}
+.insights .prose h2:first-child { margin-top: .6em; }
+.insights .prose ul { padding-left: 1.3em; }
+.insights .prose li { margin: .4em 0; }

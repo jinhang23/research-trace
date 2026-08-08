@@ -1,5 +1,5 @@
 ---
-description: 检查 trace 的 MCP server 在这台机器上接通了没有，没通就说清楚该改哪一项
+description: '检查 trace 的 MCP server 在这台机器上接通了没有，没通就说清楚该改哪一项'
 ---
 
 诊断 trace 插件在**当前这台机器**上的接线状况。按顺序查，每一步都要**实际跑**，

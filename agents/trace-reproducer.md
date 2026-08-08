@@ -1,6 +1,6 @@
 ---
 name: trace-reproducer
-description: Re-run a recorded research step to the level the user agreed on, then write the outcome back as a repro record. Only invoke after the user has explicitly approved a reproduction and its scope — this agent spends real compute and may submit cluster jobs. Use for "复现 004" / "按 L4 重跑这一步" / "reproduce this step and record the result" once the scope is settled.
+description: 'Re-run a recorded research step to the level the user agreed on, then write the outcome back as a repro record. Only invoke after the user has explicitly approved a reproduction and its scope — this agent spends real compute and may submit cluster jobs. Use for "复现 004" / "按 L4 重跑这一步" / "reproduce this step and record the result" once the scope is settled.'
 tools: Read, Grep, Glob, Bash
 disallowedTools: WebSearch
 model: sonnet

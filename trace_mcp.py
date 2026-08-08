@@ -111,6 +111,9 @@ class HttpBackend:
     def create_project(self, name):
         return self._call("POST", "/api/projects", {"name": name})
 
+    def update_project(self, project, payload):
+        return self._call("PATCH", f"/api/projects/{urllib.parse.quote(project)}", payload)
+
     def create(self, project, payload):
         return self._call("POST", f"/api/p/{urllib.parse.quote(project)}/steps", payload)
 
@@ -182,6 +185,15 @@ class LocalBackend:
 
     def create_project(self, name):
         return self._guard(self.W.create_project, self.root, name).to_dict()
+
+    def update_project(self, project, payload):
+        add = None
+        if payload.get("add_insight"):
+            a = payload["add_insight"]
+            add = (a.get("kind"), a.get("text", ""))
+        return self._guard(self.W.update_project, self.root, project,
+                           name=payload.get("name"), insights=payload.get("insights"),
+                           add=add).to_dict()
 
     def create(self, project, payload):
         step, created = self._guard(
@@ -369,6 +381,32 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "trace_insight",
+        "description": (
+            "往项目的「洞察」里记一条。**这是项目级的沉淀，不属于任何单独一步**——"
+            "「回译在这个数据集上一直没用」是三次尝试之后的判断，挂在哪一步都不对。\n"
+            "什么时候写：一条线走完得出总体结论时、发现一个会反复咬人的坑时、"
+            "冒出一个还没验证但值得记下来的想法时。\n"
+            "写完一步之后顺手想一想：这一步有没有产生「项目级」的教训？有就记一条。\n"
+            "带上 step 让它指回证据来源，正文里会渲染成可跳转的链接。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string"},
+                "kind": {
+                    "type": "string", "enum": ["idea", "works", "fails", "pitfall"],
+                    "description": ("idea＝核心想法（还没验证的方向）；works＝有效（确认管用的）；"
+                                    "fails＝无效（确认不管用的，和 works 一样重要）；"
+                                    "pitfall＝坑（会反复咬人的问题，比如数据里的陷阱、环境的雷）"),
+                },
+                "text": {"type": "string", "description": "一句话说清楚。有数字就带上数字"},
+                "step": {"type": "string", "description": "证据来自哪一步，如 002c。会渲染成可跳转链接"},
+            },
+            "required": ["project", "kind", "text"],
+        },
+    },
+    {
         "name": "trace_read",
         "description": (
             "读一个项目的步骤树；给了 step 就读那一步的全文（含到根的溯源链、子步骤、"
@@ -507,8 +545,14 @@ def t_read(be, args) -> str:
     if args.get("step"):
         return _fmt_step(project, be.step(project, args["step"]))
     f = be.forest(project)
-    return _fmt_tree(f, f"项目 {project} · {len(f['steps'])} 步"
-                        f"（● done / ○ wip / ▣ dead，缩进表示派生关系）")
+    out = _fmt_tree(f, f"项目 {project} · {len(f['steps'])} 步"
+                       f"（● done / ○ wip / ▣ dead，缩进表示派生关系）")
+    # 项目级的洞察放最前面：它是这个项目里已经沉淀下来的判断，
+    # 比逐步去读更快让人（和你）进入状态。
+    info = next((p for p in be.projects() if p["slug"] == project), None)
+    if info and (info.get("body") or "").strip():
+        out = "【本项目已沉淀的洞察】\n" + info["body"].strip() + "\n\n" + out
+    return out
 
 
 def t_search(be, args) -> str:
@@ -547,6 +591,15 @@ def _why_is_blank(body: str) -> bool:
         return True                     # 压根没有这一节
     text = m.group(1).strip()
     return not text or text.startswith(("（", "("))   # 空的，或者还是模板里的占位括号
+
+
+def t_insight(be, args) -> str:
+    text = args["text"].strip()
+    if args.get("step"):
+        text = f"{text} —— [[{args['step'].strip()}]]"
+    p = be.update_project(args["project"], {"add_insight": {"kind": args["kind"], "text": text}})
+    label = {"idea": "核心想法", "works": "有效", "fails": "无效", "pitfall": "坑"}[args["kind"]]
+    return f"已记入 {p['slug']} 的「{label}」：{text}"
 
 
 def t_new_project(be, args) -> str:
@@ -675,6 +728,7 @@ def t_attach(be, args) -> str:
 HANDLERS = {
     "trace_projects": t_projects,
     "trace_new_project": t_new_project,
+    "trace_insight": t_insight,
     "trace_read": t_read,
     "trace_search": t_search,
     "trace_new_step": t_new_step,
@@ -703,7 +757,7 @@ def dispatch(backend, name: str, args: dict[str, Any]) -> str:
 # 的客户端连上来跑一遍互操作。
 
 SERVER_NAME = "trace"
-SERVER_VERSION = "0.8.0"
+SERVER_VERSION = "0.9.0"
 
 # 收到客户端要的版本就原样回它（前提是我们认识），否则回我们最新的。
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")

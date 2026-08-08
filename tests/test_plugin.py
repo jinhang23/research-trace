@@ -253,3 +253,43 @@ def test_the_audit_skill_delegates_instead_of_doing_the_work_itself():
 def test_the_plugin_has_a_license():
     assert (ROOT / "LICENSE").is_file()
     assert PLUGIN.get("license") == "MIT"
+
+
+# ------------------------------------------------------------ 官方校验器
+# 与其我逐条对照文档，不如让 Claude Code 自带的校验器说话。
+# 它抓到过一个我自己踩的坑：agent 的 description 里有 "Read-only: it never…"，
+# 未加引号的 YAML 标量含 ": " 直接解析失败 —— 运行时会**静默丢掉整个 frontmatter**，
+# disallowedTools 那道禁写闸门等于不存在。
+
+
+def _claude_cli():
+    import shutil
+    return shutil.which("claude") or shutil.which("claude.cmd") or shutil.which("claude.exe")
+
+
+@pytest.mark.parametrize("manifest", ["plugin.json", "marketplace.json"])
+def test_official_validator_passes_in_strict_mode(manifest):
+    import subprocess
+
+    exe = _claude_cli()
+    if not exe:
+        pytest.skip("claude CLI 不在 PATH 上")
+    p = subprocess.run([exe, "plugin", "validate", str(ROOT / ".claude-plugin" / manifest), "--strict"],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+    assert p.returncode == 0, (p.stdout + p.stderr)[-2000:]
+
+
+def test_every_frontmatter_actually_parses_as_yaml():
+    """校验器只在装了 CLI 时跑，这条是无依赖的兜底。"""
+    yaml = pytest.importorskip("yaml", reason="装了 PyYAML 才跑这条")
+    files = list(AGENT_DIR.glob("*.md")) + list(SKILL_DIR.glob("*/SKILL.md")) \
+        + list((ROOT / "commands").glob("*.md"))
+    assert files
+    for f in files:
+        text = f.read_text(encoding="utf-8")
+        head = text.split("\n---", 1)[0].removeprefix("---\n")
+        try:
+            meta = yaml.safe_load(head)
+        except yaml.YAMLError as e:
+            raise AssertionError(f"{f.relative_to(ROOT)} 的 frontmatter 不是合法 YAML：{e}") from None
+        assert isinstance(meta, dict) and meta.get("description"), f.name

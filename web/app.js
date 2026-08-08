@@ -158,7 +158,10 @@
     return api("/api/projects").then(function (d) {
       PROJECTS = d.projects || [];
       renderProjects();
-      if (!PROJECT) renderHome();
+      if (!PROJECT) { renderHome(); return; }
+      // 洞察面板是从 PROJECTS 里读的，而它比 forest 晚到。
+      // 不在这里重画一次的话，第一次打开项目看到的就是个空框。
+      if (!selected() && !editing) renderDetail();
     }).catch(function () {});
   }
 
@@ -447,15 +450,64 @@
     return String(text || "").split("\n").map(function (l) { return l.trim(); }).filter(Boolean);
   }
 
+  /* 项目洞察：不属于任何单独一步的沉淀——核心想法、什么有效什么无效、
+     踩过的坑。存在 project.md 的正文里，所以照样可 grep、可 diff。
+     没选步骤时详情面板就显示它，这也是打开项目时的落地页。 */
+  var INSIGHT_KINDS = [
+    { k: "idea", label: "核心想法", hint: "还没验证但值得记下来的方向" },
+    { k: "works", label: "有效", hint: "确认管用的" },
+    { k: "fails", label: "无效", hint: "确认不管用的——和有效一样重要" },
+    { k: "pitfall", label: "坑", hint: "会反复咬人的问题" },
+  ];
+
+  function currentProject() {
+    for (var i = 0; i < PROJECTS.length; i++) if (PROJECTS[i].slug === PROJECT) return PROJECTS[i];
+    return null;
+  }
+
+  function renderInsights(el) {
+    var p = currentProject() || { name: PROJECT, body: "" };
+    var body = (p.body || "").trim();
+    var acts = canWrite()
+      ? '<div class="acts"><button data-act="edit-insights">✎ 编辑洞察</button>'
+        + INSIGHT_KINDS.map(function (k) {
+            return '<button data-add-insight="' + k.k + '" title="' + esc(k.hint) + '">＋ ' + k.label + "</button>";
+          }).join("")
+        + '<span class="sp"></span><button data-act="child" class="primary">＋ 新步骤</button></div>'
+      : "";
+    var content = body
+      ? '<div class="prose">' + window.md.render(body, {
+          resolve: function (h) { return h; },
+        }) + "</div>"
+      : '<p class="dropnote">还没有洞察。<br>'
+        + '这里记的是**不属于任何单独一步**的判断——「回译在这个数据集上一直没用」'
+        + '是三次尝试之后的结论，挂在哪一步都不对。</p>';
+
+    el.innerHTML = '<div class="insights">'
+      + '<h1 class="title">💡 ' + esc(p.name || PROJECT) + " · 洞察</h1>"
+      + '<p class="dropnote">核心想法 · 什么有效什么无效 · 踩过的坑。'
+      + "存在 <code>project.md</code> 里，删掉程序照样能 grep。</p>"
+      + acts + content + "</div>"
+      + '<div class="sec"><h3>快捷键</h3><p class="dropnote">'
+      + '<span class="mono">↑ ↓</span> 在步骤间移动 · <span class="mono">g</span> 切换图/列表 · '
+      + '<span class="mono">n</span> 新建步骤 · <span class="mono">e</span> 编辑 · '
+      + '<span class="mono">/</span> 搜索 · <span class="mono">Esc</span> 回到这里</p></div>';
+    enhanceProse(el);
+    el.scrollTop = 0;
+  }
+
+  function patchProject(payload) {
+    return api("/api/projects/" + encodeURIComponent(PROJECT), {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }).then(function () { return refreshProjects(); }).then(function () { onHash(); });
+  }
+
   function renderDetail() {
     var el = $("#detail"), s = IDX[selected()];
     document.body.classList.toggle("editing", !!(editing && s));
-    if (!s) {
-      el.innerHTML = '<div class="placeholder">选一个步骤看详情。<br>'
-        + '<span class="mono">↑ ↓</span> 移动 · <span class="mono">g</span> 切换视图 · '
-        + '<span class="mono">n</span> 新建 · <span class="mono">e</span> 编辑 · <span class="mono">/</span> 搜索</div>';
-      return;
-    }
+    if (!s) { renderInsights(el); return; }   // 没选步骤时，详情面板就是项目主页
     if (editing) return renderEditor(s);
 
     var meta = ['<span class="pill s-' + s.status + '">' + s.status + "</span>"];
@@ -836,9 +888,40 @@
     var st = e.target.closest("[data-status]");
     if (st) { patch(selected(), { status: st.getAttribute("data-status") }).then(refreshProjects).catch(fail); return; }
 
+    var ai = e.target.closest("[data-add-insight]");
+    if (ai) {
+      var kind = ai.getAttribute("data-add-insight");
+      var label = INSIGHT_KINDS.filter(function (k) { return k.k === kind; })[0].label;
+      var txt = prompt("记一条「" + label + "」（一句话说清；带上数字更好）：");
+      if (!txt || !txt.trim()) return;
+      var sid = selected();
+      patchProject({ add_insight: { kind: kind, text: txt.trim() + (sid ? " —— [[" + sid + "]]" : "") } })
+        .then(function () { toast("已记入「" + label + "」"); }).catch(fail);
+      return;
+    }
+
     var act = e.target.closest("[data-act]");
     if (!act) return;
     var name = act.getAttribute("data-act");
+    if (name === "edit-insights") {
+      var p = currentProject() || { body: "" };
+      $("#detail").innerHTML =
+        '<div class="edhead"><b>💡 编辑项目洞察</b><span class="sp"></span>'
+        + '<button data-act="save-insights" class="primary">保存 <kbd>Ctrl↵</kbd></button>'
+        + '<button data-act="cancel">取消</button></div>'
+        + '<textarea class="editor" id="ed-insights" spellcheck="false" style="min-height:420px">'
+        + esc(p.body || INSIGHT_KINDS.map(function (k) { return "## " + k.label; }).join("\n\n") + "\n")
+        + "</textarea>"
+        + '<p class="dropnote">markdown。四个小节是约定不是强制，但 <code>trace_insight</code> '
+        + "工具会往这几个小节里追加，保持它们在的话人和 agent 写的东西就落在同一处。</p>";
+      $("#ed-insights").focus();
+      return;
+    }
+    if (name === "save-insights") {
+      patchProject({ insights: $("#ed-insights").value })
+        .then(function () { toast("已保存"); }).catch(fail);
+      return;
+    }
     if (name === "edit") { editing = true; renderDetail(); }
     else if (name === "cancel") { editing = false; renderDetail(); }
     else if (name === "child") { openNew(selected()); }
@@ -876,6 +959,14 @@
     if (!$("#lightbox").hidden && e.key === "Escape") { closeLightbox(); return; }
     var t = e.target.tagName;
     if (t === "INPUT" || t === "TEXTAREA" || t === "SELECT") {
+      if (e.target.id === "ed-insights") {
+        if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+          e.preventDefault();
+          patchProject({ insights: e.target.value }).then(function () { toast("已保存"); }).catch(fail);
+        }
+        if (e.key === "Escape") { e.preventDefault(); onHash(); }
+        return;
+      }
       if (e.target.id === "ed-body" || e.target.id === "ed-title" || e.target.id === "ed-paths") {
         if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); saveEditor(); return; }
         if ((e.metaKey || e.ctrlKey) && (e.key === "b" || e.key === "B")) {

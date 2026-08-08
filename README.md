@@ -110,7 +110,7 @@ research-trace/                     ← 仓库本身就是插件
 ├── trace_git.py                    debounce 自动 commit + push（同步的是数据仓）
 ├── trace_cli.py                    init / projects / new / check / paths / build / serve / url
 ├── web/                            无构建步骤，不引 CDN
-├── tests/                          218 个 Python 断言 + 25 个 markdown 渲染断言
+├── tests/                          233 个 Python 断言 + 25 个 markdown 渲染断言
 ├── FORMAT.md                       记录格式标准：写什么、怎么可视化、L0–L4 怎么判
 ├── deploy/                         Caddyfile · systemd unit · 部署说明
 └── projects/                       ← 你的数据（上线时用 --data-dir 指到私有仓库）
@@ -305,6 +305,8 @@ claude mcp add trace -s user \
 | `trace_projects` | 列项目 + 步骤数与状态分布 |
 | `trace_read` | 读整棵树（缩进树，比 JSON 省 token），或读单步全文 + 溯源链 |
 | `trace_search` | 在标题/正文/标签里搜——回答"之前是不是试过 X""为什么放弃了 Y" |
+| `trace_new_project` | 建项目。数据仓为空时 `trace_new_step` 会自动建，不用先跑 init |
+| `trace_insight` | 往项目洞察里记一条：核心想法 / 有效 / 无效 / 坑 |
 | `trace_new_step` | 建步骤（支持幂等键、外部产物路径） |
 | `trace_update_step` | 改状态/正文/路径；`append` 和 `add_paths` 追加比整组替换安全 |
 | `trace_attach` | 传附件；**图片必须给 caption**，给了就自动在正文插入引用 |

@@ -15,7 +15,7 @@
         "repo": "jinhang23/research-trace"
       },
       "description": "把科研过程记录成一棵只追加的步骤树，从任何结果回溯到最初的问题。含 6 个 MCP 工具、多项目、图/列表双视图、外部产物路径溯源。",
-      "version": "0.8.0",
+      "version": "0.9.0",
       "category": "research",
       "tags": [
         "research",

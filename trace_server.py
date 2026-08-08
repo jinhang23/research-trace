@@ -285,10 +285,20 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
         return JSONResponse(p.to_dict(), status_code=201)
 
     @app.patch(base + "/api/projects/{project}")
-    async def api_rename_project(project: str, request: Request) -> JSONResponse:
+    async def api_update_project(project: str, request: Request) -> JSONResponse:
+        """改显示名和/或洞察。slug 不动——它是 URL 的一部分。"""
         require_token(request)
         payload = await body_json(request)
-        p = W.rename_project(data_root, project, payload.get("name", ""))
+        add = None
+        if payload.get("add_insight"):
+            a = payload["add_insight"]
+            if not isinstance(a, dict) or not a.get("kind"):
+                raise W.WriteError('add_insight 要形如 {"kind": "idea", "text": "…"}')
+            add = (a["kind"], a.get("text", ""))
+        p = W.update_project(data_root, project,
+                             name=payload.get("name"),
+                             insights=payload.get("insights"),
+                             add=add)
         touched([f"project:{p.slug}"])
         return JSONResponse(p.to_dict())
 

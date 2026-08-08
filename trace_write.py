@@ -113,6 +113,81 @@ def create_project(root: Path, name: str) -> Project:
     return Project(slug=slug, name=name)
 
 
+# 项目级的沉淀。它不属于任何单独一步——「回译在这个数据集上一直没用」是三次
+# 尝试之后的判断，挂在哪一步都不对。所以放在 project.md 的正文里。
+INSIGHT_SECTIONS = {
+    "idea": "核心想法",
+    "works": "有效",
+    "fails": "无效",
+    "pitfall": "坑",
+}
+INSIGHT_TEMPLATE = "\n\n".join(f"## {t}" for t in INSIGHT_SECTIONS.values()) + "\n"
+
+
+def update_project(root: Path, slug: str, *, name: str | None = None,
+                   insights: str | None = None,
+                   add: tuple[str, str] | None = None) -> Project:
+    """改项目的显示名和/或洞察正文。
+
+    `add=(kind, text)` 往对应小节追加一条，小节不存在就补出来。
+    **目录名（= URL 里的 slug）永远不动**——改了会让所有已发出的链接失效。
+    """
+    from trace_core import parse_note
+
+    d = project_dir(root, slug)
+    if not d.is_dir():
+        raise NotFound(f"项目 {slug} 不存在")
+    note = d / PROJECT_NOTE
+    meta: dict[str, str] = {}
+    body = ""
+    if note.is_file():
+        meta, body, _w = parse_note(note.read_text(encoding="utf-8", errors="replace"))
+
+    final_name = _clean_line(name) if name is not None else (meta.get("name") or slug).strip()
+    if not final_name:
+        raise WriteError("项目名不能为空")
+
+    if insights is not None:
+        body = str(insights).replace("\r\n", "\n").replace("\r", "\n")
+    if add is not None:
+        kind, text = add
+        heading = INSIGHT_SECTIONS.get(kind)
+        if heading is None:
+            raise WriteError(f"洞察类型必须是 {'/'.join(INSIGHT_SECTIONS)} 之一，收到 {kind!r}")
+        text = re.sub(r"\s*\n\s*", " ", str(text or "")).strip()
+        if not text:
+            raise WriteError("洞察内容不能为空")
+        body = _append_under(body, heading, "- " + text)
+
+    note.write_text(
+        f"---\nname: {final_name}\n---\n\n{body.strip()}\n" if body.strip()
+        else f"---\nname: {final_name}\n---\n\n",
+        encoding="utf-8", newline="\n")
+    return Project(slug=slug, name=final_name, body=body.strip())
+
+
+def _append_under(body: str, heading: str, line: str) -> str:
+    """把一行追加到 `## <heading>` 小节末尾；小节不存在就按模板顺序插进去。"""
+    lines = (body or "").split("\n")
+    start = None
+    for i, l in enumerate(lines):
+        if re.match(rf"^\s*#{{1,6}}\s+{re.escape(heading)}\s*$", l):
+            start = i
+            break
+    if start is None:
+        prefix = lines + ([""] if lines and lines[-1].strip() else [])
+        return "\n".join(prefix + [f"## {heading}", line]).strip("\n")
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if re.match(r"^\s*#{1,6}\s+\S", lines[j]):
+            end = j
+            break
+    block = lines[start:end]
+    while block and not block[-1].strip():
+        block.pop()
+    return "\n".join(lines[:start] + block + [line, ""] + lines[end:]).strip("\n")
+
+
 def rename_project(root: Path, slug: str, name: str) -> Project:
     """只改显示名。**目录名（= URL 里的 slug）不动**——改了会让所有已发出的链接失效。"""
     name = _clean_line(name)

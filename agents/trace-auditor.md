@@ -1,6 +1,6 @@
 ---
 name: trace-auditor
-description: Audit whether a recorded research step can actually be traced and reproduced. Checks the record against the real world — do the recorded paths still exist, does the commit resolve, are the figures captioned, is the chain complete — and reports what is missing and at what level the chain breaks. Use when the user asks "这个结果可靠吗" / "能不能溯源" / "还差什么才能复现" / "audit this step" / "check provenance", or before citing an old result in a paper. Read-only: it never reruns experiments and never writes to the log.
+description: 'Audit whether a recorded research step can actually be traced and reproduced. Checks the record against the real world — do the recorded paths still exist, does the commit resolve, are the figures captioned, is the chain complete — and reports what is missing and at what level the chain breaks. Use when the user asks "这个结果可靠吗" / "能不能溯源" / "还差什么才能复现" / "audit this step" / "check provenance", or before citing an old result in a paper. Read-only: it never reruns experiments and never writes to the log.'
 tools: Read, Grep, Glob, Bash
 disallowedTools: Write, Edit, NotebookEdit, WebSearch
 model: sonnet
