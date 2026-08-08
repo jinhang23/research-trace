@@ -365,6 +365,7 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             author=payload.get("author", ""),
             key=payload.get("key", ""),
             tags=payload.get("tags"),
+            paths=payload.get("paths"),
         )
         if created:
             touched([f"{project}/{step.id}"])

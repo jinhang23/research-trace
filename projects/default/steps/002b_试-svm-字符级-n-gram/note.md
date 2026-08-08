@@ -7,6 +7,7 @@ date: 2026-03-06
 commit: b4c5d6e
 author: human
 tags: svm, ngram
+path: /red/nlp-lab/jdoe/scratch/svm-ngram | 27 分钟跑出来的特征矩阵，6 GB。已确认无用，可删
 ---
 
 ## 为什么

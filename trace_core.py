@@ -45,6 +45,54 @@ _ID_RE = re.compile(r"^(\d+)([a-z]*)$")
 _DIRNAME_RE = re.compile(r"^(\d+[a-z]*)_(.*)$")
 _WIKILINK_RE = re.compile(r"\[\[\s*([0-9]+[a-z]*)\s*\]\]")
 
+# front-matter 里可以重复出现的键（其余键重复时后写的覆盖先写的）
+MULTI_KEYS = ("path",)
+
+_HPC_RE = re.compile(r"^(/blue/|/orange/|/red/|/scratch/|/gpfs/|/lustre/|/work/)", re.I)
+_WIN_RE = re.compile(r"^[a-z]:[\\/]", re.I)
+
+
+def path_kind(location: str) -> str:
+    """从位置字符串猜它是什么。纯展示用（决定一个徽章），猜错也不影响任何东西。"""
+    s = (location or "").strip()
+    low = s.lower()
+    if _HPC_RE.match(low):
+        return "hpc"                                   # /blue/<组>/<用户>/… 这类超算文件系统
+    if "github.com" in low or low.startswith("git@"):
+        return "github"
+    if "gitlab.com" in low or "bitbucket.org" in low:
+        return "git"
+    if "dropbox" in low:
+        return "dropbox"
+    if "drive.google" in low or "docs.google" in low:
+        return "drive"
+    if low.startswith(("s3://", "gs://", "az://", "oss://", "minio://")):
+        return "object"
+    if any(k in low for k in ("zenodo.org", "figshare.com", "osf.io", "dataverse")):
+        return "archive"
+    if any(k in low for k in ("huggingface.co", "wandb.ai", "app.neptune.ai")):
+        return "mlhub"
+    if low.startswith(("http://", "https://")):
+        return "url"
+    if _WIN_RE.match(low) or s.startswith("\\\\"):
+        return "local"
+    return "path"
+
+
+def parse_paths(raw: str) -> list[dict[str, str]]:
+    """每行一条 `<位置> | <说明>`。说明是自由文本，校验和、大小、"哪台机器"都往里写。"""
+    out: list[dict[str, str]] = []
+    for line in (raw or "").split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        loc, _, note = line.partition("|")
+        loc = loc.strip()
+        if not loc:
+            continue
+        out.append({"location": loc, "note": note.strip(), "kind": path_kind(loc)})
+    return out
+
 # ---------------------------------------------------------------- id 工具
 
 
@@ -87,6 +135,7 @@ class Step:
     author: str = ""
     key: str = ""
     tags: list[str] = field(default_factory=list)
+    paths: list[dict[str, str]] = field(default_factory=list)
     body: str = ""
     dirname: str = ""
 
@@ -101,6 +150,7 @@ class Step:
             "author": self.author,
             "key": self.key,
             "tags": list(self.tags),
+            "paths": [dict(p) for p in self.paths],
             "body": self.body,
             "dirname": self.dirname,
         }
@@ -222,7 +272,11 @@ def parse_note(text: str) -> tuple[dict[str, str], str, list[dict[str, str]]]:
         v = v.strip()
         if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
             v = v[1:-1]
-        if k:
+        if not k:
+            continue
+        if k in MULTI_KEYS and k in meta:
+            meta[k] += "\n" + v          # 可重复的键累积；其余键仍然是后写覆盖先写
+        else:
             meta[k] = v
 
     body = "\n".join(lines[close + 1 :]).strip("\n")
@@ -272,6 +326,7 @@ def build_step(dirname: str, meta: dict[str, str], body: str) -> tuple[Step, lis
         author=(meta.get("author") or "").strip(),
         key=(meta.get("key") or "").strip(),
         tags=_parse_tags(meta.get("tags", "")),
+        paths=parse_paths(meta.get("path", "")),
         body=body,
         dirname=dirname,
     )

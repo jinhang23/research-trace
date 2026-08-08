@@ -384,6 +384,40 @@
     }).join("") + "</nav>";
   }
 
+  var KIND_LABEL = {
+    hpc: "超算", github: "GitHub", git: "Git", dropbox: "Dropbox", drive: "Drive",
+    object: "对象存储", archive: "数据仓库", mlhub: "实验平台", url: "链接",
+    local: "本机", path: "路径",
+  };
+
+  /* 外部产物的位置。checkpoint、数据集这些 GB 级的东西不进仓库，
+     只在这里记"它在哪"——溯源时最常问的就是这个。 */
+  function renderPaths(s) {
+    var ps = s.paths || [];
+    if (!ps.length) return "";
+    return '<div class="pathbox">' + ps.map(function (p) {
+      var loc = esc(p.location);
+      var isLink = /^https?:\/\//i.test(p.location);
+      return '<div class="pathrow">'
+        + '<span class="pkind k-' + esc(p.kind) + '">' + esc(KIND_LABEL[p.kind] || p.kind) + "</span>"
+        + (isLink
+            ? '<a class="ploc" href="' + loc + '" target="_blank" rel="noopener noreferrer">' + loc + "</a>"
+            : '<code class="ploc">' + loc + "</code>")
+        + '<button class="pcopy" type="button" data-copy="' + loc + '" title="复制">⧉</button>'
+        + (p.note ? '<span class="pnote">' + esc(p.note) + "</span>" : "")
+        + "</div>";
+    }).join("") + "</div>";
+  }
+
+  function pathsToText(s) {
+    return (s.paths || []).map(function (p) {
+      return p.location + (p.note ? " | " + p.note : "");
+    }).join("\n");
+  }
+  function textToPaths(text) {
+    return String(text || "").split("\n").map(function (l) { return l.trim(); }).filter(Boolean);
+  }
+
   function renderDetail() {
     var el = $("#detail"), s = IDX[selected()];
     document.body.classList.toggle("editing", !!(editing && s));
@@ -415,6 +449,7 @@
         + "</div>";
     }
 
+    var paths = renderPaths(s);
     var body = window.md.render(s.body || "", { resolve: resolverFor(s) });
 
     var back = "";
@@ -444,7 +479,7 @@
     files += "</div>";
 
     el.innerHTML = crumbs(s) + '<h1 class="title">' + esc(s.title || "(无标题)") + "</h1>"
-      + '<div class="meta">' + meta.join("") + "</div>" + acts
+      + '<div class="meta">' + meta.join("") + "</div>" + acts + paths
       + '<div class="prose">' + body + "</div>" + back + files;
     enhanceProse(el);
     el.scrollTop = 0;
@@ -473,6 +508,9 @@
       + '<button data-act="save" class="primary">保存 <kbd>Ctrl↵</kbd></button>'
       + '<button data-act="cancel">取消 <kbd>Esc</kbd></button></div>'
       + '<input class="title-input" id="ed-title" value="' + esc(s.title || "") + '" maxlength="200" placeholder="标题：一行说清这一步在干什么">'
+      + '<label class="edpaths">外部路径 · 每行一条，<code>位置 | 说明</code>'
+      + '<textarea id="ed-paths" rows="2" spellcheck="false" placeholder="/blue/组名/用户名/exp/agnews | 训练数据，12 GB">'
+      + esc(pathsToText(s)) + "</textarea></label>"
       + '<div class="edtools">' + TOOLS.map(function (t) {
           return '<button type="button" data-md="' + t.k + '" title="' + esc(t.title) + '">' + t.html + "</button>";
         }).join("") + '<span class="sp"></span><span class="edhint mono" id="ed-status"></span></div>'
@@ -651,7 +689,11 @@
   function saveEditor() {
     var s = IDX[selected()];
     if (!s) return;
-    return patch(s.id, { title: $("#ed-title").value, body: $("#ed-body").value })
+    return patch(s.id, {
+      title: $("#ed-title").value,
+      body: $("#ed-body").value,
+      paths: textToPaths($("#ed-paths").value),
+    })
       .then(function () { editing = false; renderDetail(); refreshProjects(); toast("已保存"); })
       .catch(fail);
   }
@@ -675,6 +717,8 @@
     $("#nf-date").value = todayISO();
     $("#nf-status").value = "wip";
     $("#nf-commit").value = "";
+    // 从父步骤继承路径：同一条线上的数据/代码位置多半没变，改比重打省事
+    $("#nf-paths").value = p ? pathsToText(p) : "";
     $("#dlg-new").showModal();
     setTimeout(function () { $("#nf-title").focus(); }, 30);
   }
@@ -693,6 +737,7 @@
         commit: $("#nf-commit").value.trim(),
         author: "human",
         body: $("#nf-body").value,
+        paths: textToPaths($("#nf-paths").value),
       }),
     }).then(function (step) {
       return refresh().then(function () {
@@ -719,6 +764,14 @@
       return;
     }
 
+    var cp = e.target.closest("[data-copy]");
+    if (cp) {
+      e.preventDefault();
+      navigator.clipboard.writeText(cp.getAttribute("data-copy"))
+        .then(function () { toast("已复制路径"); }, function () { toast("复制失败", true); });
+      return;
+    }
+
     var zi = e.target.closest("img.zoomable");
     if (zi) { e.preventDefault(); openLightbox(zi); return; }
     if (e.target.closest("#lightbox")) { closeLightbox(); return; }
@@ -728,6 +781,10 @@
 
     var hit = e.target.closest("#rows .row, #dnodes .card");
     if (hit) { select(hit.getAttribute("data-id")); return; }
+
+    // 点图上的空白处 = 取消选中 = 所有节点回到全亮。
+    // 不透明度这个通道只承载"是否在选中的祖先链上"，没有选中时就不该有任何东西是淡的。
+    if (e.target.closest("#scroller") && selected()) { select(""); return; }
 
     var vt = e.target.closest("#viewtoggle button");
     if (vt) {
@@ -790,7 +847,7 @@
     if (!$("#lightbox").hidden && e.key === "Escape") { closeLightbox(); return; }
     var t = e.target.tagName;
     if (t === "INPUT" || t === "TEXTAREA" || t === "SELECT") {
-      if (e.target.id === "ed-body" || e.target.id === "ed-title") {
+      if (e.target.id === "ed-body" || e.target.id === "ed-title" || e.target.id === "ed-paths") {
         if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); saveEditor(); return; }
         if ((e.metaKey || e.ctrlKey) && (e.key === "b" || e.key === "B")) {
           e.preventDefault(); wrapSel($("#ed-body"), "**", "**", "粗体"); schedulePreview(IDX[selected()]); return;

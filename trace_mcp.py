@@ -29,6 +29,18 @@ from typing import Any
 
 IMG_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".avif"}
 MARK = {"done": "●", "wip": "○", "dead": "▣"}
+KIND_LABEL = {
+    "hpc": "超算", "github": "GitHub", "git": "Git", "dropbox": "Dropbox", "drive": "Drive",
+    "object": "对象存储", "archive": "数据仓库", "mlhub": "实验平台", "url": "链接",
+    "local": "本机", "path": "路径",
+}
+PATHS_DESC = (
+    "外部产物的位置，每条写成 \"位置 | 说明\"。GB 级的东西（数据集、checkpoint）不要传进来，"
+    "只记它在哪 —— 这是溯源的一半。例："
+    "\"/blue/<组>/<用户>/exp/agnews-clean | 去重后的训练集，12 GB\"、"
+    "\"https://github.com/你/仓库/tree/9b7d112 | 跑这一步的代码\"、"
+    "\"s3://bucket/ckpt/run042.pt | sha256:ab12cd34, 4.2 GB\"。"
+)
 DEFAULT_AUTHOR = os.environ.get("TRACE_AUTHOR", "agent")
 
 BODY_TEMPLATE = (
@@ -161,7 +173,7 @@ class LocalBackend:
             status=payload.get("status", "wip"), body=payload.get("body"),
             date=payload.get("date", ""), commit=payload.get("commit", ""),
             author=payload.get("author", ""), key=payload.get("key", ""),
-            tags=payload.get("tags"),
+            tags=payload.get("tags"), paths=payload.get("paths"),
         )
         d = step.to_dict()
         d["created"] = created
@@ -200,6 +212,8 @@ def _fmt_tree(forest: dict, header: str) -> str:
         d = 0 if not s["parent"] else depth[s["parent"]] + 1
         depth[s["id"]] = d
         extra = []
+        if s.get("paths"):
+            extra.append(f"{len(s['paths'])} 路径")
         if s["files"]:
             extra.append(f"{len(s['files'])} 附件")
         if s["tags"]:
@@ -232,6 +246,11 @@ def _fmt_step(project: str, s: dict) -> str:
         head.append("  子步骤: " + ", ".join(s["children"]))
     if s.get("backlinks"):
         head.append("  被引用: " + ", ".join(s["backlinks"]))
+    if s.get("paths"):
+        head.append("  外部产物（不在仓库里，只记了位置）:")
+        for p in s["paths"]:
+            head.append(f"    [{KIND_LABEL.get(p['kind'], p['kind'])}] {p['location']}"
+                        + (f"  — {p['note']}" if p.get("note") else ""))
     if s.get("files"):
         head.append("  文件: " + ", ".join(f"{f['path']} ({f['size']}B)" for f in s["files"]))
         if any(Path(f["path"]).suffix.lower() in IMG_EXT for f in s["files"]):
@@ -298,6 +317,7 @@ TOOLS: list[dict[str, Any]] = [
                 "author": {"type": "string", "description": f"默认 {DEFAULT_AUTHOR}"},
                 "key": {"type": "string", "description": "幂等键，防止重试造出重复步骤"},
                 "tags": {"type": "array", "items": {"type": "string"}},
+                "paths": {"type": "array", "items": {"type": "string"}, "description": PATHS_DESC},
             },
             "required": ["project", "title"],
         },
@@ -322,6 +342,9 @@ TOOLS: list[dict[str, Any]] = [
                 "date": {"type": "string"},
                 "commit": {"type": "string"},
                 "tags": {"type": "array", "items": {"type": "string"}},
+                "paths": {"type": "array", "items": {"type": "string"}, "description": "整组替换。" + PATHS_DESC},
+                "add_paths": {"type": "array", "items": {"type": "string"},
+                              "description": "追加（按位置去重），比整组替换安全。" + PATHS_DESC},
             },
             "required": ["project", "step"],
         },
@@ -415,7 +438,7 @@ def _why_is_blank(body: str) -> bool:
 
 
 def t_new_step(be, args) -> str:
-    payload = {k: args[k] for k in ("parent", "title", "status", "body", "date", "commit", "key", "tags")
+    payload = {k: args[k] for k in ("parent", "title", "status", "body", "date", "commit", "key", "tags", "paths")
                if k in args and args[k] not in (None, "")}
     payload.setdefault("status", "wip")
     payload["author"] = args.get("author") or DEFAULT_AUTHOR
@@ -439,7 +462,8 @@ def t_update_step(be, args) -> str:
                 f"{locked} 不可修改。只追加是这套系统的地基——笔记里写的「见 003b」、"
                 f"论文脚注里的引用能一直有效，靠的就是 id 和 parent 不变。"
             )
-    patch = {k: args[k] for k in ("status", "title", "date", "commit", "tags") if k in args and args[k] is not None}
+    patch = {k: args[k] for k in ("status", "title", "date", "commit", "tags", "paths", "add_paths")
+             if k in args and args[k] is not None}
     if args.get("body") is not None and args.get("append"):
         raise ToolError("body 和 append 只能给一个")
     if args.get("body") is not None:

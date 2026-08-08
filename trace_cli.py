@@ -130,9 +130,40 @@ def cmd_new(args) -> int:
         commit=args.commit or "",
         author=args.author or "human",
         tags=[t.strip() for t in (args.tags or "").split(",") if t.strip()],
+        paths=args.path or None,
     )
     print(("已创建 " if created else "已存在 ") + f"{slug}/{step.id}")
     print(sd / step.dirname / core.NOTE_NAME)
+    return 0
+
+
+KIND_LABEL = {
+    "hpc": "超算", "github": "GitHub", "git": "Git", "dropbox": "Dropbox", "drive": "Drive",
+    "object": "对象存储", "archive": "数据仓库", "mlhub": "实验平台", "url": "链接",
+    "local": "本机", "path": "路径",
+}
+
+
+def cmd_paths(args) -> int:
+    """把一个项目里所有外部产物的位置列出来 —— 溯源时最常问的"东西在哪"。"""
+    cfg = load_config()
+    root = data_root(cfg)
+    slugs = [pick_project(root, args.project)] if args.project else [p.slug for p in core.scan_projects(root)]
+    total = 0
+    for slug in slugs:
+        f = core.compile_forest(core.steps_dir_of(root, slug), with_files=False)
+        rows = [(s, p) for s in f["steps"] for p in s["paths"]
+                if not args.kind or p["kind"] == args.kind]
+        if not rows:
+            continue
+        print(f"[{slug}]")
+        for s, p in rows:
+            total += 1
+            print(f"  {s['id']:<5} {KIND_LABEL.get(p['kind'], p['kind']):<6} {p['location']}"
+                  + (f"\n{'':>14}{p['note']}" if p["note"] else ""))
+        print()
+    if not total:
+        print("还没有记录任何外部路径。用 trace_cli.py new --path \"…\" 或在网页里加。")
     return 0
 
 
@@ -269,7 +300,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--commit", default="")
     p.add_argument("--author", default="human")
     p.add_argument("--tags", default="")
+    p.add_argument("--path", action="append", metavar="位置|说明",
+                   help='外部产物的位置，可重复。如 --path "/blue/组/用户/data | 训练集，12 GB"')
     p.set_defaults(fn=cmd_new)
+
+    p = sub.add_parser("paths", help="列出所有外部产物的位置")
+    p.add_argument("-P", "--project", default=None)
+    p.add_argument("--kind", default=None, help="只看某一类：hpc / github / dropbox / object / url …")
+    p.set_defaults(fn=cmd_paths)
 
     p = sub.add_parser("check", help="校验不变量")
     p.add_argument("-P", "--project", default=None)

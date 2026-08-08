@@ -7,6 +7,8 @@ date: 2026-03-13
 commit: f0a1b2c
 author: human
 tags: data, dedup
+path: /blue/nlp-lab/jdoe/analysis/minhash-dup | MinHash 去重结果（完整版），1.4 GB
+path: https://zenodo.org/record/0000000 | 打算把干净 split 发到这里（还没传）
 ---
 
 ## 为什么

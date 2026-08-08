@@ -95,10 +95,10 @@ trace/
 ├── trace_write.py    唯一写入路径 —— CLI / 网页 / agent API 全走这里
 ├── trace_server.py   FastAPI：路由 + SSE + 鉴权
 ├── trace_git.py      debounce 自动 commit + push
-├── trace_cli.py      init / projects / new-project / new / check / build / serve / url
+├── trace_cli.py      init / projects / new-project / new / check / paths / build / serve / url
 ├── trace_mcp.py      MCP server（6 个工具，两种后端：远端 HTTP / 本地文件）
 ├── web/              index.html · app.js · md.js · style.css（无构建步骤，不引 CDN）
-├── tests/            103 个 Python 断言 + 25 个 markdown 渲染断言（node --test）
+├── tests/            136 个 Python 断言 + 25 个 markdown 渲染断言（node --test）
 ├── projects/         ← 你的数据（仓库里自带一个示例项目，数字均为虚构，删掉即可）
 │   └── <slug>/
 │       ├── project.md            可选，只有一个 name 字段
@@ -128,6 +128,9 @@ date: 2026-03-11
 commit: c1d2e3f
 author: agent:claude
 tags: features, transformer
+path: /blue/<组>/<用户>/data/agnews-clean | 去重后的训练集，12 GB
+path: /orange/<组>/<用户>/ckpt/run042/best.pt | 权重，265 MB，sha256:7d4e1a9c…
+path: https://github.com/你/仓库/tree/9b7d112 | 跑这一步的代码
 ---
 
 ## 为什么      ← 承接上一步的什么发现，想验证什么假设
@@ -149,6 +152,33 @@ front-matter 用手写解析器而不是 YAML：`title: 试了 3:1 采样` 在 Y
 正文里写 `[[003b]]` 会渲染成跳转链接，并在 003b 的页面显示"被这些步骤引用"。
 这是"多父 DAG"的廉价替代品——想说"本步综合了 A 线和 B 线"，写一句就够，
 不必把森林升级成 DAG（那会让行序变成拓扑排序、轨道分配要处理合并边，复杂度约翻三倍）。
+
+## 外部产物的位置（溯源的另一半）
+
+GB 级的东西——数据集、checkpoint、中间特征——不进仓库。仓库里只记**它在哪**：
+
+```
+path: /blue/<组>/<用户>/data/agnews-clean | 去重后的训练集，12 GB
+path: /orange/<组>/<用户>/ckpt/run042/best.pt | 权重，265 MB，sha256:7d4e1a9c…
+path: https://github.com/你/仓库/tree/9b7d112 | 跑这一步的代码
+path: s3://bucket/exports/run042.parquet | 导出的预测结果
+path: https://zenodo.org/record/1234567 | 论文附带的公开版本
+```
+
+格式就是 `path: <位置> | <说明>`，可以写任意多行。竖线右边是自由文本——
+校验和、大小、"在哪台机器上"、"已确认无用可删"，想记什么记什么。
+
+位置的类型自动识别（超算 `/blue//orange//red//scratch/` · GitHub · Dropbox ·
+Google Drive · S3/GCS · Zenodo/figshare/OSF · HuggingFace/W&B · 本机盘符），
+只是给个徽章，猜错也不影响任何东西。http(s) 的会渲染成可点链接，其余的一键复制。
+
+```bash
+python trace_cli.py paths                 # 列出所有产物在哪
+python trace_cli.py paths --kind hpc       # 只看超算上的
+grep -rn "^path:" projects/                # 删掉全部程序之后照样能查
+```
+
+新建子步骤时会**继承父步骤的路径**——同一条线上数据和代码的位置多半没变，改比重打省事。
 
 ## id 规则
 
@@ -182,8 +212,8 @@ claude mcp add trace \
 | `trace_projects` | 列项目 + 步骤数与状态分布 |
 | `trace_read` | 读整棵树（缩进树，比 JSON 省 token），或读单步全文 + 溯源链 |
 | `trace_search` | 在标题/正文/标签里搜——回答"之前是不是试过 X""为什么放弃了 Y" |
-| `trace_new_step` | 建步骤（支持幂等键） |
-| `trace_update_step` | 改状态/正文；`append` 追加比整段重写安全 |
+| `trace_new_step` | 建步骤（支持幂等键、外部产物路径） |
+| `trace_update_step` | 改状态/正文/路径；`append` 和 `add_paths` 追加比整组替换安全 |
 | `trace_attach` | 传附件；**图片必须给 caption**，给了就自动在正文插入引用 |
 
 规矩写在工具描述里，agent 调用时就能看到：先读后写、先建 wip 再开跑、
@@ -248,9 +278,10 @@ python trace_cli.py projects                      # 列出项目
 python trace_cli.py new-project --name "课题名"
 python trace_cli.py new -P <项目> --title "..."    # 新建一步
 python trace_cli.py check [-P <项目>]              # 校验不变量，打印警告
+python trace_cli.py paths [-P <项目>] [--kind hpc] # 列出所有外部产物的位置
 python trace_cli.py build --out dist              # 静态导出，file:// 可直接打开，断网可用
 python trace_cli.py url                           # 打印访问地址与令牌
-python -m pytest tests                            # 103 个断言（内核 / 布局 / 写入 / 多项目 / MCP）
+python -m pytest tests                            # 136 个断言（内核 / 布局 / 写入 / 多项目 / 路径 / MCP）
 node --test tests/md.test.js                      # 25 个断言（markdown 渲染）
 ```
 

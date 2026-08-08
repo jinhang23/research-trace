@@ -7,6 +7,9 @@ date: 2026-03-05
 commit: 7d9e0f1
 author: human
 tags: transformer, finetune
+path: /blue/nlp-lab/jdoe/data/agnews-raw | 同上，未改动
+path: /orange/nlp-lab/jdoe/ckpt/distilbert-e3/best.pt | 微调后的权重，265 MB，sha256:7d4e1a9c…
+path: https://github.com/nlp-lab/agnews-cls/tree/7d9e0f1 | 跑这一步的代码
 ---
 
 ## 为什么

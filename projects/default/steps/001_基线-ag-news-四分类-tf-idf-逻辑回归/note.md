@@ -6,6 +6,8 @@ date: 2026-03-02
 commit: 1a2b3c4
 author: human
 tags: baseline
+path: /blue/nlp-lab/jdoe/data/agnews-raw | 原始数据集，120 MB，官方 train/test 划分
+path: https://github.com/nlp-lab/agnews-cls/tree/1a2b3c4 | 跑这一步的代码
 ---
 
 ## 为什么

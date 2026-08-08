@@ -28,6 +28,7 @@ from trace_core import (
     build_children,
     id_key,
     fmt_id,
+    path_kind,
     project_dir,
     projects_root,
     scan,
@@ -192,6 +193,9 @@ def render_note(step: Step) -> str:
             lines.append(f"{k}: {v}")
     if step.tags:
         lines.append("tags: " + ", ".join(step.tags))
+    for p in step.paths:
+        note = p.get("note", "").strip()
+        lines.append(f"path: {p['location']}" + (f" | {note}" if note else ""))
     lines.append("---")
     lines.append("")
     lines.append(step.body.rstrip("\n"))
@@ -210,6 +214,29 @@ def _clean_line(v: Any) -> str:
     return re.sub(r"[\r\n]+", " ", str(v or "")).strip()
 
 
+def norm_paths(raw: Any) -> list[dict[str, str]]:
+    """把外部传来的路径规整成 [{location, note, kind}]。
+
+    接受 "位置 | 说明" 这样的字符串，也接受 {"location":…, "note":…} 这样的字典，
+    单条也可以不套列表——agent 和人怎么写都能接住。
+    kind 是派生的，从位置形状猜出来，不存也不接受外部传入。
+    """
+    if not raw:
+        return []
+    items = [raw] if isinstance(raw, (str, dict)) else list(raw)
+    out: list[dict[str, str]] = []
+    for item in items:
+        if isinstance(item, dict):
+            loc, note = _clean_line(item.get("location")), _clean_line(item.get("note"))
+        else:
+            head, _, tail = str(item).partition("|")
+            loc, note = _clean_line(head), _clean_line(tail)
+        if not loc:
+            continue
+        out.append({"location": loc, "note": note, "kind": path_kind(loc)})
+    return out
+
+
 # ---------------------------------------------------------------- 创建
 
 
@@ -225,6 +252,7 @@ def create_step(
     author: str = "",
     key: str = "",
     tags: list[str] | None = None,
+    paths: Any = None,
 ) -> tuple[Step, bool]:
     """新建一步。返回 (step, created)；created=False 表示命中幂等键返回了既有步骤。"""
     steps_dir.mkdir(parents=True, exist_ok=True)
@@ -259,6 +287,7 @@ def create_step(
         author=_clean_line(author),
         key=key,
         tags=[_clean_line(t) for t in (tags or []) if _clean_line(t)],
+        paths=norm_paths(paths),
         body=(BODY_TEMPLATE if body is None else body),
         dirname=f"{sid}_{slugify(title)}",
     )
@@ -273,7 +302,7 @@ def create_step(
 
 # ---------------------------------------------------------------- 修改
 
-MUTABLE = ("status", "title", "body", "date", "commit", "author", "tags")
+MUTABLE = ("status", "title", "body", "date", "commit", "author", "tags", "paths", "add_paths")
 
 
 def update_step(steps_dir: Path, sid: str, patch: dict[str, Any]) -> Step:
@@ -315,6 +344,11 @@ def update_step(steps_dir: Path, sid: str, patch: dict[str, Any]) -> Step:
         if isinstance(raw, str):
             raw = [t for t in re.split(r"[,，]", raw)]
         step.tags = [_clean_line(t) for t in (raw or []) if _clean_line(t)]
+    if "paths" in patch:
+        step.paths = norm_paths(patch["paths"])            # 整组替换
+    if "add_paths" in patch:                                # 追加，位置去重
+        seen = {p["location"] for p in step.paths}
+        step.paths = step.paths + [p for p in norm_paths(patch["add_paths"]) if p["location"] not in seen]
 
     # 目录名不跟着 title 改：目录名里的 id 是给 shell 补全用的，
     # 改名会让所有已经发出去的相对链接失效。

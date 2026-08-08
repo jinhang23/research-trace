@@ -196,6 +196,37 @@ main { display: flex; height: calc(100% - 41px); align-items: stretch; }
 .acts { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 18px; padding-bottom: 14px; border-bottom: 1px solid var(--rule); }
 .acts .sp { flex: 1; }
 
+/* 外部产物的位置：checkpoint、数据集这些不进仓库，只记"它在哪" */
+.pathbox {
+  margin: 0 0 18px; padding: 10px 12px; border-radius: 6px;
+  background: var(--hi); border: 1px solid var(--rule);
+}
+.pathrow { display: flex; align-items: baseline; flex-wrap: wrap; gap: 7px; line-height: 1.9; }
+.pathrow + .pathrow { margin-top: 3px; }
+.pkind {
+  flex: 0 0 auto; font-size: 10px; padding: 1px 6px; border-radius: 3px;
+  background: var(--panel); border: 1px solid var(--rule); color: var(--muted);
+}
+.pkind.k-hpc { color: var(--accent); border-color: var(--accent); }
+.pkind.k-github, .pkind.k-git { color: var(--done); border-color: var(--done); }
+.ploc {
+  font-family: var(--mono); font-size: 12px; word-break: break-all;
+  background: none; padding: 0; color: var(--ink);
+}
+a.ploc { color: var(--accent); }
+.pcopy { padding: 0 5px; font-size: 11px; line-height: 15px; border-color: transparent; background: transparent; color: var(--muted); }
+.pcopy:hover { background: var(--panel); border-color: var(--rule); }
+.pnote { flex: 1 1 100%; font-size: 11.5px; color: var(--muted); padding-left: 2px; }
+
+.edpaths { display: block; font-size: 11.5px; color: var(--muted); margin-bottom: 10px; }
+.edpaths code { font-family: var(--mono); font-size: 11px; background: var(--hi); padding: 0 4px; border-radius: 3px; }
+.edpaths textarea {
+  display: block; width: 100%; margin-top: 4px; padding: 7px 10px; resize: vertical;
+  font-family: var(--mono); font-size: 12px; line-height: 1.7;
+  border: 1px solid var(--rule); border-radius: 5px; background: var(--panel); color: var(--ink);
+}
+.edpaths textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
 /* 正文用衬线，机器记录用等宽——一眼分清哪些是自动来的、哪些是自己判断的。
    行长限制在 ~76 个字符：这是人眼舒适的阅读宽度，超过就容易串行。 */
 .prose { font-family: var(--serif); font-size: 15.5px; line-height: 1.85; max-width: 76ch; }

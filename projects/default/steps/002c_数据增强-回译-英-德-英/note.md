@@ -7,6 +7,8 @@ date: 2026-03-08
 commit: e7f8a9b
 author: agent:claude
 tags: augmentation
+path: /blue/nlp-lab/jdoe/data/agnews-backtrans | 回译增强后的训练集，240 MB
+path: https://huggingface.co/Helsinki-NLP/opus-mt-en-de | 回译用的翻译模型
 ---
 
 ## 为什么

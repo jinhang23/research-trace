@@ -87,6 +87,9 @@
       <label>日期 <input id="nf-date" class="mono" type="date"></label>
     </div>
     <label>commit <input id="nf-commit" class="mono" placeholder="可留空"></label>
+    <label>外部路径 · 每行一条，<code>位置 | 说明</code>
+      <textarea id="nf-paths" rows="2" spellcheck="false" placeholder="/blue/组名/用户名/exp/agnews | 训练数据，12 GB&#10;https://github.com/你/仓库/tree/9b7d112 | 跑这一步的代码"></textarea>
+    </label>
     <label>正文 <textarea id="nf-body" rows="12" spellcheck="false"></textarea></label>
     <p class="hint">「为什么」是整个系统里唯一无法自动生成的字段——日志能自动存，commit 能自动记，只有「我当时为什么决定试这个」必须你写。</p>
     <menu>
