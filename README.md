@@ -96,9 +96,9 @@ trace/
 ├── trace_server.py   FastAPI：路由 + SSE + 鉴权
 ├── trace_git.py      debounce 自动 commit + push
 ├── trace_cli.py      init / projects / new-project / new / check / paths / build / serve / url
-├── trace_mcp.py      MCP server（6 个工具，两种后端：远端 HTTP / 本地文件）
+├── trace_mcp.py      MCP server（手写 JSON-RPC，零依赖；两种后端：远端 HTTP / 本地文件）
 ├── web/              index.html · app.js · md.js · style.css（无构建步骤，不引 CDN）
-├── tests/            136 个 Python 断言 + 25 个 markdown 渲染断言（node --test）
+├── tests/            152 个 Python 断言 + 25 个 markdown 渲染断言（node --test）
 ├── projects/         ← 你的数据（仓库里自带一个示例项目，数字均为虚构，删掉即可）
 │   └── <slug>/
 │       ├── project.md            可选，只有一个 name 字段
@@ -191,21 +191,28 @@ grep -rn "^path:" projects/                # 删掉全部程序之后照样能�
 ## MCP（推荐给 agent 用）
 
 `trace_mcp.py` 把 trace 暴露成 6 个 MCP 工具。比让 agent 自己拼 HTTP 请求好在：
-参数有 schema（客户端先校验，不合法的调用发不出去）、不用生成 requests/curl 代码、
+参数有 schema（不合法的调用先被拦下）、不用生成 requests/curl 代码、
 中文不会再撞上终端编码。
+
+**零依赖。** MCP 是一份开放协议规范，`mcp` 那个 pip 包只是它的官方 Python SDK 之一。
+stdio 侧要实现的就是换行分隔的 JSON-RPC 2.0 加四个方法（`initialize` / `tools/list` /
+`tools/call` / `ping`），所以这里直接说协议，不依赖 SDK：
+
+- 任何裸 Python 3.10+ 都能跑，HiperGator 上不用往 conda 环境里装东西
+- 不会被 SDK 的破坏性改版牵连（`mcp` 2.0 就删掉了 1.x 的整套装饰器 API，
+  协议本身一个字没变）
+
+代价是协议细节得自己守住，所以测试里除了自测，还会**拿官方 SDK 的客户端连上来跑一遍
+互操作**（`tests/test_mcp.py::test_interop_with_the_official_sdk_client`，
+SDK 只是测试期依赖，装了才跑）。
 
 ### 装
 
 装完会得到一个真正的 `trace-mcp` 命令（Windows 上是 `Scripts/trace-mcp.exe`），
 配置里就不用写死某个 `.py` 的绝对路径了。
 
-> **注意 mcp 的版本**：本项目要 `mcp>=1.9,<2`（pyproject 里已经钉好了）。
-> mcp 2.0 是破坏性改版——移除了 `mcp.server.fastmcp`，低层 `Server` 的
-> `@list_tools`/`@call_tool` 装饰器也没了。如果你的环境里已经有 mcp 2.x，
-> 建议把 trace-mcp 装进单独的虚拟环境，配置里用那个环境的绝对路径。
-
 ```bash
-# 只要 MCP：不用 clone，直接从 GitHub 装
+# 只要 MCP：不用 clone，也不会拉任何依赖
 pip install "git+https://github.com/jinhang23/research-trace"
 
 # 还要跑网页服务：clone 下来（web/ 和 projects/ 得在仓库里）
@@ -316,7 +323,7 @@ python trace_cli.py check [-P <项目>]              # 校验不变量，打印�
 python trace_cli.py paths [-P <项目>] [--kind hpc] # 列出所有外部产物的位置
 python trace_cli.py build --out dist              # 静态导出，file:// 可直接打开，断网可用
 python trace_cli.py url                           # 打印访问地址与令牌
-python -m pytest tests                            # 136 个断言（内核 / 布局 / 写入 / 多项目 / 路径 / MCP）
+python -m pytest tests                            # 152 个断言（内核 / 布局 / 写入 / 多项目 / 路径 / MCP 协议）
 node --test tests/md.test.js                      # 25 个断言（markdown 渲染）
 ```
 

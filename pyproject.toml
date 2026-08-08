@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "research-trace"
-version = "0.3.0"
+version = "0.4.0"
 description = "只追加的科研步骤树：人和 agent 都能写，从任何结果回溯到最初的问题"
 readme = "README.md"
 requires-python = ">=3.10"
-# mcp 2.0 是破坏性改版：mcp.server.fastmcp 整个移除，低层 Server 的
-# @list_tools/@call_tool 装饰器也没了，改成 MCPServer.add_tool(fn) 从函数签名推 schema。
-# 要同时支持就得把 6 个工具再写一遍带类型标注的函数、和现有的 JSON Schema 重复一份，
-# 不值。等 2.x 生态稳定再迁。
-dependencies = ["mcp>=1.9,<2"]
+
+# 零运行时依赖。MCP 是一份开放协议规范，`mcp` 那个 pip 包只是它的官方 Python SDK；
+# stdio 侧就是换行分隔的 JSON-RPC 2.0，直接说协议即可，不必依赖 SDK。
+# 于是也不会再被 SDK 的破坏性改版牵连（mcp 2.0 删掉了 1.x 的整套装饰器 API）。
+dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/jinhang23/research-trace"
@@ -27,6 +27,9 @@ trace-mcp = "trace_mcp:main"
 # 所以不打包，用 `pip install -e .[server]` 或直接 requirements.txt。
 [project.optional-dependencies]
 server = ["fastapi>=0.110", "uvicorn>=0.27"]
+# 只在跑测试时用：拿官方 SDK 的客户端连上我们手写的服务端，验证互操作。
+# 运行时不需要。
+dev = ["pytest", "mcp>=1.9,<2"]
 
 [tool.setuptools]
 # 只装 MCP 这条链路要用到的三个模块。它们都是纯代码，不依赖仓库里的任何数据文件，

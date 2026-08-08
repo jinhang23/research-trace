@@ -536,61 +536,188 @@ def dispatch(backend, name: str, args: dict[str, Any]) -> str:
 # ---------------------------------------------------------------- MCP
 
 
-def _check_sdk() -> None:
-    """版本不对时给一条能照做的话，而不是一段 AttributeError 回溯。"""
+# MCP 是一份开放协议规范，`mcp` 那个 pip 包只是它的官方 Python SDK 之一。
+# stdio 这一侧要实现的东西很小——换行分隔的 JSON-RPC 2.0，加上
+# initialize / tools/list / tools/call / ping 四个方法——所以这里直接说协议，
+# 不依赖 SDK。好处是实打实的：
+#   * 零依赖，任何裸 Python 3.10+ 都能跑（HiperGator 上不用往 conda 环境里装东西）
+#   * 不会被 SDK 的破坏性改版牵连（mcp 2.0 就删掉了 1.x 的整套装饰器 API）
+# 代价是协议细节得自己守住，所以 tests/test_mcp.py 里除了自测，还会用官方 SDK
+# 的客户端连上来跑一遍互操作。
+
+SERVER_NAME = "trace"
+SERVER_VERSION = "0.4.0"
+
+# 收到客户端要的版本就原样回它（前提是我们认识），否则回我们最新的。
+PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
+
+INSTRUCTIONS = (
+    "这是一棵只追加的科研步骤树。规矩："
+    "① 动手之前先 trace_read 看这条线走到哪了；"
+    "② 开跑之前就建 wip 步骤，跑完再改成 done/dead——等跑完才记的话，跑挂的那一步就不存在了；"
+    "③ 正文必须写「为什么」，这是唯一无法自动生成的字段；"
+    "④ 失败也要记，标 dead 并写清放弃理由，死胡同是这里最有价值的部分；"
+    "⑤ 图必须给 caption，你看不到图，图注是它唯一的信息来源；"
+    "⑥ 产物落在哪（超算路径、GitHub、对象存储）用 paths 记下来；"
+    "⑦ id 和 parent 写下就不可改。"
+)
+
+_JSON_TYPES: dict[str, Any] = {
+    "string": str, "number": (int, float), "integer": int,
+    "boolean": bool, "array": list, "object": dict,
+}
+
+
+def validate_args(schema: dict[str, Any], args: dict[str, Any]) -> None:
+    """按 inputSchema 校验。官方 SDK 会做这件事，自己说协议就得自己做。
+
+    只覆盖 required / type / enum / array-items —— 这几样就是工具参数会出错的全部形式。
+    """
+    props = schema.get("properties") or {}
+    for k in schema.get("required") or []:
+        if k not in args or args[k] is None or args[k] == "":
+            raise ToolError(f"缺少必填参数 {k}")
+    for k, v in args.items():
+        spec = props.get(k)
+        if spec is None:
+            raise ToolError(f"不认识的参数 {k}；这个工具接受：{', '.join(props) or '（无）'}")
+        if v is None:
+            continue
+        want = spec.get("type")
+        py = _JSON_TYPES.get(want)
+        if py and not isinstance(v, py):
+            raise ToolError(f"参数 {k} 应当是 {want}，收到 {type(v).__name__}")
+        if want == "array":
+            item = (spec.get("items") or {}).get("type")
+            ipy = _JSON_TYPES.get(item)
+            if ipy and any(not isinstance(x, ipy) for x in v):
+                raise ToolError(f"参数 {k} 的每一项都应当是 {item}")
+        if spec.get("enum") and v not in spec["enum"]:
+            raise ToolError(f"参数 {k} 只能是 {' / '.join(map(str, spec['enum']))}")
+
+
+def _result(mid: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": mid, "result": payload}
+
+
+def _error(mid: Any, code: int, message: str) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": mid, "error": {"code": code, "message": message}}
+
+
+class Session:
+    """一次连接的全部状态。后端延迟创建，配置错了要在 tools/call 时报出来而不是启动就死。"""
+
+    def __init__(self) -> None:
+        self.protocol = PROTOCOL_VERSIONS[0]
+        self.backend: Any = None
+
+    def get_backend(self) -> Any:
+        if self.backend is None:
+            self.backend = make_backend()
+        return self.backend
+
+
+def handle(msg: Any, session: Session) -> dict[str, Any] | None:
+    """处理一条 JSON-RPC 消息。返回要回的对象；通知（没有 id）返回 None。
+
+    纯函数式的形状，所以协议逻辑可以脱离子进程直接单测。
+    """
+    if not isinstance(msg, dict):
+        return _error(None, -32600, "请求必须是 JSON 对象")
+    is_notification = "id" not in msg
+    mid = msg.get("id")
+    method = msg.get("method")
+    params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+
+    if not isinstance(method, str):
+        return None if is_notification else _error(mid, -32600, "缺少 method")
+
     try:
-        from mcp.server import Server
-    except ImportError:
-        raise ToolError("没装 mcp：pip install 'mcp>=1.9,<2'") from None
-    if not hasattr(Server, "list_tools"):
-        import importlib.metadata as md
+        if method == "initialize":
+            want = params.get("protocolVersion")
+            session.protocol = want if want in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0]
+            return _result(mid, {
+                "protocolVersion": session.protocol,
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+                "instructions": INSTRUCTIONS,
+            })
 
+        if method.startswith("notifications/") or method == "initialized":
+            return None                                   # 通知一律不回
+
+        if method == "ping":
+            return _result(mid, {})
+
+        if method == "tools/list":
+            return _result(mid, {"tools": [
+                {"name": t["name"], "description": t["description"], "inputSchema": t["inputSchema"]}
+                for t in TOOLS
+            ]})
+
+        if method == "tools/call":
+            name = params.get("name")
+            args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+            spec = next((t for t in TOOLS if t["name"] == name), None)
+            if spec is None:
+                return _error(mid, -32602, f"未知工具: {name}")
+            try:
+                validate_args(spec["inputSchema"], args)
+                text = dispatch(session.get_backend(), name, args)
+            except ToolError as e:
+                # 工具层的失败用 isError 回，让模型看得到、能改；
+                # JSON-RPC 的 error 只留给协议层的问题。
+                return _result(mid, {"content": [{"type": "text", "text": str(e)}], "isError": True})
+            return _result(mid, {"content": [{"type": "text", "text": text}], "isError": False})
+
+        return None if is_notification else _error(mid, -32601, f"不支持的方法: {method}")
+
+    except Exception as e:                                 # 兜底，绝不让连接因为一条消息断掉
+        return None if is_notification else _error(mid, -32603, f"内部错误: {type(e).__name__}: {e}")
+
+
+def serve_stdio(stream_in=None, stream_out=None) -> None:
+    sin = stream_in if stream_in is not None else sys.stdin
+    sout = stream_out if stream_out is not None else sys.stdout
+    session = Session()
+
+    def emit(obj: Any) -> None:
+        # ensure_ascii=True：输出全是 ASCII，Windows 上的终端编码就影响不到协议通道。
+        sout.write(json.dumps(obj) + "\n")
+        sout.flush()
+
+    for line in sin:
+        line = line.strip()
+        if not line:
+            continue
         try:
-            ver = md.version("mcp")
-        except Exception:
-            ver = "未知"
-        raise ToolError(
-            f"装的 mcp 是 {ver}，API 不兼容。mcp 2.0 移除了低层 Server 的 "
-            f"@list_tools/@call_tool 装饰器。请装 1.x：pip install 'mcp>=1.9,<2'"
-        )
-
-
-async def amain() -> None:
-    _check_sdk()
-    from mcp.server import Server
-    from mcp.server.stdio import stdio_server
-    from mcp.types import TextContent, Tool
-
-    backend: Any = None
-    app = Server("trace")
-
-    @app.list_tools()
-    async def list_tools() -> list[Tool]:
-        return [Tool(name=t["name"], description=t["description"], inputSchema=t["inputSchema"]) for t in TOOLS]
-
-    @app.call_tool()
-    async def call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextContent]:
-        nonlocal backend
-        try:
-            if backend is None:
-                backend = make_backend()
-            return [TextContent(type="text", text=dispatch(backend, name, arguments or {}))]
-        except ToolError as e:
-            raise ValueError(str(e)) from None
-
-    async with stdio_server() as (read, write):
-        await app.run(read, write, app.create_initialization_options())
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            emit(_error(None, -32700, "JSON 解析失败"))
+            continue
+        if isinstance(msg, list):                          # 老版本协议允许批量，逐条处理
+            out = [r for r in (handle(m, session) for m in msg) if r is not None]
+            if out:
+                emit(out)
+            continue
+        resp = handle(msg, session)
+        if resp is not None:
+            emit(resp)
 
 
 def main() -> int:
-    import asyncio
-
+    # stdout 是协议通道：关掉 Windows 的 \n → \r\n 转换，诊断一律走 stderr。
     try:
-        asyncio.run(amain())
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+        sys.stdout.reconfigure(encoding="utf-8", newline="\n")
+    except (AttributeError, OSError):
+        pass
+    try:
+        serve_stdio()
     except KeyboardInterrupt:
         pass
-    except ToolError as e:
-        print(f"trace-mcp: {e}", file=sys.stderr)   # stdout 是协议通道，诊断只能走 stderr
+    except Exception as e:
+        print(f"trace-mcp: {e}", file=sys.stderr)
         return 2
     return 0
 
