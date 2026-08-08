@@ -96,8 +96,9 @@ trace/
 ├── trace_server.py   FastAPI：路由 + SSE + 鉴权
 ├── trace_git.py      debounce 自动 commit + push
 ├── trace_cli.py      init / projects / new-project / new / check / build / serve / url
+├── trace_mcp.py      MCP server（6 个工具，两种后端：远端 HTTP / 本地文件）
 ├── web/              index.html · app.js · md.js · style.css（无构建步骤，不引 CDN）
-├── tests/            81 个 Python 断言 + 25 个 markdown 渲染断言（node --test）
+├── tests/            103 个 Python 断言 + 25 个 markdown 渲染断言（node --test）
 ├── projects/         ← 你的数据（仓库里自带一个示例项目，数字均为虚构，删掉即可）
 │   └── <slug>/
 │       ├── project.md            可选，只有一个 name 字段
@@ -156,6 +157,39 @@ front-matter 用手写解析器而不是 YAML：`title: 试了 3:1 采样` 在 Y
 每个项目的 id 各自从 001 开始，互不影响。
 
 ---
+
+## MCP（推荐给 agent 用）
+
+`trace_mcp.py` 把 trace 暴露成 6 个 MCP 工具。比让 agent 自己拼 HTTP 请求好在：
+参数有 schema（客户端先校验，不合法的调用发不出去）、不用生成 requests/curl 代码、
+中文不会再撞上终端编码。
+
+```bash
+pip install mcp        # 只有协议层需要它；HTTP 后端只用标准库
+
+# 本地模式：agent 和数据在同一台机器上，不需要起服务
+claude mcp add trace --env TRACE_DATA=/path/to/trace -- python /path/to/trace/trace_mcp.py
+
+# 远端模式：agent 在 HPC 上，数据在你的域名后面
+claude mcp add trace \
+  --env TRACE_URL=https://你的域名/t/<space> \
+  --env TRACE_TOKEN=<写入令牌> \
+  -- python /path/to/trace/trace_mcp.py
+```
+
+| 工具 | 干什么 |
+|---|---|
+| `trace_projects` | 列项目 + 步骤数与状态分布 |
+| `trace_read` | 读整棵树（缩进树，比 JSON 省 token），或读单步全文 + 溯源链 |
+| `trace_search` | 在标题/正文/标签里搜——回答"之前是不是试过 X""为什么放弃了 Y" |
+| `trace_new_step` | 建步骤（支持幂等键） |
+| `trace_update_step` | 改状态/正文；`append` 追加比整段重写安全 |
+| `trace_attach` | 传附件；**图片必须给 caption**，给了就自动在正文插入引用 |
+
+规矩写在工具描述里，agent 调用时就能看到：先读后写、先建 wip 再开跑、
+必须写「为什么」、失败标 dead 并写清放弃理由、改 `id`/`parent` 直接拒绝。
+
+MCP 和 REST API 是同一套后端的两个门面，可以混用。
 
 ## agent 读到的是什么
 
@@ -216,7 +250,7 @@ python trace_cli.py new -P <项目> --title "..."    # 新建一步
 python trace_cli.py check [-P <项目>]              # 校验不变量，打印警告
 python trace_cli.py build --out dist              # 静态导出，file:// 可直接打开，断网可用
 python trace_cli.py url                           # 打印访问地址与令牌
-python -m pytest tests                            # 81 个断言（内核 / 布局 / 写入 / 多项目）
+python -m pytest tests                            # 103 个断言（内核 / 布局 / 写入 / 多项目 / MCP）
 node --test tests/md.test.js                      # 25 个断言（markdown 渲染）
 ```
 
