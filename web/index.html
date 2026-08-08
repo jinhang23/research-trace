@@ -14,15 +14,27 @@
   <select id="proj" title="切换项目"></select>
   <div class="grow">
     <input id="search" type="search" placeholder="搜索 id / 标题 / 正文 / 标签   （按 / 聚焦）" autocomplete="off" spellcheck="false">
+    <!-- 搜索范围。agent 的 trace_search 不给 project 就搜全部，人这边也得有同一个能力 -->
+    <button id="btn-scope" type="button">本项目</button>
     <span id="hits" class="mono"></span>
   </div>
   <div class="seg" id="viewtoggle">
     <button data-view="graph" title="图视图">图</button><button data-view="list" title="列表视图">列表</button>
   </div>
   <button id="btn-new" title="从选中节点派生新步骤（n）">＋ 新步骤</button>
+  <!-- 新建项目必须在顶栏：只剩一个项目时项目索引页会 302 弹回项目页，
+       按钮长在那个页面上就等于永远点不到 -->
+  <button id="btn-newproj" data-newproj="1" title="新建一个项目">＋ 项目</button>
   <button id="btn-token" title="设置写入令牌">🔒</button>
+  <!-- 数据仓同步：平时只是一个小箭头，失败时旁边那块红的会露出来 -->
+  <span id="gitdot" class="gitdot" hidden></span>
+  <button id="gitwarn" data-gitretry="1" hidden>⇅ 同步失败</button>
   <span id="live" class="dot" title="实时连接"></span>
 </header>
+
+<!-- 跨项目搜索结果。挂在顶栏下面而不是抢走详情面板：搜索是「顺手查一下」，
+     不该把你正在读的那一步顶掉 -->
+<div id="hitlist" hidden></div>
 
 <div id="warnbar" hidden></div>
 
@@ -30,7 +42,7 @@
 <section id="home" hidden>
   <div class="home-head">
     <h1>__TITLE__</h1>
-    <button id="btn-newproj" class="primary">＋ 新建项目</button>
+    <button data-newproj="1" class="primary">＋ 新建项目</button>
   </div>
   <div id="cards"></div>
 </section>
@@ -56,6 +68,9 @@
       <span><i class="lg done"></i>done 实线</span>
       <span><i class="lg wip"></i>wip 虚线</span>
       <span><i class="lg dead"></i>dead 点线</span>
+      <!-- 字形标记是第四个通道：不抢线型（status）也不抢不透明度（祖先链/搜索） -->
+      <span class="lgm"><i class="cmk lv0">L0</i>链断了</span>
+      <span class="lgm"><i class="cmk rfail">↺✕</i>复现失败</span>
       <span class="sp"></span>
       <span id="zoombar">
         <button data-zoom="out" title="缩小">−</button>
@@ -72,6 +87,13 @@
 <dialog id="dlg-new">
   <form method="dialog">
     <h2>新建步骤</h2>
+    <div id="nf-draft" class="draftbar" hidden>
+      <b>上次没写完</b><span class="mono" id="nf-draft-when"></span>
+      <span id="nf-draft-title"></span>
+      <span class="sp"></span>
+      <button type="button" data-newdraft="restore">恢复</button>
+      <button type="button" data-newdraft="discard">丢弃</button>
+    </div>
     <label>派生自 <input id="nf-parent" class="mono" readonly></label>
     <label>标题 <input id="nf-title" maxlength="200" required placeholder="一行说清这一步在干什么"></label>
     <div class="row2">
@@ -95,6 +117,47 @@
       <button id="nf-ok" value="ok" class="primary">创建</button>
     </menu>
   </form>
+</dialog>
+
+<!-- 离开编辑器前的确认。三个出口而不是两个：用户真正想说的第三件事是
+     「这段我不要了，别再拿草稿烦我」 -->
+<dialog id="dlg-leave">
+  <div class="dlgbody">
+    <h2>还有没保存的改动</h2>
+    <p class="hint"><b id="leave-what" class="mono"></b><br>
+      内容已经自动存进这台机器的浏览器草稿里，离开不会丢。
+      下次打开这一步会问你要不要恢复。</p>
+    <menu>
+      <button type="button" data-leave="stay" class="primary">继续编辑</button>
+      <button type="button" data-leave="keep">离开（保留草稿）</button>
+      <button type="button" data-leave="discard" class="danger">丢弃草稿并离开</button>
+    </menu>
+  </div>
+</dialog>
+
+<!-- 保存冲突。不静默覆盖也不静默丢弃：两边都是人写的字，摆出来让人判 -->
+<dialog id="dlg-conflict">
+  <div class="dlgbody">
+    <h2>这一步在你编辑期间被改过</h2>
+    <p class="hint" id="cf-why"></p>
+    <div class="cfsplit">
+      <div class="cfpane">
+        <h3 id="cf-server-meta"></h3>
+        <div class="cfbody mono" id="cf-server"></div>
+      </div>
+      <div class="cfpane">
+        <h3 id="cf-mine-meta"></h3>
+        <div class="cfbody mono" id="cf-mine"></div>
+      </div>
+    </div>
+    <p class="hint">高亮的是两边不一样的行。选哪个都不会丢东西：保留服务器版本时，
+      你的这份仍然留在浏览器草稿里。</p>
+    <menu>
+      <button type="button" data-conflict="cancel" class="primary">回编辑器再看看</button>
+      <button type="button" data-conflict="theirs">保留服务器版本</button>
+      <button type="button" data-conflict="mine" class="danger">用我的覆盖</button>
+    </menu>
+  </div>
 </dialog>
 
 <div id="lightbox" hidden>

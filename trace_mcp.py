@@ -58,6 +58,93 @@ class ToolError(Exception):
     pass
 
 
+# ---------------------------------------------------------------- 数据仓体检
+
+DATA_ROOT_READY = "ready"      # 已经是数据仓（有 projects/）
+DATA_ROOT_EMPTY = "empty"      # 目录在、但里面什么都没有
+DATA_ROOT_ABSENT = "absent"    # 目录还不存在（但父目录在，可以建）
+DATA_ROOT_OCCUPIED = "occupied"  # 目录里有别的东西，却没有 projects/
+
+
+def _visible_entries(d: Path) -> list[str]:
+    """目录里点开头之外的条目名。`.git`、`.trace-lock` 这些不算「内容」。"""
+    try:
+        return sorted(x.name for x in d.iterdir() if not x.name.startswith("."))
+    except OSError:
+        return []
+
+
+def _sibling_data_roots(d: Path) -> list[str]:
+    """同一层里长得像数据仓的目录名 —— 用来提示「你是不是想指那个」。"""
+    try:
+        return sorted(x.name for x in d.parent.iterdir()
+                      if x.is_dir() and x.name != d.name and (x / "projects").is_dir())[:5]
+    except OSError:
+        return []
+
+
+def check_data_root(raw: str | Path) -> tuple[Path, str, str]:
+    """看一眼数据仓路径是什么状况。**只看不动**，一个目录都不建。
+
+    要解决的问题是：`ensure_layout` 见到什么路径都乖乖 mkdir，所以「首次全新安装」
+    和「老机器上把路径打岔了一个字符」在磁盘上是**一模一样**的观测（空目录 + 0 个项目），
+    自检还照样报「全部通过」。用户于是在一棵凭空造出来的空树上开始记录，几十步之后
+    才发现老项目一个都看不见。
+
+    这里不禁止创建 —— 换机首装时数据仓本来就不存在，插件的 data_dir 说明里也写明
+    「目录不存在会自动建出来」，禁掉等于挡住正常的第一次初始化。做法是**把状态说出来**，
+    让调用方（selfcheck / init）能区分这四种情况并如实报出去。
+
+    唯一当场拒绝的是「连父目录都不存在」：那不是「还没初始化」，那是路径写错了
+    ——没人会指望一个记录工具替你 mkdir -p 一整条凭空的路径。
+
+    返回 (解析后的绝对路径, 上面四个状态之一, 给人看的一句话)。
+    """
+    text = str(raw)
+    # 宿主没把 ${user_config.…} 展开就原样传下来了。实测过：这种字面量会被
+    # 当成相对路径，在当前工作目录下真的建出一个名叫 ${user_config.data_dir}
+    # 的目录，然后一切「正常」。这是配置管道坏了，不是「还没初始化」。
+    if "${" in text:
+        raise ToolError(
+            f"数据仓路径里有没被展开的配置模板：{text}\n"
+            "说明宿主没有把 /plugin 里填的值代进来。去 /plugin → research-trace → 配置，"
+            "确认数据仓目录那一栏填的是真实路径；照原样用下去会在当前目录建出一个"
+            "以模板名命名的幽灵目录。")
+
+    root = Path(text).expanduser()
+    try:
+        root = root.resolve()
+    except OSError:
+        pass
+
+    if root.exists() and not root.is_dir():
+        raise ToolError(f"数据仓路径 {root} 是个文件，不是目录。填步骤树所在的目录（里面是 projects/）。")
+
+    if (root / "projects").is_dir() or (root / "steps").is_dir():
+        return root, DATA_ROOT_READY, ""
+
+    def _hint(head: str) -> str:
+        sibs = _sibling_data_roots(root)
+        if sibs:
+            return head + f" 同一层里这些看着才像数据仓：{'、'.join(sibs)} —— 你确定不是想指其中一个吗？"
+        return head
+
+    if root.is_dir():
+        rest = _visible_entries(root)
+        if not rest:
+            return root, DATA_ROOT_EMPTY, _hint(f"{root} 是个空目录，我会在里面建一棵全新的空树。")
+        return root, DATA_ROOT_OCCUPIED, _hint(
+            f"{root} 里已经有 {'、'.join(rest[:5])}{' 等' if len(rest) > 5 else ''}，"
+            f"却没有 projects/ —— 如果这台机器上本来就有记录，那多半是路径填错了。")
+
+    if not root.parent.is_dir():
+        raise ToolError(
+            f"数据仓路径 {root} 不存在，连它的上级 {root.parent} 也不存在。\n"
+            "这不像「还没初始化」，像是路径写错了（盘符大小写、分隔符、多打一层）。\n"
+            "确认路径；如果确实要新建，先手工把上级目录建出来再重试。")
+    return root, DATA_ROOT_ABSENT, _hint(f"{root} 还不存在，我会现建一个全新的空仓。")
+
+
 # ---------------------------------------------------------------- 后端
 
 
@@ -140,7 +227,10 @@ class LocalBackend:
         import trace_write as W
 
         self.core, self.W = core, W
-        self.root = root.resolve()
+        # 先看一眼这个路径是什么状况再动手。ensure_layout 见到什么都建，
+        # 于是「填错一个字符」和「首次安装」在磁盘上没有区别 —— 状态记下来，
+        # 自检要靠它把「我刚给你造了一棵空树」这件事说出口。
+        self.root, self.root_state, self.root_note = check_data_root(root)
         core.ensure_layout(self.root)
 
     def _sd(self, project):
@@ -835,10 +925,65 @@ def dispatch(backend, name: str, args: dict[str, Any]) -> str:
 # 的客户端连上来跑一遍互操作。
 
 SERVER_NAME = "trace"
-SERVER_VERSION = "1.1.0"
+SERVER_VERSION = "1.2.0"
 
 # 收到客户端要的版本就原样回它（前提是我们认识），否则回我们最新的。
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
+
+# 格式标准的可执行摘要。
+#
+# 为什么内联而不是只指路：README 主推的「只要 MCP」装法是
+# `pip install git+…`，而 pyproject.toml 只打包三个 .py —— 那台机器上根本
+# 不存在 FORMAT.md，也不存在 skills/。原来的 instructions 却写着「完整的写作
+# 格式标准在插件根目录的 FORMAT.md」，agent 去找、找不到，然后手上只剩九个
+# 工具描述：指标表怎么写、图注要承载结论、dead 要写放弃理由、L0–L4 怎么判、
+# repro 三种状态是什么，一样都拿不到。initialize 的 instructions 是**唯一**
+# 无论怎么装都一定送达的通道，所以要点必须放在这里。
+#
+# 没有做成第十个工具（比如 trace_format），是因为工具数量本身是插件清单里
+# 对外宣称的规格（.claude-plugin/plugin.json 与 marketplace.json 都写着
+# 「9 个 MCP 工具」，tests/test_plugin.py 机械地钉着这个数），加一个就要连带
+# 改两份不属于本次改动范围的清单文件；而且多一次工具往返才拿到格式标准，
+# 意味着「没想起来调」的 agent 照样写歪 —— 送到眼前比放在货架上有效。
+FORMAT_ESSENTIALS = (
+    "【写作格式标准 v1 · 要点】总原则：可视化必须从已经可读的文本里长出来。"
+    "一张 PNG 人看得见、你看不见，一个 markdown 表格人和你读到的是同一批数字——"
+    "所以优先级是 表格 > front-matter 字段 > 围栏代码块 > 带图注的图 > 裸图（不允许）。"
+    "① 五个小节固定为 为什么 / 做了什么 / 结果 / 结论 / 下一步。"
+    "「为什么」写**假设**（承接上一步的什么发现、想验证什么），不是写动作；"
+    "「做了什么」里的命令要完整到别人能照着跑；done / dead **必须**写「结论」。"
+    "② 指标一律用 markdown 表格，不要用图：主指标放第一个数值列，基线在最上面，"
+    "最好的一行用 **加粗**；不用手写 `---:`，整列是数字就会自动右对齐并加底纹条"
+    "（底纹纯属加成，你读到的还是原数字）；带单位的值（`40 s`）会让整列变文字列，"
+    "这是对的，不要为了对齐去掉单位；有方差就写成 `0.943 ± 0.004`。"
+    "③ 图独占一段并带图注，写成 `![](loss.png \"第 12 轮后验证集回升，所以 epoch 定在 3\")`——"
+    "图注写这张图**说明了什么**，不是「这是一张 loss 曲线」；没图注的图 check 会报"
+    "figure_without_caption，评级卡在 L0。"
+    "④ 正文里 `[[003b]]` 是交叉引用，会渲染成跳转链接并在对方页面显示反向链接。"
+    "⑤ 外部产物用 paths 记成 `位置 | 说明`，说明里带上校验和与大小；"
+    "GB 级的东西不要传进来，只记它在哪 —— 这是溯源的一半。"
+    "⑥ 可溯源性等级：L0 不可溯源（缺「为什么」/「做了什么」，或有图没图注，或 done/dead 没结论）；"
+    "L1 可读；L2 可定位（L1 + 记了 commit + 记了产物位置）；L3 可重跑（repro: runnable）；"
+    "L4 已复现（repro: verified）。**等级受祖先制约**——祖先没记数据在哪，后代再全，"
+    "整条链也追不到底，所以补记录要从**最弱的那一环**补起，不是从最新那一步补起。"
+    "⑦ repro 三种状态：runnable＝查过、命令环境种子齐全；verified＝真跑过、数字在容差内对上；"
+    "failed＝试过、跑不起来或对不上（和成功一样重要，「checkpoint 被清了」本身就是溯源结论）。"
+    "只追加不覆盖。"
+    # 下面两条只在这份摘要里，不在 FORMAT.md 的摘要范围之外——
+    # pip 装的机器上根本没有 FORMAT.md（pyproject 只打包三个 .py），
+    # 而 agent 手写 project.md 或者判断某段 markdown 会不会渲染，靠的就是这两条。
+    "⑧ 每个项目还有一个 project.md，装项目级沉淀（「回译在这个数据集上一直没用」"
+    "是三次尝试之后的判断，挂在哪一步都不对）。小节名**逐字固定**为 "
+    "`## 核心想法` / `## 有效` / `## 无效` / `## 坑`，外加一个由系统自己写的 "
+    "`## 已删除`（删掉一步之后，「为什么删的」只剩那一行——**绝不要手工改它**）。"
+    "写它请用 trace_insight，别整段覆盖。"
+    "⑨ 渲染器是手写的，认 CommonMark 的一个子集：标题 / 段落 / 强调 / 行内代码 / "
+    "围栏代码块 / 列表（含嵌套、有序、任务）/ 引用块 / 表格 / 链接 / 图片 / "
+    "删除线 / 水平线 / `[[id]]` 交叉引用。**有意不做**：引用式链接 `[a][ref]`、"
+    "脚注、setext 标题、四空格缩进代码块（用围栏）。数学公式不做渲染，原样保留——"
+    "`$\\alpha$` 人和你都读得到原文，但不会变成排版好的公式，所以别指望它显示效果。"
+    "文件名带空格时图片要写成 `![](<loss curve.png> \"图注\")`。"
+)
 
 INSTRUCTIONS = (
     "这是一棵只追加的科研步骤树。规矩："
@@ -848,11 +993,21 @@ INSTRUCTIONS = (
     "④ 失败也要记，标 dead 并写清放弃理由，死胡同是这里最有价值的部分；"
     "⑤ 图必须给 caption，你看不到图，图注是它唯一的信息来源；"
     "⑥ 产物落在哪（超算路径、GitHub、对象存储）用 paths 记下来；"
-    "⑦ id 和 parent 写下就不可改。"
-    "完整的写作格式标准在插件根目录的 FORMAT.md —— 指标一律用 markdown 表格（渲染时"
-    "数值列会自动加底纹条，而你读到的还是原数字），图必须带承载结论的图注，"
-    "「为什么」要写假设不是动作。"
+    "⑦ id 和 parent 写下就不可改。\n\n"
+    + FORMAT_ESSENTIALS
 )
+
+
+def _format_doc() -> Path | None:
+    """这台机器上有没有完整的 FORMAT.md（clone / 插件安装才有，pip 装没有）。"""
+    p = Path(__file__).resolve().parent / "FORMAT.md"
+    return p if p.is_file() else None
+
+
+if _format_doc() is not None:
+    INSTRUCTIONS += (
+        f"\n\n完整版（含示例与出处）在 {_format_doc()} —— 上面这份是它的摘要，"
+        "两者冲突时以文件为准。")
 
 _JSON_TYPES: dict[str, Any] = {
     "string": str, "number": (int, float), "integer": int,
@@ -1027,6 +1182,163 @@ def serve_stdio(stream_in=None, stream_out=None) -> None:
             emit(resp)
 
 
+# ---------------------------------------------------------------- 自检
+
+# 插件把用户在 /plugin 里填的四项灌进这四个环境变量。名字写在这里是为了
+# 让自检能在「一个都没设」的时候，指名道姓地说清缺的是哪几个。
+PLUGIN_ENV = ("TRACE_ROLE", "TRACE_DATA", "TRACE_URL", "TRACE_TOKEN")
+PLUGIN_NAME = "research-trace"
+
+
+def plugin_user_config() -> tuple[Path | None, dict[str, str]]:
+    """尽力找出 Claude Code 里 research-trace 插件**实际填了什么**。
+
+    为什么需要它：插件的 TRACE_* 只注入给 Claude Code 拉起的 MCP 子进程，
+    **不进入 shell 环境**。用户在一台已经配好的机器上按 README 跑
+    `trace_mcp.py --selfcheck`，看到的是「没有配置后端」——在配好的机器上报错，
+    正砸在「换机器要能自证接通」这条需求上。
+
+    这是**尽力而为**：插件配置存在哪、用什么形状存，是宿主的实现细节，不是契约。
+    所以找不到不算失败，只是走到 explain_plugin_env() 那条「你现在这个上下文
+    看不到插件的配置，要这样查」的路上去。任何解析失败一律当作没找到。
+    """
+    base = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude"))
+    cands = [base / "plugins" / "config.json", base / "settings.json",
+             base / "settings.local.json", Path.home() / ".claude.json"]
+    keys = {"role", "data_dir", "url", "token", "python"}
+
+    def dig(node, depth=0):
+        if depth > 8 or not isinstance(node, dict):
+            return None
+        for k, v in node.items():
+            if PLUGIN_NAME in str(k) and isinstance(v, dict):
+                flat = {kk: vv for kk, vv in v.items() if kk in keys and isinstance(vv, (str, int))}
+                if flat:
+                    return {kk: str(vv) for kk, vv in flat.items()}
+            hit = dig(v, depth + 1)
+            if hit:
+                return hit
+        return None
+
+    for p in cands:
+        try:
+            if not p.is_file():
+                continue
+            found = dig(json.loads(p.read_text(encoding="utf-8")))
+        except (OSError, ValueError, RecursionError):
+            continue
+        if found:
+            return p, found
+    return None, {}
+
+
+def explain_plugin_env() -> None:
+    """当前 shell 里一个 TRACE_* 都没有时，说清这是为什么、以及该怎么查真值。"""
+    print("\n  ⓘ 这个 shell 里一个 TRACE_* 都没设。如果你是**通过插件**装的，这属于正常现象：")
+    print(f"      /plugin 里填的四项是灌给 Claude Code 拉起的 MCP 子进程的（{', '.join(PLUGIN_ENV)}），")
+    print("      不会出现在你手工敲命令的这个环境里。也就是说：**本次自检看不到插件的配置**，")
+    print("      它报的「没配后端」不代表插件没配好。")
+    p, vals = plugin_user_config()
+    if vals:
+        shown = {k: ("****" if k == "token" and v else v) for k, v in vals.items()}
+        print(f"      我在 {p} 里找到了一份 {PLUGIN_NAME} 的配置：{shown}")
+        print("      照它跑一遍就能验到真实配置：")
+        print(f"        python {Path(__file__).resolve()} --selfcheck"
+              + "".join(f" --{k.replace('data_dir', 'data')} \"{v}\""
+                        for k, v in vals.items() if k in ("role", "data_dir", "url") and v))
+    else:
+        print("      要验插件实际生效的配置，两条路，任选其一：")
+        print("        (a) 在 Claude Code 会话里直接调 mcp__plugin_research-trace_trace__trace_projects")
+        print("            —— 那个调用跑在**带着插件 env 的子进程**里，是唯一的地面真值；")
+        print("        (b) 打开 /plugin → research-trace → 配置，把里面的值抄下来重跑本自检：")
+        print(f"            python {Path(__file__).resolve()} --selfcheck "
+              "--role server --data \"<你填的数据仓目录>\"")
+        print(f"            python {Path(__file__).resolve()} --selfcheck "
+              "--role client --url \"<远端地址>\" --token \"<写入令牌>\"")
+
+
+SELFCHECK_FLAGS = {"--role": "TRACE_ROLE", "--data": "TRACE_DATA",
+                   "--url": "TRACE_URL", "--token": "TRACE_TOKEN",
+                   "--config": "TRACE_CONFIG"}
+
+
+def apply_selfcheck_flags(argv: list[str]) -> list[str]:
+    """把 `--role/--data/--url/--token/--config` 写进本进程的环境变量。
+
+    存在的理由就是上面那条：插件的配置在 shell 里看不见，用户只能从 /plugin
+    界面把值抄出来。抄出来之后总得有个地方能喂进去——不然「自证接通」这件事
+    在插件安装路径下根本没有出口。写进 os.environ 而不是另开一条配置通路，
+    是为了让被验的东西和真实运行时**逐字**走同一条 make_backend 代码路径。
+    """
+    rest, i = [], 0
+    while i < len(argv):
+        a = argv[i]
+        key, val = (a.split("=", 1) + [None])[:2] if "=" in a else (a, None)
+        if key in SELFCHECK_FLAGS:
+            if val is None:
+                i += 1
+                val = argv[i] if i < len(argv) else ""
+            os.environ[SELFCHECK_FLAGS[key]] = val
+        else:
+            rest.append(a)
+        i += 1
+    return rest
+
+
+# 写权限探针用的项目名。它不会存在，也不该存在：探针只想知道
+# 「令牌过不过得了门」，不想在任何人的记录里留下一个字节。
+WRITE_PROBE = "__trace_selfcheck_probe__"
+
+
+def probe_write(be) -> tuple[bool, str]:
+    """确认这台机器**写得进去**，且不留任何垃圾。返回 (行不行, 说明)。
+
+    为什么必须验写：原来的自检三项（列项目、JSON-RPC 握手、Python 版本）全是读路径，
+    而服务端的读是不要令牌的。于是「客户端没填令牌」这种最常见的漏配也能拿到满屏 ✓ +
+    「全部通过」，直到 agent 真正开始记录、第一次写入撞上 401 —— 恰好是最不该卡住的时刻。
+
+    不留垃圾的做法：
+      · 远端：PATCH 一个**必然不存在**的项目。require_token 排在业务逻辑前面，
+        所以令牌不对 → 401，令牌对 → 404「项目不存在」。两种回答都不写一个字节。
+      · 本地：在数据仓根下建一个点开头的空探针文件再删掉。点开头的条目
+        scan/list_files/signature 全都跳过，即使进程被 kill 留下它也不进任何视图。
+        不用 os.access：Windows 上它只看只读属性，不看 ACL，会给出假阳性。
+    """
+    if isinstance(be, HttpBackend):
+        try:
+            status = be._call("GET", "/api/status")
+        except ToolError as e:
+            return False, f"连不上服务端，写入无从谈起：{e}"
+        protected = bool(status.get("write_protected"))
+        if not protected:
+            return True, "服务端没设写入令牌（谁都能写）——公网部署请务必设上"
+        try:
+            be._call("PATCH", f"/api/p/{WRITE_PROBE}/steps/{WRITE_PROBE}", {})
+        except ToolError as e:
+            msg = str(e)
+            if msg.startswith("401"):
+                return False, ("令牌不对或没填。后果很具体：读（浏览、trace_read）一切正常，"
+                               "第一次写入才 401。去 /plugin → research-trace → 写入令牌，"
+                               "填服务端 `python trace_cli.py url` 打印的那一串。")
+            if msg.startswith("404"):
+                return True, "令牌通过了服务端的写入闸门（探针项目不存在，回 404，没写任何东西）"
+            return False, f"写入探针得到意料之外的回答：{msg}"
+        # 走到这里说明探针项目真的存在且被改成功了——这不该发生，但也没造成损坏
+        return True, f"写入闸门通过（注意：竟然真有一个叫 {WRITE_PROBE} 的项目）"
+
+    probe = be.root / f".trace-write-probe-{os.getpid()}"
+    try:
+        probe.write_bytes(b"")
+    except OSError as e:
+        return False, f"数据仓目录写不进去（{e.strerror or e}）——检查属主和权限"
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+    return True, "数据仓目录可写（探针文件已删除，没留痕迹）"
+
+
 def selfcheck() -> int:
     """`trace-mcp --selfcheck`：一条命令确认这台机器上能不能用。
 
@@ -1057,6 +1369,20 @@ def selfcheck() -> int:
     print(f"    配置来源: {'环境变量 ' + '/'.join(where) if where else '（无环境变量）'}"
           + (f" + 文件 {src}" if src else ""))
     say(role in ROLES, f"角色: {role}", "" if role in ROLES else f"→ 只能是 {'/'.join(ROLES)}")
+    # 角色不是摆设：client 会把本地目录**清空**，server 会把远端地址清空，
+    # 两样都填了也不是「远端优先」。选错的症状是「读到的是另一头的数据」，
+    # 而不是报错，所以这里必须把生效语义和改法一起说出来。
+    print("    " + {
+        "auto": "两样都填时远端优先；只填一样就用那一样",
+        "server": "只认数据仓目录，远端地址即使填了也会被忽略",
+        "client": "只认远端地址 + 写入令牌，本地目录即使填了也会被忽略",
+    }.get(role, "未知角色"))
+    print("    改角色: /plugin → research-trace → 配置 → 角色（server / client / auto）；"
+          "或设 TRACE_ROLE，或改配置文件里的 \"role\"")
+    # 判据是「插件灌的那四个」一个都没有，而不是「一个环境变量都没有」：
+    # TRACE_CONFIG 指的是配置文件，和插件那条注入通路无关，设了它照样看不见插件的配置。
+    if not any(os.environ.get(k, "").strip() for k in PLUGIN_ENV):
+        explain_plugin_env()
 
     try:
         be = make_backend()
@@ -1068,6 +1394,12 @@ def selfcheck() -> int:
     if isinstance(be, LocalBackend) and be.root.name == "projects":
         print("    ⚠ 数据仓目录本身就叫 projects —— 多半是指深了一层。"
               f"应当填它的父目录 {be.root.parent}，否则会造出 projects/projects。")
+    # 「这是全新的空仓」必须说出口。不说的话，路径打岔一个字符 → 凭空造出一棵空树 →
+    # 自检照报「全部通过」→ 用户在假树上记几十步才发现老项目一个都不见了。
+    if isinstance(be, LocalBackend) and be.root_state != DATA_ROOT_READY:
+        print(f"    ⚠ {be.root_note}")
+        print("      如果这台机器上本来就有记录，说明数据仓目录填错了 —— "
+              "现在改还来得及，等记了几十步再改就要手工搬目录了。")
 
     try:
         ps = be.projects()
@@ -1084,6 +1416,9 @@ def selfcheck() -> int:
     except ToolError as e:
         say(False, "读取失败", str(e))
         return 1
+
+    good, detail = probe_write(be)
+    say(good, "写入" + ("正常" if good else "会失败"), detail)
 
     # 走一遍真实的 JSON-RPC，确认协议层没问题
     msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -1108,6 +1443,9 @@ def main() -> int:
             sys.stdout.reconfigure(encoding="utf-8")
         except (AttributeError, OSError):
             pass
+        # 只在自检这条路上解析这几个开关：它们改的是本进程的 TRACE_*，
+        # 让「从 /plugin 抄出来的值」能走和真实运行时完全相同的 make_backend。
+        apply_selfcheck_flags([a for a in sys.argv[1:] if a != "--selfcheck"])
         return selfcheck()
     if "--version" in sys.argv[1:]:
         print(SERVER_VERSION)

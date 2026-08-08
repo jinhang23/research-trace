@@ -1,21 +1,43 @@
 ---
 name: research-trace
-description: "记录与查询科研步骤树（trace 系统，支持多项目）。触发词：记一步、这步记进去、为什么放弃了 X、这个结果怎么来的、之前试过什么、溯源、步骤树、trace、新建步骤、标记 dead、这条路走不通、切到哪个项目。开始一个新实验前应主动读现状，跑完一个实验后应主动提出记录。"
+description: "记录与查询科研步骤树（trace 系统，支持多项目）。触发词：记一步、这步记进去、为什么放弃了 X、这个结果怎么来的、之前试过什么、溯源、步骤树、trace、新建步骤、标记 dead、这条路走不通、切到哪个项目、记一条洞察、复现、能不能重跑。开始一个新实验前应主动读现状，跑完一个实验后应主动提出记录。"
 ---
 
 # trace — 科研步骤树
 
-**如果 `trace_*` 这组 MCP 工具可用，优先用它们**（`trace_projects` / `trace_read` /
-`trace_search` / `trace_new_step` / `trace_update_step` / `trace_attach`）——
-参数有 schema、不用自己拼请求、中文不会撞终端编码。下面的 REST 用法是没有 MCP 时的退路。
+**如果 `trace_*` 这组 MCP 工具可用，优先用它们**——参数有 schema、不用自己拼请求、
+中文不会撞终端编码。九个工具：
 
-REST API。配置来自三个环境变量：
+| 工具 | 什么时候用 |
+|---|---|
+| `trace_projects` | 不确定该记到哪个项目时，先调它 |
+| `trace_read` | **动手之前**先读。给 `step` 就读那一步全文 + 溯源链 + L0–L4 |
+| `trace_search` | 「之前是不是试过 X」「为什么放弃了 Y」。不给 `project` 就搜全部项目 |
+| `trace_new_project` | 建项目。同一个课题的不同尝试是**分叉的步骤**，不是新项目 |
+| `trace_insight` | 项目级的沉淀：核心想法 / 有效 / 无效 / 坑 |
+| `trace_new_step` | 建步骤。**开跑之前就建**（`status=wip`） |
+| `trace_update_step` | 改状态 / 追加正文 / 追加产物路径 / 追加一条 `repro` |
+| `trace_delete_step` | 真删。只用于误建、测试数据、粘进去的令牌 |
+| `trace_attach` | 传附件。**图片必须给 `caption`** |
+
+下面的 REST 用法是没有 MCP 时的退路。配置来自三个环境变量：
 
 - `TRACE_URL` — 形如 `https://你的域名/t/<space>`（含 space，不含末尾斜杠）
 - `TRACE_TOKEN` — 写入令牌；读不需要
 - `TRACE_PROJECT` — 默认项目 slug；没设就先 `GET /api/projects` 看有哪些，然后问用户
 
 前两个没设就先问用户，不要猜。
+
+## 格式标准在 FORMAT.md
+
+**这份 SKILL 讲的是「怎么调」，`FORMAT.md` 讲的是「写什么、写成什么样」**——
+每个 front-matter 键什么意思、五个小节各写什么、指标表和图注怎么写、
+`project.md` 的四个洞察小节叫什么、L0–L4 怎么判、渲染器认哪些 markdown 语法。
+下面只摘最容易写错的几条，**完整契约以 `FORMAT.md` 为准**。
+
+拿不到那个文件的时候（`pip install git+…` 那条安装路径只装三个 `.py`，
+机器上根本没有 `FORMAT.md`）：MCP 的 `initialize` instructions 里内联了它的
+可执行摘要，你在会话开始时就已经收到了。
 
 ## 数据模型
 
@@ -27,10 +49,14 @@ REST API。配置来自三个环境变量：
 | `id` | 服务端分配，永不变更。`003` 派生出 `004` / `004b` / `004c` |
 | `parent` | 单父，**同项目内**。写下之后不可改，改了返回 409 |
 | `status` | 只有三个：`wip` / `done` / `dead` |
-| `title` `date` `commit` `author` `tags` | 展示用 |
-| `body` | 自由正文 |
+| `title` `date` `commit` `author` `tags` | 展示用。`date` 不给的话服务端填当天 |
+| `key` | 幂等键。见规矩 5 |
+| `body` | 自由正文，按 `FORMAT.md` 的五个小节写 |
+| `paths` | 外部产物的位置，`位置 \| 说明`。整组替换；`add_paths` 是追加 |
+| `repro` | 复现记录，**只能追加**。见「复现记录」一节 |
+| `digest` | `sha256(note.md 原始字节)[:12]`。用来做冲突检测，见「别覆盖掉别人的写入」 |
 
-派生字段（`children` `backlinks` `files` `lineage` `lane` `row` `tree`）由服务端算出，
+派生字段（`children` `backlinks` `files` `lineage` `lane` `row` `tree` `trace`）由服务端算出，
 **不要试图写它们**。
 
 ## 规矩
@@ -43,11 +69,70 @@ REST API。配置来自三个环境变量：
    必须写出来。没有这段，这条记录半年后就是废的。
 4. **失败一定要记，标 `dead`，写清放弃的理由**。死胡同是这个系统最有价值的部分——
    半年后你会想知道为什么当时放弃了 X。
+   标了 `dead` 不写结论，`check` 会报 `missing_conclusion`——那条警告就是冲你来的。
 5. **`key` 幂等键**。凡是可能重试的写入都带上（如 `key: "dedup-rerun-v1"`）：
    同 key 重发返回既有步骤而不是造一个重复的。
 6. **附件**：跑的脚本、日志、图都传到该 step 目录。大文件（checkpoint、数据集）
-   留在仓库外，正文里记路径 + 校验和 + 大小。
+   留在仓库外，正文里记路径 + 校验和 + 大小。附件名**别带空格和括号**（理由见 FORMAT.md 第 5 节）。
 7. **不确定该记到哪个项目就问**，不要随便挑一个，更不要新建项目。
+8. **写完一步想一句**：这一步有没有产生**项目级**的教训？有就 `trace_insight` 记一条。
+
+## 别覆盖掉别人的写入
+
+同一个步骤会被两边写：你（agent）和坐在网页前的人。整组替换 `body` 之前，
+**带上冲突检测**：
+
+```python
+s = call("GET", p("/steps/004"))
+call("PATCH", p("/steps/004"), {
+    "body": s["body"] + "\n## 结果\n…\n",
+    "expect": s["digest"],          # 或者 If-Match 头，二选一
+})
+```
+
+- 不带 `expect` = 不检查，行为和以前一样（所以**追加式**的写入可以不带）。
+- 摘要对不上 → **409**，响应体里有 `current`（服务器当前那一份完整 step，含正文）
+  和 `digest`。这时**不要原样重试**：把你的改动合到 `current["body"]` 上，
+  用新的 `digest` 再存一次。原样重试等于把这期间人写的东西抹掉。
+- MCP 的 `trace_update_step` 用 `append` 参数就够了（它先读再拼，不整组替换）。
+
+优先用追加：`append`（正文）、`add_paths`（产物路径）、`repro`（复现记录）。
+整组替换只在真的要重写整段时用。
+
+## 复现记录（`repro`）
+
+查证或重跑别人的步骤之后，把结论写回去。三种状态，**只追加，不覆盖**：
+
+| 状态 | 什么意思 |
+|---|---|
+| `runnable` | 查过：命令、环境、种子都齐全，照着能跑 |
+| `verified` | 真跑过，数字在容差内对上了 |
+| `failed` | 试过，跑不起来或者对不上 |
+
+```python
+call("PATCH", p("/steps/004"), {"add_repro":
+     "verified | 2026-08-08 | agent:claude | 干净 split 重跑 3 个种子，0.9506±0.0008"})
+```
+
+MCP 那边是 `trace_update_step(project=…, step="004", repro="verified | … | … | …")`。
+
+**`failed` 和成功一样要写。**「/orange 上的 checkpoint 已被清理，跑不了」本身就是
+溯源结论——它回答了「这个结果现在还能不能信」。别因为结论不好看就不写。
+
+## 可溯源性等级（L0–L4）
+
+`trace_read` 读单步时会告诉你这一步自己的等级、**整条链**的等级、以及**最弱的那一环**。
+
+| 级 | 判据 |
+|---|---|
+| L0 | 「为什么」或「做了什么」空着，或有图没图注，或 `done`/`dead` 却没结论 |
+| L1 | 上面这些都齐了 |
+| L2 | L1 + 记了 `commit` + 记了产物 `path` |
+| L3 | 已经到 L2，且有一条 `repro: runnable` |
+| L4 | 有一条 `repro: verified`（最后那条说了算） |
+
+**等级受祖先制约**：001 没记数据在哪，004 写得再全，整条链也追不到底。
+所以被问到"要不要补记录"时，**从 `weakest` 指的那一步补起**，不是从最新那一步补起。
 
 ## 正文模板
 
@@ -84,42 +169,77 @@ REST API。配置来自三个环境变量：
 不是"这是一张 loss 曲线"。`trace_cli.py check` 会对没有图注的图报警告。
 
 需要真的看图时可以取原字节（读是公开的，不需要令牌）：
-`GET /p/{项目}/files/{id}/{文件名}`。
+`GET {TRACE_URL}/p/{项目}/files/{id}/{文件名}`。
 
-**表**：正常的 markdown 表格即可。渲染器会把**整列都是数字的列自动右对齐**并用等宽数字，
-所以不必手写 `---:`；需要强制对齐时再写 `:---` / `---:` / `:---:`。
-指标表把主指标放第一列之后，行按可比性排列。
+**表**：正常的 markdown 表格即可。渲染器会把**整列都是数字的列自动右对齐**并用等宽数字
+并画一条底纹条，所以不必手写 `---:`；需要强制对齐时再写 `:---` / `---:` / `:---:`。
+指标表把主指标放第一列之后，行按可比性排列（基线在最上面），最好的一行 `**加粗**`。
+`0.943 ± 0.004` 这种带方差的写法**照样算数值列**（底纹按主值 0.943 算），
+带单位的 `40 s` 算文字列——这是对的，不要为了对齐去掉单位。
+单元格里的字面竖线写成 `\|`。
 
-## 外部产物的位置（溯源的另一半）
+**公式**：`$…$` / `$$…$$` **不会**被渲染成排版公式（不引 KaTeX），而是原样保留成
+等宽文本。所以人和你读到的都是同一份原式。指标不要写成公式，写成表格。
 
-GB 级的东西不要传进来（数据集、checkpoint、中间特征），**只记它在哪**。
-`paths` / `add_paths` 参数，每条写成 `位置 | 说明`：
+渲染器有意不支持的语法（引用式链接 `[a][ref]`、脚注 `[^1]`、setext 标题、
+四空格缩进代码块）见 `FORMAT.md` 第 12 节——写了就是原样一坨文本。
+
+## 项目洞察（`project.md`）
+
+**不属于任何单独一步的结论写在这里。**「回译在这个数据集上一直没用」是三次尝试之后
+的判断，挂在哪一步都不对。四个固定小节，标题一个字都不能差：
+
+| 小节 | `trace_insight` 的 `kind` | 写什么 |
+|---|---|---|
+| `## 核心想法` | `idea` | 还没验证、但值得记下来的想法 |
+| `## 有效` | `works` | 试过、确实管用的做法 |
+| `## 无效` | `fails` | 试过、不管用的做法 |
+| `## 坑` | `pitfall` | 会反复咬人的陷阱 |
+
+```python
+call("PATCH", "/api/projects/" + PROJ,
+     {"add_insight": {"kind": "fails", "text": "回译在这个数据集上一直没用，三次都在噪声内"}})
+```
+
+一条一行，`- ` 开头，要能被 `grep` 一行捞出来。带上出处：正文里写 `[[004]]`。
+
+`project.md` 里还有一个 `## 已删除` 小节，由系统在删除步骤时自己写。
+**永远不要动它**——目录已经没了，那一行是「为什么删的」仅存的证据。
+
+## 跨项目搜索
+
+「之前好像在某个课题里试过对比学习，最后放弃了」——不给 `project` 就是搜全部：
 
 ```
-/blue/<组>/<用户>/data/agnews-clean | 去重后的训练集，12 GB
-/orange/<组>/<用户>/ckpt/run042/best.pt | 权重，265 MB，sha256:7d4e1a9c…
-https://github.com/你/仓库/tree/9b7d112 | 跑这一步的代码
-s3://bucket/exports/run042.parquet | 导出的预测结果
+GET {TRACE_URL}/api/search?q=对比学习
+GET {TRACE_URL}/api/search?q=对比学习&project=<slug>&limit=100
 ```
 
-竖线右边是自由文本，校验和、大小、"在哪台机器上"、"已确认无用可删"都往里写。
-类型（超算 / GitHub / Dropbox / 对象存储 / 数据仓库 …）由系统从位置形状自动识别，不用你标。
-
-**跑完一个实验之后，产物落在哪一定要记下来**——半年后想复现这个结果，
-光有代码和 commit 不够，还得知道那份数据和权重在哪。用 `add_paths` 追加最安全。
+回 `hits`（每条带 `project` / `id` / `title` / `status` / `where` / `snippet`）、
+`total`、`truncated`。MCP 那边是 `trace_search(query=…)`，参数名叫 `query`，
+端点两个名字都收。
 
 ## 端点
+
+Base = `TRACE_URL`（形如 `https://你的域名/t/<space>`）。
 
 | 方法 | 路径 | 鉴权 |
 |---|---|---|
 | GET | `/api/projects` — 项目列表 + 步骤数与状态分布 | — |
-| GET | `/api/p/{项目}/forest` — 全量 steps + tree + warnings | — |
-| GET | `/api/p/{项目}/steps/{id}` — 含 `lineage` `files` `backlinks` | — |
+| GET | `/api/p/{项目}/forest` — 全量 steps（含 `trace` `digest`）+ tree + warnings | — |
+| GET | `/api/p/{项目}/steps/{id}` — 含 `lineage` `files` `backlinks` `trace` `digest` | — |
+| GET | `/api/search` — 跨项目搜索，`?q=` 或 `?query=` | — |
+| GET | `/api/status` — 版本、项目数、步骤数、git 同步状态、`write_protected` | — |
+| GET | `/api/git` — 自动 git 同步的状态（`ok` / `summary` / `hint`） | — |
 | POST | `/api/projects` — `{name}` | Bearer |
-| POST | `/api/p/{项目}/steps` — `{parent, title, status, body, date, commit, author, key, tags}` | Bearer |
-| PATCH | `/api/p/{项目}/steps/{id}` — 只能改 `status` `title` `body` `date` `commit` `author` `tags` | Bearer |
+| PATCH | `/api/projects/{项目}` — `{name}` / `{insights}` / `{add_insight:{kind,text}}` | Bearer |
+| POST | `/api/p/{项目}/steps` — `{parent, title, status, body, date, commit, author, key, tags, paths}` | Bearer |
+| PATCH | `/api/p/{项目}/steps/{id}` — `status` `title` `body` `date` `commit` `author` `tags` `paths` `add_paths` `add_repro`；可带 `expect` | Bearer |
+| DELETE | `/api/p/{项目}/steps/{id}` — `{reason}` 必填 | Bearer |
 | PUT | `/api/p/{项目}/steps/{id}/files/{相对路径}` — raw body，自己定文件名 | Bearer |
 | POST | `/api/p/{项目}/steps/{id}/files` — raw body，服务端定名；`X-Filename` 头可选（需 URL 编码），不给就按内容哈希命名 | Bearer |
+| DELETE | `/api/p/{项目}/steps/{id}/files/{相对路径}` — 删一个附件 | Bearer |
+| POST | `/api/sync` — 立刻跑一次 git commit + push | Bearer |
 
 ```python
 import json, os, urllib.request
@@ -146,21 +266,40 @@ step = call("POST", p("/steps"), {
     "body": "## 为什么\n[[004]] 发现测试集有 2.3% 近重复样本，历史数字都要重新算……\n",
 })
 call("PUT", p(f"/steps/{step['id']}/files/run.sh"), raw=open("run.sh", "rb").read())
-call("PATCH", p(f"/steps/{step['id']}"), {"status": "done",
+call("PATCH", p(f"/steps/{step['id']}"), {"status": "done", "expect": step["digest"],
      "body": step["body"] + "\n## 结果\n去重后准确率 0.947（去重前 0.951）。\n"})
 ```
 
 请求体必须是 UTF-8（Windows 终端默认 GBK，用上面的 Python 方式，别用 curl 拼中文）。
 
+## 报错了怎么办
+
+不是所有失败都该重试。看返回体里的 `kind` 和 `written`：
+
+| 情况 | 该做什么 |
+|---|---|
+| **401** | 令牌不对或没填。**不是**磁盘故障——文件系统的错误不会返回 401 |
+| **409** + `expect`/`digest` | 冲突检测拦下了。重新读、合并、带新 `digest` 再存。**别原样重试** |
+| **409** 其它 | 改了 `id`/`parent`，或者幂等键/目录撞车。读错误正文，别硬来 |
+| **400** `kind: name_too_long` | 文件名太长（Windows 整条路径 260、Linux 单个文件名 255 **字节**，一个中文 3 字节）。换个短名字 |
+| **409** `kind: locked` / **403** `permission` | 文件被占用 / 权限不足。可以过一会儿重试 |
+| **507** `disk_full` / **503** `unavailable` | 磁盘满 / 网络盘掉线。**告诉用户**，别静默重试 |
+| **400** 其它 | 参数不合法（未知字段、`status` 不在三个值里、`repro` 状态写错）。读错误正文改参数 |
+
+`written: false` 的意思是**这次写入一个字节都没发生**，磁盘上原来的内容完好——
+可以放心地改参数重来，不用担心留下半份文件。
+
 ## 不要做的事
 
-- 不要直接改服务器上的文件绕过 API（本地 clone 里手写 note.md 再 push 是可以的）
+- 不要直接改服务器上的文件绕过 API（本地 clone 里手写 note.md 再 push 是可以的，
+  但必须是 UTF-8，且照 `FORMAT.md` 的 front-matter 写）
 - 不要试图改 `id` 或 `parent`——只追加是这套系统的地基
 - **不要用 `trace_delete_step` 处理失败的实验。** 试过、走不通，那是 `status=dead`，
   是研究结论，也是这套系统里最有价值的东西。删除只用于"这条记录本身就不该存在"
-  （误建、测试数据、粘进去的令牌）。删了会有两个代价：id 可能被重用、
-  子步骤变孤儿——工具会把实际发生的情况报给你
+  （误建、测试数据、粘进去的令牌）。删了会有三个代价：id 可能被重用、
+  子步骤变孤儿、正文里的 `[[006]]` 变成悬空引用——工具会把实际发生的情况报给你
 - 不要跨项目挂 `parent`——`parent` 必须是同一个项目里已存在的 id
 - 不要用旧 logbook 的字段（`metrics_json` `params_json` `subproject_id`）或
   旧状态名（`draft` `ongoing` `success` `failed`），一律 400
 - 不要把结果塞进 `title`——`title` 是一行摘要，数字放正文的「结果」小节
+- 不要整组替换 `paths` 或 `body` 而不带 `expect`——用 `add_paths` / `append`

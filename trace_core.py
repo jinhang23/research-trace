@@ -113,12 +113,18 @@ def parse_repro(raw: str) -> list[dict[str, str]]:
     return out
 
 
+# 这两个模式在 sections()/_filled() 里对每一行正文都要试一次，是全流程调用次数
+# 最多的正则。预编译掉 re 模块的缓存查找（实测占 compile_forest 的一成以上）。
+_HEADING_RE = re.compile(r"^\s*#{1,6}\s+(.*?)\s*$")
+_PLACEHOLDER_RE = re.compile(r"^[（(].*?[）)]\s*$", re.S)
+
+
 def sections(body: str) -> dict[str, str]:
     """按 `## 小节名` 切正文。用于判断「为什么」这类小节是不是真的写了东西。"""
     out: dict[str, str] = {}
     name, buf = None, []
     for line in (body or "").split("\n"):
-        m = re.match(r"^\s*#{1,6}\s+(.*?)\s*$", line)
+        m = _HEADING_RE.match(line)
         if m:
             if name is not None:
                 out[name] = "\n".join(buf).strip()
@@ -135,7 +141,7 @@ def _filled(text: str) -> bool:
     t = (text or "").strip()
     if not t:
         return False
-    t = re.sub(r"^[（(].*?[）)]\s*$", "", t, flags=re.S).strip()
+    t = _PLACEHOLDER_RE.sub("", t).strip()
     return bool(t)
 
 
@@ -199,6 +205,11 @@ class Step:
     repro: list[dict[str, str]] = field(default_factory=list)
     body: str = ""
     dirname: str = ""
+    # note.md 原始字节的 sha256 前 12 位。乐观并发控制用：客户端把读到的这个值
+    # 当 expect 传回来，写侧（trace_write.digest_of）用同一个公式重算，对不上就 409。
+    # 公式必须和 trace_write.digest_of 逐字一致，否则冲突检测会变成永久误报。
+    # 内存里凭空造出来的 Step（测试、纯函数演算）没有对应文件，留空串。
+    digest: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -215,6 +226,7 @@ class Step:
             "repro": [dict(r) for r in self.repro],
             "body": self.body,
             "dirname": self.dirname,
+            "digest": self.digest,
         }
 
 
@@ -279,7 +291,15 @@ def scan_projects(root: Path) -> list[Project]:
         note = d / PROJECT_NOTE
         if note.is_file():
             try:
-                meta, body, _ = parse_note(note.read_text(encoding="utf-8", errors="replace"))
+                # 和步骤的 note.md 走同一个解码器：GBK / UTF-16 存的中文不能静默
+                # 变成一串 U+FFFD。project.md 装的是项目级沉淀（「回译一直没用」
+                # 这种三次尝试后的判断），糊掉了不比糊掉一步的正文轻。
+                # decode_note 的第二个返回值是警告，Project 没有承载警告的字段，
+                # 所以把它折进 name —— 让人在项目列表上一眼看见，而不是无声无息。
+                text, warns = decode_note(note.read_bytes(), f"{d.name}/{PROJECT_NOTE}")
+                meta, body, _ = parse_note(text)
+                if warns:
+                    meta["name"] = (meta.get("name") or d.name).strip() + "  ⚠ 编码有问题"
             except OSError:
                 pass
         out.append(
@@ -423,8 +443,36 @@ def list_files(step_dir: Path) -> list[dict[str, Any]]:
     return out
 
 
+def decode_note(raw: bytes, where: str = "") -> tuple[str, list[dict[str, str]]]:
+    """把 note.md / project.md 的原始字节解成文本，解不干净就**说出来**。
+
+    以前这里直接 errors="replace"：GBK 或 UTF-16 存的中文会静默变成一串 U+FFFD，
+    页面上是乱码、warnings 里一个字都没有，而下一次任何写入都会把这些替换字符
+    落盘，原始字节再也回不来。所以宁可吵：报一条 error 级警告，让人在 check 和
+    网页顶栏立刻看见「这个文件不是 UTF-8，别去改它，先转码」。
+
+    仍然返回替换后的文本而不是抛异常——残缺输入必须还能出图（构建器永不中断）。
+    """
+    try:
+        return raw.decode("utf-8"), []
+    except UnicodeDecodeError as exc:
+        text = raw.decode("utf-8", errors="replace")
+        return text, [warn(
+            "error", "not_utf8",
+            f"不是合法的 UTF-8（第 {exc.start} 字节起解不出来），已用 � 顶替。"
+            f"很可能是 GBK 或 UTF-16 存的（cmd 的 echo>、PowerShell 的 Out-File、"
+            f"编辑器「ANSI 另存」都会这样）。请先转成 UTF-8 再编辑，"
+            f"否则下一次保存会把 � 写进文件，原文永久丢失",
+            where)]
+
+
 def scan(steps_dir: Path, with_files: bool = True) -> tuple[list[Step], dict[str, list[dict]], list[dict[str, str]]]:
-    """读目录，找 note.md。没有 note.md 的目录静默跳过（允许临时目录共存）。"""
+    """读目录，找 note.md。没有 note.md 的目录静默跳过（允许临时目录共存）。
+
+    返回的 files 以**目录名**为键，不是 step.id：id 可能重复（validate 会把后来的
+    改名成 `001~dup2`），而目录名在一次扫描里天然唯一。以前用 id 做键时，两个同 id
+    的目录会互相覆盖同一个键，结果 001 的附件清单里列的是另一个目录的文件。
+    """
     steps: list[Step] = []
     files: dict[str, list[dict]] = {}
     warnings: list[dict[str, str]] = []
@@ -438,25 +486,43 @@ def scan(steps_dir: Path, with_files: bool = True) -> tuple[list[Step], dict[str
         if not note.is_file():
             continue
         try:
-            text = note.read_text(encoding="utf-8", errors="replace")
+            raw = note.read_bytes()
         except OSError as exc:
             warnings.append(warn("error", "unreadable", f"无法读取: {exc}", entry.name))
             continue
+        text, w0 = decode_note(raw, entry.name)
         meta, body, w1 = parse_note(text)
         step, w2 = build_step(entry.name, meta, body)
-        for w in w1 + w2:
+        step.digest = hashlib.sha256(raw).hexdigest()[:12]
+        for w in w0 + w1 + w2:
             w["where"] = w["where"] or entry.name
-        warnings.extend(w1 + w2)
+        warnings.extend(w0 + w1 + w2)
         steps.append(step)
-        files[step.id] = list_files(entry) if with_files else []
+        files[entry.name] = list_files(entry) if with_files else []
     return steps, files, warnings
 
 
 def signature(steps_dir: Path) -> str:
-    """目录内容指纹，用于判断是否需要重新编译。不进入静态导出产物。"""
+    """目录内容指纹，用于判断是否需要重新编译。不进入静态导出产物。
+
+    传项目的 **steps 目录**（core.steps_dir_of(root, slug)）。同级的 project.md
+    由本函数自己带上，调用方不需要多传一个路径：指纹的语义是「这个项目在磁盘上
+    变了没有」，而项目洞察（需求 20）就存在 project.md 里。漏掉它的后果是
+    改一条洞察不涨 version、SSE 不推送，另一台机器上的洞察面板一直是旧的。
+    """
     h = hashlib.sha1()
+    note = steps_dir.parent / PROJECT_NOTE
+    try:
+        st = note.stat()
+        h.update(PROJECT_NOTE.encode("utf-8"))
+        h.update(f"{st.st_mtime_ns}:{st.st_size}".encode("ascii"))
+        has_project_note = True
+    except OSError:
+        has_project_note = False
     if not steps_dir.is_dir():
-        return "empty"
+        # 没有 steps 目录时仍要区分「project.md 也没有」和「只有 project.md」，
+        # 否则新建项目后写洞察照样不涨版本。
+        return "empty" if not has_project_note else h.hexdigest()[:16]
     for root, dirs, names in os.walk(steps_dir):
         dirs[:] = sorted(d for d in dirs if not d.startswith("."))
         for n in sorted(names):
@@ -574,37 +640,47 @@ def compute_lanes(
 ) -> tuple[dict[str, int], dict[str, int]]:
     """git graph 那套轨道分配。返回 (lane, end)。
 
-      row(n)   = n 在 order 中的下标
-      end(n)   = n 子树中最大的行号
-      depth(n) = end(n) - row(n)
-      heir(p)  = children(p) 中 depth 最大者，平局取 id 序最小者
+      row(n)    = n 在 order 中的下标
+      end(n)    = n 子树中最大的行号（用来判断轨道什么时候空出来）
+      height(n) = n 子树的高度：叶子为 0，否则 1 + max(height(子))
+      heir(p)   = children(p) 中 height 最大者，平局取 id 序最小者
 
       L1 heir 继承父的轨道
       L2 其余子节点取编号最小且 busy[l] < row(n) 的空闲轨道，没有就新开
       L3 分配后 busy[lane] = max(busy[lane], end(n))
 
-    用 depth 选主线而不是"第一个子节点"：最早尝试的那条支往往是后来废掉的，
-    用 depth 选等于让实际走下去的那条线留在主干，死胡同自然被甩到旁边。
+    用**高度**选主线而不是"第一个子节点"：最早尝试的那条支往往是后来废掉的，
+    用高度选等于让实际走下去的那条线留在主干，死胡同自然被甩到旁边。
+
+    这里刻意不能用 `end(n) - row(n)`。O2 保证子树占连续行区间，所以那个差值恒等于
+    「子树节点数 − 1」，是子树的**大小**，只在链状子树上才碰巧等于高度。两者一旦
+    分道扬镳，选出来的恰好是反的：一条死胡同底下挂着 5 个一次性小试验（大小 6、
+    高度 1）会赢过真正往下走的 4 步链（大小 5、高度 4），主线被甩到 lane 1。
     """
     row = {sid: i for i, sid in enumerate(order)}
 
     end: dict[str, int] = {}
-    for sid in reversed(order):
+    height: dict[str, int] = {}
+    for sid in reversed(order):  # order 是前序，倒着走 = 子先于父
         e = row[sid]
+        h = 0
         for c in children.get(sid, ()):
             if end[c] > e:
                 e = end[c]
+            if height[c] + 1 > h:
+                h = height[c] + 1
         end[sid] = e
+        height[sid] = h
 
     heir: dict[str, str] = {}
     for p, kids in children.items():
         if not kids:
             continue
-        best, best_depth = None, -1
+        best, best_h = None, -1
         for c in kids:
-            d = end[c] - row[c]
-            if d > best_depth or (d == best_depth and id_key(c) < id_key(best)):
-                best, best_depth = c, d
+            h = height[c]
+            if h > best_h or (h == best_h and id_key(c) < id_key(best)):
+                best, best_h = c, h
         heir[p] = best
 
     lane: dict[str, int] = {}
@@ -657,6 +733,9 @@ def compute_tree(
 
     x: dict[str, float] = {}
     next_x: dict[int, float] = {}
+    # 当前这棵树在**每一层**上的公共左边界。前一棵树排完后抬高它，这样后一棵树
+    # 即使更深、深到前面从没有过的层，也仍然从前一棵树的右边起排。
+    tree_floor = float(PAD)
 
     def shift_subtree(sid: str, delta: float) -> None:
         stack = list(children.get(sid, ()))
@@ -664,12 +743,12 @@ def compute_tree(
             n = stack.pop()
             x[n] += delta
             d = depth[n]
-            next_x[d] = max(next_x.get(d, float(PAD)), x[n] + NODE_W + H_GAP)
+            next_x[d] = max(next_x.get(d, tree_floor), x[n] + NODE_W + H_GAP)
             stack.extend(children.get(n, ()))
 
     def place(sid: str) -> None:
         d = depth[sid]
-        floor_ = next_x.get(d, float(PAD))
+        floor_ = next_x.get(d, tree_floor)
         kids = children.get(sid, [])
         if not kids:
             x[sid] = floor_
@@ -693,11 +772,13 @@ def compute_tree(
                 stack.append((sid, True))
                 for c in reversed(children.get(sid, ())):
                     stack.append((c, False))
-        # 让下一棵树在所有层上都躲开这一棵，两棵树不会互相穿插
-        edge = max(next_x.values()) + TREE_GAP - H_GAP
-        for d in list(next_x):
-            next_x[d] = edge
-        next_x[0] = edge
+        # 让下一棵树在所有层上都躲开这一棵，两棵树不会互相穿插。
+        # 注意不能只把 next_x 里**已有的键**推到 edge：那些键只是前面几棵树到达过的
+        # 层，后一棵树若更深，多出来的那些层在 next_x 里没有键，会退回 PAD，
+        # 从画布最左边排起，正好钻到前一棵树的下方（删除产生孤儿后多根很常见）。
+        # 所以改成抬高公共下限、清空 next_x —— 对所有层一视同仁，包括还没出现过的层。
+        tree_floor = max(next_x.values()) + TREE_GAP - H_GAP
+        next_x.clear()
 
     max_depth = max(depth.values())
     nodes = {sid: {"x": round(x[sid], 2), "y": PAD + depth[sid] * (NODE_H + V_GAP), "depth": depth[sid]} for sid in order}
@@ -730,21 +811,28 @@ def compute_backlinks(by_id: dict[str, Step]) -> dict[str, list[str]]:
     return back
 
 
-_IMG_IN_BODY = re.compile(r'!\[([^\]]*)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)')
+# 两种目标写法都要认：裸路径，以及 CommonMark 的 <...>。
+# 后者是渲染器为了支持 `loss curve (run 42).png` 这类带空格的文件名才接的——
+# 只认裸路径的话，恰恰是最容易漏图注的那批图（文件名带空格、从别处拷来的）
+# 全部逃过检查：md.js 照常渲染出一张没有说明的图，check 却报一切正常。
+_IMG_IN_BODY = re.compile(r'!\[([^\]]*)\]\(\s*(?:<([^>]*)>|([^)\s]+))(?:\s+"([^"]*)")?\s*\)')
 
 
-def lint_body(step: Step) -> list[dict[str, str]]:
-    """内容层的提醒（不是结构不变量，永远只是 warning）。
-
-    目前只有一条：图片必须有图注。理由是这个系统有两类读者——
+def _lint_figures(step: Step) -> list[dict[str, str]]:
+    """图片必须有图注。理由是这个系统有两类读者——
 
       * 人：半年后看到一张没有说明的曲线，认不出画的是什么；
       * agent：只读得到 `![](loss_curve.png)` 这一行，图里的信息对它是黑洞。
 
     图注是这张图对文本读者唯一的信息来源，所以它不是装饰，是内容。
+
+    单独拆出来是因为 traceability() 要用它判 captions，而 lint_body() 已经
+    扩到「所有内容层缺陷」——traceability 若调 lint_body 就会把「没写结论」
+    也算成图注问题，而且两者会互相递归。
     """
     out: list[dict[str, str]] = []
-    for alt, src, title in _IMG_IN_BODY.findall(step.body):
+    for alt, angle, bare, title in _IMG_IN_BODY.findall(step.body):
+        src = angle or bare
         if not (alt.strip() or title.strip()):
             out.append(
                 warn("warn", "figure_without_caption",
@@ -752,6 +840,44 @@ def lint_body(step: Step) -> list[dict[str, str]]:
                      f"没有图注的话，图里的结论对文本读者和 agent 都是丢失的",
                      step.dirname)
             )
+    return out
+
+
+# 内容层缺陷：小节名 → (警告 code, 为什么这条缺了要紧)。
+# 只对 done / dead 生效——wip 是"还在写"，对着一个刚建出来的空模板报警只会训练
+# 大家忽略警告；而一旦作者宣布这一步有结果了（done）或者放弃了（dead），
+# 这条记录就是最终形态，删掉全部程序之后能不能读懂它，此刻定生死（G4）。
+_CONTENT_CHECKS = (
+    ("为什么", "missing_why", "为什么做这一步——这是唯一无法从代码和数据里自动生成的字段，丢了就永远补不回来"),
+    ("做了什么", "missing_what", "做了什么——重跑要靠它，只有标题的话别人（和半年后的你）无从下手"),
+    ("结论", "missing_conclusion", "结论——假设到底成不成立"),
+)
+
+
+def lint_body(step: Step) -> list[dict[str, str]]:
+    """内容层的提醒（不是结构不变量，永远只是 warn 级）。
+
+    两类：图片缺图注，以及**已经收尾的步骤缺关键小节**。
+
+    后者是 G4 的执法点。traceability() 早就把「没写结论」算进 missing 了，但那
+    只在 agent 逐步读 MCP 详情时才露出来；check 和网页读的是 warnings，于是
+    「点一下按钮标成 dead、一个字理由都不写」全流程零提示。半年后删掉程序、
+    grep 这个目录，只剩下 `status: dead` 和一个标题，答不出「我当年为什么放弃了 X」
+    ——正是 G4 要防的那一件事。所以这里把它抬进 warnings。
+
+    级别用 warn 不用 error：这不是结构错误（树照样能建、图照样能画），
+    是记录质量问题。error 留给「构建被迫改动数据」的情形（重复 id、环）。
+    """
+    out = _lint_figures(step)
+    if step.status in ("done", "dead"):
+        sec = sections(step.body)
+        for name, code, why in _CONTENT_CHECKS:
+            if not _filled(sec.get(name, "")):
+                out.append(
+                    warn("warn", code,
+                         f"状态是 {step.status} 却没写「{name}」：{why}",
+                         step.dirname)
+                )
     return out
 
 
@@ -777,7 +903,7 @@ def traceability(step: Step) -> dict[str, Any]:
         "why": _filled(sec.get("为什么", "")),
         "what": _filled(sec.get("做了什么", "")),
         "conclusion": step.status == "wip" or _filled(sec.get("结论", "")),
-        "captions": not lint_body(step),
+        "captions": not _lint_figures(step),
         "commit": bool(step.commit.strip()),
         "paths": bool(step.paths),
     }
@@ -814,23 +940,67 @@ def traceability(step: Step) -> dict[str, Any]:
             "repro": dict(latest) if latest else None}
 
 
+def _trace_dict(self_t: dict[str, Any], worst_id: str, worst_level: str,
+                lineage_entries: list[dict[str, str]]) -> dict[str, Any]:
+    """组装 trace 字段。键的顺序是产物的一部分（静态导出要逐字节一致），别动。"""
+    return {
+        "self": self_t["level"],
+        "chain": worst_level,
+        "weakest": worst_id,
+        "missing": self_t["missing"],
+        "repro": self_t["repro"],
+        "lineage": lineage_entries,
+    }
+
+
 def chain_traceability(by_id: dict[str, Step], sid: str) -> dict[str, Any]:
     """整条链的可溯源性 = 链上最弱的一环。
 
     这是这套评级真正有用的地方：001 没记数据在哪，004 就算自己写得再全，
     「004 这个结论是怎么来的」依然追不到底。
+
+    只问一个节点用这个；要问整棵树用 compute_traces()，别在循环里调本函数。
     """
     chain = lineage(by_id, sid)
     per = {i: traceability(by_id[i]) for i in chain}
     worst_id = min(chain, key=lambda i: (LEVELS.index(per[i]["level"]), chain.index(i)))
-    return {
-        "self": per[sid]["level"],
-        "chain": per[worst_id]["level"],
-        "weakest": worst_id,
-        "missing": per[sid]["missing"],
-        "repro": per[sid]["repro"],
-        "lineage": [{"id": i, "level": per[i]["level"]} for i in chain],
-    }
+    return _trace_dict(per[sid], worst_id, per[worst_id]["level"],
+                       [{"id": i, "level": per[i]["level"]} for i in chain])
+
+
+def compute_traces(by_id: dict[str, Step], order: list[str]) -> dict[str, dict[str, Any]]:
+    """一次算出所有步骤的链路可溯源性。输出与逐个调 chain_traceability 完全一致。
+
+    为什么要有批量版本：chain_traceability 每次都把整条祖先链的 traceability
+    重算一遍，深链上就是 n²/2 次正文解析（1000 步实测 17 秒，其中 500500 次
+    traceability 调用占了绝大部分）。而「链上最弱一环」是可递推的：
+
+        worst(n) = worst(parent(n)) 与 n 自己之中等级更低者，平局取更靠近根的那个
+
+    平局取祖先，正是原来 min() 的第二关键字 chain.index —— 祖先在链里下标更小。
+    order 是前序（父一定排在子前面），所以自顶向下扫一遍就够，每步 O(1)。
+
+    lineage 列表用「父的列表 + 自己」增量拼出来，且各条链共享同一批条目对象：
+    产物是只读的派生数据，共享不改变任何一次比较或序列化的结果，却把深链上的
+    对象数从 n²/2 降到 n。
+    """
+    per = {sid: traceability(by_id[sid]) for sid in order}
+    entry = {sid: {"id": sid, "level": per[sid]["level"]} for sid in order}
+
+    worst: dict[str, str] = {}
+    lines: dict[str, list[dict[str, str]]] = {}
+    out: dict[str, dict[str, Any]] = {}
+    for sid in order:
+        p = by_id[sid].parent
+        if p is None or p not in lines:   # 根；p 不在 lines 里说明链断了，按根处理
+            worst[sid] = sid
+            lines[sid] = [entry[sid]]
+        else:
+            wp = worst[p]
+            worst[sid] = wp if LEVELS.index(per[wp]["level"]) <= LEVELS.index(per[sid]["level"]) else sid
+            lines[sid] = lines[p] + [entry[sid]]
+        out[sid] = _trace_dict(per[sid], worst[sid], per[worst[sid]]["level"], lines[sid])
+    return out
 
 
 def lineage(by_id: dict[str, Step], sid: str) -> list[str]:
@@ -858,17 +1028,23 @@ def compile_forest(steps_dir: Path, with_files: bool = True) -> dict[str, Any]:
     lane, end = compute_lanes(by_id, children, order)
     back = compute_backlinks(by_id)
 
+    traces = compute_traces(by_id, order)             # 派生，不存储
+
     w_lint: list[dict[str, str]] = []
     steps_out = []
     for sid in order:
-        w_lint.extend(lint_body(by_id[sid]))
-        d = by_id[sid].to_dict()
+        step = by_id[sid]
+        w_lint.extend(lint_body(step))
+        d = step.to_dict()
         d["children"] = children.get(sid, [])
         d["backlinks"] = back.get(sid, [])
-        d["files"] = files.get(sid, [])
+        # 用目录名取附件，不用 id：两个目录写了同一个 id 时，validate 只改得动
+        # 后一个的 id（→ 001~dup2），而附件是按目录扫出来的，用 id 做键会把
+        # 001 的清单换成 001~dup2 那个目录的文件（点开 404，自己的附件消失）。
+        d["files"] = files.get(step.dirname, [])
         d["lane"] = lane[sid]
         d["row"] = len(steps_out)
-        d["trace"] = chain_traceability(by_id, sid)   # 派生，不存储
+        d["trace"] = traces[sid]
         steps_out.append(d)
 
     return {

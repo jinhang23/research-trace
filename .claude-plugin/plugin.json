@@ -1,8 +1,8 @@
 {
   "name": "research-trace",
   "displayName": "科研溯源 trace",
-  "version": "1.1.0",
-  "description": "把科研过程记录成一棵只追加的步骤树：每一步自带代码、日志、产物和一句「我为什么要做这一步」，从任何结果都能回溯到最初的问题。带 8 个 MCP 工具（零依赖，手写 JSON-RPC）、多项目、图/列表双视图、外部产物路径溯源、L0–L4 可溯源性评级、项目级洞察沉淀。",
+  "version": "1.2.0",
+  "description": "把科研过程记录成一棵只追加的步骤树：每一步自带代码、日志、产物和一句「我为什么要做这一步」，从任何结果都能回溯到最初的问题。带 9 个 MCP 工具（零依赖，手写 JSON-RPC）、多项目、图/列表双视图、外部产物路径溯源、L0–L4 可溯源性评级、项目级洞察沉淀。",
   "author": {
     "name": "Jinhang Wei"
   },
@@ -48,7 +48,7 @@
     "python": {
       "type": "string",
       "title": "Python 解释器",
-      "description": "跑 MCP server 用的 Python，要 3.10 以上（server 本身零依赖，不需要装任何包）。Linux / macOS / 超算上保持默认 python3 即可。Windows 上多半要填绝对路径，比如 C:/ProgramData/anaconda3/python.exe —— 因为 PATH 上的 python 经常指向别的软件自带的 2.x。装完可以跑 /research-trace:doctor 验一下。",
+      "description": "跑 MCP server 用的 Python，要 3.10 以上（server 本身零依赖，不需要装任何包）。\n最省事也最不会错的填法：在你平时跑实验的那个终端/环境里执行 `python -c \"import sys; print(sys.executable)\"`，把打印出来的绝对路径原样贴进来 —— 那就是「当前环境下的 Python」，一定跑得起来。\nLinux / macOS / 超算上如果 `python3` 已经指向对的那个，保持默认也行。\nWindows 上默认值多半是错的，请务必填绝对路径（形如 C:/ProgramData/anaconda3/python.exe）：PATH 上的 `python3` 常常是应用商店的占位程序，`python` 又可能指向别的软件自带的旧版本，两者都不会报「缺包」，只会让 trace 这个 MCP server 连不上。\n填错的症状就是工具列表里没有 trace_*。装完先跑 /research-trace:doctor，或在同一个终端里跑 `<你填的这个解释器> <插件根>/trace_mcp.py --selfcheck` 验一下。",
       "default": "python3"
     }
   },

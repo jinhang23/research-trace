@@ -11,13 +11,20 @@
 
 ```bash
 pip install -r requirements.txt
-python trace_cli.py init                            # 生成 config.json（含访问路径与写入令牌）
-#   上线时用 --data-dir ../trace-data 把数据放进另一个私有仓库
-python trace_cli.py new-project --name "我的课题"
+python trace_cli.py init --project "我的课题"        # 生成 config.json（含访问路径与写入令牌）
 python trace_cli.py serve                           # 起服务，终端会打印访问地址
 ```
 
 浏览器打开打印出来的地址，点右上角 🔒 把令牌存进浏览器，就能建步骤、改正文、拖文件了。
+
+两个默认值值得知道，它们是为了让上面这三行**照抄也不会出事**：
+
+- **数据放在 `../trace-data`**（`--data-dir` 的默认值），也就是这个代码仓的**外面**。
+  项目自己的不变量是"代码仓公开、数据仓私有"，默认值必须先满足它。
+- **自动 git 同步默认是关的。** 要开得显式 `--git`，而且数据仓和代码仓在同一个
+  git 工作区时会被直接拒绝——`git add -A && git commit && git push` 一旦跑在公开
+  代码仓上，未发表的实验记录 45 秒后就上了公网，而且推送成功时一个字都不打印。
+  上线时怎么开见 [deploy/README.md](deploy/README.md)。
 
 键盘：`↑↓` 移动 · `g` 切换图/列表 · `n` 从选中节点派生 · `e` 编辑 · `/` 搜索
 编辑时：`Ctrl+B` 粗体 · `Ctrl+I` 斜体 · `Ctrl+Enter` 保存 · `Esc` 取消
@@ -56,10 +63,33 @@ python trace_cli.py serve                           # 起服务，终端会打�
 几张图、几个附件。树大了用底部的缩放条，或 `Ctrl` + 滚轮。
 
 **列表** —— git graph 那样的轨道图 + 定高行。看全貌：几百步时用它扫和搜最快。
-主线恒在轨道 0，选主线用的是"这一支还要往下延伸多远"，不是"哪个子节点 id 最小"——
-最早尝试的那条支往往是后来废掉的那条。
+主线恒在轨道 0，选主线用的是"这一支还要往下延伸多远"——精确地说是**子树高度**
+（叶子记 0，父 = 1 + 子的最大值），平局取 id 序最小的那个。不是"哪个子节点 id 最小"
+（最早尝试的那条支往往是后来废掉的那条），也不是"哪个子树的节点最多"
+（一个死胡同下面挂五个快速小试验，节点数能压过真正走下去的那条深链）。
+
+窄屏（<760px）第一次打开默认走列表视图：图的画布是绝对像素，手机上等于一屏一个节点
+全靠拖；列表的轨道只有十几像素宽，窄屏上完整可读。切到图视图会自动缩放到适应宽度，
+选择会被记住。
 
 两个视图共用同一份数据和同一套选中逻辑。布局都是纯函数算好的，视图只负责画。
+
+两个视图上都能看到**可溯源性**：自身还停在 L0 的节点标一个 `L0`，最近一次复现失败的
+标一个 `↺✕`。详情面板里有完整的一栏——自身等级、整条链的等级、最弱的那一环
+（可点跳过去）、还缺什么的待办清单、从根到自己的等级链条、以及全部 `repro` 记录。
+
+## 找得回来、写得不丢
+
+- **跨项目搜索**：顶栏的搜索框可以在「本项目 / 全部项目」之间切。
+  "之前好像在某个课题里试过对比学习，最后放弃了"——这是这套系统存在的理由之一，
+  人不该被迫一个项目一个项目点进去各搜一遍（agent 一次 `trace_search` 就跨全部项目了）。
+- **草稿**：正文、标题、外部路径边写边存进 localStorage。按 `Esc`、点面包屑、
+  点自己刚写的 `[[007]]`、按后退键、关标签页——都不会让写了十分钟的记录蒸发。
+  下次打开是一条"有草稿"的提示，恢复还是丢弃由你决定，不会自动替你套上。
+- **保存冲突**：见下面 P2 那段。409 时把服务器版本和你正在编辑的版本并排摆出来、
+  逐行标出差异，三个出口：回编辑器 / 保留服务器版本（你的留在草稿里）/ 用我的覆盖。
+- **同步状态**：顶栏一个 ⇅ 图标。自动 git 同步失败或者根本没配好时它会变红，
+  悬停给出原因和修法，点一下立刻重试一次。平时安静。
 
 ---
 
@@ -72,10 +102,21 @@ python trace_cli.py serve                           # 起服务，终端会打�
 > 不需要注册。你可以直接 `mkdir` + `vim note.md`，页面五秒内自己跟上。
 
 **P2 · 只追加.** id 不重编号，父子关系一旦写下不再改。
-可变的只有 `status` 和正文。改 `id` / `parent` 的 API 请求一律 409。
+可变的只有 `status` / `title` / `body` / `date` / `commit` / `author` / `tags` / `paths`。
+改 `id` / `parent` 的 API 请求一律 409。`repro` 复现记录**只能追加**，没有替换那条路。
 
 > 这是溯源能成立的前提：笔记里写的"见 002b"、论文脚注里的引用，永远有效。
 > 项目的 slug 同理——改显示名不动目录名，已经发出去的链接不会失效。
+
+"只追加"在**并发**下同样要成立，所以写接口有乐观并发控制：每一步都带一个
+`digest = sha256(note.md 原始字节)[:12]`，`PATCH` 时把它放进请求体的 `expect`
+或者 `If-Match` 头，对不上就 409 且一个字节都不写。409 的响应体里带着服务器
+当前那一份完整内容，网页会把两边并排摆出来让人自己挑，而不是只弹一句"冲突了"。
+不传 `expect` 就是不检查（agent 的追加式写入不受影响）。
+
+> 挡的是这个：你在网页里编辑 004 的正文，同一时间你自己的 Claude 会话跑完实验
+> 往 004 里追加了「结果」和产物路径。没有这道闸门的话，你一按保存，那份
+> **打开编辑器那一刻**的旧快照整组盖回去，agent 写的东西无声消失，两次请求都是 200。
 
 删除是这条原则**唯一的例外**，只用于"这条记录本身就不该存在"——误建、测试数据、
 不小心粘进去的令牌。它和 `dead` 是两回事：`dead` 是研究结论，删掉真实的失败
@@ -113,10 +154,10 @@ research-trace/                     ← 仓库本身就是插件
 ├── trace_mcp.py                    MCP server（手写 JSON-RPC，零依赖）← 插件清单指向它
 ├── trace_server.py                 FastAPI：路由 + SSE + 鉴权
 ├── trace_git.py                    debounce 自动 commit + push（同步的是数据仓）
-├── trace_cli.py                    init / projects / new / check / paths / build / serve / url
+├── trace_cli.py                    init / projects / new-project / new / rm / check / paths / build / serve / url
 ├── web/                            无构建步骤，不引 CDN
-├── tests/                          243 个 Python 断言 + 25 个 markdown 渲染断言
-├── FORMAT.md                       记录格式标准：写什么、怎么可视化、L0–L4 怎么判
+├── tests/                          pytest（内核 / 布局 / 写入 / 服务 / MCP / 插件 / 文档）+ node --test（markdown 与前端纯函数）
+├── FORMAT.md                       记录格式标准：note.md 和 project.md 写什么、怎么可视化、L0–L4 怎么判
 ├── deploy/                         Caddyfile · systemd unit · 部署说明
 └── projects/                       ← 你的数据（上线时用 --data-dir 指到私有仓库）
 ```
@@ -141,7 +182,7 @@ Python 模块留在仓库根，因为这个仓库同时也是一个 pip 包（`p
 ---
 id: 007
 parent: 005
-status: done          # wip | done | dead
+status: done
 title: 加入标题字段，准确率 0.943 → 0.951
 date: 2026-03-11
 commit: c1d2e3f
@@ -150,16 +191,34 @@ tags: features, transformer
 path: /blue/<组>/<用户>/data/agnews-clean | 去重后的训练集，12 GB
 path: /orange/<组>/<用户>/ckpt/run042/best.pt | 权重，265 MB，sha256:7d4e1a9c…
 path: https://github.com/你/仓库/tree/9b7d112 | 跑这一步的代码
+repro: verified | 2026-08-08 | agent:claude | 干净 split 重跑 3 个种子，0.9506±0.0008
 ---
 
-## 为什么      ← 承接上一步的什么发现，想验证什么假设
-## 做了什么    ← 改了哪些文件，跑了什么命令
-## 结果        ← 数字、图、观察
-## 结论        ← 假设成立与否
-## 下一步      ← 派生出哪些分支
+## 为什么
+## 做了什么
+## 结果
+## 结论
+## 下一步
 ```
 
+| 小节 | 写什么 |
+|---|---|
+| `## 为什么` | 承接上一步的什么发现，想验证什么假设 |
+| `## 做了什么` | 改了哪些文件，跑了什么命令 |
+| `## 结果` | 数字、图、观察 |
+| `## 结论` | 假设成立与否 |
+| `## 下一步` | 派生出哪些分支 |
+
 正文格式不强制，但这五个小节对应科研步骤的完整生命周期。
+标题要和上面**逐字一致**——评级和 `check` 就是按这几个名字去正文里找内容的，
+写成 `## 为什么（承接上一步）` 就等于没写。
+完整的写法契约（每个键什么意思、指标表怎么写、图注怎么写、L0–L4 怎么判、
+渲染器认哪些 markdown）在 [FORMAT.md](FORMAT.md)。
+
+每个项目还有一个 `project.md`，装**项目级**的沉淀——「回译在这个数据集上一直没用」
+是三次尝试之后的判断，挂在哪一步都不对。四个固定小节 `核心想法` / `有效` / `无效` /
+`坑`，外加一个由系统自己写的 `已删除`（删掉一步之后，「为什么删的」只剩那一行）。
+格式见 [FORMAT.md](FORMAT.md) 第 11 节。
 
 **「为什么」是整个系统里唯一无法自动生成的字段。** 日志能自动存，commit 能自动记，
 环境能自动 freeze，只有"我当时为什么决定试这个"必须人写。系统的全部设计目的，
@@ -167,6 +226,9 @@ path: https://github.com/你/仓库/tree/9b7d112 | 跑这一步的代码
 
 front-matter 用手写解析器而不是 YAML：`title: 试了 3:1 采样` 在 YAML 里是语法错误，
 而这类标题在科研记录里很常见。规则就是"冒号左边是键、右边整行是值"。
+
+"右边**整行**"要当真：`status: done   # wip | done | dead` 里那段行尾注释是值的一部分，
+会让 status 变成未知值退回 `wip`。整行以 `#` 开头才是注释。
 
 正文里写 `[[003b]]` 会渲染成跳转链接，并在 003b 的页面显示"被这些步骤引用"。
 这是"多父 DAG"的廉价替代品——想说"本步综合了 A 线和 B 线"，写一句就够，
@@ -240,9 +302,20 @@ grep -rn "^path:" projects/                # 删掉全部程序之后照样能�
 python <插件根>/trace_mcp.py --selfcheck
 ```
 
-它会报解释器版本、配置从哪读的、角色、后端、项目数，并**真跑一遍 JSON-RPC 握手**。
-通不通、哪一项要改，它自己会说。插件根目录可以用 `claude mcp list` 或在
-`~/.claude/plugins/cache/` 下找 research-trace。
+它会报解释器版本、配置从哪读的、角色、后端、项目数，**试一次写**（远端打一个必然
+404 的请求：令牌不对是 401、令牌对是 404，两种回答都不写一个字节；本地是建一个点
+开头的探针文件再删掉），并**真跑一遍 JSON-RPC 握手**。通不通、哪一项要改，它自己会说。
+插件根目录可以用 `claude mcp list` 或在 `~/.claude/plugins/cache/` 下找 research-trace。
+
+**一个必须知道的不对称**：`/plugin` 里填的那些值是灌给 **MCP 子进程**的环境变量
+（`TRACE_ROLE` / `TRACE_DATA` / `TRACE_URL` / `TRACE_TOKEN`），你在自己 shell 里跑
+`--selfcheck` 是**看不到**它们的——那不代表插件坏了。自检发现这四个一个都没有时
+会把这段说明打出来，并告诉你两条查真值的路：会话里直接调一次
+`mcp__plugin_research-trace_trace__trace_projects`，或者从 `/plugin` 里把值抄出来重跑：
+
+```bash
+python <插件根>/trace_mcp.py --selfcheck --role client --url https://你的域名/t/<space> --token <令牌>
+```
 
 最后一项值得单说：`.mcp.json` 的 `command` 是静态字符串，而 `python` 在 Windows 上
 经常指向别的软件自带的 2.x（作者机器上就是 MGLTools 的 Python 2.7.11），`python3`
@@ -256,7 +329,7 @@ python <插件根>/trace_mcp.py --selfcheck
 
 ## MCP（推荐给 agent 用）
 
-`trace_mcp.py` 把 trace 暴露成 6 个 MCP 工具。比让 agent 自己拼 HTTP 请求好在：
+`trace_mcp.py` 把 trace 暴露成 9 个 MCP 工具。比让 agent 自己拼 HTTP 请求好在：
 参数有 schema（不合法的调用先被拦下）、不用生成 requests/curl 代码、
 中文不会再撞上终端编码。
 
@@ -318,16 +391,23 @@ claude mcp add trace -s user \
 | 工具 | 干什么 |
 |---|---|
 | `trace_projects` | 列项目 + 步骤数与状态分布 |
-| `trace_read` | 读整棵树（缩进树，比 JSON 省 token），或读单步全文 + 溯源链 |
-| `trace_search` | 在标题/正文/标签里搜——回答"之前是不是试过 X""为什么放弃了 Y" |
+| `trace_read` | 读整棵树（缩进树，比 JSON 省 token），或读单步全文 + 溯源链 + L0–L4 |
+| `trace_search` | 在标题/正文/标签里搜——回答"之前是不是试过 X""为什么放弃了 Y"。不给 `project` 就搜全部项目 |
 | `trace_new_project` | 建项目。数据仓为空时 `trace_new_step` 会自动建，不用先跑 init |
 | `trace_insight` | 往项目洞察里记一条：核心想法 / 有效 / 无效 / 坑 |
 | `trace_new_step` | 建步骤（支持幂等键、外部产物路径） |
-| `trace_update_step` | 改状态/正文/路径；`append` 和 `add_paths` 追加比整组替换安全 |
+| `trace_update_step` | 改状态/正文/路径；`append` 和 `add_paths` 追加比整组替换安全；`repro` 追加一条复现记录 |
+| `trace_delete_step` | **真删**一步，必须写原因。只用于误建/测试数据/粘进去的令牌——失败的实验请标 `dead` |
 | `trace_attach` | 传附件；**图片必须给 caption**，给了就自动在正文插入引用 |
 
 规矩写在工具描述里，agent 调用时就能看到：先读后写、先建 wip 再开跑、
 必须写「为什么」、失败标 dead 并写清放弃理由、改 `id`/`parent` 直接拒绝。
+
+**格式标准怎么送到 agent 手里。** `pip install git+…` 那条路只打包三个 `.py`，
+那台机器上根本不存在 `FORMAT.md`——所以 MCP 的 `initialize` 返回的 instructions 里
+**内联**了 FORMAT.md 的可执行摘要（五个小节、指标表规则、图注、`[[交叉引用]]`、
+`paths` 格式、L0–L4 判据、`repro` 三态）。那是唯一无论怎么装都一定送达的通道。
+只有当 `FORMAT.md` 真的躺在 `trace_mcp.py` 旁边时，才会再追加一行指向它的**绝对路径**。
 
 MCP 和 REST API 是同一套后端的两个门面，可以混用。
 
@@ -347,7 +427,7 @@ MCP 和 REST API 是同一套后端的两个门面，可以混用。
 图里的判断，不必看图。`trace_cli.py check` 会对没有图注的图报警告。
 
 有视觉能力的 agent 可以直接取原图（读是公开的，不需要令牌）：
-`GET /p/{项目}/files/{id}/{文件名}` 返回原始字节。
+`GET {base}/p/{项目}/files/{id}/{文件名}` 返回原始字节。
 
 ## API（给 agent）
 
@@ -357,14 +437,41 @@ Base = `/t/<space>`。读公开，写要 `Authorization: Bearer <token>`。
 |---|---|---|
 | GET | `/api/projects` | 项目列表 + 各自的步骤数与状态分布 |
 | POST | `/api/projects` | 建项目 `{name}` |
-| GET | `/api/p/{项目}/forest` | 全量：steps（含 lane/row/children/backlinks/files）+ tree + warnings |
+| PATCH | `/api/projects/{项目}` | 改显示名 `{name}` 和/或洞察：`{insights}` 整体替换那四个小节、`{add_insight: {kind, text}}` 追加一条。slug 不动 |
+| GET | `/api/p/{项目}/forest` | 全量：steps（含 lane/row/children/backlinks/files/trace/digest）+ tree + warnings |
 | GET | `/api/p/{项目}/steps/{id}` | 单步 + `lineage`（到根的完整路径） |
+| GET | `/api/search` | 跨项目搜索。`?q=` 或 `?query=`，不给 `project` 就搜全部；回 `hits/total/truncated` |
+| GET | `/api/status` | 标题、版本、项目数、步骤数、git 同步状态、`write_protected` |
+| GET | `/api/git` | 自动 git 同步的状态：`ok/state/summary/hint/last_ok_at/pending`。带令牌多给 `detail`（git 原文，含服务器路径） |
 | GET | `/api/events` | SSE，推 `{version}` |
 | POST | `/api/p/{项目}/steps` | 建步骤。带 `key` 则幂等——重试不会产生重复 |
-| PATCH | `/api/p/{项目}/steps/{id}` | 改 status/title/body/date/commit/author/tags |
+| PATCH | `/api/p/{项目}/steps/{id}` | 改 status/title/body/date/commit/author/tags/paths；`add_paths` `add_repro` 是追加。带 `expect` 或 `If-Match` 做冲突检测 |
 | DELETE | `/api/p/{项目}/steps/{id}` | 真删目录。`{reason}` 必填 —— 只追加原则的唯一例外 |
 | PUT | `/api/p/{项目}/steps/{id}/files/{path}` | 上传附件到指定文件名（raw body） |
 | POST | `/api/p/{项目}/steps/{id}/files` | 上传附件，服务端定名（`X-Filename` 可选；没给就按内容哈希命名，重复内容自动复用） |
+| DELETE | `/api/p/{项目}/steps/{id}/files/{path}` | 删掉一个附件 |
+| POST | `/api/sync` | 立刻跑一次 git commit + push，返回和 `/api/git` 同样的结构 |
+
+读接口一律公开（和 `forest` 一致），写接口一律要 `Bearer`。
+另外两条不在 API 命名空间下、给人和有视觉能力的 agent 用的路径：
+`{base}/p/{项目}/` 是网页，`{base}/p/{项目}/files/{id}/{文件名}` 直接返回附件原始字节（公开）。
+
+**错误是可分支的，不是一坨 500。** 文件系统层的失败会带上 `kind` 和 `written: false`：
+
+| `kind` | 状态码 | 什么时候 |
+|---|---|---|
+| `name_too_long` | 400 | 文件名/路径超长（Windows 整条路径 260，Linux 单个文件名 255 **字节**） |
+| `locked` | 409 | 文件被别的程序占用 |
+| `permission` | 403 | 权限不足、目录只读 |
+| `disk_full` | 507 | 磁盘满 |
+| `missing` | 404 | 路径上有一段不存在 |
+| `unavailable` | 503 | NAS / 网络盘掉线 |
+| `io_error` | 500 | 其余 |
+
+`written: false` 是可以信的：记录本体和附件的写入都是「同目录临时文件 → fsync →
+`os.replace`」，失败时磁盘上的原文一个字节都没动过。
+令牌不对是 401，和上面这些**不共用**异常处理——以前共用一个，于是"文件被占用"
+会被报成"需要写入令牌"，agent 拿到 401 会去重找令牌，而真正的问题在磁盘上。
 
 ```python
 import json, urllib.request
@@ -379,8 +486,10 @@ req = urllib.request.Request(
 step = json.load(urllib.request.urlopen(req))
 ```
 
-Claude Code 用户：`~/.claude/skills/research-trace/SKILL.md` 已写好接入规则，
-设好 `TRACE_URL`、`TRACE_TOKEN`、`TRACE_PROJECT` 三个环境变量即可。
+Claude Code 用户：[`skills/research-trace/SKILL.md`](skills/research-trace/SKILL.md)
+已写好接入规则（装插件时随插件一起分发）。走 REST 这条退路时设好 `TRACE_URL`、
+`TRACE_TOKEN`、`TRACE_PROJECT` 三个环境变量即可；有 MCP 工具就直接用工具。
+怎么写记录的契约在 [FORMAT.md](FORMAT.md)。
 
 ## 命令
 
@@ -388,13 +497,19 @@ Claude Code 用户：`~/.claude/skills/research-trace/SKILL.md` 已写好接入�
 python trace_cli.py projects                      # 列出项目
 python trace_cli.py new-project --name "课题名"
 python trace_cli.py new -P <项目> --title "..."    # 新建一步
-python trace_cli.py check [-P <项目>]              # 校验不变量，打印警告
+python trace_cli.py rm -P <项目> <id> --reason "…" # 真删一步（原因必填）
+python trace_cli.py check [-P <项目>] [--strict]   # 校验不变量 + 打印 L0–L4 与最弱一环
 python trace_cli.py paths [-P <项目>] [--kind hpc] # 列出所有外部产物的位置
 python trace_cli.py build --out dist              # 静态导出，file:// 可直接打开，断网可用
 python trace_cli.py url                           # 打印访问地址与令牌
-python -m pytest tests                            # 172 个断言（内核 / 布局 / 写入 / 多项目 / 路径 / MCP 协议）
-node --test tests/md.test.js                      # 25 个断言（markdown 渲染）
+python trace_mcp.py --selfcheck                   # 自检：解释器 / 角色 / 后端 / 读 / 写 / JSON-RPC 握手
+python -m pytest tests                            # 内核 / 布局 / 写入 / 服务 / MCP 协议 / 插件 / 文档
+node --test "tests/**/*.test.js"                  # markdown 渲染 + 前端纯函数
 ```
+
+`check` 的退出码默认只看结构性错误（重复 id、环这类逼着构建改动数据的问题）。
+`--strict` 把内容层缺陷（`dead` 没写结论、图没图注、链卡在 L0/L1）也算成失败——
+给 CI 用。默认不算，是因为 `wip` 天天红一片只会训练大家忽略警告。
 
 `build` 的产物是确定性的：同样的输入两次构建逐字节一致，所以 `dist/` 直接 gitignore。
 
@@ -414,8 +529,14 @@ node --test tests/md.test.js                      # 25 个断言（markdown 渲�
 | 目录名 id ≠ front-matter id | 以 front-matter 为准 + 警告 |
 | 目录里没有 `note.md` | 静默跳过（允许临时目录共存） |
 | 项目目录里没有 `project.md` | 用目录名当项目名——目录就是项目 |
+| `note.md` 不是 UTF-8（GBK / UTF-16） | 读得下来（非法字节变 `�`）+ 一条 `not_utf8` **错误**级警告；**写入直接拒绝**，让你先转码 |
 
 警告显示在页面顶栏，从不阻塞构建。
+
+最后那一条值得单说：以前是静默 `errors="replace"`，于是 Windows 中文环境下
+`cmd.exe` 的 `echo … > note.md`（GBK）或 PowerShell 5.1 的 `>`（UTF-16LE）写出来的笔记
+一声不吭地显示成乱码，你在网页上点一下状态按钮，那份 `�` 就落盘了，原始字节不可逆丢失。
+现在写入侧会拦住并告诉你哪个字节解不开。
 
 ## 部署
 
@@ -423,8 +544,13 @@ node --test tests/md.test.js                      # 25 个断言（markdown 渲�
 
 ## 刻意不做的
 
-多人协作与并发编辑 · 自动捕获（不 hook shell / git / 文件系统）· 重跑与复现执行 ·
+多人协作（账号、权限分级、评论、@提醒）· 实时协同编辑（OT / CRDT，两个人同时敲一段
+正文）· 自动捕获（不 hook shell / git / 文件系统）· 重跑与复现执行 ·
 大文件版本管理 · 全文索引服务（`grep` 就够）· 拖拽自由布局（布局一旦手工摆放，
 就不再是文件系统的纯函数了）。
 
 它们都会把"没有这个工具也能读"变成一句空话。
+
+要和上面 P2 那段区分开：**并发写入的冲突检测是做了的**（`expect` / `If-Match` → 409 +
+把两边内容摆出来）。做的是"别让后一次保存无声地吃掉前一次"，不做的是"两个人
+同时编辑同一段正文还能自动合并"。前者是数据完整性，后者是协作产品。

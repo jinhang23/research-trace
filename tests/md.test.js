@@ -7,9 +7,12 @@ const { test } = require("node:test");
 const assert = require("node:assert");
 
 require("../web/md.js");
-const { render } = globalThis.md;
+const { render, safeHref, numericValue } = globalThis.md;
 
 const R = (s, opts) => render(s, opts || {});
+/* 洞察面板（app.js renderInsights）传的 resolve 是恒等函数，相对路径原样落进 href。
+   安全断言必须按这个最坏情况来测，用带重写的 resolve 会把问题遮住。 */
+const RAW = { resolve: (h) => h };
 
 /* ---------------------------------------------------------------- 安全 */
 
@@ -157,4 +160,280 @@ test("CRLF 与 BOM 不影响解析", () => {
 test("同样的输入产出同样的输出", () => {
   const src = "## 结果\n\n| a | b |\n|---|--:|\n| x | 1.2 |\n\n![图](a.png \"说明\")";
   assert.equal(R(src), R(src));
+});
+
+/* ======================================================= 附件名里的空格与括号
+   trace_mcp._md_ref 对含空格/括号的路径会生成 CommonMark 的 <...> 形式，
+   网页拖拽上传则直接插入裸路径。两种都必须能渲染出图，否则
+   `loss curve (run 42).png` 这类再普通不过的文件名在正文里就只剩一串源码。 */
+
+test("文件名带空格时 <尖括号> 形式的图片仍渲染成 img 而不是裸源码", () => {
+  const h = R('![](<loss curve.png> "第 12 轮后验证集回升")', { resolve: (p) => "/files/3/" + p });
+  assert.ok(h.includes('src="/files/3/loss curve.png"'), h);
+  assert.ok(!h.includes("&lt;"), "尖括号是语法，不该原样显示出来");
+  assert.ok(h.includes("<figcaption>第 12 轮后验证集回升</figcaption>"));
+});
+
+test("文件名带空格时 <尖括号> 形式的普通附件链接也认得", () => {
+  const h = R("见 [数据](<data set.csv>)", { resolve: (p) => "/files/3/" + p });
+  assert.ok(h.includes('href="/files/3/data set.csv"'), h);
+});
+
+test("文件名里的成对括号不把 src 截断", () => {
+  const h = R("如图 ![x](fig(1).png) 所示");
+  assert.ok(h.includes('src="fig(1).png"'), h);
+  assert.ok(!h.includes(".png)"), "不该有残留的裸文本 .png)");
+});
+
+test("空格加括号的文件名（loss curve (run 42).png）完整保留", () => {
+  const h = R("![](<loss curve (run 42).png>)", RAW);
+  assert.ok(h.includes('src="loss curve (run 42).png"'), h);
+});
+
+test("图注的 HTML 转义没被 <尖括号> 支持弄坏", () => {
+  // 标题里的引号在整体转义后是 &quot;，正则若按 " 写会整条匹配不上
+  assert.ok(R('![a](b.png "说明")').includes("<figcaption>说明</figcaption>"));
+  assert.ok(R("![a](b.png '说明')").includes("<figcaption>说明</figcaption>"));
+});
+
+test("FORMAT.md 那样折行写的长图注仍然进 figcaption", () => {
+  const h = R('![](loss.png "第 12 轮之后验证集回升，\n说明再往后就是纯过拟合。")');
+  assert.ok(h.includes("<figure>"), h);
+  assert.ok(h.includes("纯过拟合"), h);
+});
+
+/* ================================================== 表格里的 \| 是字面竖线
+   从 Excel 粘贴时 app.js 会把单元格内的竖线转义成 \|。解析器不认的话，
+   那一格被劈成两格、整行右移，最右边一列被 head.map 静默截掉。 */
+
+test("表格单元格里的 \\| 不当分隔符，右边的列不被挤掉", () => {
+  const h = R(["| 命令 | 说明 |", "|---|---|", "| cat a \\| wc -l | 数行 |"].join("\n"));
+  assert.equal((h.match(/<td/g) || []).length, 2, h);
+  assert.ok(h.includes("<td>cat a | wc -l</td>"), h);
+  assert.ok(h.includes("数行"), "第二列的原值不该被顶掉");
+});
+
+test("一格里多个 \\| 也不会顶掉右侧多列", () => {
+  const h = R(["| 取值 | 含义 |", "|---|---|", "| 低\\|中\\|高 | 等级 |"].join("\n"));
+  assert.ok(h.includes("<td>低|中|高</td>"), h);
+  assert.ok(h.includes("等级"), h);
+});
+
+test("以 \\| 结尾的单元格不被当成行尾收口竖线", () => {
+  const h = R(["| a | b |", "|---|---|", "| x\\| | y |"].join("\n"));
+  assert.equal((h.match(/<td/g) || []).length, 2, h);
+  assert.ok(h.includes("<td>x|</td>"), h);
+});
+
+/* ============================================ 带方差的数值列（FORMAT.md §4）
+   FORMAT.md 明写「有方差就写进去（0.943 ± 0.004）」，又承诺数值列自动右对齐
+   并带底纹条。两条不能互相打架——照着标准写不该反而丢掉可视化。 */
+
+test("0.943 ± 0.004 仍算数值列，右对齐不被方差关掉", () => {
+  const h = R(["| 模型 | 准确率 |", "|---|---|", "| 基线 | 0.897 ± 0.010 |", "| 新 | **0.943 ± 0.004** |"].join("\n"));
+  const ths = h.match(/<th(?=[\s>])[^>]*>/g);
+  assert.equal(ths[1], '<th class="ta-right">', h);
+});
+
+test("底纹条按主数值算，误差项不参与", () => {
+  const h = R(["| 模型 | 准确率 |", "|---|---|", "| 基线 | 0.897 ± 0.010 |", "| 新 | **0.943 ± 0.004** |"].join("\n"));
+  assert.ok(h.includes('data-num="0.897"'), h);
+  assert.ok(h.includes('data-num="0.943"'), h);
+  assert.equal(numericValue("0.943 ± 0.004"), 0.943);
+  assert.equal(numericValue("0.943±0.004"), 0.943);
+  assert.equal(numericValue("0.943 +/- 0.004"), 0.943);
+});
+
+test("千分位 / 百分号 / 科学计数 / 负号都算数值", () => {
+  const h = R(["| a | b | c |", "|---|---|---|", "| 1,024 | 87% | -4.5E+2 |", "| 2,048 | 91% | 1.2e-3 |"].join("\n"));
+  const ths = h.match(/<th(?=[\s>])[^>]*>/g);
+  assert.deepEqual(ths, ['<th class="ta-right">', '<th class="ta-right">', '<th class="ta-right">'], h);
+  assert.equal(numericValue("1,024"), 1024);
+  assert.equal(numericValue("-4.5E+2"), -450);
+});
+
+test("带单位的 40 s 仍然是文字列 —— FORMAT.md 说这是对的，别为了对齐去掉单位", () => {
+  const h = R(["| 模型 | 训练耗时 |", "|---|---|", "| 基线 | 40 s |", "| 新 | 18 min |"].join("\n"));
+  assert.equal(h.match(/<th(?=[\s>])[^>]*>/g)[1], "<th>", h);
+  assert.ok(!h.includes("data-num"), "文字列不该带主数值");
+  assert.ok(Number.isNaN(numericValue("40 s")));
+});
+
+test("占位横线的格子不产出 data-num，也不该让整列失去数值身份", () => {
+  const h = R(["| x | v |", "|---|---|", "| a | 1.2 |", "| b | — |"].join("\n"));
+  assert.ok(h.includes('<th class="ta-right">'), h);
+  assert.equal((h.match(/data-num/g) || []).length, 1, h);
+});
+
+/* ==================================================== CommonMark 常见结构 */
+
+test("有序列表的子列表仍是 ol，编号不丢", () => {
+  const h = R("1. a\n   1. b\n   2. c\n2. d");
+  assert.equal((h.match(/<ol/g) || []).length, 2, h);
+  assert.ok(!h.includes("<ul"), "有序子列表不该退化成无序");
+});
+
+test("有序列表从 3 开始时保留起始编号", () => {
+  assert.ok(R("3. 三\n4. 四").includes('<ol start="3">'));
+});
+
+test("三层缩进不被压平成两层", () => {
+  const h = R("- L1\n  - L2\n    - L3");
+  assert.equal((h.match(/<ul/g) || []).length, 3, h);
+});
+
+test("列表项里的围栏代码不把列表劈开，也不泄漏缩进", () => {
+  const h = R("- 步骤\n  ```bash\n  cmd --x\n  ```\n- 下一步");
+  assert.equal((h.match(/<ul/g) || []).length, 1, h);
+  assert.ok(h.includes("<code>cmd --x</code>"), "代码内容不该带上列表的缩进：" + h);
+  assert.ok(h.includes('data-lang="bash"'));
+});
+
+test("项与项之间的空行不把一个列表切成两个", () => {
+  const h = R("- 第一项\n\n- 第二项");
+  assert.equal((h.match(/<ul/g) || []).length, 1, h);
+  assert.equal((h.match(/<li>/g) || []).length, 2, h);
+});
+
+test("嵌套任务列表里子项的勾选框不落在父项的 label 内", () => {
+  const h = R("- [ ] 顶层\n  - [x] 子项");
+  assert.ok(/<label class="task"><input type="checkbox" disabled>顶层<\/label>/.test(h), h);
+});
+
+test("表格单元格里的行内代码 / 链接 / 加粗都渲染", () => {
+  const h = R(["| a | b |", "|---|---|", "| `code` | [x](https://e.com) **粗** |"].join("\n"));
+  assert.ok(h.includes("<code>code</code>"), h);
+  assert.ok(h.includes('href="https://e.com"'), h);
+  assert.ok(h.includes("<strong>粗</strong>"), h);
+});
+
+test("代码块里的 markdown 一律不解析", () => {
+  const h = R("```\n| a | b |\n- 列表\n**粗**\n```");
+  assert.ok(!h.includes("<table"), h);
+  assert.ok(!h.includes("<li>"), h);
+  assert.ok(h.includes("**粗**"), h);
+});
+
+test("下划线强调生效，但 some_var_name 不被劈开", () => {
+  const h = R("_不确定_ 与 __确定__，但 some_var_name 不变");
+  assert.ok(h.includes("<em>不确定</em>"), h);
+  assert.ok(h.includes("<strong>确定</strong>"), h);
+  assert.ok(h.includes("some_var_name"), h);
+});
+
+test("删除线与水平线", () => {
+  const h = R("~~废弃~~\n\n---\n\n后文");
+  assert.ok(h.includes("<del>废弃</del>"), h);
+  assert.ok(h.includes("<hr>"), h);
+});
+
+test("引用块里可以放表格和嵌套列表", () => {
+  const h = R("> | a | b |\n> |---|---|\n> | 1 | 2 |");
+  assert.ok(h.includes("<blockquote>") && h.includes("<table>"), h);
+});
+
+test("含成对括号的裸 URL 不被截成坏链接", () => {
+  const h = R("见 https://en.wikipedia.org/wiki/Foo_(bar) 第 3 节");
+  assert.ok(h.includes('href="https://en.wikipedia.org/wiki/Foo_(bar)"'), h);
+});
+
+test("强调规则不污染已经生成的 href", () => {
+  const h = R("[x](https://a.com/**b**/c)");
+  assert.ok(h.includes('href="https://a.com/**b**/c"'), h);
+  assert.ok(!/href="[^"]*<strong>/.test(h), h);
+});
+
+test("反斜杠转义按 CommonMark 生效，但 Windows 路径不被吃掉", () => {
+  const h = R("字面 \\* 星号，路径 C:\\Users\\wei\\data");
+  assert.ok(h.includes("字面 * 星号"), h);
+  assert.ok(!h.includes("<em>"), h);
+  assert.ok(h.includes("C:\\Users\\wei\\data"), "路径里的反斜杠后面不是 ASCII 标点，必须原样保留：" + h);
+});
+
+test("<https://…> 自动链接", () => {
+  assert.ok(R("见 <https://arxiv.org/abs/1>").includes('href="https://arxiv.org/abs/1"'));
+});
+
+/* 数学公式：不引 KaTeX（零依赖硬约束），但必须原样留住 —— 被 * _ \ 的规则啃过
+   就再也读不回原式，人和 LLM 双双丢信息。 */
+
+test("行内公式原样保留，不被强调和反斜杠规则啃掉", () => {
+  const h = R("误差 $\\alpha_i \\pm 0.01$ 见下");
+  assert.ok(h.includes("$\\alpha_i \\pm 0.01$"), h);
+  assert.ok(!h.includes("<em>"), h);
+});
+
+test("$$ 行间公式整段原样保留，换行不丢", () => {
+  const h = R("$$\n\\sum_{i=1}^{n} x_i^2\n$$");
+  assert.ok(h.includes("\\sum_{i=1}^{n} x_i^2"), h);
+  assert.ok(h.includes("$$"), "定界符要留着，grep 得到才算没丢信息");
+});
+
+test("货币写法不被误当成公式", () => {
+  const h = R("花了 $5 又花了 $3");
+  assert.ok(!h.includes('class="math"'), h);
+  assert.ok(h.includes("$5") && h.includes("$3"), h);
+});
+
+/* =============================================================== XSS 面
+   正文是人和 agent 通过 API 写进来的不可信输入，洞察面板还用恒等 resolve
+   直接把地址落进 href，所以每一条都要钉住。 */
+
+test("拒绝前置控制字符绕过的 javascript: 链接", () => {
+  const h = R("[点我](\u0001javascript:alert(1))", RAW);
+  assert.ok(h.includes('href="#"'), h);
+  assert.ok(!/javascript:/i.test(h), h);
+  assert.equal(safeHref("\u0001javascript:alert(1)"), "#");
+  assert.equal(safeHref("\u0000\u001fdata:text/html,x"), "#");
+});
+
+test("拒绝 <尖括号> 目标里夹了制表符/换行的 javascript:", () => {
+  assert.ok(R("[点我](<java\tscript:alert(1)>)", RAW).includes('href="#"'));
+  assert.equal(safeHref("java\tscript:alert(1)"), "#");
+});
+
+test("拒绝 &#106;avascript: 这类实体绕过", () => {
+  assert.ok(R("[点我](&#106;avascript:alert(1))", RAW).includes('href="#"'));
+  assert.equal(safeHref("&#106;avascript:alert(1)"), "#");
+  assert.equal(safeHref("&#x6a;avascript:alert(1)"), "#");
+  assert.equal(safeHref("javascript&colon;alert(1)"), "#");
+});
+
+test("大小写混写和前后空白不能绕过协议黑名单", () => {
+  assert.equal(safeHref("  JaVaScRiPt:alert(1)"), "#");
+  assert.equal(safeHref("VBScript:msgbox(1)"), "#");
+  assert.ok(R("[a](VBScript:msgbox(1))", RAW).includes('href="#"'));
+});
+
+test("safeHref 返回的是剥干净控制字符的地址，不把剥离工作留给浏览器", () => {
+  assert.equal(safeHref("https://e.com/\u0001x", null), "https://e.com/x");
+});
+
+test("图片的 src 走同一道闸门", () => {
+  assert.ok(R("![x](\u0001javascript:alert(1))", RAW).includes('src="#"'));
+  assert.ok(R("![x](data:text/html;base64,PHNjcmlwdD4=)", RAW).includes('src="#"'));
+});
+
+test("iframe / style / 注释里藏的标签一律只是文本", () => {
+  const h = R("<iframe src=x></iframe>\n<style>body{}</style>\n<!-- <script>alert(1)</script> -->");
+  assert.ok(!/<(iframe|style|script)/i.test(h), h);
+  assert.ok(h.includes("&lt;iframe"), h);
+});
+
+test("on* 事件属性写不进任何标签", () => {
+  const h = R("<svg onload=alert(1)>\n\n[<img src=x onerror=alert(1)>](https://e.com)");
+  assert.ok(!/<[a-z][^>]*\son[a-z]+=/i.test(h), h);
+});
+
+test("表格单元格和图注里的裸 HTML 同样进不去", () => {
+  const t = R(["| a |", "|---|", "| <img src=x onerror=alert(1)> |"].join("\n"));
+  assert.ok(!/<img[^>]*onerror/i.test(t), t);
+  const f = R('![a](b.png "<script>alert(1)</script>")');
+  assert.ok(!/<script/i.test(f), f);
+});
+
+test("正文里的 NUL 不再串掉行内代码的内容", () => {
+  const h = R("`x` \u00000\u0000");
+  assert.equal((h.match(/<code>/g) || []).length, 1, h);
+  assert.ok(!h.includes("undefined"), h);
 });

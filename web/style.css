@@ -76,10 +76,15 @@ html, body {
 .seg button + button { border-left: 1px solid var(--rule); }
 .seg button.on { background: var(--accent); color: #fff; }
 
-body.home-mode #top .grow,
+/* 项目索引页曾经把整个搜索框藏掉，于是人这边压根没有跨项目搜索——同一个能力
+   agent 有（trace_search 不给 project 就搜全部），人没有，正好违反 FORMAT.md
+   第 0 节「人和 LLM 信息对等」。现在索引页保留搜索框（它同时筛项目卡片和搜正文），
+   只藏掉与项目内视图绑死的那几个控件。 */
 body.home-mode #viewtoggle,
 body.home-mode #btn-new { display: none; }
 #top .grow { flex: 1; display: flex; align-items: center; gap: 8px; min-width: 0; }
+#btn-scope { flex: 0 0 auto; padding: 4px 9px; font-size: 12px; white-space: nowrap; }
+body.home-mode #btn-scope { display: none; }   /* 索引页本来就是全局搜 */
 #search {
   flex: 1; min-width: 0; padding: 5px 9px;
   border: 1px solid var(--rule); border-radius: 5px;
@@ -100,6 +105,22 @@ button.on { background: var(--hi); border-color: var(--accent); }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
 .dot.live { background: var(--done); }
 .dot.off { background: var(--dead); }
+
+/* 数据仓同步。平时是一个几乎看不见的箭头（悬停能查到最近同步了什么），
+   失败时旁边那块红的露出来——数据仓是换机器和灾难恢复的全部依据，
+   静默失败几周之后才在另一台机器上发现是空的，代价太大。 */
+.gitdot { flex: 0 0 auto; font-size: 12px; line-height: 1; color: var(--muted); opacity: .55; cursor: default; }
+.gitdot::before { content: "⇅"; }
+.gitdot.g-pushed, .gitdot.g-clean { color: var(--done); opacity: .8; }
+.gitdot.g-committed { color: var(--wip); opacity: .85; }
+.gitdot.g-misconfigured { color: var(--wip); opacity: 1; }
+.gitdot.g-error { color: var(--dead); opacity: 1; }
+#gitwarn {
+  flex: 0 0 auto; padding: 3px 8px; font-size: 11.5px; white-space: nowrap;
+  color: var(--dead); border-color: var(--dead);
+  background: color-mix(in srgb, var(--dead) 12%, transparent);
+}
+#gitwarn[hidden] { display: none; }
 
 #warnbar {
   padding: 6px 14px; font-size: 12px; line-height: 1.6;
@@ -509,3 +530,185 @@ dialog menu { display: flex; justify-content: flex-end; gap: 8px; padding: 0; ma
 
 button.danger { color: var(--dead); border-color: color-mix(in srgb, var(--dead) 45%, var(--rule)); }
 button.danger:hover { background: color-mix(in srgb, var(--dead) 12%, transparent); }
+
+/* ---------------------------------------------------------------- 可溯源性 */
+
+/* 等级是 FORMAT.md 第 10 节算出来的，人这一侧的出口。
+   注意这里的颜色**不承载信息**：L0/L4 之间的区别首先由「L0」「L4」这几个字母
+   和后面的中文标签承载，颜色只是补强。打印成黑白、或者色觉异常的人看，
+   信息量一点不少。图上的标记同理——用的是字形通道，不动线型和不透明度。 */
+.lv {
+  display: inline-flex; align-items: baseline; gap: 4px;
+  font-family: var(--mono); font-size: 11px; padding: 1px 7px;
+  border: 1px solid var(--rule); border-radius: 3px; white-space: nowrap;
+}
+.lv-L0 { color: var(--dead); border-color: var(--dead); }
+.lv-L1 { color: var(--wip); border-color: color-mix(in srgb, var(--wip) 60%, var(--rule)); }
+.lv-L2 { color: var(--ink); }
+.lv-L3, .lv-L4 { color: var(--done); border-color: var(--done); }
+.lv.mini { font-size: 11px; padding: 0 6px; }
+
+.tracebox .lvrow { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; margin-bottom: 10px; }
+.tracebox .lvcap { font-size: 12px; color: var(--muted); }
+.tracebox .lvsep { color: var(--rule); }
+.tracebox .lvcap a { color: var(--accent); font-family: var(--mono); }
+
+/* missing 是一份可执行的 todo，不是评语。所以用清单的样子，不用告警的样子。 */
+.lvmiss { margin: 0 0 10px; padding-left: 1.2em; font-size: 13px; line-height: 1.8; }
+.lvmiss li::marker { content: "☐  "; color: var(--muted); }
+.lvok { margin-bottom: 10px; }
+
+/* 整条链。「补记录要从最弱的一环补起，不是从最新那一步补起」——不把整条链摆出来，
+   这句话就没法落地。 */
+.lvchain { display: flex; flex-wrap: wrap; align-items: center; gap: 3px; margin-bottom: 4px; }
+.lvchain .lvarrow { color: var(--muted); font-size: 10px; }
+.lvnode {
+  display: inline-flex; align-items: center; gap: 4px; text-decoration: none;
+  font-family: var(--mono); font-size: 10.5px; padding: 1px 6px;
+  border: 1px solid var(--rule); border-radius: 3px; color: var(--muted);
+}
+.lvnode i { font-style: normal; font-size: 9.5px; opacity: .85; }
+.lvnode.lv-L0 { color: var(--dead); border-color: var(--dead); }
+.lvnode.lv-L3, .lvnode.lv-L4 { color: var(--done); border-color: var(--done); }
+.lvnode.here { background: var(--hi); font-weight: 700; }
+.lvnode:hover { background: var(--hi); }
+
+.tracebox .rhead {
+  font-size: 11px; letter-spacing: .09em; text-transform: uppercase;
+  color: var(--muted); margin: 18px 0 8px; font-weight: 600;
+}
+.repro {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px;
+  padding: 5px 0; border-top: 1px dashed var(--rule); font-size: 12.5px;
+}
+.repro:first-child { border-top: 0; }
+.rstate {
+  font-family: var(--mono); font-size: 10.5px; padding: 1px 6px; border-radius: 3px;
+  border: 1px solid var(--rule); color: var(--muted);
+}
+.r-verified .rstate { color: var(--done); border-color: var(--done); }
+.r-runnable .rstate { color: var(--accent); border-color: var(--accent); }
+/* failed 不降级，但它是最该被看见的一行：「试过，checkpoint 被清了，跑不了」
+   本身就是溯源结论。 */
+.r-failed .rstate { color: var(--dead); border-color: var(--dead); background: color-mix(in srgb, var(--dead) 10%, transparent); }
+.rmeta { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.rnote { flex: 1 1 100%; color: var(--ink); line-height: 1.7; }
+
+/* 图/列表上的两个字形标记 */
+.cmk.lv0, .cmk.rfail {
+  font-family: var(--mono); font-size: 9px; line-height: 13px; padding: 0 3px;
+  border-radius: 2px; border: 1px solid var(--dead); color: var(--dead); opacity: 1;
+}
+.row .cmk.lv0, .row .cmk.rfail { flex: 0 0 auto; }
+#legend .lgm { display: inline-flex; align-items: center; gap: 5px; }
+#legend .lgm i { width: auto; border: 1px solid var(--dead); color: var(--dead);
+  font-family: var(--mono); font-size: 9px; padding: 0 3px; border-radius: 2px;
+  font-style: normal; margin-right: 0; border-top-width: 1px; }
+
+/* ---------------------------------------------------------------- 草稿 / 冲突 */
+
+.draftbar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  margin: 0 0 10px; padding: 7px 11px; font-size: 12px; line-height: 1.6;
+  border: 1px solid color-mix(in srgb, var(--wip) 55%, var(--rule)); border-radius: 5px;
+  background: color-mix(in srgb, var(--wip) 10%, var(--panel));
+}
+.draftbar .sp { flex: 1; }
+.draftbar .mono { color: var(--muted); font-size: 11px; }
+.draftbar .dwarn { flex: 1 1 100%; color: var(--dead); font-size: 11.5px; }
+.draftbar button { padding: 3px 9px; font-size: 12px; }
+
+.dlgbody { padding: 18px 20px; }
+.dlgbody h2 { margin: 0 0 12px; font-size: 15px; }
+.dlgbody menu { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; padding: 0; margin: 14px 0 0; }
+#dlg-conflict { width: min(1100px, 96vw); }
+.cfsplit { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.cfpane { min-width: 0; border: 1px solid var(--rule); border-radius: 6px; overflow: hidden; }
+.cfpane h3 {
+  margin: 0; padding: 6px 10px; font-family: var(--mono); font-size: 11px; font-weight: 600;
+  color: var(--muted); background: var(--hi); border-bottom: 1px solid var(--rule);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cfbody { max-height: 46vh; overflow: auto; font-size: 12px; line-height: 1.6; padding: 6px 0; }
+.cfbody .dl { padding: 0 10px; white-space: pre-wrap; word-break: break-word; }
+.cfbody .dl.ch { background: color-mix(in srgb, var(--wip) 20%, transparent); }
+
+/* ---------------------------------------------------------------- 跨项目搜索 */
+
+#hitlist {
+  position: sticky; top: 41px; z-index: 4; max-height: 62vh; overflow: auto;
+  padding: 8px 14px 14px; background: var(--panel);
+  border-bottom: 1px solid var(--rule); box-shadow: 0 8px 18px rgba(0,0,0,.10);
+}
+#hitlist[hidden] { display: none; }
+.hithead { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--muted); margin-bottom: 6px; }
+.hithead .sp { flex: 1; }
+.hithead button { padding: 2px 8px; font-size: 11px; }
+.hitgroup h4 {
+  margin: 10px 0 4px; font-size: 11px; letter-spacing: .06em; color: var(--muted);
+  display: flex; gap: 8px; align-items: baseline;
+}
+.hitgroup h4 .mono { font-size: 10.5px; opacity: .7; }
+.hit {
+  display: grid; grid-template-columns: auto 1fr auto; gap: 4px 9px;
+  padding: 5px 8px; border-radius: 5px; text-decoration: none; color: inherit;
+}
+.hit:hover { background: var(--hi); }
+.hit .hid {
+  font-family: var(--mono); font-size: 11px; padding: 0 5px; border-radius: 3px;
+  border: 1px solid var(--muted); line-height: 17px;
+}
+.hit .hid.s-done { border-color: var(--done); color: var(--done); }
+.hit .hid.s-wip { border-style: dashed; border-color: var(--wip); color: var(--wip); }
+.hit .hid.s-dead { border-style: dotted; border-color: var(--dead); color: var(--dead); }
+.hit .ht { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hit .hd { font-size: 11px; color: var(--muted); }
+.hit .hs { grid-column: 2 / -1; font-size: 11.5px; color: var(--muted); line-height: 1.6; }
+
+/* ---------------------------------------------------------------- 洞察编辑 */
+
+#ed-insights-warn.warn { color: var(--dead); }
+.others { margin-top: 18px; padding-top: 12px; border-top: 1px solid var(--rule); }
+.others h4 { margin: 0 0 8px; font-size: 11px; letter-spacing: .06em; color: var(--muted); font-weight: 600; }
+.othersec {
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.7; white-space: pre-wrap;
+  background: var(--hi); border: 1px solid var(--rule); border-radius: 5px;
+  padding: 9px 12px; margin: 0 0 8px; color: var(--muted); overflow-x: auto;
+}
+
+/* ---------------------------------------------------------------- 窄屏 */
+
+/* 图视图在窄屏上的说法：不删、不改布局算法（那是纯函数，改了图和列表就对不上），
+   而是**换默认**——首次在窄屏打开走列表视图（app.js 里那段），图视图仍然一键可切，
+   切过去自动缩放到适应宽度。理由：图的画布宽度是绝对像素，一棵稍宽的树在 375px 上
+   等于「一屏一个节点，全靠横向拖」；列表视图的轨道只有十几像素宽，窄屏上完整可读。 */
+@media (max-width: 760px) {
+  /* 顶栏排成两行：控件一行、搜索框独占一行。搜索框在窄屏上尤其不能被挤成一条缝——
+     跨项目搜索是这个界面上最需要打字的东西。 */
+  #top { flex-wrap: wrap; gap: 6px; padding: 6px 8px; }
+  /* 第一行放项目/视图/新建，第二行是搜索框 + 令牌和状态灯。order 把后三个拽到
+     搜索框那一行，否则它们自己占掉第三行，顶栏在 812px 高的屏上白吃掉一整行。 */
+  #top .grow { order: 10; flex: 1 1 55%; }
+  #btn-token { order: 11; }
+  #gitdot, #gitwarn, #live { order: 12; }
+  #proj { max-width: 33vw; padding: 5px 4px; }
+  #btn-new, #btn-newproj, #btn-token { padding: 5px 7px; font-size: 12.5px; }
+  .seg button { padding: 5px 8px; }
+  #hitlist { top: 0; position: static; max-height: none; }
+  main { height: auto; }
+  #scroller { max-height: 52vh; }
+  #detail { padding: 14px 14px 48px; }
+  .prose { font-size: 15px; }
+  .cfsplit { grid-template-columns: 1fr; }
+  .cfbody { max-height: 26vh; }
+  .dlgbody menu { justify-content: stretch; }
+  .dlgbody menu button { flex: 1 1 auto; }
+  #legend { flex-wrap: wrap; gap: 8px 12px; }
+  .prose table { font-size: 12px; }
+  .file, .thumb { max-width: 100%; }
+}
+@media (max-width: 480px) {
+  .hit { grid-template-columns: auto 1fr; }
+  .hit .hd { display: none; }        /* 日期在手机上不值一列 */
+  #legend .lgm { display: none; }
+}

@@ -20,15 +20,37 @@ import sys
 from pathlib import Path
 
 import trace_core as core
+import trace_mcp as mcp
 import trace_write as W
 from trace_server import CONFIG_PATH, ROOT, WEB, load_config, make_config
 
 STATIC_ASSETS = ("style.css", "app.js", "md.js")
 
+# 默认把数据仓放在代码仓**外面**。项目自己的不变量是「代码仓公开、数据仓私有」，
+# 而 data_dir="." 正好违反它：README 的「30 秒上手」照默认跑一遍，未发表的实验记录
+# 就躺在一个公开仓库的工作区里，只等某一次 `git add -A`。放在同级目录既不需要用户
+# 想清楚路径，又天然满足那条不变量。
+DEFAULT_DATA_DIR = "../trace-data"
+
+LEVELS = ("L0", "L1", "L2", "L3", "L4")
+LEVEL_LABEL = {"L0": "不可溯源", "L1": "可读", "L2": "可定位", "L3": "可重跑", "L4": "已复现"}
+
 
 def data_root(cfg: dict) -> Path:
-    root = (ROOT / cfg.get("data_dir", ".")).resolve()
+    """解析 data_dir 并确保布局在。**路径不对劲会当场说出来。**
+
+    以前这里是无条件 ensure_layout：填错一个字符 → 凭空建出一棵合法的空树 →
+    什么都不报。区分不出「首次安装」和「路径打岔」的根子在于两者的观测一模一样，
+    所以这里的做法不是禁止创建（换机首装时数据仓本来就不存在），而是把状态说出来。
+    """
+    raw = cfg.get("data_dir", DEFAULT_DATA_DIR)
+    try:
+        root, state, note = mcp.check_data_root(ROOT / raw)
+    except mcp.ToolError as exc:
+        raise W.WriteError(str(exc)) from None
     core.ensure_layout(root)
+    if state != mcp.DATA_ROOT_READY:
+        print(f"⚠ {note}")
     return root
 
 
@@ -53,43 +75,116 @@ def inline(payload) -> str:
 # ---------------------------------------------------------------- init
 
 
+def git_worktree_of(p: Path) -> Path | None:
+    """p 落在哪个 git 工作区里（自下而上找 .git）。找不到返回 None。
+
+    不调 `git rev-parse` 是因为这条判断必须在**没装 git 的机器上**也给出答案，
+    而且它决定的是「要不要允许自动同步」这种安全默认值 —— 拿不到答案时不能默默放行。
+    """
+    for d in [p, *p.parents]:
+        if (d / ".git").exists():
+            return d
+    return None
+
+
+def shares_repo_with_code(root: Path) -> bool:
+    """数据仓和这份代码在同一个 git 仓库里吗。
+
+    这是「自动同步能不能开」的唯一闸门。项目自己的不变量是「代码仓公开、数据仓私有」，
+    而 GitSync 跑的是 `git add -A && git commit && git push` —— 两者同仓时，
+    第一次建步骤 45 秒后，未发表的实验记录就被推进了公开仓库，而且推送成功时
+    **一个字都不会打印**（失败才写进 last）。所以这不是提醒，是禁止。
+    """
+    if root == ROOT or ROOT in root.parents or root in ROOT.parents:
+        return True
+    a, b = git_worktree_of(root), git_worktree_of(ROOT)
+    return a is not None and a == b
+
+
+def _ask_yes(question: str) -> bool:
+    """只在真的连着终端时才问。非交互环境（CI、测试、脚本）一律走安全默认值。"""
+    try:
+        if not (sys.stdin and sys.stdin.isatty()):
+            return False
+        return input(question).strip().lower() in ("y", "yes", "是")
+    except (EOFError, OSError):
+        return False
+
+
 def cmd_init(args) -> int:
     if CONFIG_PATH.is_file() and not args.force:
         print(f"config.json 已存在（--force 覆盖）: {CONFIG_PATH}")
         return 1
+
+    want_git = bool(getattr(args, "git", False)) and not args.no_git
+    if getattr(args, "git", False) and args.no_git:
+        print("--git 和 --no-git 只能给一个。", file=sys.stderr)
+        return 2
+
+    # 先把路径体检做完再落盘：配置写下去之后才发现路径不对，用户得先删 config.json
+    # 才能重来，而 --force 会连令牌一起换掉。
+    try:
+        root, state, note = mcp.check_data_root(ROOT / args.data_dir)
+    except mcp.ToolError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
+
+    same_repo = shares_repo_with_code(root)
+    if want_git and same_repo:
+        print(f"错误: 拒绝在 {root} 上开自动 git 同步 —— 它和这份代码在同一个 git 仓库里。",
+              file=sys.stderr)
+        print("      自动同步跑的是 `git add -A && git commit && git push`，"
+              "代码仓一旦是公开的，", file=sys.stderr)
+        print("      你未发表的实验记录就会被推到公网上，而且推送成功时不打印任何东西。",
+              file=sys.stderr)
+        print("      正确做法：另建一个**私有**仓库，用 --data-dir 指过去，再 --git。",
+              file=sys.stderr)
+        return 2
+
+    # 没明确表态时问一句。git 同步的后果（把私有笔记推到某个 remote）不该由默认值决定。
+    if not want_git and not args.no_git and not same_repo and (root / ".git").exists():
+        want_git = _ask_yes(f"数据仓 {root} 是个 git 仓库。要开自动 git 同步（commit + push）吗？[y/N] ")
+
     cfg = make_config(args.title)
     cfg["data_dir"] = args.data_dir
-    cfg["git"]["enabled"] = not args.no_git
+    # 默认关。「只在确认数据仓不是这个代码仓时才可能开启」这条闸门在上面，
+    # 这里只是把结论写下去。
+    cfg["git"]["enabled"] = want_git
     CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-    root = data_root(cfg)
+    core.ensure_layout(root)
     if not core.scan_projects(root):
         W.create_project(root, args.project)
 
-    separate = root != ROOT
+    separate = not same_repo
     print(f"已写入 {CONFIG_PATH}")
-    print(f"  数据仓    {root}" + ("" if separate else "   ← 和代码在同一个目录"))
+    print(f"  数据仓    {root}" + ("" if separate else "   ← 和代码在同一个 git 仓库"))
+    if state != mcp.DATA_ROOT_READY:
+        print(f"            ⓘ {note}")
     print(f"  访问路径  /t/{cfg['space']}/")
     print(f"  写入令牌  {cfg['token']}")
     print("\nconfig.json 含密钥，已在 .gitignore 中。请另行备份。")
 
     if not cfg["git"]["enabled"]:
-        print("\n自动 git 同步没开。要开：把数据仓做成 git 仓库并配好私有 remote，")
-        print('然后把 config.json 里的 git.enabled 改成 true。')
+        print("\n自动 git 同步：**关**（默认）。")
+        if same_repo:
+            print("  这个数据仓和代码在同一个 git 仓库里，所以它也开不了 —— "
+                  "开了等于把科研笔记推进代码仓。")
+            print(f"  要开：另建一个私有仓库，重新跑 init --data-dir <私有仓库> --git"
+                  f"（现在的默认值是 {DEFAULT_DATA_DIR}）。")
+        else:
+            print("  要开：把数据仓做成 git 仓库、配好**私有** remote，然后重跑 "
+                  "init --force --git，或把 config.json 里的 git.enabled 改成 true。")
         return 0
 
     # 自动同步 commit 的是**数据仓**，所以要检查的也是数据仓。
     if not (root / ".git").exists():
         print(f"\n⚠ 自动 git 同步开着，但 {root} 不是 git 仓库，同步会一直是 no-op。")
         print("  先在数据仓里 git init 并 git remote add origin <私有仓库>。")
-    elif not separate:
-        print("\n⚠ 自动 git 同步开着，而数据和代码在同一个仓库里。")
-        print("  如果这个仓库的 remote 是公开的，你的科研笔记会被推到公网上。")
-        print("  建议：另建一个**私有**仓库，用 --data-dir 指过去。")
     else:
-        code, out = subprocess.run(["git", "remote", "get-url", cfg["git"].get("remote", "origin")],
-                                   cwd=str(root), capture_output=True, text=True,
-                                   encoding="utf-8", errors="replace").returncode, ""
+        code = subprocess.run(["git", "remote", "get-url", cfg["git"].get("remote", "origin")],
+                              cwd=str(root), capture_output=True, text=True,
+                              encoding="utf-8", errors="replace").returncode
         print("\n自动 git 同步已开启，目标是数据仓。"
               + ("" if code == 0 else f"\n⚠ 但数据仓还没有名为 {cfg['git'].get('remote', 'origin')} 的 remote，push 会失败（commit 仍然正常）。"))
         print("  再确认一次：那个 remote 必须是**私有**仓库。")
@@ -207,21 +302,75 @@ def cmd_paths(args) -> int:
     return 0
 
 
+def _histogram(levels: list[str]) -> str:
+    c = {k: 0 for k in LEVELS}
+    for x in levels:
+        if x in c:
+            c[x] += 1
+    return "  ".join(f"{k} {c[k]}" for k in LEVELS if c[k])
+
+
 def cmd_check(args) -> int:
+    """校验不变量 + 按 FORMAT.md 执法。
+
+    FORMAT.md 第 10 节写死了「`check` 和网页会给出等级」，而在这之前 check 只打印
+    步数/轨道/树尺寸/警告数，一个等级都不显示 —— L0–L4 在整个系统里只有 MCP 单步
+    详情一条出口。这里把三样补上，都是 compile_forest 早就算好的派生字段：
+
+      · L0–L4 分布（自身 / 整条链各一份）—— 链级才是「这个结论追不追得到底」；
+      · **最弱的一环**，按它卡住了多少条链排序 —— FORMAT.md 明写「补记录要从最弱
+        的那一环补起，不是从最新那一步补起」，不点名就没法照做；
+      · 每一条 missing 逐行列出，直接就是待办清单。
+    """
     cfg = load_config()
     root = data_root(cfg)
     slugs = [pick_project(root, args.project)] if args.project else [p.slug for p in core.scan_projects(root)]
-    errors = 0
+    errors = weak = warns = 0
     for slug in slugs:
         f = core.compile_forest(core.steps_dir_of(root, slug))
         ws = f["warnings"]
         errs = [w for w in ws if w["level"] == "error"]
         errors += len(errs)
-        print(f"[{slug}] {len(f['steps'])} 步 · {f['lane_count']} 轨道 · "
+        warns += len(ws) - len(errs)
+        steps = f["steps"]
+        print(f"[{slug}] {len(steps)} 步 · {f['lane_count']} 轨道 · "
               f"树 {f['tree']['w']}×{f['tree']['h']}px · 警告 {len(ws)}（错误 {len(errs)}）")
+
+        traces = [(s, s.get("trace") or {}) for s in steps]
+        if traces:
+            print("  可溯源性  自身 " + (_histogram([t.get("self", "") for _, t in traces]) or "—"))
+            print("            整链 " + (_histogram([t.get("chain", "") for _, t in traces]) or "—"))
+
+        # 谁卡住了最多的链。只点名链级还停在 L0/L1 的那些：L2 以上说明「东西在哪、
+        # 代码是哪版」都追得到，再催就是噪音，而噪音会让人开始整体忽略这一段。
+        blame: dict[str, int] = {}
+        for s, t in traces:
+            w = t.get("weakest")
+            if w and t.get("chain") in ("L0", "L1"):
+                blame[w] = blame.get(w, 0) + 1
+        by_id = {s["id"]: (s, t) for s, t in traces}
+        for wid, n in sorted(blame.items(), key=lambda kv: (-kv[1], kv[0])):
+            s, t = by_id.get(wid, (None, {}))
+            if s is None:
+                continue
+            weak += 1
+            print(f"  ↓ 最弱一环 {wid} [{t.get('self')} {LEVEL_LABEL.get(t.get('self'), '')}] "
+                  f"{s['title']} —— 卡住 {n} 条链")
+            for m in t.get("missing", []):
+                print(f"      · {m}")
+
         for w in ws:
             print(("  ✕ " if w["level"] == "error" else "  ⚠ ") + f"[{w['where'] or w['code']}] {w['message']}")
-    return 1 if errors else 0
+
+    if errors:
+        return 1
+    # --strict 给 CI 用：把「内容层缺陷」也算成失败。默认不算，是因为 wip 阶段的
+    # 记录本来就该是残缺的（内核只对 done/dead 报这些警告，但仍有正当的过渡期），
+    # 天天红一片只会训练大家忽略它。要拦就得是显式选择。
+    if getattr(args, "strict", False) and (weak or warns):
+        print(f"\n--strict：{warns} 条内容层警告、{weak} 个最弱一环 —— 判为失败。")
+        return 1
+    return 0
 
 
 # ---------------------------------------------------------------- build
@@ -320,11 +469,16 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("init", help="初始化")
     p.add_argument("--title", default="科研溯源")
     p.add_argument("--project", default="default", help="首个项目的名字")
-    p.add_argument("--data-dir", default=".", metavar="路径",
-                   help="数据仓在哪（projects/ 的父目录）。上线时建议指向一个**私有**仓库，"
-                        "让代码仓可以公开，比如 --data-dir ../trace-data")
+    p.add_argument("--data-dir", default=DEFAULT_DATA_DIR, metavar="路径",
+                   help=f"数据仓在哪（projects/ 的父目录），默认 {DEFAULT_DATA_DIR}。"
+                        "它应当是一个**私有**仓库，好让代码仓可以公开。"
+                        "填 . 就是和代码放一起——那样自动 git 同步会被禁掉。")
     p.add_argument("--force", action="store_true")
-    p.add_argument("--no-git", action="store_true", help="不开自动 git 同步")
+    p.add_argument("--git", action="store_true",
+                   help="开自动 git 同步（默认关）。数据仓和代码仓是同一个 git 仓库时会被拒绝——"
+                        "那等于把未发表的科研笔记推进公开的代码仓")
+    p.add_argument("--no-git", action="store_true",
+                   help="明确不开自动 git 同步（现在是默认行为；保留它是为了让老脚本继续能跑）")
     p.set_defaults(fn=cmd_init)
 
     p = sub.add_parser("projects", help="列出项目")
@@ -360,8 +514,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--kind", default=None, help="只看某一类：hpc / github / dropbox / object / url …")
     p.set_defaults(fn=cmd_paths)
 
-    p = sub.add_parser("check", help="校验不变量")
+    p = sub.add_parser("check", help="校验不变量，并按 FORMAT.md 给出 L0–L4 可溯源性等级")
     p.add_argument("-P", "--project", default=None)
+    p.add_argument("--strict", action="store_true",
+                   help="把内容层缺陷（dead 没写结论、图没图注、链卡在 L0/L1）也算成失败，给 CI 用")
     p.set_defaults(fn=cmd_check)
 
     p = sub.add_parser("build", help="静态导出")

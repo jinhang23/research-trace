@@ -79,6 +79,66 @@ def test_separate_trees_do_not_interleave():
     assert x["010"] >= x["002"] + core.NODE_W, "第二棵树在所有层上都要躲开第一棵"
 
 
+def _tree_boxes(by_id, children, tree):
+    """每棵树的水平包围盒 [最左, 最右+卡片宽]。"""
+    boxes = {}
+    for root in (sid for sid, s in by_id.items() if s.parent is None):
+        stack, members = [root], []
+        while stack:
+            n = stack.pop()
+            members.append(n)
+            stack.extend(children.get(n, ()))
+        col = [tree["nodes"][m]["x"] for m in members]
+        boxes[root] = (min(col), max(col) + core.NODE_W)
+    return boxes
+
+
+def test_a_deeper_second_tree_still_clears_the_first():
+    """防的是：树间间隔只按「前面的树到过的层」算，后一棵更深时多出来的层退回 PAD。
+
+    退回 PAD 的那些层会从画布最左边排起，正好钻进前一棵树的正下方——同层卡片不会
+    真重叠（那些层前一棵树没有节点），但人在图上会把它们误读成前一棵树的分支。
+    删一步产生孤儿之后森林就是这个形状（深浅不一的多根），所以并不罕见。
+    """
+    by_id, children, _, t = mk(("001", None), ("002", "001"),
+                               ("010", None), ("011", "010"), ("012", "011"),
+                               ("013", "012"), ("014", "012"))
+    boxes = _tree_boxes(by_id, children, t)
+    (a0, a1), (b0, b1) = boxes["001"], boxes["010"]
+    assert a1 <= b0, f"两棵树的水平包围盒相交: {boxes}"
+    assert b0 - a1 >= core.TREE_GAP - core.H_GAP, "树之间至少要留出 TREE_GAP"
+
+
+def test_no_two_trees_overlap_however_their_depths_are_ordered():
+    """深→浅→更深，逐个换顺序都不许穿插；顺带确认同层卡片仍然不重叠。"""
+    shapes = [
+        # (根, 链长)：故意让第二棵最浅、第三棵最深，覆盖"超出历史最大深度"的分支
+        [("001", 4), ("100", 1), ("200", 6)],
+        [("001", 6), ("100", 2), ("200", 3)],
+        [("001", 1), ("100", 5), ("200", 2)],
+    ]
+    for shape in shapes:
+        pairs = []
+        for root, length in shape:
+            n = int(root)
+            pairs.append((root, None))
+            for k in range(1, length):
+                pairs.append((f"{n + k:03d}", f"{n + k - 1:03d}"))
+        by_id, children, _, t = mk(*pairs)
+
+        boxes = sorted(_tree_boxes(by_id, children, t).values())
+        for (_, prev_right), (nxt_left, _) in zip(boxes, boxes[1:]):
+            assert prev_right <= nxt_left, f"{shape} 的两棵树包围盒相交: {boxes}"
+
+        by_level: dict[int, list[float]] = {}
+        for v in t["nodes"].values():
+            by_level.setdefault(v["depth"], []).append(v["x"])
+        for level, row in by_level.items():
+            row.sort()
+            for a, b in zip(row, row[1:]):
+                assert b - a >= core.NODE_W, f"{shape} 第 {level} 层卡片重叠"
+
+
 # ------------------------------------------------------------ 性质
 
 

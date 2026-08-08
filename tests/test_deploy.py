@@ -27,10 +27,13 @@ def sandbox(tmp_path: Path, monkeypatch):
     return code
 
 
+def args_for_init(**kw):
+    return type("A", (), {"title": "t", "project": "第一个课题", "data_dir": ".",
+                          "force": False, "git": False, "no_git": True, **kw})()
+
+
 def init(sandbox, **kw):
-    args = type("A", (), {"title": "t", "project": "第一个课题", "data_dir": ".",
-                          "force": False, "no_git": True, **kw})()
-    assert cli.cmd_init(args) == 0
+    assert cli.cmd_init(args_for_init(**kw)) == 0
     return json.loads((sandbox / "config.json").read_text(encoding="utf-8"))
 
 
@@ -59,9 +62,7 @@ def test_init_generates_a_token_so_nobody_has_to_invent_one(sandbox):
 
 def test_init_refuses_to_clobber_an_existing_config(sandbox):
     init(sandbox)
-    args = type("A", (), {"title": "t", "project": "p", "data_dir": ".",
-                          "force": False, "no_git": True})()
-    assert cli.cmd_init(args) == 1
+    assert cli.cmd_init(args_for_init(project="p")) == 1
 
 
 # ------------------------------------------------------------ 同步打在哪个仓
@@ -121,3 +122,142 @@ def test_config_with_a_secret_lives_in_the_code_repo_and_is_ignored(sandbox, tmp
     assert not (data / "config.json").exists()
     ignored = (Path(__file__).resolve().parent.parent / ".gitignore").read_text(encoding="utf-8")
     assert "config.json" in ignored
+
+
+# ------------------------------------------------------------ 默认值本身必须是安全的
+# 这一组守的是"照 README 的 30 秒上手跑一遍，会不会把未发表的科研笔记推进公开代码仓"。
+# 危险的不是某一行代码，是**默认值**：真正的 push 发生在第一次建步骤 45 秒之后，
+# 不在任何人看着的时候，而且成功时一个字都不打印。
+
+
+def test_init_does_not_turn_on_git_sync_unless_asked(sandbox):
+    """默认必须是关。开着的话，README 的 30 秒上手就是一条静默的泄露路径。"""
+    cfg = init(sandbox, no_git=False)          # 两个开关都不给 = 用户没表态
+    assert cfg["git"]["enabled"] is False
+
+
+def test_init_refuses_to_enable_git_when_data_lives_in_the_code_repo(sandbox, tmp_path: Path):
+    """`git add -A && git push` 打在代码仓上 = 把私有笔记推到公网。这是禁止，不是提醒。"""
+    (sandbox / ".git").mkdir()
+    assert cli.cmd_init(args_for_init(data_dir=".", git=True, no_git=False)) == 2
+    assert not (sandbox / "config.json").exists(), "被拒绝时不该留下半份配置"
+
+
+def test_init_refuses_git_even_for_a_subdirectory_of_the_code_repo(sandbox):
+    """`--data-dir ./data` 看着像"分开了"，其实还在同一个 git 工作区里。"""
+    (sandbox / ".git").mkdir()
+    (sandbox / "data").mkdir()
+    assert cli.cmd_init(args_for_init(data_dir="data", git=True, no_git=False)) == 2
+
+
+def test_init_enables_git_only_for_a_separate_repo(sandbox, tmp_path: Path):
+    """闸门不能误伤正常用法：数据仓是另一个 git 仓库时，--git 必须真的能开。"""
+    (sandbox / ".git").mkdir()
+    data = tmp_path / "data"
+    (data / ".git").mkdir(parents=True)
+    cfg = init(sandbox, data_dir=str(data), git=True, no_git=False)
+    assert cfg["git"]["enabled"] is True
+
+
+def test_the_default_data_dir_is_outside_the_code_repo(sandbox, tmp_path: Path):
+    """默认值决定了绝大多数人的实际形态。默认落在代码仓里 = 默认违反"代码公开、数据私有"。"""
+    assert cli.main(["init"]) == 0
+    cfg = json.loads((sandbox / "config.json").read_text(encoding="utf-8"))
+    assert cfg["data_dir"] != ".", "默认不能把数据仓放在代码仓里"
+    assert cli.data_root(cfg) != sandbox
+    assert not (sandbox / "projects").exists()
+    assert list((cli.data_root(cfg) / "projects").iterdir()), "第一个项目要建在数据仓里"
+
+
+def test_no_git_still_works_so_old_scripts_do_not_break(sandbox):
+    """`--no-git` 现在是默认行为，但 deploy 文档和老脚本里还写着它，不能报错。"""
+    assert cli.main(["init", "--data-dir", ".", "--no-git"]) == 0
+
+
+# ------------------------------------------------------------ 数据仓路径填错
+
+
+def test_data_root_speaks_up_when_the_target_is_not_a_data_repo(sandbox, tmp_path: Path, capsys):
+    """填错一个字符 → 凭空造出一棵空树 → 全程静默，是这套系统最贵的一个失败。"""
+    wrong = tmp_path / "写岔了"
+    wrong.mkdir()
+    (wrong / "论文.docx").write_text("x", encoding="utf-8")
+    (tmp_path / "写对了" / "projects").mkdir(parents=True)
+
+    cli.data_root({"data_dir": str(wrong)})
+    out = capsys.readouterr().out
+    assert "projects" in out and "填错" in out
+    assert "写对了" in out, "同一层里有真数据仓时要点名，让人一眼看出指错了"
+
+
+def test_data_root_stays_quiet_on_a_real_data_repo(sandbox, tmp_path: Path, capsys):
+    """别搞得太聪明：正常的数据仓一个字都不该多说，否则警告很快就没人看。"""
+    data = tmp_path / "data"
+    (data / "projects").mkdir(parents=True)
+    cli.data_root({"data_dir": str(data)})
+    assert capsys.readouterr().out == ""
+
+
+def test_a_path_whose_parent_is_missing_is_treated_as_a_typo(sandbox, tmp_path: Path):
+    """"目录不存在会自动建" 只对下一级成立；连上级都没有，那是路径写错了，不是没初始化。"""
+    with pytest.raises(Exception):
+        cli.data_root({"data_dir": str(tmp_path / "没有这层" / "也没有这层" / "仓")})
+
+
+# ------------------------------------------------------------ check 要真的执法
+# FORMAT.md 第 10 节写死了「check 和网页会给出等级」。在这之前 check 只打印
+# 步数/轨道/树尺寸/警告数，那句话的两个主语都不成立。
+
+
+def check_args(**kw):
+    return type("A", (), {"project": None, "strict": False, **kw})()
+
+
+@pytest.fixture()
+def graded(sandbox, tmp_path: Path, monkeypatch):
+    """一棵有意造得等级参差的树：根是 L0，孙子自己写得全但被根拖住。"""
+    import trace_write as W
+
+    data = tmp_path / "data"
+    data.mkdir()
+    init(sandbox, data_dir=str(data))
+    monkeypatch.setattr(cli, "load_config", lambda: {"data_dir": str(data)})
+    sd = core.steps_dir_of(data, "第一个课题")
+    W.create_step(sd, title="基线", status="done", body="## 为什么\n看基线\n## 做了什么\n跑\n")
+    W.create_step(sd, parent="001", title="加标题字段", status="done", commit="abc",
+                  paths=["/blue/x | 训练集"],
+                  body="## 为什么\n假设标题有用\n## 做了什么\n跑\n## 结论\n有用\n")
+    W.create_step(sd, parent="002", title="回译增强", status="dead",
+                  body="## 为什么\n试试\n## 做了什么\n跑\n")
+    return data
+
+
+def test_check_prints_the_traceability_levels(graded, capsys):
+    assert cli.cmd_check(check_args()) == 0
+    out = capsys.readouterr().out
+    assert "可溯源性" in out
+    assert "L0" in out and "L2" in out, "自身等级的分布要看得见"
+    assert "整链" in out, "链级才回答「这个结论追不追得到底」，不能只报自身"
+
+
+def test_check_names_the_weakest_link_and_what_it_is_missing(graded, capsys):
+    """FORMAT.md 明写「补记录要从最弱的那一环补起」——不点名就没法照做。"""
+    cli.cmd_check(check_args())
+    out = capsys.readouterr().out
+    assert "最弱一环 001" in out, "被拖住的是根 001，不是最新那一步"
+    assert "卡住 3 条链" in out
+    assert "没记 commit" in out and "没记产物位置" in out, "missing 要列成可操作的清单"
+
+
+def test_check_warns_about_a_dead_step_without_a_conclusion(graded, capsys):
+    """G4 的执法点：标了 dead 却没写为什么放弃，删掉程序后 grep 就答不出来了。"""
+    cli.cmd_check(check_args())
+    out = capsys.readouterr().out
+    assert "dead" in out and "结论" in out
+
+
+def test_check_stays_green_by_default_but_strict_fails(graded, capsys):
+    """默认不因内容缺陷失败（wip 天天红一片只会训练大家忽略警告），--strict 才拦。"""
+    assert cli.cmd_check(check_args()) == 0
+    assert cli.cmd_check(check_args(strict=True)) == 1
+    assert "--strict" in capsys.readouterr().out

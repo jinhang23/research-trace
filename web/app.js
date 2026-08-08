@@ -1,3 +1,129 @@
+/* traceUtil — 不碰 DOM 的纯函数层。
+ *
+ * 单独一个作用域并在 node 下 module.exports 出去，是为了这些判断能被真正测到
+ * （tests/app.test.js）。下面那一大坨界面代码依赖 document，在 node 里跑不起来，
+ * 于是「洞察小节怎么切」「草稿键怎么拼」「搜索命中怎么截片段」这些最容易写错、
+ * 出错后果又最重（覆盖别人写的洞察 / 丢草稿）的逻辑就永远没有回归保护。
+ * 所以把它们从界面里剥出来。
+ */
+(function (global) {
+  "use strict";
+
+  /* FORMAT.md 第 10 节的五级。label 只给人看，任何比较都用下标，不要比字符串。 */
+  var LEVELS = ["L0", "L1", "L2", "L3", "L4"];
+  var LEVEL_LABEL = {
+    L0: "不可溯源", L1: "可读", L2: "可定位", L3: "可重跑", L4: "已复现",
+  };
+  var LEVEL_HINT = {
+    L0: "「为什么」或「做了什么」空着，或有图没图注，或 done/dead 却没结论",
+    L1: "看得懂当时的判断，但跑不了",
+    L2: "记了 commit 和产物位置，找得回代码和数据",
+    L3: "有人确认过命令/环境/种子齐全",
+    L4: "有人真跑过，数字在容差内对上了",
+  };
+  /* failed 不降级——「试过，跑不起来，因为 checkpoint 被清了」不改变记录本身的
+     完整度，但它是整条链上最该被人看见的一行，所以单独给了个显眼的标签。 */
+  var REPRO_LABEL = {
+    verified: "已复现", runnable: "可重跑", failed: "复现失败", unknown: "状态不明",
+  };
+
+  /* 必须和 trace_write.INSIGHT_SECTIONS 的四个值逐字一致：服务端的 _merge_insights
+     只认这四个标题，前端切错一个字，那一节就会被当成「非洞察小节」留在磁盘上，
+     用户在框里删掉它却发现删不掉。 */
+  var INSIGHT_HEADINGS = ["核心想法", "有效", "无效", "坑"];
+  var HEADING_RE = /^\s*#{1,6}\s+(.+?)\s*$/;
+
+  function levelIndex(l) { var i = LEVELS.indexOf(l); return i < 0 ? 0 : i; }
+
+  /* 把 project.md 正文切成 [{heading, lines}]；第一个标题之前的部分 heading 为 null。
+     和 trace_write._split_sections 同构——两边切法不一致的话，前端以为自己只提交了
+     洞察，服务端却按别的边界合并。 */
+  function splitSections(body) {
+    var out = [], head = null, buf = [];
+    var flush = function () {
+      var any = buf.some(function (l) { return l.trim(); });
+      if (head !== null || any) out.push({ heading: head, lines: buf });
+    };
+    String(body == null ? "" : body).split("\n").forEach(function (line) {
+      var m = HEADING_RE.exec(line);
+      if (m) { flush(); head = m[1]; buf = [line]; }
+      else buf.push(line);
+    });
+    flush();
+    return out;
+  }
+
+  /* 「编辑洞察」那个框里该放什么、以及什么绝对不能放进去。
+     editable = 前言 + 四个洞察小节（缺的补成空标题，好让 trace_insight 有地方追加）；
+     others  = 其余小节，尤其是「## 已删除」里那些「为什么删的」——目录已经没了，
+              那几行是 G4 唯一还能 grep 到的证据，所以它们只读、不进提交文本。 */
+  function splitInsightBody(body) {
+    var secs = splitSections(body);
+    var editable = [], others = [], seen = {};
+    secs.forEach(function (s) {
+      var text = s.lines.join("\n").replace(/^\n+|\n+$/g, "");
+      if (!text.trim()) return;
+      if (s.heading === null || INSIGHT_HEADINGS.indexOf(s.heading) >= 0) {
+        if (s.heading !== null) seen[s.heading] = 1;
+        editable.push(text);
+      } else {
+        others.push({ heading: s.heading, text: text });
+      }
+    });
+    INSIGHT_HEADINGS.forEach(function (h) { if (!seen[h]) editable.push("## " + h); });
+    return { editable: editable.join("\n\n") + "\n", others: others };
+  }
+
+  /* 提交前的自检：用户可能把整段正文（含「## 已删除」）粘回框里。服务端会丢弃这些
+     小节，但用户不知道自己白写了，所以前端要能提前说出来是哪几节。 */
+  function foreignHeadings(text) {
+    return splitSections(text).filter(function (s) {
+      return s.heading !== null && INSIGHT_HEADINGS.indexOf(s.heading) < 0;
+    }).map(function (s) { return s.heading; });
+  }
+
+  /* 草稿键。项目和步骤 id 都进键里：同一个浏览器同时开几个项目是常态，
+     键撞了就是把 A 项目的草稿恢复到 B 项目的另一步上。两段各自 encodeURIComponent
+     之后再用 ':' 拼——不编码的话 slug "a:b" + id "c" 和 slug "a" + id "b:c"
+     会拼成同一个键，用户以为草稿丢了。 */
+  function draftKey(project, id) {
+    return "trace.draft:" + encodeURIComponent(String(project == null ? "" : project))
+      + ":" + encodeURIComponent(String(id == null ? "" : id));
+  }
+
+  function hay(step) {
+    return (step.id + " " + (step.title || "") + " " + (step.body || "") + " "
+            + (step.tags || []).join(" ")).toLowerCase();
+  }
+  function matches(step, q) {
+    q = String(q || "").trim().toLowerCase();
+    return !q || hay(step).indexOf(q) >= 0;
+  }
+
+  /* 命中片段。跨项目搜索的结果列表里，人要靠这一行判断「是不是我要找的那条」，
+     所以截的是**命中处**的上下文，不是正文开头。 */
+  function snippet(text, q, radius) {
+    var s = String(text == null ? "" : text).replace(/\s+/g, " ").trim();
+    q = String(q || "").trim();
+    radius = radius || 42;
+    if (!q) return s.slice(0, radius * 2);
+    var i = s.toLowerCase().indexOf(q.toLowerCase());
+    if (i < 0) return s.slice(0, radius * 2);
+    var a = Math.max(0, i - radius), b = Math.min(s.length, i + q.length + radius);
+    return (a > 0 ? "…" : "") + s.slice(a, b) + (b < s.length ? "…" : "");
+  }
+
+  var U = {
+    LEVELS: LEVELS, LEVEL_LABEL: LEVEL_LABEL, LEVEL_HINT: LEVEL_HINT,
+    REPRO_LABEL: REPRO_LABEL, INSIGHT_HEADINGS: INSIGHT_HEADINGS,
+    levelIndex: levelIndex, splitSections: splitSections,
+    splitInsightBody: splitInsightBody, foreignHeadings: foreignHeadings,
+    draftKey: draftKey, matches: matches, snippet: snippet,
+  };
+  global.traceUtil = U;
+  if (typeof module !== "undefined" && module.exports) module.exports = U;
+})(typeof globalThis !== "undefined" ? globalThis : this);
+
 /* app.js — 视图层。
  *
  * 交互契约（规格书第 7 节）：唯一状态是 selected，而 selected 就是 location.hash，
@@ -13,6 +139,11 @@
 (function () {
   "use strict";
 
+  // 没有 DOM 就只是被 node 载进来取上面那层纯函数，界面一个字都不该启动。
+  if (typeof document === "undefined") return;
+
+  var U = window.traceUtil;
+
   var BASE = window.TRACE_BASE || "";
   var MODE = window.TRACE_MODE === "static" ? "static" : "server";
   var PROJECT = window.TRACE_PROJECT || "";
@@ -25,7 +156,17 @@
   var PROJECTS = [];
   var query = "";
   var editing = false;
-  var view = localStorage.getItem("trace.view") === "list" ? "list" : "graph";
+  /* 窄屏（手机、竖着的平板）第一次打开默认走列表视图。
+     图视图的画布宽度是布局算好的绝对像素，一棵稍微宽一点的树在 375px 上就是
+     「一屏只看得见一个节点，全靠横向拖」——那不是可视化，是拼图。列表视图的轨道
+     图在窄屏上依然完整可读（轨道只有十几像素宽），所以窄屏的默认答案是列表，
+     图视图仍然一键可切、并且切过去会自动缩放到适应宽度。
+     只在**没有存过偏好**时这样选：用户明确切过就永远听用户的。 */
+  var savedView = localStorage.getItem("trace.view");
+  var NARROW = 760;
+  var view = savedView === "list" ? "list"
+    : savedView === "graph" ? "graph"
+    : (window.innerWidth && window.innerWidth < NARROW ? "list" : "graph");
   var zoom = 1;
 
   var TEMPLATE = "## 为什么\n\n\n## 做了什么\n\n\n## 结果\n\n\n## 结论\n\n\n## 下一步\n";
@@ -46,6 +187,8 @@
   }
   function canWrite() { return MODE === "server"; }
 
+  /* 失败时抛的 Error 上挂着 status 和 data：409 冲突要把服务端连同错误一起返回的
+     「当前内容」摆给人看，只留一句 message 就没得可摆了。 */
   function api(path, opts) {
     opts = opts || {};
     opts.headers = opts.headers || {};
@@ -54,7 +197,12 @@
       return r.text().then(function (t) {
         var j = {};
         try { j = t ? JSON.parse(t) : {}; } catch (e) { j = { error: t.slice(0, 200) }; }
-        if (!r.ok) throw new Error(j.error || r.status + " " + r.statusText);
+        if (!r.ok) {
+          var err = new Error(j.error || r.status + " " + r.statusText);
+          err.status = r.status;
+          err.data = j;
+          throw err;
+        }
         return j;
       });
     });
@@ -66,7 +214,9 @@
     return (PROJECT ? "../../p/" : "p/") + encodeURIComponent(slug) + "/index.html";
   }
   function homeHref() {
-    if (MODE !== "static") return BASE + "/";
+    // ?all=1 是服务端那个「只剩一个项目就跳进去」的旁路。不带它的话，
+    // 点「所有项目 ▸」会被 302 立刻弹回来，首页上的跨项目搜索永远够不着。
+    if (MODE !== "static") return BASE + "/?all=1";
     return PROJECT ? "../../index.html" : "index.html";
   }
 
@@ -98,7 +248,10 @@
   function isAgent(s) { return (s.author || "").indexOf("agent") === 0; }
 
   function selected() { var h = decodeURIComponent(location.hash.slice(1)); return IDX[h] ? h : ""; }
-  function select(id) {
+  /* 切换选中会把编辑器整个丢掉重渲染，所以先过一道离开确认。
+     确认框只在**有未保存改动**时出现——每次点节点都弹一下才是真的烦人。 */
+  function select(id) { guardLeave(function () { forceSelect(id); }); }
+  function forceSelect(id) {
     editing = false;
     if (id) location.hash = "#" + encodeURIComponent(id);
     else history.replaceState(null, "", location.pathname + location.search);
@@ -121,7 +274,13 @@
   }
 
   function renderHome() {
-    $("#cards").innerHTML = PROJECTS.map(function (p) {
+    // 项目索引页的搜索框以前被 CSS 直接隐藏。现在它同时干两件事：
+    // 筛项目卡片（下面这段），以及跨项目搜步骤正文（#hitlist）。
+    var q = query.trim().toLowerCase();
+    var list = q ? PROJECTS.filter(function (p) {
+      return (p.name + " " + p.slug).toLowerCase().indexOf(q) >= 0;
+    }) : PROJECTS;
+    $("#cards").innerHTML = list.map(function (p) {
       var c = p.counts || {};
       var bar = p.steps
         ? ["done", "wip", "dead"].map(function (k) {
@@ -136,7 +295,11 @@
         + (p.latest ? " · 最近 " + esc(p.latest) : "") + "</div>"
         + (p.warnings ? '<div class="pwarn">⚠ ' + p.warnings + " 条警告</div>" : "")
         + "</a>";
-    }).join("") || '<p class="placeholder">还没有项目。点右上角新建一个。</p>';
+    }).join("") || '<p class="placeholder">'
+      + (q ? "没有名字含「" + esc(query.trim()) + "」的项目。<br>正文命中在上面的搜索结果里。"
+           : "还没有项目。点右上角 <b>＋ 项目</b> 新建一个。")
+      + "</p>";
+    $("#hits").textContent = q ? list.length + " / " + PROJECTS.length + " 个项目" : "";
   }
 
   /* -------------------------------------------------------------- 数据 */
@@ -209,7 +372,8 @@
       var pics = (s.files || []).filter(function (f) { return IMG.test(f.path); }).length;
       var other = (s.files || []).length - pics;
       var marks = (pics ? '<span class="cmk" title="' + pics + ' 张图">🖼' + (pics > 1 ? pics : "") + "</span>" : "")
-        + (other ? '<span class="cmk" title="' + other + ' 个附件">📎' + (other > 1 ? other : "") + "</span>" : "");
+        + (other ? '<span class="cmk" title="' + other + ' 个附件">📎' + (other > 1 ? other : "") + "</span>" : "")
+        + traceMarks(s);
       return '<div class="card s-' + s.status + '" data-id="' + esc(s.id) + '" tabindex="0"'
         + ' style="left:' + n.x + "px;top:" + n.y + "px;width:" + NW + "px;height:" + NH + 'px">'
         + '<div class="chead"><span class="cid">' + esc(s.id) + "</span>"
@@ -284,11 +448,38 @@
       return '<div class="row s-' + s.status + '" data-id="' + esc(s.id) + '">'
         + '<span class="id s-' + s.status + '">' + esc(s.id) + "</span>"
         + '<span class="t">' + esc(s.title || "(无标题)") + "</span>"
+        + traceMarks(s)
         + (pics ? '<span class="who" title="' + pics + ' 个附件">📎</span>' : "")
         + (isAgent(s) ? '<span class="who" title="' + esc(s.author) + '">🤖</span>' : "")
         + '<span class="d">' + esc(s.date || "") + "</span>"
         + "</div>";
     }).join("");
+  }
+
+  /* 图/列表上的可溯源提示。
+   *
+   * 规格书那条约束：一个视觉通道只承载一件事。线型已经被 status 占了，不透明度
+   * 被「是否在祖先链上 / 是否命中搜索」占了，颜色只作线型的补强。所以这里用的是
+   * **字形标记**这个第四通道——和已有的 🖼 📎 🤖 同一档：它是一小段可读文本，
+   * 不改线型、不改不透明度、不给节点换色，打印和色盲下也一样看得见。
+   *
+   * 只标两种，不标满五级：满级标记会退化成噪声，而这两种是需要人去动手的——
+   *   L0  这一步自己就断了链，别人（包括半年后的自己）复原不了
+   *   ↺✕ 有人真去复现过并且失败了，这是最该被看见的一行结论
+   */
+  function traceMarks(s) {
+    var out = "";
+    var t = s.trace || null;
+    if (t && t.self === "L0") {
+      var why = (t.missing || []).slice(0, 3).join("；") || U.LEVEL_HINT.L0;
+      out += '<span class="cmk lv0" title="L0 不可溯源 — ' + esc(why) + '">L0</span>';
+    }
+    var last = (s.repro || [])[(s.repro || []).length - 1];
+    if (last && last.state === "failed") {
+      out += '<span class="cmk rfail" title="复现失败'
+        + (last.note ? "：" + esc(last.note) : "") + '">↺✕</span>';
+    }
+    return out;
   }
 
   function renderWarnings() {
@@ -301,6 +492,10 @@
   }
 
   function applyView() {
+    // 窄屏切到图视图时先自动适应宽度，否则第一眼是画布左上角那一小块
+    if (view === "graph" && window.innerWidth < NARROW && F.tree && F.tree.w > $("#scroller").clientWidth) {
+      fitZoom();
+    }
     $("#dwrap").hidden = view !== "graph";
     $("#track").hidden = view !== "list";
     $("#empty").hidden = F.steps.length > 0;
@@ -348,10 +543,15 @@
   /* 指标表的数值列加一条底纹，长度按列内相对大小。
      纯粹是加成：单元格里的数字一个没动，LLM 读到的和渲染前一模一样，
      去掉这层样式也不丢任何信息。这正是「可视化从可读文本里长出来」那条原则。 */
-  var NUMCELL = /^[-+±−]?[\d,]*\.?\d+(?:[eE][-+]?\d+)?\s*%?$/;
+  /* 数值判定不再由这里重做一遍。md.js 已经在渲染时判过「这一列是不是数值列」并把
+     主数值写进了 <td data-num>（`0.943 ± 0.004` 取 0.943，误差项不参与）。这边再写
+     一条正则就是两套判定，实测就分叉过：md.js 判定右对齐生效、这边判定 NaN 于是
+     整列不画底纹，同一张表两种说法。所以只认 data-num。
+     `—` 这类占位格没有 data-num，跳过它本身而不是把整列作废——一列里缺一个数
+     不该让其余几行的对比消失。 */
   function numOf(td) {
-    var v = td.textContent.replace(/[*_`\s,]|&nbsp;/g, "").replace(/[±−]/g, "-").replace(/%$/, "");
-    return NUMCELL.test(td.textContent.replace(/[*_`\s]/g, "")) ? parseFloat(v) : NaN;
+    var raw = td.dataset ? td.dataset.num : undefined;
+    return raw === undefined ? NaN : parseFloat(raw);
   }
   function barTables(root) {
     root.querySelectorAll("table").forEach(function (tb) {
@@ -360,14 +560,16 @@
       var cols = tb.querySelectorAll("thead th").length;
       for (var c = 0; c < cols; c++) {
         var cells = rows.map(function (r) { return r.children[c]; }).filter(Boolean);
-        var vals = cells.map(numOf);
-        if (vals.length < 2 || vals.some(isNaN)) continue;          // 有一格不是数就整列不画
+        var pairs = cells.map(function (td) { return { td: td, v: numOf(td) }; })
+                         .filter(function (p) { return !isNaN(p.v); });
+        if (pairs.length < 2) continue;
+        var vals = pairs.map(function (p) { return p.v; });
         var lo = Math.min.apply(null, vals), hi = Math.max.apply(null, vals);
         if (!(hi > lo)) continue;                                    // 整列一样，画了没意义
-        cells.forEach(function (td, i) {
-          var f = (vals[i] - lo) / (hi - lo);
-          td.style.setProperty("--bar", (6 + f * 94).toFixed(1) + "%");
-          td.classList.add("hasbar");
+        pairs.forEach(function (p) {
+          var f = (p.v - lo) / (hi - lo);
+          p.td.style.setProperty("--bar", (6 + f * 94).toFixed(1) + "%");
+          p.td.classList.add("hasbar");
         });
       }
     });
@@ -441,6 +643,76 @@
     }).join("") + "</div>";
   }
 
+  /* ---------------------------------------------------------- 可溯源性 */
+
+  function lvChip(level, extra) {
+    var l = U.LEVEL_LABEL[level] ? level : "L0";
+    return '<span class="lv lv-' + l + (extra ? " " + extra : "") + '" title="'
+      + esc(l + " " + U.LEVEL_LABEL[l] + " — " + U.LEVEL_HINT[l]) + '">'
+      + l + " " + esc(U.LEVEL_LABEL[l]) + "</span>";
+  }
+
+  /* FORMAT.md 第 10 节算出来的等级，人这一侧的出口。
+   *
+   * 三件事必须同时在场，少一件这块就没用：
+   *  1) 自身等级——这一步写得够不够；
+   *  2) 整条链的等级 + 最弱的那一环是谁（可点过去）——「补记录要从最弱的一环补起，
+   *     不是从最新那一步补起」，不指出是谁，这句话就落不了地；
+   *  3) missing 是一份可执行的 todo，不是评语。
+   * repro 记录连 failed 的一起列——「试过，checkpoint 被清了，跑不了」本身就是
+   * 溯源结论，把它藏起来等于把最贵的那条信息丢掉。
+   */
+  function renderTrace(s) {
+    var t = s.trace;
+    var repro = s.repro || [];
+    if (!t) return "";
+
+    var weak = t.weakest && t.weakest !== s.id ? IDX[t.weakest] : null;
+    var head = '<div class="lvrow">' + lvChip(t.self) + '<span class="lvcap">这一步自己</span>'
+      + '<span class="lvsep">·</span>' + lvChip(t.chain, "chain")
+      + '<span class="lvcap">整条链</span>';
+    if (weak) {
+      head += '<span class="lvsep">—</span><span class="lvcap">最弱的一环是 '
+        + '<a href="#' + esc(weak.id) + '" data-goto="' + esc(weak.id) + '">' + esc(weak.id) + "</a> "
+        + esc(weak.title || "") + "，先补它</span>";
+    } else if (t.weakest === s.id && t.chain !== "L4") {
+      head += '<span class="lvsep">—</span><span class="lvcap">最弱的一环就是这一步</span>';
+    }
+    head += "</div>";
+
+    var todo = (t.missing || []).length
+      ? '<ul class="lvmiss">' + t.missing.map(function (m) {
+          return "<li>" + esc(m) + "</li>";
+        }).join("") + "</ul>"
+      : '<p class="dropnote lvok">机械可判的部分都齐了。再往上要有人真去跑一遍。</p>';
+
+    var chain = (t.lineage || []).length > 1
+      ? '<div class="lvchain">' + t.lineage.map(function (e) {
+          return '<a class="lvnode lv-' + esc(e.level) + (e.id === s.id ? " here" : "")
+            + '" href="#' + esc(e.id) + '" data-goto="' + esc(e.id) + '" title="'
+            + esc((IDX[e.id] || {}).title || "") + '">' + esc(e.id)
+            + '<i>' + esc(e.level) + "</i></a>";
+        }).join('<span class="lvarrow">→</span>') + "</div>"
+      : "";
+
+    var rp = repro.length
+      ? '<div class="repros">' + repro.map(function (r) {
+          var st = U.REPRO_LABEL[r.state] ? r.state : "unknown";
+          return '<div class="repro r-' + st + '">'
+            + '<span class="rstate">' + esc(U.REPRO_LABEL[st]) + "</span>"
+            + (r.date ? '<span class="rmeta">' + esc(r.date) + "</span>" : "")
+            + (r.by ? '<span class="rmeta">' + esc(r.by) + "</span>" : "")
+            + (r.note ? '<span class="rnote">' + esc(r.note) + "</span>" : "")
+            + "</div>";
+        }).join("") + "</div>"
+      : '<p class="dropnote">还没有人尝试复现。<code>repro:</code> 由审计/复现 agent 写回，'
+        + "失败的记录和成功的一样要留着。</p>";
+
+    return '<div class="sec tracebox"><h3>可溯源性 · L0–L4</h3>'
+      + head + todo + chain
+      + '<h4 class="rhead">复现记录 · ' + repro.length + "</h4>" + rp + "</div>";
+  }
+
   function pathsToText(s) {
     return (s.paths || []).map(function (p) {
       return p.location + (p.note ? " | " + p.note : "");
@@ -504,6 +776,68 @@
     }).then(function () { return refreshProjects(); }).then(function () { onHash(); });
   }
 
+  /* 「编辑洞察」只提交它真正编辑的那部分。
+   *
+   * 从前这个框预填的是 project.md 的**整段正文**，保存时也整段提交回去。两件事叠在
+   * 一起就会静默毁记录：(a) 预填用的是打开页面那一刻的旧值，这期间 agent 通过
+   * trace_insight 记的东西不在框里；(b) 整段里还包含「## 已删除」——步骤目录被真删
+   * 之后，那几行「为什么删的」是 G4 唯一还能 grep 到的证据。一次保存两样一起没。
+   *
+   * 内核侧现在有兜底（update_project 只替换四个洞察小节），但前端不能靠兜底：
+   * 兜底只保证磁盘不坏，不保证人看到的是真相——框里显示着「## 已删除」，用户改了它
+   * 却发现改不动，那是另一种形式的骗人。所以这里把正文切开：洞察进可编辑框，
+   * 其余小节以只读形式列在下面并写明「这次编辑不会动它」。
+   */
+  function openInsightEditor() {
+    // 预填之前先取一次最新的：这个框最大的风险就是拿旧正文覆盖新内容。
+    var go = MODE === "server" ? refreshProjects() : Promise.resolve();
+    go.then(function () {
+      var p = currentProject() || { body: "" };
+      var split = U.splitInsightBody(p.body || "");
+      var others = split.others.length
+        ? '<div class="others"><h4>下面这些小节不属于洞察，这次编辑不会动它们</h4>'
+          + split.others.map(function (o) {
+              return '<pre class="othersec">' + esc(o.text) + "</pre>";
+            }).join("")
+          + '<p class="dropnote">删除步骤时写下的「为什么删的」就落在 <code>## 已删除</code> 里。'
+          + "目录已经没了，这几行是仅存的证据，所以它不进这个编辑框。</p></div>"
+        : "";
+      $("#detail").innerHTML =
+        '<div class="edhead"><b>💡 编辑项目洞察</b><span class="sp"></span>'
+        + '<button data-act="save-insights" class="primary">保存 <kbd>Ctrl↵</kbd></button>'
+        + '<button data-act="cancel">取消</button></div>'
+        + '<textarea class="editor" id="ed-insights" spellcheck="false" style="min-height:360px">'
+        + esc(split.editable)
+        + "</textarea>"
+        + '<p class="dropnote" id="ed-insights-warn"></p>'
+        + '<p class="dropnote">markdown。提交的只有这四个小节（以及标题之前的引言）。'
+        + "<code>trace_insight</code> 工具往同样的小节里追加，保持它们在，人和 agent 写的就落在同一处。</p>"
+        + others;
+      var ta = $("#ed-insights");
+      ta.addEventListener("input", paintInsightWarn);
+      paintInsightWarn();
+      ta.focus();
+    }).catch(fail);
+  }
+
+  function paintInsightWarn() {
+    var ta = $("#ed-insights"), box = $("#ed-insights-warn");
+    if (!ta || !box) return;
+    var bad = U.foreignHeadings(ta.value);
+    box.innerHTML = bad.length
+      ? '⚠ <b>' + esc(bad.map(function (h) { return "## " + h; }).join("、"))
+        + "</b> 不是洞察小节，保存时会被丢弃（磁盘上的那一份保持原样）。"
+      : "";
+    box.classList.toggle("warn", !!bad.length);
+  }
+
+  function saveInsights() {
+    var ta = $("#ed-insights");
+    if (!ta) return;
+    patchProject({ insights: ta.value })
+      .then(function () { toast("已保存（只替换了四个洞察小节）"); }).catch(fail);
+  }
+
   function renderDetail() {
     var el = $("#detail"), s = IDX[selected()];
     document.body.classList.toggle("editing", !!(editing && s));
@@ -511,6 +845,9 @@
     if (editing) return renderEditor(s);
 
     var meta = ['<span class="pill s-' + s.status + '">' + s.status + "</span>"];
+    // 整条链的等级放在最显眼处：人常常只看一眼顶部就走，而「这个结论追不追得到底」
+    // 恰恰是最该被那一眼看到的。详细的缺项和复现记录在下面的可溯源性小节里。
+    if (s.trace) meta.push(lvChip(s.trace.chain, "mini"));
     if (s.date) meta.push(esc(s.date));
     if (s.commit) meta.push("commit " + esc(s.commit));
     if (s.author) meta.push(esc(s.author));
@@ -562,9 +899,170 @@
 
     el.innerHTML = crumbs(s) + '<h1 class="title">' + esc(s.title || "(无标题)") + "</h1>"
       + '<div class="meta">' + meta.join("") + "</div>" + acts + paths
-      + '<div class="prose">' + body + "</div>" + back + files;
+      + '<div class="prose">' + body + "</div>" + back + renderTrace(s) + files;
     enhanceProse(el);
     el.scrollTop = 0;
+  }
+
+  /* -------------------------------------------------------------- 草稿 */
+
+  /* 正文是人一个字一个字想出来的，丢了就是丢了。所以编辑器里的内容一边写一边落进
+     localStorage，退出、刷新、误点、断网重试全都不清它——只有「保存成功」和用户
+     明确点「丢弃」这两件事清。
+     恢复不自动做：直接把草稿盖上去等于替用户做了选择，而磁盘上那一份可能才是新的
+     （别人/agent 刚改过）。所以下次打开时把两边都摆出来，让人挑。 */
+  var DRAFT_DEBOUNCE = 500;
+  var draftTimer = null;
+  var NEW_DRAFT_ID = "__new__";   // 新建对话框那份草稿的键；真实 id 只可能是数字或 00X~dupN
+
+  function readDraft(id) {
+    try {
+      var raw = localStorage.getItem(U.draftKey(PROJECT, id));
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) { return null; }
+  }
+  function writeDraft(id, d) {
+    // 配额满 / 隐私模式下写不进去：草稿是加成，不该反过来拦住人写正文
+    try { localStorage.setItem(U.draftKey(PROJECT, id), JSON.stringify(d)); } catch (e) { /* 忽略 */ }
+  }
+  function dropDraft(id) {
+    try { localStorage.removeItem(U.draftKey(PROJECT, id)); } catch (e) { /* 忽略 */ }
+  }
+
+  function editorState() {
+    var b = $("#ed-body");
+    if (!b) return null;
+    return { title: ($("#ed-title") || {}).value || "", body: b.value,
+             paths: ($("#ed-paths") || {}).value || "" };
+  }
+  function sameAsStep(s, st) {
+    return !!(s && st && st.title === (s.title || "") && st.body === (s.body || "")
+              && st.paths === pathsToText(s));
+  }
+  function isDirty() {
+    if (!editing) return false;
+    var s = IDX[selected()], st = editorState();
+    return !!(s && st && !sameAsStep(s, st));
+  }
+  function hhmm() {
+    var d = new Date(), p = function (n) { return (n < 10 ? "0" : "") + n; };
+    return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+  }
+  function saveDraftNow() {
+    var s = IDX[selected()], st = editorState();
+    if (!editing || !s || !st) return;
+    if (sameAsStep(s, st)) { dropDraft(s.id); setEdStatus(""); return; }
+    st.at = Date.now();
+    st.base = s.digest || "";            // 草稿是基于哪一版写的，恢复时要拿它对账
+    writeDraft(s.id, st);
+    setEdStatus("草稿已存 " + hhmm());
+  }
+  function scheduleDraft() {
+    clearTimeout(draftTimer);
+    draftTimer = setTimeout(saveDraftNow, DRAFT_DEBOUNCE);
+  }
+  function setEdStatus(t) { var e = $("#ed-status"); if (e) e.textContent = t; }
+
+  /* 离开确认。三个出口，因为「留下 / 走」两个不够：用户真正想说的第三件事是
+     「这段我不要了，别再拿草稿烦我」。只给两个选项会逼人把不想要的东西一直留着。 */
+  var pendingLeave = null;
+  function guardLeave(next) {
+    if (!isDirty()) { next(); return; }
+    saveDraftNow();
+    pendingLeave = next;
+    var s = IDX[selected()];
+    $("#leave-what").textContent = s ? s.id + "「" + (s.title || "") + "」" : "";
+    $("#dlg-leave").showModal();
+  }
+  function resolveLeave(how) {
+    var dlg = $("#dlg-leave");
+    if (dlg.open) dlg.close();
+    var next = pendingLeave;
+    pendingLeave = null;
+    if (how === "stay") return;
+    if (how === "discard") {
+      var s = IDX[selected()];
+      if (s) dropDraft(s.id);
+      toast("草稿已丢弃");
+    }
+    if (next) next();
+  }
+
+  /* -------------------------------------------------------------- 冲突 */
+
+  /* 服务端在 PATCH 冲突时回 409。绝不静默覆盖，也绝不静默丢弃——两边都是人写的字，
+     该由人来判。所以把服务器当前的正文和自己编辑中的正文并排摆出来。 */
+  function lineSet(t) {
+    var m = Object.create(null);
+    String(t || "").split("\n").forEach(function (l) { m[l.trim()] = 1; });
+    return m;
+  }
+  function diffPane(text, otherSet) {
+    return String(text || "").split("\n").map(function (l) {
+      var same = otherSet[l.trim()] || !l.trim();
+      return '<div class="dl' + (same ? "" : " ch") + '">' + (esc(l) || "&nbsp;") + "</div>";
+    }).join("");
+  }
+
+  function handleConflict(s, st, err) {
+    // 服务端如果连当前内容一起返回了就直接用；没有就自己再读一次那一步。
+    var d = err.data || {};
+    var given = d.current || d.server || d.step || null;
+    var got = given ? Promise.resolve(given) : papi("/steps/" + encodeURIComponent(s.id));
+    return got.then(function (server) {
+      if (!server || !server.digest || (s.digest && server.digest === s.digest)) {
+        // 摘要没变 → 这个 409 不是「别人先改了」（比如重复 id 的 ~dup 标记也会 409）。
+        // 那种情况没有两个版本可比，照常把服务端的原话报出来。
+        fail(err);
+        return;
+      }
+      openConflict(s, st, server, err);
+    }).catch(function () { fail(err); });
+  }
+
+  var conflictCtx = null;
+  function openConflict(s, mine, server, err) {
+    conflictCtx = { id: s.id, mine: mine, server: server };
+    var a = lineSet(server.body), b = lineSet(mine.body);
+    $("#cf-why").textContent = String(err && err.message || "服务器上的内容已经变了");
+    $("#cf-server-meta").textContent =
+      "服务器当前 · " + (server.author || "?") + " · " + (server.date || "") + " · " + (server.digest || "");
+    $("#cf-mine-meta").textContent = "你编辑中的（已存成草稿）";
+    $("#cf-server").innerHTML = diffPane(server.body, b);
+    $("#cf-mine").innerHTML = diffPane(mine.body, a);
+    $("#dlg-conflict").showModal();
+  }
+
+  function resolveConflict(how) {
+    var c = conflictCtx;
+    var dlg = $("#dlg-conflict");
+    if (dlg.open) dlg.close();
+    if (!c) return;
+    if (how === "cancel") return;                     // 回编辑器，草稿还在
+    if (how === "theirs") {
+      // 保留服务器版本。自己的那份不丢——它已经在草稿里，下次进这一步会被问要不要恢复。
+      conflictCtx = null;
+      editing = false;
+      refresh().then(function () {
+        toast("已保留服务器版本；你的改动留在草稿里，下次打开这一步会问你要不要恢复");
+      }).catch(fail);
+      return;
+    }
+    // 用我的覆盖：expect 换成刚读到的那一版，这样只覆盖「我看过的这一版」，
+    // 而不是变成一个永远不检查冲突的强制写。
+    papi("/steps/" + encodeURIComponent(c.id), {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        title: c.mine.title, body: c.mine.body, paths: textToPaths(c.mine.paths),
+        expect: c.server.digest || "",
+      }),
+    }).then(function () {
+      dropDraft(c.id);
+      conflictCtx = null;
+      editing = false;
+      return refresh().then(refreshProjects).then(function () { toast("已用你的版本覆盖"); });
+    }).catch(fail);
   }
 
   /* -------------------------------------------------------------- 编辑器 */
@@ -584,11 +1082,28 @@
     { k: "hr", html: "—", title: "分隔线", block: "---" },
   ];
 
+  /* 上次没写完的那份。不自动套上去——磁盘上那份可能才是新的。 */
+  function draftBanner(s) {
+    var d = readDraft(s.id);
+    if (!d || sameAsStep(s, d)) return "";
+    var when = d.at ? new Date(d.at).toLocaleString() : "";
+    var moved = d.base && s.digest && d.base !== s.digest;
+    return '<div class="draftbar">'
+      + "<b>发现未保存的草稿</b>" + (when ? '<span class="mono">' + esc(when) + "</span>" : "")
+      + (moved ? '<span class="dwarn">⚠ 这份草稿写的时候，服务器上的正文还是另一版——'
+                 + "此后它被改过，恢复会盖掉那次改动</span>" : "")
+      + '<span class="sp"></span>'
+      + '<button data-draft="restore">恢复草稿</button>'
+      + '<button data-draft="discard">丢弃草稿</button>'
+      + "</div>";
+  }
+
   function renderEditor(s) {
     $("#detail").innerHTML =
       '<div class="edhead">' + crumbs(s) + '<span class="sp"></span>'
       + '<button data-act="save" class="primary">保存 <kbd>Ctrl↵</kbd></button>'
       + '<button data-act="cancel">取消 <kbd>Esc</kbd></button></div>'
+      + draftBanner(s)
       + '<input class="title-input" id="ed-title" value="' + esc(s.title || "") + '" maxlength="200" placeholder="标题：一行说清这一步在干什么">'
       + '<label class="edpaths">外部路径 · 每行一条，<code>位置 | 说明</code>'
       + '<textarea id="ed-paths" rows="2" spellcheck="false" placeholder="/blue/组名/用户名/exp/agnews | 训练数据，12 GB">'
@@ -698,6 +1213,7 @@
             insertAt(ta, "[" + info.path + "](" + info.path + ")");
           }
           schedulePreview(s);
+          scheduleDraft();
         });
       });
     }, Promise.resolve()).then(function () {
@@ -707,7 +1223,12 @@
   }
 
   function bindEditor(ta, s) {
-    ta.addEventListener("input", function () { schedulePreview(s); });
+    ta.addEventListener("input", function () { schedulePreview(s); scheduleDraft(); });
+    // 标题和外部路径同样是人敲进去的，一起进草稿
+    ["#ed-title", "#ed-paths"].forEach(function (sel) {
+      var el = $(sel);
+      if (el) el.addEventListener("input", scheduleDraft);
+    });
 
     ta.addEventListener("paste", function (e) {
       var dt = e.clipboardData;
@@ -764,20 +1285,33 @@
           insertBlock(ta, t.block, t.back);
         }
         schedulePreview(s);
+        scheduleDraft();   // setRangeText 不触发 input 事件，工具栏插入的内容得自己钉
       });
     });
   }
 
   function saveEditor() {
     var s = IDX[selected()];
-    if (!s) return;
+    var st = editorState();
+    if (!s || !st) return;
+    clearTimeout(draftTimer);
+    saveDraftNow();                       // 先钉住：网络失败、409、页面被关都不该让这段字消失
     return patch(s.id, {
-      title: $("#ed-title").value,
-      body: $("#ed-body").value,
-      paths: textToPaths($("#ed-paths").value),
+      title: st.title,
+      body: st.body,
+      paths: textToPaths(st.paths),
+      // 乐观并发控制：expect 是我打开这一步时读到的摘要。这期间别人改过就 409，
+      // 由人来判怎么合，而不是谁最后按保存谁赢。
+      expect: s.digest || "",
     })
-      .then(function () { editing = false; renderDetail(); refreshProjects(); toast("已保存"); })
-      .catch(fail);
+      .then(function () {
+        dropDraft(s.id);
+        editing = false; renderDetail(); refreshProjects(); toast("已保存");
+      })
+      .catch(function (e) {
+        if (e && e.status === 409) return handleConflict(s, st, e);
+        fail(e);
+      });
   }
 
   /* -------------------------------------------------------------- 写入 */
@@ -788,6 +1322,19 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }).then(function () { return refresh(); });
+  }
+
+  /* 新建对话框里的正文同样要存草稿：<dialog> 按 Esc 直接就关了，而「为什么」这一段
+     常常是先写十分钟才想好标题的。草稿按项目存一份，不区分父节点。 */
+  function newDraft() { return readDraft(NEW_DRAFT_ID); }
+  function saveNewDraft() {
+    var b = $("#nf-body");
+    if (!b || !$("#dlg-new").open) return;
+    var d = { title: $("#nf-title").value, body: b.value, paths: $("#nf-paths").value,
+              commit: $("#nf-commit").value, status: $("#nf-status").value,
+              parent: $("#nf-parent").dataset.pid || "", at: Date.now() };
+    if (!d.title.trim() && d.body === TEMPLATE && !d.paths.trim()) { dropDraft(NEW_DRAFT_ID); return; }
+    writeDraft(NEW_DRAFT_ID, d);
   }
 
   function openNew(parentId) {
@@ -801,8 +1348,31 @@
     $("#nf-commit").value = "";
     // 从父步骤继承路径：同一条线上的数据/代码位置多半没变，改比重打省事
     $("#nf-paths").value = p ? pathsToText(p) : "";
+
+    var d = newDraft();
+    $("#nf-draft").hidden = !d;
+    if (d) {
+      $("#nf-draft-when").textContent = d.at ? new Date(d.at).toLocaleString() : "";
+      $("#nf-draft-title").textContent = d.title || "(还没写标题)";
+    }
     $("#dlg-new").showModal();
     setTimeout(function () { $("#nf-title").focus(); }, 30);
+  }
+
+  function restoreNewDraft() {
+    var d = newDraft();
+    if (!d) return;
+    $("#nf-title").value = d.title || "";
+    $("#nf-body").value = d.body || TEMPLATE;
+    $("#nf-paths").value = d.paths || "";
+    $("#nf-commit").value = d.commit || "";
+    if (d.status) $("#nf-status").value = d.status;
+    if (d.parent && IDX[d.parent]) {
+      $("#nf-parent").dataset.pid = d.parent;
+      $("#nf-parent").value = d.parent + "  " + (IDX[d.parent].title || "");
+    }
+    $("#nf-draft").hidden = true;
+    toast("已恢复草稿");
   }
 
   function submitNew() {
@@ -822,8 +1392,9 @@
         paths: textToPaths($("#nf-paths").value),
       }),
     }).then(function (step) {
+      dropDraft(NEW_DRAFT_ID);
       return refresh().then(function () {
-        select(step.id);
+        forceSelect(step.id);
         scrollToSelected();
         refreshProjects();
         toast("已创建 " + step.id);
@@ -857,6 +1428,43 @@
     var zi = e.target.closest("img.zoomable");
     if (zi) { e.preventDefault(); openLightbox(zi); return; }
     if (e.target.closest("#lightbox")) { closeLightbox(); return; }
+
+    // 三个对话框的按钮：离开确认 / 冲突 / 草稿条。都在最前面处理——
+    // 它们出现的时刻正是「再点错一下就丢东西」的时刻。
+    var lv = e.target.closest("[data-leave]");
+    if (lv) { e.preventDefault(); resolveLeave(lv.getAttribute("data-leave")); return; }
+    var cf = e.target.closest("[data-conflict]");
+    if (cf) { e.preventDefault(); resolveConflict(cf.getAttribute("data-conflict")); return; }
+    var dr = e.target.closest("[data-draft]");
+    if (dr) {
+      e.preventDefault();
+      var ds = IDX[selected()], how = dr.getAttribute("data-draft"), dd = ds && readDraft(ds.id);
+      if (!ds) return;
+      if (how === "restore" && dd) {
+        $("#ed-title").value = dd.title || "";
+        $("#ed-body").value = dd.body || "";
+        $("#ed-paths").value = dd.paths || "";
+        updatePreview(ds);
+        toast("已恢复草稿");
+      } else {
+        dropDraft(ds.id);
+        toast("草稿已丢弃");
+      }
+      // 只找详情面板里那一条：新建对话框的 #nf-draft 用的是同一个类
+      var bar = $("#detail .draftbar");
+      if (bar) bar.remove();
+      return;
+    }
+    if (e.target.closest("[data-newdraft]")) {
+      e.preventDefault();
+      if (e.target.closest("[data-newdraft]").getAttribute("data-newdraft") === "restore") restoreNewDraft();
+      else { dropDraft(NEW_DRAFT_ID); $("#nf-draft").hidden = true; toast("草稿已丢弃"); }
+      return;
+    }
+    if (e.target.closest("[data-newproj]")) { e.preventDefault(); newProject(); return; }
+    if (e.target.closest("[data-gitretry]")) { e.preventDefault(); retrySync(); return; }
+    var gh = e.target.closest("#hitlist a");
+    if (gh) { hideHits(); return; }   // 让链接照常跳走，只把面板收起来
 
     var goto = e.target.closest("[data-goto]");
     if (goto) { e.preventDefault(); select(goto.getAttribute("data-goto")); scrollToSelected(); return; }
@@ -904,27 +1512,10 @@
     var act = e.target.closest("[data-act]");
     if (!act) return;
     var name = act.getAttribute("data-act");
-    if (name === "edit-insights") {
-      var p = currentProject() || { body: "" };
-      $("#detail").innerHTML =
-        '<div class="edhead"><b>💡 编辑项目洞察</b><span class="sp"></span>'
-        + '<button data-act="save-insights" class="primary">保存 <kbd>Ctrl↵</kbd></button>'
-        + '<button data-act="cancel">取消</button></div>'
-        + '<textarea class="editor" id="ed-insights" spellcheck="false" style="min-height:420px">'
-        + esc(p.body || INSIGHT_KINDS.map(function (k) { return "## " + k.label; }).join("\n\n") + "\n")
-        + "</textarea>"
-        + '<p class="dropnote">markdown。四个小节是约定不是强制，但 <code>trace_insight</code> '
-        + "工具会往这几个小节里追加，保持它们在的话人和 agent 写的东西就落在同一处。</p>";
-      $("#ed-insights").focus();
-      return;
-    }
-    if (name === "save-insights") {
-      patchProject({ insights: $("#ed-insights").value })
-        .then(function () { toast("已保存"); }).catch(fail);
-      return;
-    }
+    if (name === "edit-insights") { openInsightEditor(); return; }
+    if (name === "save-insights") { saveInsights(); return; }
     if (name === "edit") { editing = true; renderDetail(); }
-    else if (name === "cancel") { editing = false; renderDetail(); }
+    else if (name === "cancel") { guardLeave(function () { editing = false; renderDetail(); }); }
     else if (name === "child") { openNew(selected()); }
     else if (name === "delete") {
       var d = IDX[selected()];
@@ -945,7 +1536,8 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ reason: why.trim(), by: "human", date: todayISO() }),
       }).then(function (info) {
-        select("");
+        dropDraft(d.id);          // 目录都没了，留着草稿只会在别的步骤上误弹
+        forceSelect("");
         return refresh().then(refreshProjects).then(function () {
           toast("已删除 " + info.id
                 + (info.orphaned.length ? "；" + info.orphaned.join("、") + " 已变成孤儿" : ""));
@@ -958,22 +1550,52 @@
   $("#proj").addEventListener("change", function (e) {
     location.href = e.target.value ? projectHref(e.target.value) : homeHref();
   });
-  $("#search").addEventListener("input", function (e) { query = e.target.value; renderSelection(); });
+  $("#search").addEventListener("input", function (e) {
+    query = e.target.value;
+    renderSelection();
+    if (!PROJECT) renderHome();     // 项目索引页：搜索词也用来筛项目卡片
+    scheduleGlobalSearch();
+  });
+  $("#search").addEventListener("focus", function () { if (hitsShown()) showHits(); });
+  $("#btn-scope").addEventListener("click", function () {
+    scopeAll = !scopeAll;
+    localStorage.setItem("trace.scope", scopeAll ? "all" : "one");
+    paintScope();
+    scheduleGlobalSearch();
+  });
   $("#btn-new").addEventListener("click", function () { openNew(selected()); });
   $("#btn-token").addEventListener("click", function () {
     var t = prompt("写入令牌（留空则清除）：", token());
     if (t !== null) { setToken(t.trim()); toast(t.trim() ? "令牌已保存到本浏览器" : "令牌已清除"); }
   });
-  $("#btn-newproj").addEventListener("click", function () {
-    var name = prompt("项目名：");
-    if (!name || !name.trim()) return;
-    api("/api/projects", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: name.trim() }),
-    }).then(function (p) { location.href = projectHref(p.slug); }).catch(fail);
-  });
   $("#nf-ok").addEventListener("click", function (e) { e.preventDefault(); $("#dlg-new").close(); submitNew(); });
-  window.addEventListener("hashchange", onHash);
+  ["#nf-title", "#nf-body", "#nf-paths", "#nf-commit"].forEach(function (sel) {
+    var el = $(sel);
+    if (el) el.addEventListener("input", saveNewDraft);
+  });
+  // <dialog> 按 Esc 会直接关，关之前把没写完的东西钉住
+  $("#dlg-new").addEventListener("close", saveNewDraft);
+
+  /* 浏览器后退键会绕过 select() 的确认框直接换 hash。这里不弹窗（用户按的是后退，
+     拦住它更烦人），改成把草稿钉死再走——内容一个字都不会丢，下次进这一步会被问。 */
+  window.addEventListener("hashchange", function () {
+    if (editing && isDirty()) {
+      clearTimeout(draftTimer);
+      saveDraftNow();
+      toast("离开了编辑中的内容，已存成草稿");
+    }
+    editing = false;
+    onHash();
+  });
+
+  /* 关标签页 / 刷新。草稿已经落盘了，这道确认防的是「以为自己刚才按过保存」。 */
+  window.addEventListener("beforeunload", function (e) {
+    if (!isDirty()) return;
+    clearTimeout(draftTimer);
+    saveDraftNow();
+    e.preventDefault();
+    e.returnValue = "";
+  });
 
   // Ctrl/⌘ + 滚轮缩放图视图
   $("#scroller").addEventListener("wheel", function (e) {
@@ -984,25 +1606,39 @@
 
   document.addEventListener("keydown", function (e) {
     if (!$("#lightbox").hidden && e.key === "Escape") { closeLightbox(); return; }
+    if ($("#dlg-leave").open || $("#dlg-conflict").open) {
+      // 这两个框问的正是「要不要丢东西」，Esc 一律理解成「先别动，我再想想」
+      if (e.key === "Escape") {
+        e.preventDefault();
+        if ($("#dlg-leave").open) resolveLeave("stay"); else resolveConflict("cancel");
+      }
+      return;
+    }
+    if (hitsShown() && e.key === "Escape") { e.preventDefault(); hideHits(); return; }
     var t = e.target.tagName;
     if (t === "INPUT" || t === "TEXTAREA" || t === "SELECT") {
       if (e.target.id === "ed-insights") {
-        if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
-          e.preventDefault();
-          patchProject({ insights: e.target.value }).then(function () { toast("已保存"); }).catch(fail);
-        }
+        if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); saveInsights(); }
         if (e.key === "Escape") { e.preventDefault(); onHash(); }
         return;
       }
       if (e.target.id === "ed-body" || e.target.id === "ed-title" || e.target.id === "ed-paths") {
         if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); saveEditor(); return; }
         if ((e.metaKey || e.ctrlKey) && (e.key === "b" || e.key === "B")) {
-          e.preventDefault(); wrapSel($("#ed-body"), "**", "**", "粗体"); schedulePreview(IDX[selected()]); return;
+          e.preventDefault(); wrapSel($("#ed-body"), "**", "**", "粗体");
+          schedulePreview(IDX[selected()]); scheduleDraft(); return;
         }
         if ((e.metaKey || e.ctrlKey) && (e.key === "i" || e.key === "I")) {
-          e.preventDefault(); wrapSel($("#ed-body"), "*", "*", "斜体"); schedulePreview(IDX[selected()]); return;
+          e.preventDefault(); wrapSel($("#ed-body"), "*", "*", "斜体");
+          schedulePreview(IDX[selected()]); scheduleDraft(); return;
         }
-        if (e.key === "Escape") { e.preventDefault(); editing = false; renderDetail(); return; }
+        // Esc 从前是直接丢弃。写了十分钟的正文按一下退出全屏/退出输入法就没了，
+        // 而且没有任何撤销入口——现在先存草稿再问。
+        if (e.key === "Escape") {
+          e.preventDefault();
+          guardLeave(function () { editing = false; renderDetail(); });
+          return;
+        }
       }
       if (e.key === "Escape") e.target.blur();
       return;
@@ -1020,7 +1656,10 @@
       applyView(); renderSelection(); scrollToSelected();
     } else if (e.key === "n" && canWrite()) { e.preventDefault(); openNew(selected()); }
     else if (e.key === "e" && canWrite() && selected()) { e.preventDefault(); editing = true; renderDetail(); }
-    else if (e.key === "Escape") { if (editing) { editing = false; renderDetail(); } else select(""); }
+    else if (e.key === "Escape") {
+      if (editing) guardLeave(function () { editing = false; renderDetail(); });
+      else select("");
+    }
   });
 
   // 阅读模式下拖文件到详情面板：上传并追加到正文末尾
@@ -1054,15 +1693,236 @@
     });
   }
 
+  /* -------------------------------------------------------------- 跨项目搜索 */
+
+  /* FORMAT.md 第 0 节写死「人和 LLM 信息对等」。agent 一句 trace_search 不给 project
+     就搜遍所有项目，人这边原来只能一个课题一个课题点进去各搜一遍——而「我当年好像
+     在某个项目里试过对比学习，后来放弃了」恰恰是记不清在哪个项目里的那类问题。
+     所以搜索框加一个范围开关，项目索引页默认就是全局。
+
+     取数据分两条路：优先打服务端的搜索端点（一次请求搜全部）；端点不在就退回逐个
+     项目拉 forest 在浏览器里搜。退路不是可有可无——静态导出和老版本服务端都没有
+     那个端点，而「搜不到」这件事人是察觉不到的，只会以为自己记错了。 */
+  var scopeAll = localStorage.getItem("trace.scope") === "all";
+  var gsearchTimer = null, gsearchSeq = 0;
+  var forestCache = Object.create(null);
+
+  function paintScope() {
+    var b = $("#btn-scope");
+    b.textContent = scopeAll ? "全部项目" : "本项目";
+    b.classList.toggle("on", scopeAll);
+    b.title = scopeAll
+      ? "搜索范围：全部项目（点击只搜当前项目）"
+      : "搜索范围：当前项目（点击搜全部项目）";
+    b.hidden = MODE !== "server";
+  }
+  function hitsShown() { return !$("#hitlist").hidden; }
+  function showHits() { $("#hitlist").hidden = false; }
+  function hideHits() { $("#hitlist").hidden = true; }
+
+  var WHERE_LABEL = { title: "标题", body: "正文", tags: "标签", id: "编号" };
+
+  function normalizeHits(d) {
+    var arr = Array.isArray(d) ? d : (d.hits || d.results || d.steps || []);
+    var rows = arr.map(function (h) {
+      return {
+        slug: h.project || h.slug || h.project_slug || "",
+        name: h.project_name || h.name || h.project || "",
+        id: h.id || h.step || "",
+        title: h.title || "",
+        status: h.status || "wip",
+        date: h.date || "",
+        body: h.snippet || h.excerpt || h.body || "",
+        where: h.where || [],
+      };
+    }).filter(function (h) { return h.slug && h.id; });
+    // total 照实报，这样能说「还有 200 条没显示」，而不是让人以为搜完了
+    return { rows: rows, total: (d && typeof d.total === "number") ? d.total : rows.length };
+  }
+
+  function searchRemote(q) {
+    return api("/api/search?q=" + encodeURIComponent(q) + "&limit=80").then(normalizeHits);
+  }
+
+  /* 端点不在（老服务端）时的退路：逐个项目拉 forest 在浏览器里搜。
+     判定用 U.matches，和服务端 search_hits / MCP trace_search 覆盖同样的字段。 */
+  function searchLocally(q) {
+    var names = {};
+    PROJECTS.forEach(function (p) { names[p.slug] = p.name || p.slug; });
+    return PROJECTS.map(function (p) { return p.slug; }).reduce(function (chain, slug) {
+      return chain.then(function (acc) {
+        var got = slug === PROJECT
+          ? Promise.resolve({ steps: F.steps })
+          : (forestCache[slug]
+              ? Promise.resolve(forestCache[slug])
+              : api("/api/p/" + encodeURIComponent(slug) + "/forest").then(function (f) {
+                  forestCache[slug] = f;
+                  return f;
+                }));
+        return got.then(function (f) {
+          (f.steps || []).forEach(function (s) {
+            if (!U.matches(s, q)) return;
+            acc.push({ slug: slug, name: names[slug] || slug, id: s.id, title: s.title,
+                       status: s.status, date: s.date, body: s.body, where: [] });
+          });
+          return acc;
+        }, function () { return acc; });
+      });
+    }, Promise.resolve([])).then(function (rows) {
+      return { rows: rows, total: rows.length };
+    });
+  }
+
+  function scheduleGlobalSearch() {
+    clearTimeout(gsearchTimer);
+    gsearchTimer = setTimeout(runGlobalSearch, 220);
+  }
+
+  function runGlobalSearch() {
+    var q = query.trim();
+    var wantGlobal = MODE === "server" && (scopeAll || !PROJECT);
+    if (!wantGlobal || q.length < 2) {
+      hideHits();
+      if (!wantGlobal && q && MODE === "static" && !PROJECT) {
+        $("#hitlist").innerHTML = '<p class="dropnote">静态导出是断网可读的一堆文件，'
+          + "跨项目搜索需要服务端。请在项目页内搜索，或用 <code>grep -r</code>。</p>";
+        showHits();
+      }
+      return;
+    }
+    var seq = ++gsearchSeq;
+    $("#hitlist").innerHTML = '<p class="dropnote">搜索中…</p>';
+    showHits();
+    searchRemote(q).catch(function () { return searchLocally(q); })
+      .then(function (res) {
+        if (seq !== gsearchSeq) return;    // 打字比请求快，只认最后一次
+        paintHits(q, res.rows, res.total);
+      })
+      .catch(function (e) {
+        if (seq !== gsearchSeq) return;
+        $("#hitlist").innerHTML = '<p class="dropnote">搜索失败：' + esc(String(e && e.message || e)) + "</p>";
+      });
+  }
+
+  function paintHits(q, hits, total) {
+    if (!hits.length) {
+      $("#hitlist").innerHTML = '<p class="dropnote">全部 ' + PROJECTS.length
+        + " 个项目里都没有「" + esc(q) + "」。</p>";
+      return;
+    }
+    var byProj = {}, order = [];
+    hits.forEach(function (h) {
+      if (!byProj[h.slug]) { byProj[h.slug] = []; order.push(h.slug); }
+      byProj[h.slug].push(h);
+    });
+    var more = total > hits.length ? "（共 " + total + " 条，只列前 " + hits.length + " 条）" : "";
+    $("#hitlist").innerHTML = '<div class="hithead">' + hits.length + " 条命中 · "
+      + order.length + " 个项目" + esc(more) + '<span class="sp"></span>'
+      + '<button type="button" id="hit-close">关闭</button></div>'
+      + order.map(function (slug) {
+          var rows = byProj[slug];
+          return '<div class="hitgroup"><h4>' + esc(rows[0].name || slug)
+            + '<span class="mono">' + rows.length + "</span></h4>"
+            + rows.map(function (h) {
+                // 正文没命中时（只命中标题/标签/id）没有片段可截，就说清是哪儿命中的，
+                // 别留一行空白让人以为片段加载失败。
+                var tail = h.body
+                  ? esc(U.snippet(h.body, q))
+                  : (h.where || []).map(function (w) { return WHERE_LABEL[w] || w; }).join(" / ");
+                return '<a class="hit" href="' + projectHref(slug) + "#" + encodeURIComponent(h.id) + '">'
+                  + '<span class="hid s-' + esc(h.status) + '">' + esc(h.id) + "</span>"
+                  + '<span class="ht">' + esc(h.title || "(无标题)") + "</span>"
+                  + '<span class="hd mono">' + esc(h.date || "") + "</span>"
+                  + (tail ? '<span class="hs">' + (h.body ? tail : "命中：" + esc(tail)) + "</span>" : "")
+                  + "</a>";
+              }).join("")
+            + "</div>";
+        }).join("");
+    var cl = $("#hit-close");
+    if (cl) cl.addEventListener("click", hideHits);
+  }
+
+  /* -------------------------------------------------------------- 同步状态 */
+
+  /* 数据仓的 git push 是换机器和灾难恢复的全部依据，而它失败起来是完全无声的：
+     服务照常返回 201、页面照常刷新，几周后到另一台机器上 git pull 才发现是空的。
+     所以这里给一个「平时不吵、出事必见」的指示：正常时只是顶栏一个小箭头（悬停
+     能看到最近一次同步了什么），失败时变成一块红色的、点得开、能一键重试的提示。 */
+  var GIT = null;
+  // 服务端已经把状态分类过了（state + 人话 summary + 怎么修的 hint），这里只兜底：
+  // 万一对上的是个老服务端，至少别把裸 state 直接甩给用户。
+  var GIT_LABEL = {
+    disabled: "未启用自动同步", misconfigured: "数据仓还没配好", idle: "还没有同步过",
+    clean: "没有要同步的改动", committed: "已提交，还没推到远端",
+    pushed: "已推送到远端", error: "同步失败",
+  };
+
+  function refreshGit() {
+    if (MODE !== "server") return Promise.resolve();
+    // 专用端点优先；老服务端没有它，退回 /api/status 里的 git 字段。
+    return api("/api/git")
+      .catch(function () { return api("/api/status").then(function (d) { return d.git; }); })
+      .then(function (g) { GIT = g || null; paintGit(); })
+      .catch(function () { /* 状态查不到不该弹错——它本身就是个后台指示 */ });
+  }
+
+  function gitText() {
+    if (!GIT) return "";
+    var t = GIT.summary || GIT_LABEL[GIT.state] || GIT.state || "";
+    if (GIT.at) t += "（" + GIT.at + "）";
+    if (GIT.pending) t += " · 还有 " + GIT.pending + " 处改动在等";
+    if (GIT.hint) t += "\n怎么修：" + GIT.hint;
+    if (GIT.detail) t += "\ngit 原文：" + GIT.detail;
+    return t;
+  }
+
+  function paintGit() {
+    var dot = $("#gitdot"), warn = $("#gitwarn");
+    if (!GIT) { dot.hidden = true; warn.hidden = true; return; }
+    // ok 由服务端判定（pushed / clean 才算好）。没有 ok 字段的老服务端退回看 state。
+    var bad = GIT.ok === undefined ? GIT.state === "error" : !GIT.ok;
+    var loud = bad && GIT.state !== "disabled" && GIT.state !== "idle";
+    dot.hidden = false;
+    dot.className = "gitdot g-" + (GIT.state || "idle");
+    dot.title = "数据仓同步 · " + gitText();
+    // 只有「本来该同步却没同步成」才吵：没开自动同步、刚起服务还没写过，都不是问题
+    warn.hidden = !loud;
+    warn.textContent = "⇅ " + (GIT.state === "error" ? "同步失败" : "同步没配好");
+    warn.title = gitText() + "\n（点击立即重试）";
+  }
+
+  function retrySync() {
+    toast("正在同步…");
+    api("/api/sync", { method: "POST" }).then(function (r) {
+      if (r && r.state) GIT = r;
+      paintGit();
+      var ok = GIT && (GIT.ok === undefined ? GIT.state !== "error" : GIT.ok);
+      toast((ok ? "同步完成：" : "仍然失败：") + ((GIT && GIT.summary) || ""), !ok);
+      return refreshGit();
+    }).catch(fail);
+  }
+
   /* -------------------------------------------------------------- 启动 */
 
+  function newProject() {
+    var name = prompt("项目名：");
+    if (!name || !name.trim()) return;
+    api("/api/projects", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name.trim() }),
+    }).then(function (p) { location.href = projectHref(p.slug); }).catch(fail);
+  }
+
   paintToken();
+  paintScope();
   if (MODE === "static" || !PROJECT) {
     $("#btn-new").hidden = MODE === "static" || !PROJECT;
     $("#btn-token").hidden = MODE === "static";
   }
+  /* 「＋ 项目」以前只长在项目索引页上，而只剩一个项目时那个页面会 302 弹回项目页，
+     于是网页端永远建不出第二个项目。现在它在顶栏，任何页面都够得着。 */
+  $("#btn-newproj").hidden = MODE === "static";
   if (MODE === "static") {
-    $("#btn-newproj").hidden = true;
     $("#live").className = "dot";
     $("#live").title = "静态导出 — 只读";
   }
@@ -1100,9 +1960,14 @@
       if (seen < 0) { seen = v; return; }
       if (v !== seen) {
         seen = v;
+        forestCache = Object.create(null);   // 别的项目也可能变了，跨项目搜索的缓存作废
         refreshProjects();
+        refreshGit();
         if (PROJECT && !editing) refresh();   // 正在编辑时不要把用户的输入冲掉
       }
     };
+    // git 是防抖提交的（默认 45 秒），版本号不变也可能刚刚 push 失败，所以另外轮询。
+    refreshGit();
+    setInterval(refreshGit, 20000);
   }
 })();
