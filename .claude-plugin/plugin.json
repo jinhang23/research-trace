@@ -1,7 +1,7 @@
 {
   "name": "research-trace",
   "displayName": "科研溯源 trace",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "把科研过程记录成一棵只追加的步骤树：每一步自带代码、日志、产物和一句「我为什么要做这一步」，从任何结果都能回溯到最初的问题。带 6 个 MCP 工具（零依赖，手写 JSON-RPC）、多项目、图/列表双视图、外部产物路径溯源。",
   "author": {
     "name": "Jinhang Wei"
@@ -10,5 +10,42 @@
   "repository": "https://github.com/jinhang23/research-trace",
   "keywords": ["research", "provenance", "lab-notebook", "reproducibility", "科研", "溯源"],
   "skills": "./skills",
-  "commands": "./commands"
+  "commands": "./commands",
+
+  "userConfig": {
+    "data_dir": {
+      "type": "directory",
+      "title": "本地数据仓目录",
+      "description": "步骤树所在的目录（里面是 projects/）。agent 和数据在同一台机器上时填这个，不需要起服务。留空则用下面的远端地址。"
+    },
+    "url": {
+      "type": "string",
+      "title": "远端服务地址（可选）",
+      "description": "形如 https://你的域名/t/<space> ，含那段不可猜的 space。填了它就优先于本地目录——agent 在超算上、数据在域名后面时用这个。"
+    },
+    "token": {
+      "type": "string",
+      "title": "写入令牌（配远端时才需要）",
+      "description": "服务器上跑 python trace_cli.py url 可以查到。读是公开的，只有写入需要它。",
+      "sensitive": true
+    },
+    "python": {
+      "type": "string",
+      "title": "Python 解释器",
+      "description": "跑 MCP server 用的 Python，要 3.10 以上（server 本身零依赖，不需要装任何包）。Linux / macOS / 超算上保持默认 python3 即可。Windows 上多半要填绝对路径，比如 C:/ProgramData/anaconda3/python.exe —— 因为 PATH 上的 python 经常指向别的软件自带的 2.x。装完可以跑 /research-trace:doctor 验一下。",
+      "default": "python3"
+    }
+  },
+
+  "mcpServers": {
+    "trace": {
+      "command": "${user_config.python}",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/trace_mcp.py"],
+      "env": {
+        "TRACE_DATA": "${user_config.data_dir}",
+        "TRACE_URL": "${user_config.url}",
+        "TRACE_TOKEN": "${user_config.token}"
+      }
+    }
+  }
 }
