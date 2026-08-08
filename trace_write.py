@@ -12,6 +12,7 @@ CLI、网页表单、agent API 全部调这里，不允许任何一方绕过去�
 
 from __future__ import annotations
 
+import hashlib
 import re
 import unicodedata
 from pathlib import Path
@@ -375,6 +376,51 @@ def attach_file(steps_dir: Path, sid: str, relpath: str, data: bytes) -> dict[st
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(data)
     return {"path": safe_relpath(relpath), "size": len(data)}
+
+
+EXT_BY_MIME = {
+    "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp",
+    "image/svg+xml": "svg", "image/avif": "avif", "image/bmp": "bmp",
+    "text/plain": "txt", "text/csv": "csv", "text/tab-separated-values": "tsv",
+    "application/json": "json", "application/pdf": "pdf",
+}
+
+
+def attach_auto(steps_dir: Path, sid: str, data: bytes, filename: str = "", mime: str = "") -> dict[str, Any]:
+    """服务端定名的附件上传，供网页粘贴/拖拽使用。
+
+    有文件名就用文件名（`train.log` 比一串哈希好读得多），重名且内容不同才加后缀；
+    没有文件名（剪贴板里的位图）就用内容哈希命名——于是同一张图粘贴两次只存一份。
+    """
+    if len(data) > MAX_FILE_BYTES:
+        raise WriteError(f"文件超过 {MAX_FILE_BYTES // (1024 * 1024)} MB 上限；大文件请留在仓库外，正文里记路径 + 校验和 + 大小")
+    if not data:
+        raise WriteError("空文件")
+
+    by_id = load(steps_dir)
+    base_dir = step_dir(steps_dir, by_id, sid)
+    digest = hashlib.sha1(data).hexdigest()
+
+    name = safe_relpath(filename).rsplit("/", 1)[-1] if filename.strip() else ""
+    if not name:
+        ext = EXT_BY_MIME.get((mime or "").split(";")[0].strip().lower(), "bin")
+        name = f"{'img' if ext in ('png', 'jpg', 'gif', 'webp', 'svg', 'avif', 'bmp') else 'file'}-{digest[:10]}.{ext}"
+
+    stem, dot, ext = name.rpartition(".")
+    if not dot:
+        stem, ext = name, ""
+    candidate, n = name, 2
+    while True:
+        target = base_dir / candidate
+        if not target.exists():
+            break
+        if hashlib.sha1(target.read_bytes()).hexdigest() == digest:
+            return {"path": candidate, "size": len(data), "reused": True}  # 同名同内容，直接复用
+        candidate = f"{stem}-{n}{('.' + ext) if ext else ''}"
+        n += 1
+
+    target.write_bytes(data)
+    return {"path": candidate, "size": len(data), "reused": False}
 
 
 def delete_file(steps_dir: Path, sid: str, relpath: str) -> None:

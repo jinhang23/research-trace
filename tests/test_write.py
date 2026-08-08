@@ -151,6 +151,60 @@ def test_oversized_attachment_is_refused(tmp_path: Path):
         W.attach_file(d, s.id, "big.bin", b"0" * (W.MAX_FILE_BYTES + 1))
 
 
+def test_attach_auto_keeps_a_real_filename(tmp_path: Path):
+    """`train.log` 比一串哈希好读得多，有文件名就用文件名。"""
+    d = mkroot(tmp_path)
+    s, _ = W.create_step(d, title="x")
+    info = W.attach_auto(d, s.id, b"loss 0.42\n", filename="train.log", mime="text/plain")
+    assert info["path"] == "train.log" and info["reused"] is False
+
+
+def test_attach_auto_names_clipboard_images_by_content_hash(tmp_path: Path):
+    """剪贴板里的位图没有文件名，用内容哈希命名——于是同一张图粘贴两次只存一份。"""
+    d = mkroot(tmp_path)
+    s, _ = W.create_step(d, title="x")
+    a = W.attach_auto(d, s.id, b"\x89PNG fake", mime="image/png")
+    assert a["path"].startswith("img-") and a["path"].endswith(".png")
+
+    b = W.attach_auto(d, s.id, b"\x89PNG fake", mime="image/png")
+    assert b["path"] == a["path"] and b["reused"] is True
+    assert len(core.compile_forest(d)["steps"][0]["files"]) == 1
+
+
+def test_attach_auto_does_not_clobber_a_different_file_with_the_same_name(tmp_path: Path):
+    d = mkroot(tmp_path)
+    s, _ = W.create_step(d, title="x")
+    a = W.attach_auto(d, s.id, b"first", filename="fig.png", mime="image/png")
+    b = W.attach_auto(d, s.id, b"second", filename="fig.png", mime="image/png")
+    assert (a["path"], b["path"]) == ("fig.png", "fig-2.png")
+    assert [f["path"] for f in core.compile_forest(d)["steps"][0]["files"]] == ["fig-2.png", "fig.png"]
+
+
+def test_attach_auto_reuses_on_identical_name_and_content(tmp_path: Path):
+    d = mkroot(tmp_path)
+    s, _ = W.create_step(d, title="x")
+    W.attach_auto(d, s.id, b"same", filename="a.txt")
+    again = W.attach_auto(d, s.id, b"same", filename="a.txt")
+    assert again["reused"] is True
+    assert len(core.compile_forest(d)["steps"][0]["files"]) == 1
+
+
+def test_attach_auto_rejects_empty_and_oversized(tmp_path: Path):
+    d = mkroot(tmp_path)
+    s, _ = W.create_step(d, title="x")
+    with pytest.raises(W.WriteError):
+        W.attach_auto(d, s.id, b"")
+    with pytest.raises(W.WriteError):
+        W.attach_auto(d, s.id, b"0" * (W.MAX_FILE_BYTES + 1), filename="big.bin")
+
+
+def test_attach_auto_blocks_path_traversal_in_the_filename(tmp_path: Path):
+    d = mkroot(tmp_path)
+    s, _ = W.create_step(d, title="x")
+    with pytest.raises(W.WriteError):
+        W.attach_auto(d, s.id, b"x", filename="../../evil.txt")
+
+
 def test_slugify_keeps_cjk_and_drops_path_hostile_chars():
     assert W.slugify("试了 3:1 采样 / AUC 0.82") == "试了-3-1-采样-auc-0-82"
     assert W.slugify("!!!") == "step"

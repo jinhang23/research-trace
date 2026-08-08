@@ -39,9 +39,11 @@
   <section id="left">
     <div id="scroller">
       <!-- 图视图：SVG 画边，HTML 卡片叠在上面（文本截断/hover 都好做） -->
-      <div id="diagram" hidden>
-        <svg id="dedges" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"></svg>
-        <div id="dnodes"></div>
+      <div id="dwrap" hidden>
+        <div id="diagram">
+          <svg id="dedges" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"></svg>
+          <div id="dnodes"></div>
+        </div>
       </div>
       <!-- 列表视图：轨道 SVG + 定高行，两者靠固定行高对齐 -->
       <div id="track" hidden>
@@ -51,9 +53,16 @@
       <p id="empty" hidden>这个项目还没有步骤。点右上角 <b>＋ 新步骤</b> 开始。</p>
     </div>
     <footer id="legend">
-      <span><i class="lg done"></i>done 实线实心</span>
-      <span><i class="lg wip"></i>wip 虚线空心</span>
-      <span><i class="lg dead"></i>dead 点线断头</span>
+      <span><i class="lg done"></i>done 实线</span>
+      <span><i class="lg wip"></i>wip 虚线</span>
+      <span><i class="lg dead"></i>dead 点线</span>
+      <span class="sp"></span>
+      <span id="zoombar">
+        <button data-zoom="out" title="缩小">−</button>
+        <button data-zoom="reset" title="回到 100%"><span id="zoomval">100%</span></button>
+        <button data-zoom="in" title="放大">＋</button>
+        <button data-zoom="fit" title="适应宽度">适应</button>
+      </span>
     </footer>
   </section>
 
@@ -86,6 +95,12 @@
     </menu>
   </form>
 </dialog>
+
+<div id="lightbox" hidden>
+  <button id="lb-close" title="关闭（Esc）">×</button>
+  <img id="lb-img" alt="">
+  <div id="lb-cap"></div>
+</div>
 
 <script id="forest-data" type="application/json">__DATA__</script>
 <script id="projects-data" type="application/json">__PROJECTS__</script>

@@ -24,6 +24,7 @@ import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
@@ -383,6 +384,20 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
     async def api_attach(project: str, sid: str, relpath: str, request: Request) -> JSONResponse:
         require_token(request)
         info = W.attach_file(sd(project), sid, relpath, await request.body())
+        touched([f"{project}/{sid}"])
+        return JSONResponse(info, status_code=201)
+
+    @app.post(base + "/api/p/{project}/steps/{sid}/files")
+    async def api_attach_auto(project: str, sid: str, request: Request) -> JSONResponse:
+        """服务端定名的上传，供网页粘贴截图 / 拖文件用。"""
+        require_token(request)
+        # HTTP 头只能是 latin-1，中文文件名由前端 encodeURIComponent 编过
+        raw_name = unquote(request.headers.get("x-filename", ""))
+        info = W.attach_auto(
+            sd(project), sid, await request.body(),
+            filename=raw_name,
+            mime=request.headers.get("content-type", ""),
+        )
         touched([f"{project}/{sid}"])
         return JSONResponse(info, status_code=201)
 

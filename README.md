@@ -18,12 +18,41 @@ python trace_cli.py serve                           # 起服务，终端会打�
 
 浏览器打开打印出来的地址，点右上角 🔒 把令牌存进浏览器，就能建步骤、改正文、拖文件了。
 
-键盘：`↑↓` 移动 · `g` 切换图/列表 · `n` 从选中节点派生 · `e` 编辑 · `/` 搜索 · `Ctrl+Enter` 保存
+键盘：`↑↓` 移动 · `g` 切换图/列表 · `n` 从选中节点派生 · `e` 编辑 · `/` 搜索
+编辑时：`Ctrl+B` 粗体 · `Ctrl+I` 斜体 · `Ctrl+Enter` 保存 · `Esc` 取消
+
+## 写：插图和表格的成本要足够低
+
+正文是 markdown + 实时预览，**不是所见即所得**——`note.md` 必须保持人能直接读、
+能 grep、能 diff，所以不引入会生成 HTML 的富文本编辑器。代价由这几件事补回来：
+
+- **截图直接 `Ctrl+V`** 粘贴到编辑框，自动上传到该步骤目录并在光标处插入。
+  光标会落在 `![|](图名)` 的方括号里，接着打字就是图注。
+  同一张图粘贴两次只存一份（按内容哈希命名）。
+- **从 Excel / Google Sheets / 网页表格复制**的内容直接粘贴，自动转成 markdown 表格。
+- 文件可以拖进编辑框（插在光标处）或拖到阅读页（追加到正文末尾）。
+- 工具栏 12 个按钮：粗体 / 斜体 / 行内代码 / 标题 / 列表 / 任务 / 引用 / 代码块 /
+  链接 / 图片 / 表格 / 分隔线。
+- 编辑时左边的图会让位，整个工作区变成「编辑 | 预览」两栏——写「为什么」是这个
+  系统的核心动作，值得一块像样的书写台。
+
+## 读：给人看的排版
+
+- **图**：独占一段的图片渲染成带图注的 `figure`（图注取 `![alt](src "图注")` 里的
+  引号内容，没写就用 alt）。点击放大看原图。
+- **表格**：`:---` / `---:` / `:---:` 控制列对齐；**没写对齐时，整列都是数字的列
+  自动右对齐并用等宽数字**，小数点自然成列。宽表格在自己的容器里横向滚动，
+  不会把版面撑坏。
+- **代码块**：显示语言标记，悬停出现复制按钮。
+- 正文行长限制在 76 字符——超过这个宽度人眼容易串行。
+- 正文用衬线体，id / 日期 / commit / 文件名 / 命令用等宽体：一眼分清哪些是机器
+  记录的、哪些是自己判断的。
 
 ## 两个视图
 
 **图** —— 自上而下的树，节点是卡片。看结构：哪里分了叉、哪条是主线、哪条断了。
-用 Reingold–Tilford 紧凑布局，父节点永远居中于它的子节点。
+用 Reingold–Tilford 紧凑布局，父节点永远居中于它的子节点。卡片上会标出这一步有
+几张图、几个附件。树大了用底部的缩放条，或 `Ctrl` + 滚轮。
 
 **列表** —— git graph 那样的轨道图 + 定高行。看全貌：几百步时用它扫和搜最快。
 主线恒在轨道 0，选主线用的是"这一支还要往下延伸多远"，不是"哪个子节点 id 最小"——
@@ -68,7 +97,7 @@ trace/
 ├── trace_git.py      debounce 自动 commit + push
 ├── trace_cli.py      init / projects / new-project / new / check / build / serve / url
 ├── web/              index.html · app.js · md.js · style.css（无构建步骤，不引 CDN）
-├── tests/            73 个断言，pytest tests
+├── tests/            79 个 Python 断言 + 25 个 markdown 渲染断言（node --test）
 ├── projects/         ← 你的数据（仓库里自带一个示例项目，数字均为虚构，删掉即可）
 │   └── <slug>/
 │       ├── project.md            可选，只有一个 name 字段
@@ -141,7 +170,8 @@ Base = `/t/<space>`。读公开，写要 `Authorization: Bearer <token>`。
 | GET | `/api/events` | SSE，推 `{version}` |
 | POST | `/api/p/{项目}/steps` | 建步骤。带 `key` 则幂等——重试不会产生重复 |
 | PATCH | `/api/p/{项目}/steps/{id}` | 改 status/title/body/date/commit/author/tags |
-| PUT | `/api/p/{项目}/steps/{id}/files/{path}` | 上传附件（raw body） |
+| PUT | `/api/p/{项目}/steps/{id}/files/{path}` | 上传附件到指定文件名（raw body） |
+| POST | `/api/p/{项目}/steps/{id}/files` | 上传附件，服务端定名（`X-Filename` 可选；没给就按内容哈希命名，重复内容自动复用） |
 
 ```python
 import json, urllib.request
@@ -168,7 +198,8 @@ python trace_cli.py new -P <项目> --title "..."    # 新建一步
 python trace_cli.py check [-P <项目>]              # 校验不变量，打印警告
 python trace_cli.py build --out dist              # 静态导出，file:// 可直接打开，断网可用
 python trace_cli.py url                           # 打印访问地址与令牌
-python -m pytest tests                            # 73 个断言
+python -m pytest tests                            # 79 个断言（内核 / 布局 / 写入 / 多项目）
+node --test tests/md.test.js                      # 25 个断言（markdown 渲染）
 ```
 
 `build` 的产物是确定性的：同样的输入两次构建逐字节一致，所以 `dist/` 直接 gitignore。

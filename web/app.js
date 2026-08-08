@@ -2,13 +2,13 @@
  *
  * 交互契约（规格书第 7 节）：唯一状态是 selected，而 selected 就是 location.hash，
  * 所以连"唯一状态"都不需要一个变量来存——刷新、分享链接、前进后退全都自然正确。
- * lineage / detail / 面包屑 / 高亮全部由它派生。
  *
  * 两个视图（图 / 列表）共用同一份数据和同一套选中逻辑：布局是纯函数算好的，
- * 视图只负责把坐标画出来。所以加一个视图只是加一个 render 函数。
+ * 视图只负责把坐标画出来。
  *
- * 搜索只 dim 不 hide：隐藏节点会破坏图的形状——而形状本身就是信息
- * （"这里分了三条支"）。搜索的目的是定位，不是过滤。
+ * 编辑器是 markdown + 实时预览，不是所见即所得：note.md 必须保持人能直接读、
+ * 能 grep、能 diff。为此把"插入图片/表格"的成本压到最低——截图直接粘贴、
+ * 表格从 Excel 直接粘贴——而不是引入一个会生成 HTML 的富文本编辑器。
  */
 (function () {
   "use strict";
@@ -26,6 +26,7 @@
   var query = "";
   var editing = false;
   var view = localStorage.getItem("trace.view") === "list" ? "list" : "graph";
+  var zoom = 1;
 
   var TEMPLATE = "## 为什么\n\n\n## 做了什么\n\n\n## 结果\n\n\n## 结论\n\n\n## 下一步\n";
   var IMG = /\.(png|jpe?g|gif|webp|svg|bmp|avif)$/i;
@@ -93,6 +94,7 @@
     if (MODE === "static") return "steps/" + encodeURIComponent(s.dirname) + "/" + p;
     return BASE + "/p/" + encodeURIComponent(PROJECT) + "/files/" + encodeURIComponent(s.id) + "/" + p;
   }
+  function resolverFor(s) { return function (h) { return fileURL(s, h); }; }
   function isAgent(s) { return (s.author || "").indexOf("agent") === 0; }
 
   function selected() { var h = decodeURIComponent(location.hash.slice(1)); return IDX[h] ? h : ""; }
@@ -111,8 +113,7 @@
   /* -------------------------------------------------------------- 项目 */
 
   function renderProjects() {
-    var sel = $("#proj");
-    sel.innerHTML = '<option value="">所有项目 ▸</option>'
+    $("#proj").innerHTML = '<option value="">所有项目 ▸</option>'
       + PROJECTS.map(function (p) {
           return '<option value="' + esc(p.slug) + '"' + (p.slug === PROJECT ? " selected" : "") + ">"
             + esc(p.name) + "（" + p.steps + "）</option>";
@@ -166,9 +167,9 @@
   function renderDiagram() {
     var T = F.tree || { nodes: {}, w: 0, h: 0, node_w: 176, node_h: 58 };
     var NW = T.node_w, NH = T.node_h;
-    var wrap = $("#diagram"), svg = $("#dedges"), holder = $("#dnodes");
-    wrap.style.width = T.w + "px";
-    wrap.style.height = T.h + "px";
+    var svg = $("#dedges"), holder = $("#dnodes");
+    $("#diagram").style.width = T.w + "px";
+    $("#diagram").style.height = T.h + "px";
     svg.setAttribute("width", T.w);
     svg.setAttribute("height", T.h);
     svg.setAttribute("viewBox", "0 0 " + T.w + " " + T.h);
@@ -202,15 +203,34 @@
     holder.innerHTML = F.steps.map(function (s) {
       var n = T.nodes[s.id];
       if (!n) return "";
+      var pics = (s.files || []).filter(function (f) { return IMG.test(f.path); }).length;
+      var other = (s.files || []).length - pics;
+      var marks = (pics ? '<span class="cmk" title="' + pics + ' 张图">🖼' + (pics > 1 ? pics : "") + "</span>" : "")
+        + (other ? '<span class="cmk" title="' + other + ' 个附件">📎' + (other > 1 ? other : "") + "</span>" : "");
       return '<div class="card s-' + s.status + '" data-id="' + esc(s.id) + '" tabindex="0"'
         + ' style="left:' + n.x + "px;top:" + n.y + "px;width:" + NW + "px;height:" + NH + 'px">'
         + '<div class="chead"><span class="cid">' + esc(s.id) + "</span>"
         + '<span class="cst">' + s.status + "</span>"
         + (isAgent(s) ? '<span class="cbot" title="' + esc(s.author) + '">🤖</span>' : "")
+        + marks
         + '<span class="cdate">' + esc(s.date || "") + "</span></div>"
         + '<div class="ctitle">' + esc(s.title || "(无标题)") + "</div>"
         + "</div>";
     }).join("");
+    setZoom(zoom);
+  }
+
+  function setZoom(z) {
+    zoom = Math.max(0.3, Math.min(2, z));
+    var T = F.tree || { w: 0, h: 0 };
+    $("#diagram").style.transform = "scale(" + zoom + ")";
+    $("#dwrap").style.width = Math.ceil(T.w * zoom) + "px";
+    $("#dwrap").style.height = Math.ceil(T.h * zoom) + "px";
+    $("#zoomval").textContent = Math.round(zoom * 100) + "%";
+  }
+  function fitZoom() {
+    var w = F.tree && F.tree.w;
+    setZoom(w ? Math.min(1, ($("#scroller").clientWidth - 10) / w) : 1);
   }
 
   /* -------------------------------------------------------------- 列表视图 */
@@ -257,9 +277,11 @@
 
   function renderRows() {
     $("#rows").innerHTML = F.steps.map(function (s) {
+      var pics = (s.files || []).length;
       return '<div class="row s-' + s.status + '" data-id="' + esc(s.id) + '">'
         + '<span class="id s-' + s.status + '">' + esc(s.id) + "</span>"
         + '<span class="t">' + esc(s.title || "(无标题)") + "</span>"
+        + (pics ? '<span class="who" title="' + pics + ' 个附件">📎</span>' : "")
         + (isAgent(s) ? '<span class="who" title="' + esc(s.author) + '">🤖</span>' : "")
         + '<span class="d">' + esc(s.date || "") + "</span>"
         + "</div>";
@@ -276,9 +298,10 @@
   }
 
   function applyView() {
-    $("#diagram").hidden = view !== "graph";
+    $("#dwrap").hidden = view !== "graph";
     $("#track").hidden = view !== "list";
     $("#empty").hidden = F.steps.length > 0;
+    $("#zoombar").hidden = view !== "graph";
     document.querySelectorAll("#viewtoggle button").forEach(function (b) {
       b.classList.toggle("on", b.getAttribute("data-view") === view);
     });
@@ -317,6 +340,37 @@
     if (el) el.scrollIntoView({ block: "nearest", inline: "nearest" });
   }
 
+  /* -------------------------------------------------------------- 正文增强 */
+
+  /* 代码块加"复制"按钮；正文渲染完调用一次。图片的灯箱走事件委托，不用逐个绑。 */
+  function enhanceProse(root) {
+    root.querySelectorAll("pre.code").forEach(function (pre) {
+      if (pre.querySelector(".copy")) return;
+      var b = document.createElement("button");
+      b.className = "copy";
+      b.type = "button";
+      b.textContent = "复制";
+      b.addEventListener("click", function () {
+        navigator.clipboard.writeText(pre.querySelector("code").textContent).then(function () {
+          b.textContent = "已复制";
+          setTimeout(function () { b.textContent = "复制"; }, 1400);
+        }, function () { toast("复制失败", true); });
+      });
+      pre.appendChild(b);
+    });
+  }
+
+  function openLightbox(img) {
+    var fig = img.closest("figure");
+    $("#lb-img").src = img.currentSrc || img.src;
+    $("#lb-img").alt = img.alt || "";
+    var cap = (fig && fig.querySelector("figcaption")) ? fig.querySelector("figcaption").textContent : (img.title || img.alt || "");
+    $("#lb-cap").textContent = cap;
+    $("#lb-cap").hidden = !cap;
+    $("#lightbox").hidden = false;
+  }
+  function closeLightbox() { $("#lightbox").hidden = true; $("#lb-img").src = ""; }
+
   /* -------------------------------------------------------------- 详情 */
 
   function crumbs(s) {
@@ -332,9 +386,11 @@
 
   function renderDetail() {
     var el = $("#detail"), s = IDX[selected()];
+    document.body.classList.toggle("editing", !!(editing && s));
     if (!s) {
       el.innerHTML = '<div class="placeholder">选一个步骤看详情。<br>'
-        + '<span class="mono">↑ ↓</span> 移动 · <span class="mono">n</span> 新建 · <span class="mono">e</span> 编辑 · <span class="mono">/</span> 搜索</div>';
+        + '<span class="mono">↑ ↓</span> 移动 · <span class="mono">g</span> 切换视图 · '
+        + '<span class="mono">n</span> 新建 · <span class="mono">e</span> 编辑 · <span class="mono">/</span> 搜索</div>';
       return;
     }
     if (editing) return renderEditor(s);
@@ -350,7 +406,7 @@
     var acts = "";
     if (canWrite()) {
       acts = '<div class="acts">'
-        + '<button data-act="edit">编辑正文</button>'
+        + '<button data-act="edit">✎ 编辑正文</button>'
         + ["wip", "done", "dead"].map(function (st) {
             return '<button data-status="' + st + '"' + (s.status === st ? ' class="on"' : "") + ">" + st + "</button>";
           }).join("")
@@ -359,7 +415,7 @@
         + "</div>";
     }
 
-    var body = window.md.render(s.body || "", { resolve: function (h) { return fileURL(s, h); } });
+    var body = window.md.render(s.body || "", { resolve: resolverFor(s) });
 
     var back = "";
     if ((s.backlinks || []).length) {
@@ -375,30 +431,229 @@
     if ((s.files || []).length) {
       files += '<div class="files">' + s.files.map(function (f) {
         var url = fileURL(s, f.path);
-        var thumb = IMG.test(f.path) ? '<img class="thumb" src="' + url + '" alt="' + esc(f.path) + '" loading="lazy">' : "";
+        var thumb = IMG.test(f.path)
+          ? '<img class="thumb zoomable" src="' + url + '" alt="' + esc(f.path) + '" loading="lazy">' : "";
         return '<div class="file">' + thumb + '<a href="' + url + '" target="_blank" rel="noopener">' + esc(f.path) + "</a>"
           + '<div class="sz">' + human(f.size) + (canWrite() ? ' · <a href="#" data-rm="' + esc(f.path) + '">删除</a>' : "") + "</div></div>";
       }).join("") + "</div>";
     } else {
       files += '<p class="dropnote">还没有附件。</p>';
     }
-    if (canWrite()) files += '<p class="dropnote">把日志、脚本、图拖到本页任意位置即可上传到这一步的目录，并自动在正文末尾插入引用。</p>';
+    if (canWrite()) files += '<p class="dropnote">把日志、脚本、图拖到本页任意位置即可上传，并自动在正文末尾插入引用。'
+      + '想插在正文中间就进编辑模式，直接 Ctrl+V 粘贴截图。</p>';
     files += "</div>";
 
     el.innerHTML = crumbs(s) + '<h1 class="title">' + esc(s.title || "(无标题)") + "</h1>"
       + '<div class="meta">' + meta.join("") + "</div>" + acts
       + '<div class="prose">' + body + "</div>" + back + files;
+    enhanceProse(el);
     el.scrollTop = 0;
   }
 
+  /* -------------------------------------------------------------- 编辑器 */
+
+  var TOOLS = [
+    { k: "bold", html: "<b>B</b>", title: "粗体 (Ctrl+B)", wrap: ["**", "**"], ph: "粗体" },
+    { k: "em", html: "<i>I</i>", title: "斜体 (Ctrl+I)", wrap: ["*", "*"], ph: "斜体" },
+    { k: "code", html: "&lt;/&gt;", title: "行内代码", wrap: ["`", "`"], ph: "code" },
+    { k: "h", html: "H", title: "小节标题", prefix: "## " },
+    { k: "ul", html: "•", title: "无序列表", prefix: "- " },
+    { k: "task", html: "☑", title: "任务列表", prefix: "- [ ] " },
+    { k: "quote", html: "❞", title: "引用", prefix: "> " },
+    { k: "pre", html: "{ }", title: "代码块", block: "```\n\n```", back: 4 },
+    { k: "link", html: "🔗", title: "链接", wrap: ["[", "](url)"], ph: "文字" },
+    { k: "img", html: "🖼", title: "插入图片（也可以直接 Ctrl+V 粘贴截图）" },
+    { k: "table", html: "⊞", title: "插入表格（从 Excel 复制的内容直接粘贴也会自动转表格）" },
+    { k: "hr", html: "—", title: "分隔线", block: "---" },
+  ];
+
   function renderEditor(s) {
-    $("#detail").innerHTML = crumbs(s)
-      + '<input class="title-input" id="ed-title" value="' + esc(s.title || "") + '" maxlength="200">'
-      + '<textarea class="editor" id="ed-body" spellcheck="false">' + esc(s.body || "") + "</textarea>"
-      + '<div class="acts" style="margin-top:12px;border:0">'
-      + '<button data-act="save" class="primary">保存</button><button data-act="cancel">取消</button>'
-      + '<span class="sp"></span><span class="dropnote">id 和 parent 不可改——只追加原则是溯源能成立的前提。</span></div>';
-    $("#ed-body").focus();
+    $("#detail").innerHTML =
+      '<div class="edhead">' + crumbs(s) + '<span class="sp"></span>'
+      + '<button data-act="save" class="primary">保存 <kbd>Ctrl↵</kbd></button>'
+      + '<button data-act="cancel">取消 <kbd>Esc</kbd></button></div>'
+      + '<input class="title-input" id="ed-title" value="' + esc(s.title || "") + '" maxlength="200" placeholder="标题：一行说清这一步在干什么">'
+      + '<div class="edtools">' + TOOLS.map(function (t) {
+          return '<button type="button" data-md="' + t.k + '" title="' + esc(t.title) + '">' + t.html + "</button>";
+        }).join("") + '<span class="sp"></span><span class="edhint mono" id="ed-status"></span></div>'
+      + '<div class="edsplit">'
+      + '<textarea class="editor" id="ed-body" spellcheck="false"></textarea>'
+      + '<div class="prose edpreview" id="ed-preview"></div>'
+      + "</div>"
+      + '<p class="dropnote">截图 <b>Ctrl+V</b> 直接粘贴会自动上传并插入；从 Excel / 网页表格复制的内容粘贴会自动转成 markdown 表格；'
+      + '文件也可以拖进编辑框。id 和 parent 不可改——只追加原则是溯源能成立的前提。</p>'
+      + '<input type="file" id="ed-file" multiple accept="image/*,.log,.txt,.csv,.tsv,.json,.py,.sh,.yaml,.yml,.pdf" hidden>';
+
+    var ta = $("#ed-body");
+    ta.value = s.body || "";
+    bindEditor(ta, s);
+    updatePreview(s);
+    ta.focus();
+    ta.setSelectionRange(ta.value.length, ta.value.length);
+  }
+
+  var previewTimer = null;
+  function updatePreview(s) {
+    var pv = $("#ed-preview"), ta = $("#ed-body");
+    if (!pv || !ta) return;
+    pv.innerHTML = window.md.render(ta.value, { resolve: resolverFor(s) });
+    enhanceProse(pv);
+  }
+  function schedulePreview(s) {
+    clearTimeout(previewTimer);
+    previewTimer = setTimeout(function () { updatePreview(s); }, 120);
+  }
+
+  function insertAt(ta, text, back) {
+    var a = ta.selectionStart, b = ta.selectionEnd;
+    ta.setRangeText(text, a, b, "end");
+    if (back) ta.setSelectionRange(ta.selectionEnd - back, ta.selectionEnd - back);
+    ta.focus();
+  }
+  function wrapSel(ta, before, after, placeholder) {
+    var a = ta.selectionStart, b = ta.selectionEnd;
+    var sel = ta.value.slice(a, b) || placeholder || "";
+    ta.setRangeText(before + sel + after, a, b, "end");
+    ta.setSelectionRange(a + before.length, a + before.length + sel.length);
+    ta.focus();
+  }
+  function prefixLines(ta, prefix) {
+    var v = ta.value, a = ta.selectionStart, b = ta.selectionEnd;
+    var ls = v.lastIndexOf("\n", a - 1) + 1;
+    var le = v.indexOf("\n", b);
+    if (le < 0) le = v.length;
+    var block = v.slice(ls, le).split("\n").map(function (l) { return prefix + l; }).join("\n");
+    ta.setRangeText(block, ls, le, "end");
+    ta.focus();
+  }
+  function insertBlock(ta, text, back) {
+    var v = ta.value, a = ta.selectionStart;
+    var pre = a > 0 && v[a - 1] !== "\n" ? "\n\n" : (a > 1 && v[a - 2] !== "\n" ? "\n" : "");
+    var post = v[ta.selectionEnd] && v[ta.selectionEnd] !== "\n" ? "\n\n" : "\n";
+    insertAt(ta, pre + text + post, (back || 0) + post.length);
+  }
+
+  /* 从 Excel / Google Sheets / 网页表格复制来的是制表符分隔的文本。
+     直接转成 markdown 表格——这是科研笔记里最常见的一种粘贴。 */
+  function tsvToTable(text) {
+    var lines = String(text).replace(/\r\n?/g, "\n").replace(/\n+$/, "").split("\n");
+    if (lines.length < 2 || lines.some(function (l) { return l.indexOf("\t") < 0; })) return null;
+    var rows = lines.map(function (l) { return l.split("\t"); });
+    var n = Math.max.apply(null, rows.map(function (r) { return r.length; }));
+    if (n < 2) return null;
+    var cell = function (c) { return String(c == null ? "" : c).trim().replace(/\|/g, "\\|") || " "; };
+    var pad = function (r) { while (r.length < n) r.push(""); return r; };
+    var out = ["| " + pad(rows[0]).map(cell).join(" | ") + " |",
+               "|" + rows[0].map(function () { return "---"; }).join("|") + "|"];
+    rows.slice(1).forEach(function (r) { out.push("| " + pad(r).map(cell).join(" | ") + " |"); });
+    return out.join("\n");
+  }
+
+  function uploadAuto(step, blob, filename) {
+    var h = { "Content-Type": blob.type || "application/octet-stream" };
+    if (token()) h["Authorization"] = "Bearer " + token();
+    var name = filename || blob.name || "";
+    if (name) h["X-Filename"] = encodeURIComponent(name);   // HTTP 头只能是 latin-1，中文名要先编码
+    return fetch(BASE + "/api/p/" + encodeURIComponent(PROJECT) + "/steps/"
+                 + encodeURIComponent(step.id) + "/files", { method: "POST", headers: h, body: blob })
+      .then(function (r) {
+        return r.text().then(function (t) {
+          var j = {};
+          try { j = JSON.parse(t); } catch (e) { j = { error: t.slice(0, 200) }; }
+          if (!r.ok) throw new Error(j.error || r.status);
+          return j;
+        });
+      });
+  }
+
+  function uploadIntoEditor(s, files) {
+    var ta = $("#ed-body");
+    $("#ed-status").textContent = "上传中…";
+    return files.reduce(function (chain, f) {
+      return chain.then(function () {
+        return uploadAuto(s, f).then(function (info) {
+          if (IMG.test(info.path)) {
+            insertBlock(ta, "![](" + info.path + ")", info.path.length + 3);  // 光标落在 ![|] 里，直接打图注
+          } else {
+            insertAt(ta, "[" + info.path + "](" + info.path + ")");
+          }
+          schedulePreview(s);
+        });
+      });
+    }, Promise.resolve()).then(function () {
+      $("#ed-status").textContent = "已插入 " + files.length + " 个文件";
+      setTimeout(function () { var e = $("#ed-status"); if (e) e.textContent = ""; }, 2500);
+    }).catch(function (e) { $("#ed-status").textContent = ""; fail(e); });
+  }
+
+  function bindEditor(ta, s) {
+    ta.addEventListener("input", function () { schedulePreview(s); });
+
+    ta.addEventListener("paste", function (e) {
+      var dt = e.clipboardData;
+      if (!dt) return;
+      var files = [];
+      for (var i = 0; i < (dt.items || []).length; i++) {
+        if (dt.items[i].kind === "file") {
+          var f = dt.items[i].getAsFile();
+          if (f) files.push(f);
+        }
+      }
+      if (files.length) { e.preventDefault(); uploadIntoEditor(s, files); return; }
+      var tbl = tsvToTable(dt.getData("text/plain") || "");
+      if (tbl) {
+        e.preventDefault();
+        insertBlock(ta, tbl);
+        schedulePreview(s);
+        toast("已转成 markdown 表格");
+      }
+    });
+
+    ["dragenter", "dragover"].forEach(function (ev) {
+      ta.addEventListener(ev, function (e) { e.preventDefault(); ta.classList.add("drop"); });
+    });
+    ["dragleave", "drop"].forEach(function (ev) {
+      ta.addEventListener(ev, function () { ta.classList.remove("drop"); });
+    });
+    ta.addEventListener("drop", function (e) {
+      var files = Array.prototype.slice.call(e.dataTransfer.files || []);
+      if (!files.length) return;
+      e.preventDefault();
+      uploadIntoEditor(s, files);
+    });
+
+    $("#ed-file").addEventListener("change", function (e) {
+      var files = Array.prototype.slice.call(e.target.files || []);
+      if (files.length) uploadIntoEditor(s, files);
+      e.target.value = "";
+    });
+
+    $("#detail").querySelectorAll("[data-md]").forEach(function (b) {
+      b.addEventListener("click", function (e) {
+        e.preventDefault();
+        var t = TOOLS.filter(function (x) { return x.k === b.getAttribute("data-md"); })[0];
+        if (!t) return;
+        if (t.k === "img") { $("#ed-file").click(); return; }
+        if (t.k === "table") {
+          insertBlock(ta, "| 列 1 | 列 2 | 列 3 |\n|---|---|---|\n|  |  |  |\n|  |  |  |");
+        } else if (t.wrap) {
+          wrapSel(ta, t.wrap[0], t.wrap[1], t.ph);
+        } else if (t.prefix) {
+          prefixLines(ta, t.prefix);
+        } else if (t.block) {
+          insertBlock(ta, t.block, t.back);
+        }
+        schedulePreview(s);
+      });
+    });
+  }
+
+  function saveEditor() {
+    var s = IDX[selected()];
+    if (!s) return;
+    return patch(s.id, { title: $("#ed-title").value, body: $("#ed-body").value })
+      .then(function () { editing = false; renderDetail(); refreshProjects(); toast("已保存"); })
+      .catch(fail);
   }
 
   /* -------------------------------------------------------------- 写入 */
@@ -409,19 +664,6 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }).then(function () { return refresh(); });
-  }
-
-  function upload(s, file) {
-    return fetch(BASE + "/api/p/" + encodeURIComponent(PROJECT) + "/steps/" + encodeURIComponent(s.id)
-                 + "/files/" + encodeURIComponent(file.name), {
-      method: "PUT",
-      headers: token() ? { Authorization: "Bearer " + token() } : {},
-      body: file,
-    }).then(function (r) {
-      if (!r.ok) return r.text().then(function (t) { throw new Error(t.slice(0, 200)); });
-      var ref = (IMG.test(file.name) ? "!" : "") + "[" + file.name + "](" + file.name + ")";
-      return patch(s.id, { body: (s.body || "").replace(/\s+$/, "") + "\n\n" + ref + "\n" });
-    });
   }
 
   function openNew(parentId) {
@@ -467,6 +709,20 @@
   function onHash() { renderSelection(); renderDetail(); }
 
   document.addEventListener("click", function (e) {
+    var zb = e.target.closest("#zoombar button");
+    if (zb) {
+      var k = zb.getAttribute("data-zoom");
+      if (k === "in") setZoom(zoom * 1.25);
+      else if (k === "out") setZoom(zoom / 1.25);
+      else if (k === "reset") setZoom(1);
+      else fitZoom();
+      return;
+    }
+
+    var zi = e.target.closest("img.zoomable");
+    if (zi) { e.preventDefault(); openLightbox(zi); return; }
+    if (e.target.closest("#lightbox")) { closeLightbox(); return; }
+
     var goto = e.target.closest("[data-goto]");
     if (goto) { e.preventDefault(); select(goto.getAttribute("data-goto")); scrollToSelected(); return; }
 
@@ -496,15 +752,11 @@
 
     var act = e.target.closest("[data-act]");
     if (!act) return;
-    var name = act.getAttribute("data-act"), s = IDX[selected()];
+    var name = act.getAttribute("data-act");
     if (name === "edit") { editing = true; renderDetail(); }
     else if (name === "cancel") { editing = false; renderDetail(); }
     else if (name === "child") { openNew(selected()); }
-    else if (name === "save") {
-      patch(s.id, { title: $("#ed-title").value, body: $("#ed-body").value })
-        .then(function () { editing = false; renderDetail(); toast("已保存"); })
-        .catch(fail);
-    }
+    else if (name === "save") { saveEditor(); }
   });
 
   $("#proj").addEventListener("change", function (e) {
@@ -527,16 +779,28 @@
   $("#nf-ok").addEventListener("click", function (e) { e.preventDefault(); $("#dlg-new").close(); submitNew(); });
   window.addEventListener("hashchange", onHash);
 
+  // Ctrl/⌘ + 滚轮缩放图视图
+  $("#scroller").addEventListener("wheel", function (e) {
+    if (!(e.ctrlKey || e.metaKey) || view !== "graph") return;
+    e.preventDefault();
+    setZoom(zoom * (e.deltaY < 0 ? 1.1 : 1 / 1.1));
+  }, { passive: false });
+
   document.addEventListener("keydown", function (e) {
+    if (!$("#lightbox").hidden && e.key === "Escape") { closeLightbox(); return; }
     var t = e.target.tagName;
     if (t === "INPUT" || t === "TEXTAREA" || t === "SELECT") {
-      if (e.key === "Escape") e.target.blur();
-      if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && e.target.id === "ed-body") {
-        e.preventDefault();
-        var s = IDX[selected()];
-        patch(s.id, { title: $("#ed-title").value, body: $("#ed-body").value })
-          .then(function () { editing = false; renderDetail(); toast("已保存"); }).catch(fail);
+      if (e.target.id === "ed-body" || e.target.id === "ed-title") {
+        if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); saveEditor(); return; }
+        if ((e.metaKey || e.ctrlKey) && (e.key === "b" || e.key === "B")) {
+          e.preventDefault(); wrapSel($("#ed-body"), "**", "**", "粗体"); schedulePreview(IDX[selected()]); return;
+        }
+        if ((e.metaKey || e.ctrlKey) && (e.key === "i" || e.key === "I")) {
+          e.preventDefault(); wrapSel($("#ed-body"), "*", "*", "斜体"); schedulePreview(IDX[selected()]); return;
+        }
+        if (e.key === "Escape") { e.preventDefault(); editing = false; renderDetail(); return; }
       }
+      if (e.key === "Escape") e.target.blur();
       return;
     }
     if (e.key === "/") { e.preventDefault(); $("#search").focus(); return; }
@@ -555,25 +819,33 @@
     else if (e.key === "Escape") { if (editing) { editing = false; renderDetail(); } else select(""); }
   });
 
-  // 拖拽上传
+  // 阅读模式下拖文件到详情面板：上传并追加到正文末尾
   if (canWrite() && PROJECT) {
     var det = $("#detail");
     ["dragenter", "dragover"].forEach(function (ev) {
-      det.addEventListener(ev, function (e) { e.preventDefault(); det.classList.add("drop"); });
+      det.addEventListener(ev, function (e) { if (!editing) { e.preventDefault(); det.classList.add("drop"); } });
     });
     ["dragleave", "drop"].forEach(function (ev) {
       det.addEventListener(ev, function () { det.classList.remove("drop"); });
     });
     det.addEventListener("drop", function (e) {
+      if (editing) return;
       e.preventDefault();
       var s = IDX[selected()];
       if (!s) { toast("先选一个步骤", true); return; }
-      var files = Array.prototype.slice.call(e.dataTransfer.files);
+      var files = Array.prototype.slice.call(e.dataTransfer.files || []);
       if (!files.length) return;
+      var body = s.body || "";
       files.reduce(function (chain, f) {
-        return chain.then(function () { return upload(IDX[s.id] || s, f); });
+        return chain.then(function () {
+          return uploadAuto(s, f).then(function (info) {
+            body = body.replace(/\s+$/, "") + "\n\n"
+              + (IMG.test(info.path) ? "!" : "") + "[" + info.path + "](" + info.path + ")\n";
+          });
+        });
       }, Promise.resolve())
-        .then(function () { toast("已上传 " + files.length + " 个文件"); })
+        .then(function () { return patch(s.id, { body: body }); })
+        .then(function () { toast("已上传 " + files.length + " 个文件并写入正文"); })
         .catch(fail);
     });
   }
@@ -590,6 +862,7 @@
     $("#live").className = "dot";
     $("#live").title = "静态导出 — 只读";
   }
+  $("#lb-close").addEventListener("click", closeLightbox);
 
   function boot(id) {
     var el = document.getElementById(id);
@@ -597,7 +870,8 @@
     try { return raw ? JSON.parse(raw) : null; } catch (e) { return null; }
   }
 
-  PROJECTS = boot("projects-data") ? (boot("projects-data").projects || boot("projects-data")) : [];
+  var pb = boot("projects-data");
+  PROJECTS = pb ? (pb.projects || pb) : [];
   renderProjects();
 
   $("#home").hidden = !!PROJECT;
@@ -623,7 +897,7 @@
       if (v !== seen) {
         seen = v;
         refreshProjects();
-        if (PROJECT && !editing) refresh();
+        if (PROJECT && !editing) refresh();   // 正在编辑时不要把用户的输入冲掉
       }
     };
   }

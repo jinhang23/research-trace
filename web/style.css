@@ -123,7 +123,11 @@ main { display: flex; height: calc(100% - 41px); align-items: stretch; }
   display: flex; gap: 14px; padding: 6px 14px; font-size: 11px;
   color: var(--muted); border-top: 1px solid var(--rule); background: var(--panel);
 }
+#legend .sp { flex: 1; }
 #legend i { display: inline-block; width: 18px; border-top-width: 2px; vertical-align: middle; margin-right: 5px; }
+#zoombar { display: flex; gap: 3px; align-items: center; }
+#zoombar button { padding: 1px 7px; font-size: 11px; line-height: 16px; min-width: 24px; }
+#zoomval { font-family: var(--mono); font-size: 10.5px; }
 #legend .done { border-top-style: solid; border-color: var(--done); }
 #legend .wip  { border-top-style: dashed; border-color: var(--wip); }
 #legend .dead { border-top-style: dotted; border-color: var(--dead); }
@@ -192,34 +196,72 @@ main { display: flex; height: calc(100% - 41px); align-items: stretch; }
 .acts { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 18px; padding-bottom: 14px; border-bottom: 1px solid var(--rule); }
 .acts .sp { flex: 1; }
 
-/* 正文用衬线，机器记录用等宽——一眼分清哪些是自动来的、哪些是自己判断的 */
-.prose { font-family: var(--serif); font-size: 15.5px; line-height: 1.85; }
+/* 正文用衬线，机器记录用等宽——一眼分清哪些是自动来的、哪些是自己判断的。
+   行长限制在 ~76 个字符：这是人眼舒适的阅读宽度，超过就容易串行。 */
+.prose { font-family: var(--serif); font-size: 15.5px; line-height: 1.85; max-width: 76ch; }
 .prose h1, .prose h2, .prose h3, .prose h4 {
   font-family: var(--sans); font-weight: 600; line-height: 1.4;
-  margin: 1.7em 0 .55em; color: var(--ink);
+  margin: 1.9em 0 .6em; color: var(--ink);
 }
 .prose h1 { font-size: 17px; } .prose h2 { font-size: 15.5px; } .prose h3 { font-size: 14px; }
-.prose h2 { border-bottom: 1px solid var(--rule); padding-bottom: 4px; }
+.prose h2 { border-bottom: 1px solid var(--rule); padding-bottom: 5px; }
 .prose > :first-child { margin-top: 0; }
-.prose p { margin: .7em 0; }
+.prose p { margin: .75em 0; }
 .prose ul, .prose ol { padding-left: 1.5em; margin: .6em 0; }
-.prose li { margin: .25em 0; }
-.prose code { font-family: var(--mono); font-size: .85em; background: var(--hi); padding: 1px 5px; border-radius: 3px; }
-.prose pre.code {
-  font-family: var(--mono); font-size: 12px; line-height: 1.6;
-  background: var(--hi); border: 1px solid var(--rule); border-radius: 5px;
-  padding: 10px 12px; overflow-x: auto;
-}
-.prose pre.code code { background: none; padding: 0; font-size: inherit; }
-.prose blockquote { margin: .8em 0; padding: 2px 0 2px 14px; border-left: 3px solid var(--rule); color: var(--muted); }
-.prose img { max-width: 100%; border-radius: 5px; border: 1px solid var(--rule); }
+.prose li { margin: .3em 0; }
 .prose a { color: var(--accent); }
 .prose a.wikilink { font-family: var(--mono); font-size: .88em; padding: 0 3px; border-bottom: 1px dashed var(--accent); text-decoration: none; }
-.prose hr { border: 0; border-top: 1px solid var(--rule); margin: 1.6em 0; }
-.tablewrap { overflow-x: auto; margin: 1em 0; }
-.prose table { border-collapse: collapse; font-family: var(--sans); font-size: 13px; }
-.prose th, .prose td { border: 1px solid var(--rule); padding: 5px 10px; text-align: left; }
-.prose th { background: var(--hi); }
+.prose hr { border: 0; border-top: 1px solid var(--rule); margin: 1.8em 0; }
+.prose blockquote { margin: 1em 0; padding: 2px 0 2px 15px; border-left: 3px solid var(--rule); color: var(--muted); }
+
+/* 任务列表 */
+.prose ul.tasks { list-style: none; padding-left: .2em; }
+.prose ul.tasks .task { display: flex; gap: 8px; align-items: flex-start; }
+.prose ul.tasks input { margin-top: .45em; accent-color: var(--accent); }
+
+/* 行内代码 / 代码块 */
+.prose code { font-family: var(--mono); font-size: .85em; background: var(--hi); padding: 1px 5px; border-radius: 3px; }
+.prose pre.code {
+  position: relative; font-family: var(--mono); font-size: 12.5px; line-height: 1.65;
+  background: var(--hi); border: 1px solid var(--rule); border-radius: 6px;
+  padding: 12px 14px; overflow-x: auto; margin: 1em 0;
+}
+.prose pre.code code { background: none; padding: 0; font-size: inherit; }
+.prose pre.code[data-lang]::before {
+  content: attr(data-lang); position: absolute; top: 0; right: 58px;
+  font-family: var(--mono); font-size: 10px; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--muted); background: var(--rule); padding: 1px 6px; border-radius: 0 0 4px 4px;
+}
+.prose pre.code .copy {
+  position: absolute; top: 5px; right: 6px; padding: 2px 8px; font-size: 11px;
+  opacity: 0; transition: opacity .12s;
+}
+.prose pre.code:hover .copy, .prose pre.code .copy:focus { opacity: 1; }
+
+/* 图片：独占一段的渲染成 figure，图注在下方。点击放大看原图。 */
+.prose img { max-width: 100%; height: auto; border-radius: 5px; }
+.prose figure { margin: 1.5em 0; text-align: center; }
+.prose figure img {
+  border: 1px solid var(--rule); background: var(--panel);
+  box-shadow: 0 2px 10px rgba(0,0,0,.07); max-height: 62vh; object-fit: contain;
+}
+.prose figcaption {
+  font-family: var(--sans); font-size: 12px; color: var(--muted);
+  margin-top: 8px; line-height: 1.6; text-align: center;
+}
+.prose img.inline-img { vertical-align: middle; max-height: 1.6em; border: 1px solid var(--rule); }
+img.zoomable { cursor: zoom-in; }
+
+/* 表格：数字列右对齐 + 等宽数字，小数点自然成列；宽表格在自己的容器里横向滚动 */
+.tablewrap { overflow-x: auto; margin: 1.2em 0; border: 1px solid var(--rule); border-radius: 6px; }
+.prose table { border-collapse: collapse; font-family: var(--sans); font-size: 13px; width: 100%; }
+.prose th, .prose td { padding: 7px 12px; text-align: left; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+.prose th { background: var(--hi); font-weight: 600; position: sticky; top: 0; }
+.prose tbody tr:nth-child(even) { background: color-mix(in srgb, var(--hi) 45%, transparent); }
+.prose tbody tr:last-child td { border-bottom: 0; }
+.prose td.ta-right, .prose th.ta-right { text-align: right; font-variant-numeric: tabular-nums; }
+.prose td.ta-center, .prose th.ta-center { text-align: center; }
+.prose td.ta-left, .prose th.ta-left { text-align: left; }
 
 .sec { margin-top: 26px; padding-top: 14px; border-top: 1px solid var(--rule); }
 .sec > h3 { font-size: 11px; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); margin: 0 0 10px; font-weight: 600; }
@@ -231,11 +273,71 @@ main { display: flex; height: calc(100% - 41px); align-items: stretch; }
 .thumb { display: block; max-width: 210px; max-height: 150px; border-radius: 3px; margin-bottom: 5px; }
 .dropnote { color: var(--muted); font-size: 12px; margin-top: 10px; }
 
-.editor { width: 100%; min-height: 340px; font-family: var(--mono); font-size: 13px; line-height: 1.7;
-  padding: 12px; border: 1px solid var(--rule); border-radius: 5px; background: var(--panel); color: var(--ink); resize: vertical; }
-.editor:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
-.title-input { width: 100%; font-family: var(--serif); font-size: 19px; padding: 6px 8px; margin-bottom: 10px;
+/* ---------------------------------------------------------------- 编辑器 */
+
+/* 编辑时让详情面板占满整个工作区：写「为什么」是这个系统的核心动作，
+   值得一块像样的书写台，而不是挤在半边侧栏里。 */
+body.editing #left { display: none; }
+body.editing #detail { padding: 16px 22px 24px; display: flex; flex-direction: column; }
+
+.edhead { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.edhead .sp { flex: 1; }
+.edhead .crumbs { margin: 0; }
+kbd {
+  font-family: var(--mono); font-size: 10px; padding: 1px 4px; margin-left: 4px;
+  border: 1px solid currentColor; border-radius: 3px; opacity: .6;
+}
+
+.title-input { width: 100%; font-family: var(--serif); font-size: 19px; padding: 7px 10px; margin-bottom: 10px;
   border: 1px solid var(--rule); border-radius: 5px; background: var(--panel); color: var(--ink); }
+.title-input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+.edtools {
+  display: flex; align-items: center; gap: 3px; flex-wrap: wrap;
+  padding: 5px 6px; border: 1px solid var(--rule); border-bottom: 0; border-radius: 6px 6px 0 0;
+  background: var(--panel);
+}
+.edtools .sp { flex: 1; }
+.edtools button {
+  min-width: 30px; height: 26px; padding: 0 7px; font-size: 12.5px; line-height: 1;
+  border-color: transparent; background: transparent;
+}
+.edtools button:hover { background: var(--hi); border-color: var(--rule); }
+.edhint { font-size: 11px; color: var(--muted); padding-right: 4px; }
+
+.edsplit {
+  flex: 1; min-height: 380px; display: grid; grid-template-columns: 1fr 1fr; gap: 0;
+  border: 1px solid var(--rule); border-radius: 0 0 6px 6px; overflow: hidden;
+}
+.editor {
+  width: 100%; height: 100%; min-height: 380px; font-family: var(--mono); font-size: 13px; line-height: 1.75;
+  padding: 14px 16px; border: 0; border-right: 1px solid var(--rule);
+  background: var(--panel); color: var(--ink); resize: none; outline: none;
+}
+.editor.drop { background: color-mix(in srgb, var(--accent) 10%, var(--panel)); }
+.edpreview { padding: 14px 18px; overflow: auto; background: var(--bg); max-width: none; }
+.edpreview > :first-child { margin-top: 0; }
+
+@media (max-width: 1080px) {
+  .edsplit { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
+  .editor { border-right: 0; border-bottom: 1px solid var(--rule); }
+}
+
+/* ---------------------------------------------------------------- 灯箱 */
+
+#lightbox {
+  position: fixed; inset: 0; z-index: 40; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 14px; padding: 40px;
+  background: rgba(0,0,0,.86); cursor: zoom-out;
+}
+#lightbox[hidden] { display: none; }
+#lb-img { max-width: 100%; max-height: calc(100vh - 130px); border-radius: 4px; background: #fff; }
+#lb-cap { color: #ddd; font-size: 13px; text-align: center; max-width: 80ch; line-height: 1.7; }
+#lb-close {
+  position: absolute; top: 16px; right: 20px; width: 34px; height: 34px; padding: 0;
+  font-size: 20px; line-height: 1; color: #eee; background: rgba(255,255,255,.14); border-color: transparent;
+}
+#lb-close:hover { background: rgba(255,255,255,.26); }
 
 /* ---------------------------------------------------------------- dialog */
 
@@ -266,7 +368,10 @@ dialog menu { display: flex; justify-content: flex-end; gap: 8px; padding: 0; ma
 
 /* 边画在 SVG 上，节点是叠在上面的 HTML 卡片——这样文本截断、hover、
    焦点态都用原生 CSS 就能做，不必和 foreignObject 搏斗。 */
-#diagram { position: relative; }
+/* #dwrap 承担缩放后的实际尺寸（决定滚动范围），#diagram 保持自然尺寸并整体 scale。
+   两者分开，缩放才不会把滚动条算错。 */
+#dwrap { position: relative; }
+#diagram { position: relative; transform-origin: 0 0; }
 #dedges { position: absolute; left: 0; top: 0; pointer-events: none; }
 #dnodes { position: absolute; left: 0; top: 0; }
 
@@ -304,6 +409,7 @@ dialog menu { display: flex; justify-content: flex-end; gap: 8px; padding: 0; ma
 .card.s-done .cst { color: var(--done); }
 .card.s-wip  .cst { color: var(--wip); }
 .card.s-dead .cst { color: var(--dead); }
+.card .cmk { font-size: 9.5px; opacity: .75; }
 .card .cdate { margin-left: auto; }
 .card .ctitle {
   font-size: 12.5px; line-height: 1.42; max-height: 2.84em;
