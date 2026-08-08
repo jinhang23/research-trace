@@ -32,11 +32,17 @@ def test_declared_component_directories_exist_and_are_not_empty():
     assert (ROOT / "skills" / "research-trace" / "SKILL.md").is_file()
 
 
-def test_plugin_does_not_declare_directories_it_has_no_content_for():
-    for key in ("agents", "hooks", "outputStyles", "lspServers"):
-        if key in PLUGIN:
-            target = ROOT / str(PLUGIN[key]).lstrip("./")
-            assert target.exists(), f"清单声明了 {key} 但 {target} 不存在"
+def test_plugin_never_points_at_something_that_is_not_there():
+    """路径字段可以是目录字符串，也可以是文件数组（两种真实插件里都有）。"""
+    for key in ("skills", "commands", "agents", "hooks", "outputStyles", "lspServers"):
+        val = PLUGIN.get(key)
+        if val is None:
+            continue
+        for rel in ([val] if isinstance(val, str) else val):
+            target = ROOT / str(rel).lstrip("./")
+            assert target.exists(), f"清单声明了 {key} → {rel}，但 {target} 不存在"
+            if target.is_dir():
+                assert any(target.iterdir()), f"{key} 指向的 {target} 是空目录，加载时会报警告"
 
 
 # ------------------------------------------------------------ MCP server 声明
@@ -175,3 +181,75 @@ def test_discovery_survives_a_broken_config_json(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("TRACE_TOKEN", "")
     monkeypatch.setenv("TRACE_DATA", str(d))
     assert M.make_backend().token == ""      # 不崩，只是找不到
+
+
+# ------------------------------------------------------------ agents / skills 的约定
+# 对照真实插件（addy-agent-skills、claude-brain-sync）的写法。
+
+
+AGENT_DIR = ROOT / "agents"
+SKILL_DIR = ROOT / "skills"
+
+
+def _frontmatter(p: Path) -> dict:
+    text = p.read_text(encoding="utf-8")
+    assert text.startswith("---\n"), f"{p.name} 缺 front-matter"
+    body = text.split("\n---", 1)
+    assert len(body) == 2, f"{p.name} 的 front-matter 没有闭合"
+    out = {}
+    for line in body[0].split("\n")[1:]:
+        if ":" in line:
+            k, _, v = line.partition(":")
+            out[k.strip()] = v.strip()
+    return out
+
+
+def test_every_declared_agent_file_exists():
+    for rel in PLUGIN["agents"]:
+        assert (ROOT / rel.lstrip("./")).is_file(), f"清单声明了 {rel} 但文件不在"
+
+
+def test_agents_have_the_conventional_frontmatter():
+    for p in sorted(AGENT_DIR.glob("*.md")):
+        fm = _frontmatter(p)
+        assert fm.get("name") == p.stem, f"{p.name} 的 name 要和文件名一致"
+        assert len(fm.get("description", "")) > 80, f"{p.name} 的 description 太短，触发不了"
+        assert fm.get("model") in ("sonnet", "opus", "haiku", "inherit"), fm.get("model")
+
+
+def test_the_auditor_cannot_write():
+    """审计只查证不改动 —— 要不要复现是用户的决定，不是它的。"""
+    fm = _frontmatter(AGENT_DIR / "trace-auditor.md")
+    banned = {t.strip() for t in fm.get("disallowedTools", "").split(",")}
+    assert {"Write", "Edit"} <= banned, "auditor 必须禁掉写工具"
+    assert "Write" not in fm.get("tools", "")
+
+
+def test_every_agent_file_is_declared_in_the_manifest():
+    declared = {Path(r).name for r in PLUGIN["agents"]}
+    on_disk = {p.name for p in AGENT_DIR.glob("*.md")}
+    assert declared == on_disk, f"清单少了: {on_disk - declared}；多了: {declared - on_disk}"
+
+
+def test_skills_follow_the_directory_convention():
+    """真实插件的写法：skills/<名字>/SKILL.md，name 与目录名一致。"""
+    dirs = [d for d in SKILL_DIR.iterdir() if d.is_dir()]
+    assert dirs, "skills/ 是空的"
+    for d in dirs:
+        f = d / "SKILL.md"
+        assert f.is_file(), f"{d.name} 里没有 SKILL.md"
+        fm = _frontmatter(f)
+        assert fm.get("name") == d.name, f"{d.name}/SKILL.md 的 name 要和目录名一致"
+        assert len(fm.get("description", "")) > 60, f"{d.name} 的 description 太短"
+
+
+def test_the_audit_skill_delegates_instead_of_doing_the_work_itself():
+    """查证归 auditor、重跑归 reproducer，skill 只负责问用户和写回。"""
+    s = (SKILL_DIR / "trace-audit" / "SKILL.md").read_text(encoding="utf-8")
+    assert "trace-auditor" in s and "trace-reproducer" in s
+    assert "AskUserQuestion" in s, "问用户是 skill 的活，子 agent 问不了"
+
+
+def test_the_plugin_has_a_license():
+    assert (ROOT / "LICENSE").is_file()
+    assert PLUGIN.get("license") == "MIT"

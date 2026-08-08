@@ -91,21 +91,34 @@ python trace_cli.py serve                           # 起服务，终端会打�
 ## 目录结构
 
 ```
-trace/
-├── trace_core.py     纯函数内核：scan/parse/validate/order/lanes/tree/compile（零依赖）
-├── trace_write.py    唯一写入路径 —— CLI / 网页 / agent API 全走这里
-├── trace_server.py   FastAPI：路由 + SSE + 鉴权
-├── trace_git.py      debounce 自动 commit + push
-├── trace_cli.py      init / projects / new-project / new / check / paths / build / serve / url
-├── trace_mcp.py      MCP server（手写 JSON-RPC，零依赖；两种后端：远端 HTTP / 本地文件）
-├── web/              index.html · app.js · md.js · style.css（无构建步骤，不引 CDN）
-├── tests/            172 个 Python 断言 + 25 个 markdown 渲染断言（node --test）
-├── projects/         ← 你的数据（仓库里自带一个示例项目，数字均为虚构，删掉即可）
-│   └── <slug>/
-│       ├── project.md            可选，只有一个 name 字段
-│       └── steps/<id>_<slug>/note.md + 任意文件
-└── deploy/           Caddyfile · systemd unit · 部署说明
+research-trace/                     ← 仓库本身就是插件
+├── .claude-plugin/
+│   ├── plugin.json                 插件清单：skills / commands / agents / mcpServers / userConfig
+│   └── marketplace.json            市场目录，于是 /plugin marketplace add 就能装
+├── agents/                         子 agent
+│   ├── trace-auditor.md            查证：路径还在不在、commit 解不解析得出来（只读，不重跑）
+│   └── trace-reproducer.md         重跑：按商定范围复现并写回 repro 记录
+├── skills/
+│   ├── research-trace/SKILL.md     日常记录的规矩
+│   └── trace-audit/SKILL.md        溯源评估的对话流程（派 agent、问用户、写回）
+├── commands/doctor.md              /research-trace:doctor —— 诊断 MCP 接通没有
+│
+├── trace_core.py                   纯函数内核：scan/parse/validate/order/lanes/tree/traceability
+├── trace_write.py                  唯一写入路径 —— CLI / 网页 / MCP 全走这里
+├── trace_mcp.py                    MCP server（手写 JSON-RPC，零依赖）← 插件清单指向它
+├── trace_server.py                 FastAPI：路由 + SSE + 鉴权
+├── trace_git.py                    debounce 自动 commit + push（同步的是数据仓）
+├── trace_cli.py                    init / projects / new / check / paths / build / serve / url
+├── web/                            无构建步骤，不引 CDN
+├── tests/                          218 个 Python 断言 + 25 个 markdown 渲染断言
+├── FORMAT.md                       记录格式标准：写什么、怎么可视化、L0–L4 怎么判
+├── deploy/                         Caddyfile · systemd unit · 部署说明
+└── projects/                       ← 你的数据（上线时用 --data-dir 指到私有仓库）
 ```
+
+Python 模块留在仓库根，因为这个仓库同时也是一个 pip 包（`pyproject.toml` 在根，
+`trace-mcp` 是它的入口点）和一个能独立跑的服务；插件清单用
+`${CLAUDE_PLUGIN_ROOT}/trace_mcp.py` 指过去，装的时候整份都会进插件缓存。
 
 只有一个函数会创建 `note.md`。上一代系统的 bug 根源就是存在第二条写入路径
 （绕过 API 直接写库），导致父子关系只写进了一半的地方。这里用结构杜绝。
