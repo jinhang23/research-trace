@@ -1,7 +1,7 @@
 {
   "name": "research-trace",
   "displayName": "科研溯源 trace",
-  "version": "0.9.0",
+  "version": "1.0.0",
   "description": "把科研过程记录成一棵只追加的步骤树：每一步自带代码、日志、产物和一句「我为什么要做这一步」，从任何结果都能回溯到最初的问题。带 8 个 MCP 工具（零依赖，手写 JSON-RPC）、多项目、图/列表双视图、外部产物路径溯源、L0–L4 可溯源性评级、项目级洞察沉淀。",
   "author": {
     "name": "Jinhang Wei"
@@ -23,10 +23,16 @@
     "./agents/trace-reproducer.md"
   ],
   "userConfig": {
+    "role": {
+      "type": "string",
+      "title": "这台机器的角色",
+      "description": "三选一，装完随时可以在 /plugin 里改：\n  server —— 服务端。数据仓在这台机器上，直接读写文件。只填下面的「数据仓目录」。\n  client —— 客户端。数据在另一台机器的域名后面，通过公网管理。填「远端服务地址」和「写入令牌」。\n  auto   —— 不确定就用它：填了地址走远端，只填了目录走本地。\n填错了不会静默退回另一种模式，会当场报出来。",
+      "default": "auto"
+    },
     "data_dir": {
       "type": "directory",
       "title": "数据仓目录",
-      "description": "步骤树所在的目录（里面是 projects/）。**多数人只需要填这一项**：agent 和数据在同一台机器上时直接读写文件，不走网络，也就不需要令牌。只有当数据在另一台机器的域名后面时，才改填下面的远端地址。"
+      "description": "步骤树所在的目录 —— 是**含有** projects/ 的那一层，不是 projects/ 本身（指错一层会造出 projects/projects）。目录不存在会自动建出来。服务端 / auto 角色填这个；客户端留空。"
     },
     "url": {
       "type": "string",
@@ -53,6 +59,7 @@
         "${CLAUDE_PLUGIN_ROOT}/trace_mcp.py"
       ],
       "env": {
+        "TRACE_ROLE": "${user_config.role}",
         "TRACE_DATA": "${user_config.data_dir}",
         "TRACE_URL": "${user_config.url}",
         "TRACE_TOKEN": "${user_config.token}"

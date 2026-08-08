@@ -293,3 +293,109 @@ def test_every_frontmatter_actually_parses_as_yaml():
         except yaml.YAMLError as e:
             raise AssertionError(f"{f.relative_to(ROOT)} 的 frontmatter 不是合法 YAML：{e}") from None
         assert isinstance(meta, dict) and meta.get("description"), f.name
+
+
+# ------------------------------------------------------------ 角色
+# 装的时候问清楚是服务端还是客户端，配错了当场报出来 ——
+# 「我选了客户端，怎么读到的是本地空目录」这种问题最难查。
+
+
+@pytest.fixture(autouse=False)
+def clean_env(monkeypatch, tmp_path):
+    for k in ("TRACE_ROLE", "TRACE_URL", "TRACE_TOKEN", "TRACE_DATA"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("TRACE_CONFIG", str(tmp_path / "没有这个文件.json"))
+    return monkeypatch
+
+
+def test_role_is_offered_at_install_time():
+    spec = PLUGIN["userConfig"]["role"]
+    assert spec["default"] == "auto"
+    for v in ("server", "client", "auto"):
+        assert v in spec["description"], f"说明里要写清 {v} 是干什么的"
+    assert "TRACE_ROLE" in PLUGIN["mcpServers"]["trace"]["env"]
+
+
+def test_client_without_a_url_says_so(clean_env):
+    clean_env.setenv("TRACE_ROLE", "client")
+    with pytest.raises(M.ToolError, match="客户端"):
+        M.make_backend()
+
+
+def test_server_without_a_data_dir_says_so(clean_env):
+    clean_env.setenv("TRACE_ROLE", "server")
+    with pytest.raises(M.ToolError, match="服务端"):
+        M.make_backend()
+
+
+def test_an_unknown_role_is_refused(clean_env):
+    clean_env.setenv("TRACE_ROLE", "随便")
+    with pytest.raises(M.ToolError, match="auto/server/client"):
+        M.make_backend()
+
+
+def test_the_role_decides_even_when_both_are_filled(clean_env, tmp_path):
+    clean_env.setenv("TRACE_URL", "https://x/t/s")
+    clean_env.setenv("TRACE_DATA", str(tmp_path))
+    clean_env.setenv("TRACE_ROLE", "client")
+    assert isinstance(M.make_backend(), M.HttpBackend)
+    clean_env.setenv("TRACE_ROLE", "server")
+    assert isinstance(M.make_backend(), M.LocalBackend), "服务端本地直读，不该绕 HTTP"
+    clean_env.setenv("TRACE_ROLE", "auto")
+    assert isinstance(M.make_backend(), M.HttpBackend), "auto 下远端优先"
+
+
+def test_role_can_come_from_the_config_file_too(clean_env, tmp_path):
+    cfg = tmp_path / "c.json"
+    cfg.write_text(json.dumps({"role": "server", "data": str(tmp_path / "仓")}), encoding="utf-8")
+    clean_env.setenv("TRACE_CONFIG", str(cfg))
+    assert isinstance(M.make_backend(), M.LocalBackend)
+
+
+# ------------------------------------------------------------ 自检
+# 新机器上装完跑一条命令就知道能不能用。不需要 Claude、不需要网络。
+
+
+def test_selfcheck_passes_on_a_working_local_setup(tmp_path: Path, monkeypatch, capsys):
+    monkeypatch.setenv("TRACE_ROLE", "server")
+    monkeypatch.setenv("TRACE_DATA", str(tmp_path))
+    monkeypatch.setenv("TRACE_CONFIG", str(tmp_path / "无.json"))
+    assert M.selfcheck() == 0
+    out = capsys.readouterr().out
+    assert "全部通过" in out
+    assert f"{len(M.TOOLS)} 个工具" in out
+
+
+def test_selfcheck_fails_loudly_on_a_misconfiguration(tmp_path: Path, monkeypatch, capsys):
+    monkeypatch.setenv("TRACE_ROLE", "client")
+    monkeypatch.delenv("TRACE_URL", raising=False)
+    monkeypatch.setenv("TRACE_CONFIG", str(tmp_path / "无.json"))
+    assert M.selfcheck() == 1
+    assert "客户端" in capsys.readouterr().out
+
+
+def test_selfcheck_warns_when_the_data_dir_is_the_projects_dir_itself(tmp_path: Path, monkeypatch, capsys):
+    """指到 projects/ 本身而不是它的父目录 —— 新机器上最容易犯的配置错，要当场报。"""
+    import trace_core as core
+
+    core.ensure_layout(tmp_path)                                   # tmp/projects/
+    monkeypatch.setenv("TRACE_ROLE", "server")
+    monkeypatch.setenv("TRACE_DATA", str(tmp_path / "projects"))   # 指深了一层
+    monkeypatch.setenv("TRACE_CONFIG", str(tmp_path / "无.json"))
+    M.selfcheck()
+    out = capsys.readouterr().out
+    assert "指深了一层" in out and "父目录" in out
+
+
+def test_selfcheck_flags_the_ghost_project_left_behind(tmp_path: Path, monkeypatch, capsys):
+    """指错一层会留下一个空的 projects/projects，之后指对了它就冒出来当项目。"""
+    import trace_core as core
+
+    core.ensure_layout(tmp_path)
+    (tmp_path / "projects" / "projects" / "steps").mkdir(parents=True)   # 上次指错留下的
+    monkeypatch.setenv("TRACE_ROLE", "server")
+    monkeypatch.setenv("TRACE_DATA", str(tmp_path))
+    monkeypatch.setenv("TRACE_CONFIG", str(tmp_path / "无.json"))
+    M.selfcheck()
+    out = capsys.readouterr().out
+    assert "空壳项目" in out and "projects" in out

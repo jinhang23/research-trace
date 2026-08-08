@@ -110,7 +110,7 @@ research-trace/                     ← 仓库本身就是插件
 ├── trace_git.py                    debounce 自动 commit + push（同步的是数据仓）
 ├── trace_cli.py                    init / projects / new / check / paths / build / serve / url
 ├── web/                            无构建步骤，不引 CDN
-├── tests/                          233 个 Python 断言 + 25 个 markdown 渲染断言
+├── tests/                          243 个 Python 断言 + 25 个 markdown 渲染断言
 ├── FORMAT.md                       记录格式标准：写什么、怎么可视化、L0–L4 怎么判
 ├── deploy/                         Caddyfile · systemd unit · 部署说明
 └── projects/                       ← 你的数据（上线时用 --data-dir 指到私有仓库）
@@ -209,25 +209,35 @@ grep -rn "^path:" projects/                # 删掉全部程序之后照样能�
 /plugin install research-trace@research-trace
 ```
 
-装的时候会弹一个配置框问四件事，填完就通了，不需要 pip install 任何东西
-（MCP server 零依赖）：
+装的时候会弹一个配置框，**第一项先问这台机器是什么角色**，装完随时可以在
+`/plugin` 里改：
+
+| 角色 | 什么情况 | 要填 |
+|---|---|---|
+| **server** | 数据仓就在这台机器上，直接读写文件 | 数据仓目录 |
+| **client** | 数据在另一台机器的域名后面，你通过公网管理 | 远端服务地址 + 写入令牌 |
+| **auto**（默认） | 不确定就用它：填了地址走远端，只填了目录走本地 | 按需 |
+
+选定角色之后**配错会当场报出来**，不会悄悄退回另一种模式 ——
+「我选了客户端，怎么读到的是本地空目录」这种问题最难查。
 
 | 配置项 | 填什么 |
 |---|---|
-| 数据仓目录 | 步骤树所在的目录（里面是 `projects/`）。**多数人只填这一项** |
-| 远端服务地址 | 只在数据放在另一台机器上时才要。`https://你的域名/t/<space>` |
+| 这台机器的角色 | server / client / auto |
+| 数据仓目录 | **含有** `projects/` 的那一层，不是 `projects/` 本身（指错一层会造出 `projects/projects`）|
+| 远端服务地址 | `https://你的域名/t/<space>`，客户端才填 |
 | 写入令牌 | 多数人不用填，见下 |
 | Python 解释器 | 默认 `python3`。**Windows 上多半要改成绝对路径** |
 
-**令牌你不用自己想一个**，也多半不用填。它在 `trace_cli.py init` 建服务时就随机
-生成好了，写在服务器的 `config.json` 里（`trace_cli.py url` 能查到）。三种情况留空即可：
+**装完先自检。** 一条命令，不需要 Claude、不需要网络（本地模式下）：
 
-- 只填了数据仓目录 —— 直接读写文件，不走网络，没有鉴权这回事
-- 服务就跑在本机 —— 程序会自己去 `config.json` 里找，**并且只在 `space` 对得上
-  时才用**（本地留着的可能是另一台服务器的令牌，拿去用只会换来莫名其妙的 401）
-- 只读不写 —— 读是公开的
+```bash
+python <插件根>/trace_mcp.py --selfcheck
+```
 
-只有「往另一台机器上的服务写入」这一种情况，才需要把它从服务器复制过来。
+它会报解释器版本、配置从哪读的、角色、后端、项目数，并**真跑一遍 JSON-RPC 握手**。
+通不通、哪一项要改，它自己会说。插件根目录可以用 `claude mcp list` 或在
+`~/.claude/plugins/cache/` 下找 research-trace。
 
 最后一项值得单说：`.mcp.json` 的 `command` 是静态字符串，而 `python` 在 Windows 上
 经常指向别的软件自带的 2.x（作者机器上就是 MGLTools 的 Python 2.7.11），`python3`

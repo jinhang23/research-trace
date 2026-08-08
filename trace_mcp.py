@@ -255,10 +255,32 @@ def discover_token(url: str, hints) -> str:
     return ""
 
 
+ROLES = ("auto", "server", "client")
+
+
 def make_backend() -> HttpBackend | LocalBackend:
     cfg, src = read_config()
 
+    role = (os.environ.get("TRACE_ROLE") or cfg.get("role") or "auto").strip().lower() or "auto"
+    if role not in ROLES:
+        raise ToolError(f"角色必须是 {'/'.join(ROLES)} 之一，收到 {role!r}")
+
     url = (os.environ.get("TRACE_URL") or cfg.get("url") or "").strip()
+    data = (os.environ.get("TRACE_DATA") or cfg.get("data") or "").strip()
+
+    # 角色说明白之后，配错了就当场报出来，而不是悄悄退回另一种模式。
+    # 「我选了客户端，怎么读到的是本地空目录」这种问题最难查。
+    if role == "client":
+        if not url:
+            raise ToolError("这台机器配成了**客户端**，但没填远端服务地址。"
+                            "填 https://你的域名/t/<space> ，或者把角色改成 server / auto。")
+        data = ""
+    elif role == "server":
+        if not data:
+            raise ToolError("这台机器配成了**服务端**，但没填数据仓目录。"
+                            "填步骤树所在的目录（里面是 projects/），或者把角色改成 client / auto。")
+        url = ""
+
     if url:
         token = (os.environ.get("TRACE_TOKEN") or cfg.get("token") or "").strip()
         if not token:
@@ -757,7 +779,7 @@ def dispatch(backend, name: str, args: dict[str, Any]) -> str:
 # 的客户端连上来跑一遍互操作。
 
 SERVER_NAME = "trace"
-SERVER_VERSION = "0.9.0"
+SERVER_VERSION = "1.0.0"
 
 # 收到客户端要的版本就原样回它（前提是我们认识），否则回我们最新的。
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
@@ -949,7 +971,91 @@ def serve_stdio(stream_in=None, stream_out=None) -> None:
             emit(resp)
 
 
+def selfcheck() -> int:
+    """`trace-mcp --selfcheck`：一条命令确认这台机器上能不能用。
+
+    不需要 Claude、不需要网络（本地模式下）、不需要任何额外依赖。
+    新机器装完跑一次，通不通、哪一项要改，它自己会说。
+    """
+    import io as _io
+
+    ok = True
+
+    def say(good, label, detail=""):
+        nonlocal ok
+        ok = ok and good
+        print(f"  {'✓' if good else '✗'} {label}" + (f"  {detail}" if detail else ""))
+
+    print("trace-mcp 自检\n")
+    v = sys.version_info
+    say(v >= (3, 10), f"Python {v.major}.{v.minor}.{v.micro}",
+        "" if v >= (3, 10) else "→ 需要 3.10 以上，换一个解释器")
+    print(f"    解释器: {sys.executable}")
+
+    cfg, src = read_config()
+    role = (os.environ.get("TRACE_ROLE") or cfg.get("role") or "auto").strip().lower() or "auto"
+    where = []
+    for k in ("TRACE_ROLE", "TRACE_URL", "TRACE_TOKEN", "TRACE_DATA", "TRACE_CONFIG"):
+        if os.environ.get(k, "").strip():
+            where.append(k)
+    print(f"    配置来源: {'环境变量 ' + '/'.join(where) if where else '（无环境变量）'}"
+          + (f" + 文件 {src}" if src else ""))
+    say(role in ROLES, f"角色: {role}", "" if role in ROLES else f"→ 只能是 {'/'.join(ROLES)}")
+
+    try:
+        be = make_backend()
+    except ToolError as e:
+        say(False, "后端", "")
+        print(f"\n    {e}\n")
+        return 1
+    say(True, "后端: " + ("远端 " + be.base if isinstance(be, HttpBackend) else f"本地 {be.root}"))
+    if isinstance(be, LocalBackend) and be.root.name == "projects":
+        print("    ⚠ 数据仓目录本身就叫 projects —— 多半是指深了一层。"
+              f"应当填它的父目录 {be.root.parent}，否则会造出 projects/projects。")
+
+    try:
+        ps = be.projects()
+        say(True, f"读取正常，{len(ps)} 个项目",
+            " · ".join(f"{p['slug']}({p['steps']}步)" for p in ps[:4]) or "（还没有项目，正常）")
+        # 既没有步骤、也没写过洞察和名字的目录，多半是 data_dir 指错了一层
+        # （指到 projects/ 本身而不是它的父目录），会造出一个 projects/projects。
+        ghost = [p for p in ps if not p["steps"] and not (p.get("body") or "").strip()
+                 and p["name"] == p["slug"]]
+        if ghost:
+            print(f"    ⚠ 有 {len(ghost)} 个空壳项目：{', '.join(p['slug'] for p in ghost)}")
+            print("      如果里面有个叫 projects 的，说明数据仓目录指到 projects/ 本身了——"
+                  "应当指它的**父目录**。")
+    except ToolError as e:
+        say(False, "读取失败", str(e))
+        return 1
+
+    # 走一遍真实的 JSON-RPC，确认协议层没问题
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": PROTOCOL_VERSIONS[0]}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}]
+    sout = _io.StringIO()
+    serve_stdio(_io.StringIO("\n".join(json.dumps(m) for m in msgs) + "\n"), sout)
+    lines = [json.loads(l) for l in sout.getvalue().splitlines() if l.strip()]
+    tools = lines[1]["result"]["tools"] if len(lines) > 1 and "result" in lines[1] else []
+    say(len(lines) == 2 and len(tools) == len(TOOLS),
+        f"MCP 协议握手正常，{len(tools)} 个工具",
+        ", ".join(t["name"] for t in tools[:3]) + " …")
+
+    print("\n" + ("全部通过。把这个解释器和本文件的绝对路径填进 MCP 配置即可。" if ok
+                 else "有问题，见上面的 ✗。"))
+    return 0 if ok else 1
+
+
 def main() -> int:
+    if "--selfcheck" in sys.argv[1:]:
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except (AttributeError, OSError):
+            pass
+        return selfcheck()
+    if "--version" in sys.argv[1:]:
+        print(SERVER_VERSION)
+        return 0
     # stdout 是协议通道：关掉 Windows 的 \n → \r\n 转换，诊断一律走 stderr。
     try:
         sys.stdin.reconfigure(encoding="utf-8", errors="replace")
