@@ -342,8 +342,37 @@
 
   /* -------------------------------------------------------------- 正文增强 */
 
+  /* 指标表的数值列加一条底纹，长度按列内相对大小。
+     纯粹是加成：单元格里的数字一个没动，LLM 读到的和渲染前一模一样，
+     去掉这层样式也不丢任何信息。这正是「可视化从可读文本里长出来」那条原则。 */
+  var NUMCELL = /^[-+±−]?[\d,]*\.?\d+(?:[eE][-+]?\d+)?\s*%?$/;
+  function numOf(td) {
+    var v = td.textContent.replace(/[*_`\s,]|&nbsp;/g, "").replace(/[±−]/g, "-").replace(/%$/, "");
+    return NUMCELL.test(td.textContent.replace(/[*_`\s]/g, "")) ? parseFloat(v) : NaN;
+  }
+  function barTables(root) {
+    root.querySelectorAll("table").forEach(function (tb) {
+      var rows = [].slice.call(tb.querySelectorAll("tbody tr"));
+      if (rows.length < 2) return;
+      var cols = tb.querySelectorAll("thead th").length;
+      for (var c = 0; c < cols; c++) {
+        var cells = rows.map(function (r) { return r.children[c]; }).filter(Boolean);
+        var vals = cells.map(numOf);
+        if (vals.length < 2 || vals.some(isNaN)) continue;          // 有一格不是数就整列不画
+        var lo = Math.min.apply(null, vals), hi = Math.max.apply(null, vals);
+        if (!(hi > lo)) continue;                                    // 整列一样，画了没意义
+        cells.forEach(function (td, i) {
+          var f = (vals[i] - lo) / (hi - lo);
+          td.style.setProperty("--bar", (6 + f * 94).toFixed(1) + "%");
+          td.classList.add("hasbar");
+        });
+      }
+    });
+  }
+
   /* 代码块加"复制"按钮；正文渲染完调用一次。图片的灯箱走事件委托，不用逐个绑。 */
   function enhanceProse(root) {
+    barTables(root);
     root.querySelectorAll("pre.code").forEach(function (pre) {
       if (pre.querySelector(".copy")) return;
       var b = document.createElement("button");

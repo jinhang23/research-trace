@@ -196,6 +196,9 @@ def render_note(step: Step) -> str:
     for p in step.paths:
         note = p.get("note", "").strip()
         lines.append(f"path: {p['location']}" + (f" | {note}" if note else ""))
+    for r in step.repro:
+        lines.append("repro: " + " | ".join([r.get("state", "unknown"), r.get("date", ""),
+                                             r.get("by", ""), r.get("note", "")]).rstrip(" |"))
     lines.append("---")
     lines.append("")
     lines.append(step.body.rstrip("\n"))
@@ -302,7 +305,34 @@ def create_step(
 
 # ---------------------------------------------------------------- 修改
 
-MUTABLE = ("status", "title", "body", "date", "commit", "author", "tags", "paths", "add_paths")
+MUTABLE = ("status", "title", "body", "date", "commit", "author", "tags",
+           "paths", "add_paths", "add_repro")
+
+
+def norm_repro(raw: Any) -> list[dict[str, str]]:
+    """把一条复现记录规整成 {state, date, by, note}。
+
+    只接受追加，不接受整组替换——复现历史是只追加的：
+    "去年试过、失败了" 和 "今年试过、成功了" 是两条事实，后者不该抹掉前者。
+    """
+    from trace_core import REPRO_STATES
+
+    items = [raw] if isinstance(raw, (str, dict)) else list(raw or [])
+    out: list[dict[str, str]] = []
+    for item in items:
+        if isinstance(item, dict):
+            d = {k: _clean_line(item.get(k)) for k in ("state", "date", "by", "note")}
+        else:
+            parts = [_clean_line(x) for x in str(item).split("|")]
+            d = dict(zip(("state", "date", "by", "note"), parts + [""] * 4))
+            if len(parts) > 4:
+                d["note"] = " | ".join(parts[3:])
+        state = (d.get("state") or "").lower()
+        if state not in REPRO_STATES:
+            raise WriteError(f"复现结果必须是 {'/'.join(REPRO_STATES)} 之一，收到 {d.get('state')!r}")
+        d["state"] = state
+        out.append(d)
+    return out
 
 
 def update_step(steps_dir: Path, sid: str, patch: dict[str, Any]) -> Step:
@@ -349,6 +379,8 @@ def update_step(steps_dir: Path, sid: str, patch: dict[str, Any]) -> Step:
     if "add_paths" in patch:                                # 追加，位置去重
         seen = {p["location"] for p in step.paths}
         step.paths = step.paths + [p for p in norm_paths(patch["add_paths"]) if p["location"] not in seen]
+    if "add_repro" in patch:                                # 只追加：复现历史不覆盖
+        step.repro = step.repro + norm_repro(patch["add_repro"])
 
     # 目录名不跟着 title 改：目录名里的 id 是给 shell 补全用的，
     # 改名会让所有已经发出去的相对链接失效。

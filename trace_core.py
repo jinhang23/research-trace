@@ -46,7 +46,18 @@ _DIRNAME_RE = re.compile(r"^(\d+[a-z]*)_(.*)$")
 _WIKILINK_RE = re.compile(r"\[\[\s*([0-9]+[a-z]*)\s*\]\]")
 
 # front-matter 里可以重复出现的键（其余键重复时后写的覆盖先写的）
-MULTI_KEYS = ("path",)
+MULTI_KEYS = ("path", "repro")
+
+# 复现记录的取值。这是**事实**，算不出来，必须存。
+# 与之相对，可溯源性等级是**派生**的（从记了什么算出来），绝不存储。
+REPRO_STATES = ("failed", "runnable", "verified")
+
+# 可溯源性阶梯。前三级从文件里机械地算出来；后两级要有人真去看过、跑过。
+LEVELS = ("L0", "L1", "L2", "L3", "L4")
+LEVEL_LABEL = {
+    "L0": "不可溯源", "L1": "可读", "L2": "可定位", "L3": "可重跑", "L4": "已复现",
+}
+SECTIONS = ("为什么", "做了什么", "结果", "结论", "下一步")
 
 _HPC_RE = re.compile(r"^(/blue/|/orange/|/red/|/scratch/|/gpfs/|/lustre/|/work/)", re.I)
 _WIN_RE = re.compile(r"^[a-z]:[\\/]", re.I)
@@ -77,6 +88,55 @@ def path_kind(location: str) -> str:
     if _WIN_RE.match(low) or s.startswith("\\\\"):
         return "local"
     return "path"
+
+
+def parse_repro(raw: str) -> list[dict[str, str]]:
+    """每行一次复现尝试：`结果 | 日期 | 谁 | 说明`。只追加，最后一行是当前状态。
+
+    失败的尝试和成功的一样要留着——"试过，跑不起来，因为 checkpoint 被清了"
+    本身就是溯源结论。
+    """
+    out: list[dict[str, str]] = []
+    for line in (raw or "").split("\n"):
+        parts = [x.strip() for x in line.split("|")]
+        if not parts or not parts[0]:
+            continue
+        state = parts[0].lower()
+        if state not in REPRO_STATES:
+            state = "unknown"
+        out.append({
+            "state": state,
+            "date": parts[1] if len(parts) > 1 else "",
+            "by": parts[2] if len(parts) > 2 else "",
+            "note": " | ".join(parts[3:]) if len(parts) > 3 else "",
+        })
+    return out
+
+
+def sections(body: str) -> dict[str, str]:
+    """按 `## 小节名` 切正文。用于判断「为什么」这类小节是不是真的写了东西。"""
+    out: dict[str, str] = {}
+    name, buf = None, []
+    for line in (body or "").split("\n"):
+        m = re.match(r"^\s*#{1,6}\s+(.*?)\s*$", line)
+        if m:
+            if name is not None:
+                out[name] = "\n".join(buf).strip()
+            name, buf = m.group(1).strip(), []
+        elif name is not None:
+            buf.append(line)
+    if name is not None:
+        out[name] = "\n".join(buf).strip()
+    return out
+
+
+def _filled(text: str) -> bool:
+    """小节有没有实质内容。模板里的占位括号不算。"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    t = re.sub(r"^[（(].*?[）)]\s*$", "", t, flags=re.S).strip()
+    return bool(t)
 
 
 def parse_paths(raw: str) -> list[dict[str, str]]:
@@ -136,6 +196,7 @@ class Step:
     key: str = ""
     tags: list[str] = field(default_factory=list)
     paths: list[dict[str, str]] = field(default_factory=list)
+    repro: list[dict[str, str]] = field(default_factory=list)
     body: str = ""
     dirname: str = ""
 
@@ -151,6 +212,7 @@ class Step:
             "key": self.key,
             "tags": list(self.tags),
             "paths": [dict(p) for p in self.paths],
+            "repro": [dict(r) for r in self.repro],
             "body": self.body,
             "dirname": self.dirname,
         }
@@ -327,6 +389,7 @@ def build_step(dirname: str, meta: dict[str, str], body: str) -> tuple[Step, lis
         key=(meta.get("key") or "").strip(),
         tags=_parse_tags(meta.get("tags", "")),
         paths=parse_paths(meta.get("path", "")),
+        repro=parse_repro(meta.get("repro", "")),
         body=body,
         dirname=dirname,
     )
@@ -692,6 +755,84 @@ def lint_body(step: Step) -> list[dict[str, str]]:
     return out
 
 
+def traceability(step: Step) -> dict[str, Any]:
+    """这一步自己的可溯源性。**派生字段，绝不存储**（P1）。
+
+    前三级是机械可判的：
+
+      L0 不可溯源  连「为什么」或「做了什么」都没写
+      L1 可读      两者都写了、图都有图注、有结论（wip 除外，它本来就还没有结论）
+      L2 可定位    L1 + 记了 commit + 记了产物位置
+
+    再往上算不出来，必须有人真去看过、跑过，所以由 `repro:` 记录抬上去：
+
+      L3 可重跑    有人确认过命令/环境/种子齐全（repro: runnable）
+      L4 已复现    真跑过，数字对上了（repro: verified）
+
+    `repro: failed` 不降级——"试过，跑不起来"不改变记录本身的完整度，
+    但它是最该被看见的一条，所以单独作为一个状态返回。
+    """
+    sec = sections(step.body)
+    checks = {
+        "why": _filled(sec.get("为什么", "")),
+        "what": _filled(sec.get("做了什么", "")),
+        "conclusion": step.status == "wip" or _filled(sec.get("结论", "")),
+        "captions": not lint_body(step),
+        "commit": bool(step.commit.strip()),
+        "paths": bool(step.paths),
+    }
+    missing = []
+    if not checks["why"]:
+        missing.append("没写「为什么」——这是唯一无法自动生成的字段")
+    if not checks["what"]:
+        missing.append("没写「做了什么」——重跑要靠它")
+    if not checks["conclusion"]:
+        missing.append("没写「结论」——假设到底成不成立")
+    if not checks["captions"]:
+        missing.append("有图没写图注——图里的信息对文本读者是黑洞")
+    if not checks["commit"]:
+        missing.append("没记 commit——找不回当时的代码")
+    if not checks["paths"]:
+        missing.append("没记产物位置——数据和权重在哪不知道")
+
+    if not (checks["why"] and checks["what"]):
+        level = "L0"
+    elif not (checks["conclusion"] and checks["captions"]):
+        level = "L0"
+    elif checks["commit"] and checks["paths"]:
+        level = "L2"
+    else:
+        level = "L1"
+
+    latest = step.repro[-1] if step.repro else None
+    if latest and latest["state"] == "verified":
+        level = "L4"
+    elif latest and latest["state"] == "runnable" and level == "L2":
+        level = "L3"
+
+    return {"level": level, "missing": missing, "checks": checks,
+            "repro": dict(latest) if latest else None}
+
+
+def chain_traceability(by_id: dict[str, Step], sid: str) -> dict[str, Any]:
+    """整条链的可溯源性 = 链上最弱的一环。
+
+    这是这套评级真正有用的地方：001 没记数据在哪，004 就算自己写得再全，
+    「004 这个结论是怎么来的」依然追不到底。
+    """
+    chain = lineage(by_id, sid)
+    per = {i: traceability(by_id[i]) for i in chain}
+    worst_id = min(chain, key=lambda i: (LEVELS.index(per[i]["level"]), chain.index(i)))
+    return {
+        "self": per[sid]["level"],
+        "chain": per[worst_id]["level"],
+        "weakest": worst_id,
+        "missing": per[sid]["missing"],
+        "repro": per[sid]["repro"],
+        "lineage": [{"id": i, "level": per[i]["level"]} for i in chain],
+    }
+
+
 def lineage(by_id: dict[str, Step], sid: str) -> list[str]:
     """从根到 sid 的 id 序列。派生，不存储。"""
     chain: list[str] = []
@@ -727,6 +868,7 @@ def compile_forest(steps_dir: Path, with_files: bool = True) -> dict[str, Any]:
         d["files"] = files.get(sid, [])
         d["lane"] = lane[sid]
         d["row"] = len(steps_out)
+        d["trace"] = chain_traceability(by_id, sid)   # 派生，不存储
         steps_out.append(d)
 
     return {

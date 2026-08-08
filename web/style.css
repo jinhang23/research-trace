@@ -291,6 +291,18 @@ img.zoomable { cursor: zoom-in; }
 .prose tbody tr:nth-child(even) { background: color-mix(in srgb, var(--hi) 45%, transparent); }
 .prose tbody tr:last-child td { border-bottom: 0; }
 .prose td.ta-right, .prose th.ta-right { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* 数值列的底纹条：长度按列内相对大小，让「哪个最好」一眼可见。
+   纯装饰——数字本身一个没动，去掉这段样式不丢任何信息。 */
+.prose td.hasbar { position: relative; }
+.prose td.hasbar::before {
+  content: ""; position: absolute; left: 0; top: 3px; bottom: 3px;
+  width: var(--bar, 0); border-radius: 0 2px 2px 0;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  z-index: 0; pointer-events: none;
+}
+.prose td.hasbar { z-index: 1; }
+.prose tbody tr:nth-child(even) td.hasbar::before { background: color-mix(in srgb, var(--accent) 22%, transparent); }
 .prose td.ta-center, .prose th.ta-center { text-align: center; }
 .prose td.ta-left, .prose th.ta-left { text-align: left; }
 

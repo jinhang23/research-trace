@@ -1,17 +1,23 @@
 {
   "name": "research-trace",
   "displayName": "科研溯源 trace",
-  "version": "0.6.0",
-  "description": "把科研过程记录成一棵只追加的步骤树：每一步自带代码、日志、产物和一句「我为什么要做这一步」，从任何结果都能回溯到最初的问题。带 6 个 MCP 工具（零依赖，手写 JSON-RPC）、多项目、图/列表双视图、外部产物路径溯源。",
+  "version": "0.7.0",
+  "description": "把科研过程记录成一棵只追加的步骤树：每一步自带代码、日志、产物和一句「我为什么要做这一步」，从任何结果都能回溯到最初的问题。带 7 个 MCP 工具（零依赖，手写 JSON-RPC）、多项目、图/列表双视图、外部产物路径溯源、L0–L4 可溯源性评级。",
   "author": {
     "name": "Jinhang Wei"
   },
   "homepage": "https://github.com/jinhang23/research-trace",
   "repository": "https://github.com/jinhang23/research-trace",
-  "keywords": ["research", "provenance", "lab-notebook", "reproducibility", "科研", "溯源"],
+  "keywords": [
+    "research",
+    "provenance",
+    "lab-notebook",
+    "reproducibility",
+    "科研",
+    "溯源"
+  ],
   "skills": "./skills",
   "commands": "./commands",
-
   "userConfig": {
     "data_dir": {
       "type": "directory",
@@ -36,11 +42,12 @@
       "default": "python3"
     }
   },
-
   "mcpServers": {
     "trace": {
       "command": "${user_config.python}",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/trace_mcp.py"],
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/trace_mcp.py"
+      ],
       "env": {
         "TRACE_DATA": "${user_config.data_dir}",
         "TRACE_URL": "${user_config.url}",

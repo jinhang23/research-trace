@@ -185,3 +185,105 @@ def test_paths_survive_the_http_json_shape(be):
     M.dispatch(be, "trace_new_step", {"project": "alpha", "title": "x", "paths": ["/blue/a | 说明"]})
     p = be.step("alpha", "001")["paths"][0]
     assert set(p) == {"location", "note", "kind"}
+
+
+# ------------------------------------------------------------ 可溯源性评级
+# 派生字段：从记了什么算出来，绝不存储。
+
+
+def S(**kw):
+    d = dict(id="001", status="done", title="t", body="", commit="", paths=[], repro=[])
+    d.update(kw)
+    return core.Step(**d)
+
+
+FULL = "## 为什么\n因为要验证 X。\n\n## 做了什么\n跑了 train.py\n\n## 结论\n成立。"
+
+
+def test_L0_when_the_why_is_missing():
+    assert core.traceability(S(body="## 做了什么\n跑了脚本\n\n## 结论\nok"))["level"] == "L0"
+
+
+def test_L0_when_the_body_is_still_the_template():
+    """模板里的占位括号不算写了。"""
+    tpl = "## 为什么\n（承接上一步的什么发现，想验证什么假设）\n\n## 做了什么\n\n## 结论\n"
+    assert core.traceability(S(body=tpl))["level"] == "L0"
+
+
+def test_L0_when_a_figure_has_no_caption():
+    body = FULL + "\n\n![](loss.png)\n"
+    t = core.traceability(S(body=body, commit="abc", paths=[{"location": "/blue/a", "note": "", "kind": "hpc"}]))
+    assert t["level"] == "L0"
+    assert any("图注" in m for m in t["missing"])
+
+
+def test_wip_without_a_conclusion_is_not_penalised():
+    """在做的步骤本来就还没有结论。"""
+    body = "## 为什么\n想试 X。\n\n## 做了什么\n跑着"
+    assert core.traceability(S(status="wip", body=body))["level"] == "L1"
+    assert core.traceability(S(status="done", body=body))["level"] == "L0"
+
+
+def test_L1_then_L2_as_commit_and_paths_are_added():
+    assert core.traceability(S(body=FULL))["level"] == "L1"
+    assert core.traceability(S(body=FULL, commit="abc"))["level"] == "L1"
+    t = core.traceability(S(body=FULL, commit="abc",
+                            paths=[{"location": "/blue/a", "note": "", "kind": "hpc"}]))
+    assert t["level"] == "L2" and t["missing"] == []
+
+
+def _l2(**kw):
+    return S(body=FULL, commit="abc", paths=[{"location": "/blue/a", "note": "", "kind": "hpc"}], **kw)
+
+
+def test_repro_records_lift_to_L3_and_L4():
+    assert core.traceability(_l2(repro=[{"state": "runnable", "date": "", "by": "", "note": ""}]))["level"] == "L3"
+    assert core.traceability(_l2(repro=[{"state": "verified", "date": "", "by": "", "note": ""}]))["level"] == "L4"
+
+
+def test_a_failed_repro_does_not_lower_the_level_but_is_surfaced():
+    """"试过，跑不起来"不改变记录本身的完整度，但它是最该被看见的一条。"""
+    t = core.traceability(_l2(repro=[{"state": "failed", "date": "2026-07-02", "by": "human",
+                                      "note": "checkpoint 被清了"}]))
+    assert t["level"] == "L2"
+    assert t["repro"]["state"] == "failed" and "checkpoint" in t["repro"]["note"]
+
+
+def test_runnable_cannot_skip_L2():
+    """自己都没记 commit / 路径，声称"可重跑"是不成立的。"""
+    assert core.traceability(S(body=FULL, repro=[{"state": "runnable", "date": "", "by": "", "note": ""}]))["level"] == "L1"
+
+
+def test_the_chain_is_capped_by_its_weakest_ancestor(tmp_path: Path):
+    """001 没记数据在哪，004 就算自己写得再全，整条链也追不到底。"""
+    d = tmp_path / "steps"
+    d.mkdir()
+    a, _ = W.create_step(d, title="根", body=FULL, commit="aaa")          # L1：没有 path
+    b, _ = W.create_step(d, parent=a.id, title="子", body=FULL, commit="bbb",
+                         paths=["/blue/x | 数据"])                        # 自己是 L2
+    by_id = W.load(d)
+    t = core.chain_traceability(by_id, b.id)
+    assert t["self"] == "L2"
+    assert t["chain"] == "L1" and t["weakest"] == a.id
+    assert [x["level"] for x in t["lineage"]] == ["L1", "L2"]
+
+
+def test_repro_lines_round_trip_and_only_append(tmp_path: Path):
+    d = tmp_path / "steps"
+    d.mkdir()
+    s, _ = W.create_step(d, title="x", body=FULL)
+    W.update_step(d, s.id, {"add_repro": ["failed | 2026-07-02 | human | checkpoint 被清了"]})
+    W.update_step(d, s.id, {"add_repro": ["verified | 2026-08-08 | agent:claude | 重跑一致"]})
+    back = W.load(d)[s.id]
+    assert [r["state"] for r in back.repro] == ["failed", "verified"], "去年失败不该被今年成功抹掉"
+    assert back.repro[0]["note"] == "checkpoint 被清了"
+    text = (d / back.dirname / core.NOTE_NAME).read_text(encoding="utf-8")
+    assert text.count("\nrepro: ") == 2
+
+
+def test_an_unknown_repro_state_is_refused(tmp_path: Path):
+    d = tmp_path / "steps"
+    d.mkdir()
+    s, _ = W.create_step(d, title="x")
+    with pytest.raises(W.WriteError, match="runnable"):
+        W.update_step(d, s.id, {"add_repro": ["成功了 | 2026-08-08 | 我 | 说明"]})

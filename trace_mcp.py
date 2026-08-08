@@ -33,6 +33,7 @@ IMG_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".avif"}
 # 不 import trace_write，而大小检查必须在读文件**之前**做。
 MAX_ATTACH_BYTES = 32 * 1024 * 1024
 MARK = {"done": "●", "wip": "○", "dead": "▣"}
+LEVELS = {"L0": "不可溯源", "L1": "可读", "L2": "可定位", "L3": "可重跑", "L4": "已复现"}
 KIND_LABEL = {
     "hpc": "超算", "github": "GitHub", "git": "Git", "dropbox": "Dropbox", "drive": "Drive",
     "object": "对象存储", "archive": "数据仓库", "mlhub": "实验平台", "url": "链接",
@@ -107,6 +108,9 @@ class HttpBackend:
     def step(self, project, sid):
         return self._call("GET", f"/api/p/{urllib.parse.quote(project)}/steps/{urllib.parse.quote(sid)}")
 
+    def create_project(self, name):
+        return self._call("POST", "/api/projects", {"name": name})
+
     def create(self, project, payload):
         return self._call("POST", f"/api/p/{urllib.parse.quote(project)}/steps", payload)
 
@@ -175,6 +179,9 @@ class LocalBackend:
             return fn(*a, **kw)
         except self.W.WriteError as e:
             raise ToolError(str(e)) from None
+
+    def create_project(self, name):
+        return self._guard(self.W.create_project, self.root, name).to_dict()
 
     def create(self, project, payload):
         step, created = self._guard(
@@ -278,6 +285,9 @@ def _fmt_tree(forest: dict, header: str) -> str:
         d = 0 if not s["parent"] else depth[s["parent"]] + 1
         depth[s["id"]] = d
         extra = []
+        t = s.get("trace") or {}
+        if t.get("self"):
+            extra.append(t["self"] if t.get("chain") == t["self"] else f"{t['self']}→链{t['chain']}")
         if s.get("paths"):
             extra.append(f"{len(s['paths'])} 路径")
         if s["files"]:
@@ -308,6 +318,17 @@ def _fmt_step(project: str, s: dict) -> str:
     if meta:
         head.append("  " + "  ".join(meta))
     head.append("  溯源: " + " → ".join(s.get("lineage", [s["id"]])))
+    t = s.get("trace") or {}
+    if t:
+        line = f"  可溯源性: {t['self']} {LEVELS.get(t['self'], '')}"
+        if t.get("chain") and t["chain"] != t["self"]:
+            line += f"，但整条链只到 {t['chain']} {LEVELS.get(t['chain'], '')}（最弱的一环是 {t['weakest']}）"
+        head.append(line)
+        for m in t.get("missing", []):
+            head.append(f"    缺: {m}")
+        r = t.get("repro")
+        if r:
+            head.append(f"    复现: {r['state']} {r.get('date', '')} {r.get('by', '')} — {r.get('note', '')}".rstrip(" —"))
     if s.get("children"):
         head.append("  子步骤: " + ", ".join(s["children"]))
     if s.get("backlinks"):
@@ -332,6 +353,20 @@ TOOLS: list[dict[str, Any]] = [
         "name": "trace_projects",
         "description": "列出所有科研项目及其步骤数与 done/wip/dead 分布。不确定该记到哪个项目时先调这个。",
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "trace_new_project",
+        "description": (
+            "新建一个项目。装好插件后的**第一步**——没有项目就没地方记步骤。\n"
+            "一个项目 = 一条独立的研究线（一篇论文、一个课题），每个项目的步骤 id 都从 001 开始。"
+            "不确定该不该新建就先 trace_projects 看一眼；同一个课题的不同尝试应当是**分叉的步骤**，"
+            "不是不同的项目。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"name": {"type": "string", "description": "项目名，显示用，可以是中文"}},
+            "required": ["name"],
+        },
     },
     {
         "name": "trace_read",
@@ -411,6 +446,19 @@ TOOLS: list[dict[str, Any]] = [
                 "paths": {"type": "array", "items": {"type": "string"}, "description": "整组替换。" + PATHS_DESC},
                 "add_paths": {"type": "array", "items": {"type": "string"},
                               "description": "追加（按位置去重），比整组替换安全。" + PATHS_DESC},
+                "repro": {
+                    "type": "string",
+                    "description": (
+                        "追加一条复现记录，格式 `结果 | 日期 | 谁 | 说明`。结果三选一：\n"
+                        "  runnable —— 查过了，命令/环境/种子齐全，理论上能重跑（对应 L3）\n"
+                        "  verified —— 真跑过，数字在容差内对上了（L4）\n"
+                        "  failed   —— 试过，跑不起来或对不上。**这条和成功一样重要**，"
+                        "「checkpoint 被清了」本身就是溯源结论\n"
+                        "只追加不覆盖：去年失败、今年成功是两条事实。说明里写清判据和容差。\n"
+                        "例：`verified | 2026-08-08 | agent:claude | 干净 split 上重跑 3 个种子，"
+                        "0.9468±0.0011，原记录 0.947`"
+                    ),
+                },
             },
             "required": ["project", "step"],
         },
@@ -501,7 +549,23 @@ def _why_is_blank(body: str) -> bool:
     return not text or text.startswith(("（", "("))   # 空的，或者还是模板里的占位括号
 
 
+def t_new_project(be, args) -> str:
+    p = be.create_project(args["name"])
+    return (f"已建项目 {p['slug']}（显示名 {p['name']}）。"
+            f"接下来用 trace_new_step 记第一步，别忘了写「为什么」。")
+
+
 def t_new_step(be, args) -> str:
+    project = args["project"]
+    existing = [p["slug"] for p in be.projects()]
+    if project not in existing:
+        if existing:
+            raise ToolError(f"项目 {project} 不存在。已有：{', '.join(existing)}。"
+                            f"确实要开一条新研究线才用 trace_new_project。")
+        # 全新的数据仓，一个项目都还没有：直接建出来，省掉一次来回。
+        # 已经有项目时不这么做——那种情况下项目名对不上多半是笔误。
+        be.create_project(project)
+
     payload = {k: args[k] for k in ("parent", "title", "status", "body", "date", "commit", "key", "tags", "paths")
                if k in args and args[k] not in (None, "")}
     payload.setdefault("status", "wip")
@@ -528,6 +592,8 @@ def t_update_step(be, args) -> str:
             )
     patch = {k: args[k] for k in ("status", "title", "date", "commit", "tags", "paths", "add_paths")
              if k in args and args[k] is not None}
+    if args.get("repro"):
+        patch["add_repro"] = [args["repro"]]
     if args.get("body") is not None and args.get("append"):
         raise ToolError("body 和 append 只能给一个")
     if args.get("body") is not None:
@@ -608,6 +674,7 @@ def t_attach(be, args) -> str:
 
 HANDLERS = {
     "trace_projects": t_projects,
+    "trace_new_project": t_new_project,
     "trace_read": t_read,
     "trace_search": t_search,
     "trace_new_step": t_new_step,
@@ -636,7 +703,7 @@ def dispatch(backend, name: str, args: dict[str, Any]) -> str:
 # 的客户端连上来跑一遍互操作。
 
 SERVER_NAME = "trace"
-SERVER_VERSION = "0.6.0"
+SERVER_VERSION = "0.7.0"
 
 # 收到客户端要的版本就原样回它（前提是我们认识），否则回我们最新的。
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
@@ -650,6 +717,9 @@ INSTRUCTIONS = (
     "⑤ 图必须给 caption，你看不到图，图注是它唯一的信息来源；"
     "⑥ 产物落在哪（超算路径、GitHub、对象存储）用 paths 记下来；"
     "⑦ id 和 parent 写下就不可改。"
+    "完整的写作格式标准在插件根目录的 FORMAT.md —— 指标一律用 markdown 表格（渲染时"
+    "数值列会自动加底纹条，而你读到的还是原数字），图必须带承载结论的图注，"
+    "「为什么」要写假设不是动作。"
 )
 
 _JSON_TYPES: dict[str, Any] = {
