@@ -12,6 +12,7 @@
 ```bash
 pip install -r requirements.txt
 python trace_cli.py init                            # 生成 config.json（含访问路径与写入令牌）
+#   上线时用 --data-dir ../trace-data 把数据放进另一个私有仓库
 python trace_cli.py new-project --name "我的课题"
 python trace_cli.py serve                           # 起服务，终端会打印访问地址
 ```

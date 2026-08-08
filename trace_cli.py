@@ -58,6 +58,7 @@ def cmd_init(args) -> int:
         print(f"config.json 已存在（--force 覆盖）: {CONFIG_PATH}")
         return 1
     cfg = make_config(args.title)
+    cfg["data_dir"] = args.data_dir
     cfg["git"]["enabled"] = not args.no_git
     CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -65,16 +66,33 @@ def cmd_init(args) -> int:
     if not core.scan_projects(root):
         W.create_project(root, args.project)
 
-    if not args.no_git and not (ROOT / ".git").exists():
-        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=str(ROOT), check=False)
-
+    separate = root != ROOT
     print(f"已写入 {CONFIG_PATH}")
+    print(f"  数据仓    {root}" + ("" if separate else "   ← 和代码在同一个目录"))
     print(f"  访问路径  /t/{cfg['space']}/")
     print(f"  写入令牌  {cfg['token']}")
     print("\nconfig.json 含密钥，已在 .gitignore 中。请另行备份。")
-    if cfg["git"]["enabled"]:
-        print("\n⚠ 自动 git 同步已开启。确认 remote 指向**私有**仓库——")
-        print("  否则你的科研笔记会被自动推到公开仓库上。")
+
+    if not cfg["git"]["enabled"]:
+        print("\n自动 git 同步没开。要开：把数据仓做成 git 仓库并配好私有 remote，")
+        print('然后把 config.json 里的 git.enabled 改成 true。')
+        return 0
+
+    # 自动同步 commit 的是**数据仓**，所以要检查的也是数据仓。
+    if not (root / ".git").exists():
+        print(f"\n⚠ 自动 git 同步开着，但 {root} 不是 git 仓库，同步会一直是 no-op。")
+        print("  先在数据仓里 git init 并 git remote add origin <私有仓库>。")
+    elif not separate:
+        print("\n⚠ 自动 git 同步开着，而数据和代码在同一个仓库里。")
+        print("  如果这个仓库的 remote 是公开的，你的科研笔记会被推到公网上。")
+        print("  建议：另建一个**私有**仓库，用 --data-dir 指过去。")
+    else:
+        code, out = subprocess.run(["git", "remote", "get-url", cfg["git"].get("remote", "origin")],
+                                   cwd=str(root), capture_output=True, text=True,
+                                   encoding="utf-8", errors="replace").returncode, ""
+        print("\n自动 git 同步已开启，目标是数据仓。"
+              + ("" if code == 0 else f"\n⚠ 但数据仓还没有名为 {cfg['git'].get('remote', 'origin')} 的 remote，push 会失败（commit 仍然正常）。"))
+        print("  再确认一次：那个 remote 必须是**私有**仓库。")
     return 0
 
 
@@ -280,8 +298,11 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("init", help="初始化")
     p.add_argument("--title", default="科研溯源")
     p.add_argument("--project", default="default", help="首个项目的名字")
+    p.add_argument("--data-dir", default=".", metavar="路径",
+                   help="数据仓在哪（projects/ 的父目录）。上线时建议指向一个**私有**仓库，"
+                        "让代码仓可以公开，比如 --data-dir ../trace-data")
     p.add_argument("--force", action="store_true")
-    p.add_argument("--no-git", action="store_true")
+    p.add_argument("--no-git", action="store_true", help="不开自动 git 同步")
     p.set_defaults(fn=cmd_init)
 
     p = sub.add_parser("projects", help="列出项目")
