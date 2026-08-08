@@ -612,6 +612,31 @@ def compute_backlinks(by_id: dict[str, Step]) -> dict[str, list[str]]:
     return back
 
 
+_IMG_IN_BODY = re.compile(r'!\[([^\]]*)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)')
+
+
+def lint_body(step: Step) -> list[dict[str, str]]:
+    """内容层的提醒（不是结构不变量，永远只是 warning）。
+
+    目前只有一条：图片必须有图注。理由是这个系统有两类读者——
+
+      * 人：半年后看到一张没有说明的曲线，认不出画的是什么；
+      * agent：只读得到 `![](loss_curve.png)` 这一行，图里的信息对它是黑洞。
+
+    图注是这张图对文本读者唯一的信息来源，所以它不是装饰，是内容。
+    """
+    out: list[dict[str, str]] = []
+    for alt, src, title in _IMG_IN_BODY.findall(step.body):
+        if not (alt.strip() or title.strip()):
+            out.append(
+                warn("warn", "figure_without_caption",
+                     f'图片 {src} 没有图注。写成 ![](……  "这张图说明了什么") —— '
+                     f"没有图注的话，图里的结论对文本读者和 agent 都是丢失的",
+                     step.dirname)
+            )
+    return out
+
+
 def lineage(by_id: dict[str, Step], sid: str) -> list[str]:
     """从根到 sid 的 id 序列。派生，不存储。"""
     chain: list[str] = []
@@ -637,8 +662,10 @@ def compile_forest(steps_dir: Path, with_files: bool = True) -> dict[str, Any]:
     lane, end = compute_lanes(by_id, children, order)
     back = compute_backlinks(by_id)
 
+    w_lint: list[dict[str, str]] = []
     steps_out = []
     for sid in order:
+        w_lint.extend(lint_body(by_id[sid]))
         d = by_id[sid].to_dict()
         d["children"] = children.get(sid, [])
         d["backlinks"] = back.get(sid, [])
@@ -653,7 +680,7 @@ def compile_forest(steps_dir: Path, with_files: bool = True) -> dict[str, Any]:
         "lanes": {sid: lane[sid] for sid in order},
         "lane_count": (max(lane.values()) + 1) if lane else 0,
         "tree": compute_tree(by_id, children, order),
-        "warnings": w_scan + w_val,
+        "warnings": w_scan + w_val + w_lint,
         "row_h": ROW_H,
         "lane_w": LANE_W,
     }

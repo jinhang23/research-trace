@@ -97,7 +97,7 @@ trace/
 ├── trace_git.py      debounce 自动 commit + push
 ├── trace_cli.py      init / projects / new-project / new / check / build / serve / url
 ├── web/              index.html · app.js · md.js · style.css（无构建步骤，不引 CDN）
-├── tests/            79 个 Python 断言 + 25 个 markdown 渲染断言（node --test）
+├── tests/            81 个 Python 断言 + 25 个 markdown 渲染断言（node --test）
 ├── projects/         ← 你的数据（仓库里自带一个示例项目，数字均为虚构，删掉即可）
 │   └── <slug>/
 │       ├── project.md            可选，只有一个 name 字段
@@ -157,6 +157,24 @@ front-matter 用手写解析器而不是 YAML：`title: 试了 3:1 采样` 在 Y
 
 ---
 
+## agent 读到的是什么
+
+同一份 `note.md` 有两类读者，两边读到的东西**不一样**，这个差别值得说清楚：
+
+| | 人 | agent |
+|---|---|---|
+| 正文 | 渲染后的排版 | `GET /api/p/{项目}/steps/{id}` 返回的 markdown 原文 |
+| 表格 | 对齐好的表 | markdown 表格原文——LLM 读它比读 HTML 更省事 |
+| 结构 | 树图 / 面包屑 | `parent` `children` `lineage` `backlinks` 都是结构化字段 |
+| **图** | 看得见 | **只看得见 `![](loss_curve.png "……")` 这一行** |
+
+所以：**图注不是装饰，是这张图对 agent（以及半年后的你）唯一的信息来源。**
+把结论写进图注——"第 12 轮之后验证集回升，再往后是纯过拟合"——文本读者就拿到了
+图里的判断，不必看图。`trace_cli.py check` 会对没有图注的图报警告。
+
+有视觉能力的 agent 可以直接取原图（读是公开的，不需要令牌）：
+`GET /p/{项目}/files/{id}/{文件名}` 返回原始字节。
+
 ## API（给 agent）
 
 Base = `/t/<space>`。读公开，写要 `Authorization: Bearer <token>`。
@@ -198,7 +216,7 @@ python trace_cli.py new -P <项目> --title "..."    # 新建一步
 python trace_cli.py check [-P <项目>]              # 校验不变量，打印警告
 python trace_cli.py build --out dist              # 静态导出，file:// 可直接打开，断网可用
 python trace_cli.py url                           # 打印访问地址与令牌
-python -m pytest tests                            # 79 个断言（内核 / 布局 / 写入 / 多项目）
+python -m pytest tests                            # 81 个断言（内核 / 布局 / 写入 / 多项目）
 node --test tests/md.test.js                      # 25 个断言（markdown 渲染）
 ```
 

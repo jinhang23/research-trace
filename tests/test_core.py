@@ -98,6 +98,17 @@ def test_backlinks_replace_the_need_for_multi_parent():
     assert back["001"] == []
 
 
+def test_image_without_a_caption_is_flagged():
+    """图注是图对文本读者（人的记忆、以及 agent）唯一的信息来源。"""
+    assert codes(core.lint_body(S("001", body="![](loss.png)"))) == ["figure_without_caption"]
+    assert core.lint_body(S("001", body='![](loss.png "第 12 轮起过拟合")')) == []
+    assert core.lint_body(S("001", body="![loss 曲线](loss.png)")) == []
+
+
+def test_lint_ignores_text_without_images():
+    assert core.lint_body(S("001", body="## 结论\n没有图，只有字。")) == []
+
+
 def test_lineage_walks_to_the_root():
     by_id, _ = core.validate([S("001"), S("002", "001"), S("003", "002")])
     assert core.lineage(by_id, "003") == ["001", "002", "003"]
