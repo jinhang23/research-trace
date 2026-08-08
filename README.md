@@ -188,6 +188,32 @@ grep -rn "^path:" projects/                # 删掉全部程序之后照样能�
 
 ---
 
+## 装成 Claude Code 插件（推荐）
+
+```
+/plugin marketplace add jinhang23/research-trace
+/plugin install research-trace@research-trace
+/research-trace:setup
+```
+
+前两条把 skill、命令和这三个 Python 模块一次装齐。第三条把 MCP server 接到
+**这台机器**上——这一步不能写进插件清单，因为两样东西每台机器都不同：
+
+- **Python 解释器在哪**。`.mcp.json` 的 `command` 是静态字符串，而 `python` 在
+  Windows 上经常指向别的软件自带的 2.x（作者机器上就是 MGLTools 的 Python 2.7.11），
+  `python3` 又可能只是个 bash 脚本、不是 Windows 可执行文件。
+- **数据仓在哪**。本地目录还是远端域名，只有你知道。
+
+`/research-trace:setup` 会实际探测出一个 ≥3.10 的解释器、问清楚数据在哪、
+写 `~/.trace.json`、注册 MCP server，最后**真跑一遍 JSON-RPC 握手**确认接通了。
+
+配置文件长这样（环境变量 `TRACE_URL` / `TRACE_TOKEN` / `TRACE_DATA` 优先级更高）：
+
+```json
+{ "data": "/path/to/数据仓" }
+{ "url": "https://你的域名/t/<space>", "token": "写入令牌" }
+```
+
 ## MCP（推荐给 agent 用）
 
 `trace_mcp.py` 把 trace 暴露成 6 个 MCP 工具。比让 agent 自己拼 HTTP 请求好在：

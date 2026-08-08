@@ -196,16 +196,42 @@ class LocalBackend:
         return self._guard(self.W.attach_auto, self._sd(project), sid, data, filename=name or "", mime=mime)
 
 
+# 配置文件的查找顺序。有它才能让插件的 .mcp.json 保持静态——
+# 数据在哪是每台机器不同的，不该写死在插件清单里。
+CONFIG_PATHS = ("~/.trace.json", "~/.config/trace/config.json")
+
+
+def read_config() -> tuple[dict[str, Any], Path | None]:
+    cands = [os.environ["TRACE_CONFIG"]] if os.environ.get("TRACE_CONFIG") else []
+    for raw in cands + list(CONFIG_PATHS):
+        p = Path(raw).expanduser()
+        try:
+            if p.is_file():
+                return json.loads(p.read_text(encoding="utf-8")), p
+        except (OSError, json.JSONDecodeError):
+            continue
+    return {}, None
+
+
 def make_backend() -> HttpBackend | LocalBackend:
-    url = os.environ.get("TRACE_URL", "").strip()
+    cfg, _src = read_config()
+
+    url = (os.environ.get("TRACE_URL") or cfg.get("url") or "").strip()
     if url:
-        return HttpBackend(url, os.environ.get("TRACE_TOKEN", "").strip())
-    data = os.environ.get("TRACE_DATA", "").strip()
+        token = (os.environ.get("TRACE_TOKEN") or cfg.get("token") or "").strip()
+        return HttpBackend(url, token)
+
+    data = (os.environ.get("TRACE_DATA") or cfg.get("data") or "").strip()
     if data:
-        return LocalBackend(Path(data))
+        return LocalBackend(Path(data).expanduser())
+
     raise ToolError(
-        "没有配置后端。要么设 TRACE_URL（+ TRACE_TOKEN）打远端服务，"
-        "要么设 TRACE_DATA 指向本地 trace 仓库目录。"
+        "没有配置后端。三选一：\n"
+        "  · 写 ~/.trace.json：{\"data\": \"/path/to/数据仓\"}  或  "
+        "{\"url\": \"https://域名/t/<space>\", \"token\": \"…\"}\n"
+        "  · 设环境变量 TRACE_DATA（本地）或 TRACE_URL + TRACE_TOKEN（远端）\n"
+        "  · 设 TRACE_CONFIG 指向别处的配置文件\n"
+        "环境变量优先于配置文件。"
     )
 
 
@@ -580,7 +606,7 @@ def dispatch(backend, name: str, args: dict[str, Any]) -> str:
 # 的客户端连上来跑一遍互操作。
 
 SERVER_NAME = "trace"
-SERVER_VERSION = "0.4.0"
+SERVER_VERSION = "0.5.0"
 
 # 收到客户端要的版本就原样回它（前提是我们认识），否则回我们最新的。
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")

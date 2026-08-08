@@ -218,3 +218,36 @@ def test_official_sdk_client_accepts_every_response_shape(tmp_path: Path):
     assert len(lines) == len(msgs)
     for l in lines:
         types.JSONRPCMessage.model_validate_json(l)     # 解析不了就直接抛
+
+
+# ------------------------------------------------------------ 配置来源
+# 插件清单是静态的，而数据在哪每台机器都不同，所以必须能从配置文件读。
+
+
+def test_config_file_is_used_when_env_is_absent(tmp_path: Path, monkeypatch):
+    for k in ("TRACE_URL", "TRACE_TOKEN", "TRACE_DATA", "TRACE_CONFIG"):
+        monkeypatch.delenv(k, raising=False)
+    cfg = tmp_path / "cfg.json"
+    cfg.write_text(json.dumps({"data": str(tmp_path / "仓")}), encoding="utf-8")
+    monkeypatch.setenv("TRACE_CONFIG", str(cfg))
+    be = M.make_backend()
+    assert isinstance(be, M.LocalBackend)
+    assert (tmp_path / "仓" / "projects").is_dir()
+
+
+def test_env_wins_over_the_config_file(tmp_path: Path, monkeypatch):
+    cfg = tmp_path / "cfg.json"
+    cfg.write_text(json.dumps({"url": "https://来自文件"}), encoding="utf-8")
+    monkeypatch.setenv("TRACE_CONFIG", str(cfg))
+    monkeypatch.setenv("TRACE_URL", "https://来自环境变量")
+    assert M.make_backend().base == "https://来自环境变量"
+
+
+def test_broken_config_file_does_not_crash(tmp_path: Path, monkeypatch):
+    for k in ("TRACE_URL", "TRACE_TOKEN", "TRACE_DATA"):
+        monkeypatch.delenv(k, raising=False)
+    cfg = tmp_path / "cfg.json"
+    cfg.write_text("{ 这不是 JSON", encoding="utf-8")
+    monkeypatch.setenv("TRACE_CONFIG", str(cfg))
+    with pytest.raises(M.ToolError, match="没有配置后端"):
+        M.make_backend()
