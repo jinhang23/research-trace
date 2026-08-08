@@ -199,6 +199,11 @@ grep -rn "^path:" projects/                # 删掉全部程序之后照样能�
 装完会得到一个真正的 `trace-mcp` 命令（Windows 上是 `Scripts/trace-mcp.exe`），
 配置里就不用写死某个 `.py` 的绝对路径了。
 
+> **注意 mcp 的版本**：本项目要 `mcp>=1.9,<2`（pyproject 里已经钉好了）。
+> mcp 2.0 是破坏性改版——移除了 `mcp.server.fastmcp`，低层 `Server` 的
+> `@list_tools`/`@call_tool` 装饰器也没了。如果你的环境里已经有 mcp 2.x，
+> 建议把 trace-mcp 装进单独的虚拟环境，配置里用那个环境的绝对路径。
+
 ```bash
 # 只要 MCP：不用 clone，直接从 GitHub 装
 pip install "git+https://github.com/jinhang23/research-trace"

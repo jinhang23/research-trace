@@ -8,7 +8,11 @@ version = "0.3.0"
 description = "只追加的科研步骤树：人和 agent 都能写，从任何结果回溯到最初的问题"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["mcp>=1.0"]
+# mcp 2.0 是破坏性改版：mcp.server.fastmcp 整个移除，低层 Server 的
+# @list_tools/@call_tool 装饰器也没了，改成 MCPServer.add_tool(fn) 从函数签名推 schema。
+# 要同时支持就得把 6 个工具再写一遍带类型标注的函数、和现有的 JSON Schema 重复一份，
+# 不值。等 2.x 生态稳定再迁。
+dependencies = ["mcp>=1.9,<2"]
 
 [project.urls]
 Homepage = "https://github.com/jinhang23/research-trace"

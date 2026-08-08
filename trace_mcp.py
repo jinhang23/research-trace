@@ -536,7 +536,27 @@ def dispatch(backend, name: str, args: dict[str, Any]) -> str:
 # ---------------------------------------------------------------- MCP
 
 
+def _check_sdk() -> None:
+    """版本不对时给一条能照做的话，而不是一段 AttributeError 回溯。"""
+    try:
+        from mcp.server import Server
+    except ImportError:
+        raise ToolError("没装 mcp：pip install 'mcp>=1.9,<2'") from None
+    if not hasattr(Server, "list_tools"):
+        import importlib.metadata as md
+
+        try:
+            ver = md.version("mcp")
+        except Exception:
+            ver = "未知"
+        raise ToolError(
+            f"装的 mcp 是 {ver}，API 不兼容。mcp 2.0 移除了低层 Server 的 "
+            f"@list_tools/@call_tool 装饰器。请装 1.x：pip install 'mcp>=1.9,<2'"
+        )
+
+
 async def amain() -> None:
+    _check_sdk()
     from mcp.server import Server
     from mcp.server.stdio import stdio_server
     from mcp.types import TextContent, Tool
@@ -569,6 +589,9 @@ def main() -> int:
         asyncio.run(amain())
     except KeyboardInterrupt:
         pass
+    except ToolError as e:
+        print(f"trace-mcp: {e}", file=sys.stderr)   # stdout 是协议通道，诊断只能走 stderr
+        return 2
     return 0
 
 
