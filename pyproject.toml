@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "research-trace"
+version = "0.3.0"
+description = "只追加的科研步骤树：人和 agent 都能写，从任何结果回溯到最初的问题"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["mcp>=1.0"]
+
+[project.urls]
+Homepage = "https://github.com/jinhang23/research-trace"
+
+# 装完之后 `trace-mcp` 就是一个真正的命令（Windows 上是 Scripts/trace-mcp.exe），
+# 于是 MCP 配置写成 `command: trace-mcp`，和别的 MCP server 形状一致，
+# 不用在配置里写死某个 .py 文件的绝对路径。
+[project.scripts]
+trace-mcp = "trace_mcp:main"
+
+# 网页服务和 CLI 需要读仓库里的 web/ 与 projects/，只能在仓库里跑，
+# 所以不打包，用 `pip install -e .[server]` 或直接 requirements.txt。
+[project.optional-dependencies]
+server = ["fastapi>=0.110", "uvicorn>=0.27"]
+
+[tool.setuptools]
+# 只装 MCP 这条链路要用到的三个模块。它们都是纯代码，不依赖仓库里的任何数据文件，
+# 所以装到 site-packages 之后照样能跑。
+py-modules = ["trace_mcp", "trace_core", "trace_write"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

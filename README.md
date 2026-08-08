@@ -194,18 +194,48 @@ grep -rn "^path:" projects/                # 删掉全部程序之后照样能�
 参数有 schema（客户端先校验，不合法的调用发不出去）、不用生成 requests/curl 代码、
 中文不会再撞上终端编码。
 
-```bash
-pip install mcp        # 只有协议层需要它；HTTP 后端只用标准库
+### 装
 
+装完会得到一个真正的 `trace-mcp` 命令（Windows 上是 `Scripts/trace-mcp.exe`），
+配置里就不用写死某个 `.py` 的绝对路径了。
+
+```bash
+# 只要 MCP：不用 clone，直接从 GitHub 装
+pip install "git+https://github.com/jinhang23/research-trace"
+
+# 还要跑网页服务：clone 下来（web/ 和 projects/ 得在仓库里）
+git clone https://github.com/jinhang23/research-trace && cd research-trace
+pip install -e ".[server]"
+```
+
+### 配
+
+```bash
 # 本地模式：agent 和数据在同一台机器上，不需要起服务
-claude mcp add trace --env TRACE_DATA=/path/to/trace -- python /path/to/trace/trace_mcp.py
+claude mcp add trace -s user -e TRACE_DATA=/path/to/数据仓 -- trace-mcp
 
 # 远端模式：agent 在 HPC 上，数据在你的域名后面
-claude mcp add trace \
-  --env TRACE_URL=https://你的域名/t/<space> \
-  --env TRACE_TOKEN=<写入令牌> \
-  -- python /path/to/trace/trace_mcp.py
+claude mcp add trace -s user \
+  -e TRACE_URL=https://你的域名/t/<space> \
+  -e TRACE_TOKEN=<写入令牌> \
+  -- trace-mcp
 ```
+
+`-s user` 是全局生效；不加的话默认是 `local`（只在当前项目目录下生效）。
+
+也可以直接写进 `~/.claude.json` 的 `mcpServers`：
+
+```json
+"trace": {
+  "type": "stdio",
+  "command": "trace-mcp",
+  "env": { "TRACE_DATA": "/path/to/数据仓" }
+}
+```
+
+> **Windows 上如果提示找不到 `trace-mcp`**，把 `command` 换成绝对路径。查路径：
+> `python -c "import shutil; print(shutil.which('trace-mcp'))"`
+> （通常是 `C:/ProgramData/anaconda3/Scripts/trace-mcp.exe` 这种）
 
 | 工具 | 干什么 |
 |---|---|
