@@ -526,6 +526,7 @@
             return '<button data-status="' + st + '"' + (s.status === st ? ' class="on"' : "") + ">" + st + "</button>";
           }).join("")
         + '<span class="sp"></span>'
+        + '<button data-act="delete" class="danger" title="真删这一步。只用于误建/测试数据/粘错的敏感信息——失败的实验请标 dead">删除</button>'
         + '<button data-act="child" class="primary">＋ 从这里派生</button>'
         + "</div>";
     }
@@ -925,6 +926,32 @@
     if (name === "edit") { editing = true; renderDetail(); }
     else if (name === "cancel") { editing = false; renderDetail(); }
     else if (name === "child") { openNew(selected()); }
+    else if (name === "delete") {
+      var d = IDX[selected()];
+      if (!d) return;
+      var kids = (d.children || []).length;
+      var why = prompt([
+        "删除 " + d.id + "「" + d.title + "」",
+        "",
+        "这是真删：目录连同附件一起移除，id 可能被下一步重用。",
+        kids ? "⚠ 它有 " + kids + " 个子步骤，会变成孤儿（降级为根）。" : "",
+        "失败的实验请改标 dead，不要删。",
+        "",
+        "为什么删？（必填，会记进项目的 project.md）",
+      ].filter(Boolean).join("\n"));
+      if (!why || !why.trim()) return;
+      papi("/steps/" + encodeURIComponent(d.id), {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: why.trim(), by: "human", date: todayISO() }),
+      }).then(function (info) {
+        select("");
+        return refresh().then(refreshProjects).then(function () {
+          toast("已删除 " + info.id
+                + (info.orphaned.length ? "；" + info.orphaned.join("、") + " 已变成孤儿" : ""));
+        });
+      }).catch(fail);
+    }
     else if (name === "save") { saveEditor(); }
   });
 

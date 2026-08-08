@@ -5,15 +5,19 @@ CLI、网页表单、agent API 全部调这里，不允许任何一方绕过去�
 导致父子关系只写进了一半的地方。这里用"只有一个函数会创建 note.md"来杜绝。
 
 只追加原则（P2）在这里强制：
-  * id 由服务端分配，永不重编号；
-  * parent 一旦写下就不可改（update_step 直接抛 Conflict）；
-  * 没有删除步骤的 API。
+  * id 由服务端分配，正常情况下不重编号；
+  * parent 一旦写下就不可改（update_step 直接抛 Conflict）。
+
+唯一的例外是 delete_step()：真删目录，用来处理"这条记录本身就不该存在"
+（误建、测试数据、粘进去的令牌）。它和 status=dead 是两件事——dead 是研究结论。
+代价（id 可能被重用、子步骤变孤儿）在那个函数的说明里写清楚了。
 """
 
 from __future__ import annotations
 
 import hashlib
 import re
+import shutil
 import unicodedata
 from pathlib import Path
 from typing import Any
@@ -461,6 +465,68 @@ def update_step(steps_dir: Path, sid: str, patch: dict[str, Any]) -> Step:
     # 改名会让所有已经发出去的相对链接失效。
     (steps_dir / step.dirname / NOTE_NAME).write_text(render_note(step), encoding="utf-8", newline="\n")
     return step
+
+
+def delete_step(steps_dir: Path, sid: str, reason: str, by: str = "", date: str = "") -> dict[str, Any]:
+    """真删：整个目录连同附件一起移除。
+
+    这是对 P2「只追加」的一处**有意的例外**，用来处理"这条记录本身就不该存在"
+    ——误建、测试数据、不小心粘进去的令牌。它和 `dead` 是两件事：
+    `dead` 是研究结论（此路不通），往里塞垃圾会毁掉这套系统最有价值的信号。
+
+    两个已知代价，是明确接受的：
+
+    1. **id 会被重用。** 分配用的是"现存 id 的最大值 + 1"，删掉最大号之后
+       下一步就会拿到同一个号。于是半年前笔记里的「见 002」可能指向另一个东西。
+       要避免就得有个"用过哪些号"的中心文件，而那正是 P1 禁止的。
+    2. **子步骤会变成孤儿。** 它们的 parent 指向一个不存在的 id，
+       validate() 会把它们降级为根并给出警告——构建不会崩，但那条线断了。
+
+    所以返回值里明确告诉调用方这两件事各自发生了多少，让人能当场看见后果。
+    """
+    reason = _clean_line(reason)
+    if not reason:
+        raise WriteError(
+            "删除必须写原因。目录一删，「为什么删的」就只剩这一句了——"
+            "它和「为什么做的」一样，是半年后唯一追得回来的东西。")
+
+    by_id = load(steps_dir)
+    if sid not in by_id:
+        raise NotFound(f"步骤 {sid} 不存在")
+    target = by_id[sid]
+
+    children = sorted((k for k, s in by_id.items() if s.parent == sid), key=id_key)
+    refs = sorted(k for k, s in by_id.items()
+                  if k != sid and re.search(rf"\[\[\s*{re.escape(sid)}\s*\]\]", s.body))
+
+    d = steps_dir / target.dirname
+    files = sum(1 for _ in d.rglob("*") if _.is_file())
+    shutil.rmtree(d)
+
+    _log_deletion(steps_dir.parent, sid, target.title, reason, by, date)
+    return {"id": sid, "title": target.title, "reason": reason,
+            "files_removed": files, "orphaned": children, "dangling_refs": refs}
+
+
+def _log_deletion(project_dir_: Path, sid: str, title: str, reason: str, by: str, date: str) -> None:
+    """把删除记进项目的 project.md。
+
+    这**不是**中心索引——没有任何东西靠它重建结构，所以 P1 不破，它也不可能
+    "和实际内容不一致"。它只是一份人可读、可 grep 的历史：目录没了之后，
+    「006 是什么、为什么删的」只剩这一行。
+    """
+    note = project_dir_ / PROJECT_NOTE
+    meta: dict[str, str] = {}
+    body = ""
+    if note.is_file():
+        from trace_core import parse_note
+
+        meta, body, _w = parse_note(note.read_text(encoding="utf-8", errors="replace"))
+    stamp = " · ".join(x for x in (date.strip(), by.strip()) if x.strip())
+    entry = f"- `{sid}` {title}".rstrip() + f" —— {reason}" + (f"（{stamp}）" if stamp else "")
+    body = _append_under(body, "已删除", entry)
+    name = (meta.get("name") or project_dir_.name).strip()
+    note.write_text(f"---\nname: {name}\n---\n\n{body.strip()}\n", encoding="utf-8", newline="\n")
 
 
 def append_body(steps_dir: Path, sid: str, text: str) -> Step:

@@ -506,3 +506,6 @@ dialog menu { display: flex; justify-content: flex-end; gap: 8px; padding: 0; ma
 .insights .prose h2:first-child { margin-top: .6em; }
 .insights .prose ul { padding-left: 1.3em; }
 .insights .prose li { margin: .4em 0; }
+
+button.danger { color: var(--dead); border-color: color-mix(in srgb, var(--dead) 45%, var(--rule)); }
+button.danger:hover { background: color-mix(in srgb, var(--dead) 12%, transparent); }

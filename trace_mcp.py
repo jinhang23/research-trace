@@ -120,6 +120,9 @@ class HttpBackend:
     def update(self, project, sid, patch):
         return self._call("PATCH", f"/api/p/{urllib.parse.quote(project)}/steps/{urllib.parse.quote(sid)}", patch)
 
+    def delete(self, project, sid, payload):
+        return self._call("DELETE", f"/api/p/{urllib.parse.quote(project)}/steps/{urllib.parse.quote(sid)}", payload)
+
     def attach(self, project, sid, data, name, mime):
         h = {"Content-Type": mime}
         if name:
@@ -210,6 +213,11 @@ class LocalBackend:
 
     def update(self, project, sid, patch):
         return self._guard(self.W.update_step, self._sd(project), sid, patch).to_dict()
+
+    def delete(self, project, sid, payload):
+        return self._guard(self.W.delete_step, self._sd(project), sid,
+                           payload.get("reason", ""), by=payload.get("by", ""),
+                           date=payload.get("date", ""))
 
     def attach(self, project, sid, data, name, mime):
         return self._guard(self.W.attach_auto, self._sd(project), sid, data, filename=name or "", mime=mime)
@@ -429,6 +437,38 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "trace_delete_step",
+        "description": (
+            "**真删**一个步骤：整个目录连同附件一起移除。这是「只追加」原则的一处例外，"
+            "只用来处理**这条记录本身就不该存在**的情况——误建、测试数据、"
+            "不小心粘进去的令牌或敏感信息。\n"
+            "**不要用它处理失败的实验。** 试过、走不通，那是 status=dead —— 研究结论，"
+            "是这套系统里最有价值的东西。往里塞垃圾会毁掉这个信号；反过来，"
+            "把真实的失败删掉等于抹掉了后来人最需要的那条线索。\n"
+            "两个已知代价，调用前要清楚：\n"
+            "  · **id 会被重用** —— 删掉最大号之后，下一个新建的步骤会拿到同一个号，"
+            "于是旧笔记里的「见 002」可能指向另一个东西。\n"
+            "  · **子步骤会变成孤儿** —— 它们的 parent 指向一个不存在的 id，"
+            "会被降级为根并给出警告。\n"
+            "返回值会告诉你这两件事各自发生了多少。删之前先 trace_read 确认一眼。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string"},
+                "step": {"type": "string"},
+                "reason": {
+                    "type": "string",
+                    "description": ("为什么删。**必填** —— 目录一删，这句话就是唯一留下来的东西，"
+                                    "它会被记进项目的 project.md。写「误建的测试步骤」这种具体的，"
+                                    "不要写「清理」。"),
+                },
+                "date": {"type": "string", "description": "YYYY-MM-DD"},
+            },
+            "required": ["project", "step", "reason"],
+        },
+    },
+    {
         "name": "trace_read",
         "description": (
             "读一个项目的步骤树；给了 step 就读那一步的全文（含到根的溯源链、子步骤、"
@@ -624,6 +664,21 @@ def t_insight(be, args) -> str:
     return f"已记入 {p['slug']} 的「{label}」：{text}"
 
 
+def t_delete_step(be, args) -> str:
+    info = be.delete(args["project"], args["step"],
+                     {"reason": args["reason"], "by": DEFAULT_AUTHOR, "date": args.get("date", "")})
+    out = [f"已删除 {args['project']}/{info['id']}「{info['title']}」"
+           f"（连同 {info['files_removed']} 个文件），原因已记进项目的 project.md。"]
+    if info["orphaned"]:
+        out.append("⚠ " + "、".join(info["orphaned"])
+                   + " 的 parent 现在指向一个不存在的 id，会被降级为根并报警告。")
+    if info["dangling_refs"]:
+        out.append("⚠ " + "、".join(info["dangling_refs"])
+                   + f" 的正文里写了 [[{info['id']}]]，现在指不到东西了。")
+    out.append(f"⚠ id {info['id']} 可能被下一个新建的步骤重用——旧笔记里对它的引用会指向别的东西。")
+    return "\n".join(out)
+
+
 def t_new_project(be, args) -> str:
     p = be.create_project(args["name"])
     return (f"已建项目 {p['slug']}（显示名 {p['name']}）。"
@@ -751,6 +806,7 @@ HANDLERS = {
     "trace_projects": t_projects,
     "trace_new_project": t_new_project,
     "trace_insight": t_insight,
+    "trace_delete_step": t_delete_step,
     "trace_read": t_read,
     "trace_search": t_search,
     "trace_new_step": t_new_step,
@@ -779,7 +835,7 @@ def dispatch(backend, name: str, args: dict[str, Any]) -> str:
 # 的客户端连上来跑一遍互操作。
 
 SERVER_NAME = "trace"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
 
 # 收到客户端要的版本就原样回它（前提是我们认识），否则回我们最新的。
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")

@@ -155,6 +155,28 @@ def cmd_new(args) -> int:
     return 0
 
 
+def cmd_rm(args) -> int:
+    """真删一步。
+
+    在服务器那台机器上，`rm -rf steps/002_xxx` 本来就能达到同样的效果——
+    这个子命令的意义不是"能删"，是**逼你把原因留下来**。目录一删，
+    "为什么删的"就只剩 project.md 里的那一行了。
+    """
+    cfg = load_config()
+    root = data_root(cfg)
+    slug = pick_project(root, args.project)
+    sd = core.steps_dir_of(root, slug)
+    info = W.delete_step(sd, args.id, args.reason, by=args.by or "human", date=args.date or "")
+    print(f"已删除 {slug}/{info['id']}「{info['title']}」（连同 {info['files_removed']} 个文件）")
+    print(f"原因已记进 {core.project_dir(root, slug) / core.PROJECT_NOTE}")
+    if info["orphaned"]:
+        print("⚠ 变成孤儿（会被降级为根）：" + "、".join(info["orphaned"]))
+    if info["dangling_refs"]:
+        print("⚠ 这些步骤的正文里还写着 [[" + info["id"] + "]]：" + "、".join(info["dangling_refs"]))
+    print(f"⚠ id {info['id']} 可能被下一个新建的步骤重用。")
+    return 0
+
+
 KIND_LABEL = {
     "hpc": "超算", "github": "GitHub", "git": "Git", "dropbox": "Dropbox", "drive": "Drive",
     "object": "对象存储", "archive": "数据仓库", "mlhub": "实验平台", "url": "链接",
@@ -324,6 +346,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--path", action="append", metavar="位置|说明",
                    help='外部产物的位置，可重复。如 --path "/blue/组/用户/data | 训练集，12 GB"')
     p.set_defaults(fn=cmd_new)
+
+    p = sub.add_parser("rm", help="真删一步（只用于误建/测试数据；失败的实验请标 dead）")
+    p.add_argument("id")
+    p.add_argument("--reason", required=True, help="为什么删。必填 —— 目录一删，这句话就是唯一留下来的")
+    p.add_argument("-P", "--project", default=None)
+    p.add_argument("--by", default="human")
+    p.add_argument("--date", default="")
+    p.set_defaults(fn=cmd_rm)
 
     p = sub.add_parser("paths", help="列出所有外部产物的位置")
     p.add_argument("-P", "--project", default=None)

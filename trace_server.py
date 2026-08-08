@@ -419,6 +419,16 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
         touched([f"{project}/{sid}"])
         return JSONResponse({"ok": True})
 
+    @app.delete(base + "/api/p/{project}/steps/{sid}")
+    async def api_delete_step(project: str, sid: str, request: Request) -> JSONResponse:
+        """真删一个步骤。P2 的有意例外，见 trace_write.delete_step 的说明。"""
+        require_token(request)
+        payload = await body_json(request) if await request.body() else {}
+        info = W.delete_step(sd(project), sid, payload.get("reason", ""),
+                             by=payload.get("by", ""), date=payload.get("date", ""))
+        touched([f"{project}/{sid} 已删除"])
+        return JSONResponse(info)
+
     @app.post(base + "/api/sync")
     async def api_sync(request: Request) -> JSONResponse:
         require_token(request)

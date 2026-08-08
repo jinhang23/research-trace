@@ -6,6 +6,7 @@
 
 import json
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -128,6 +129,12 @@ def test_all_blank_gives_an_actionable_error(monkeypatch, tmp_path):
 # 令牌在 init 时就随机生成好了。本地模式根本用不上；服务在本机时程序能自己找到。
 
 
+# 这个 space 是**编出来的**，不要换成真实部署里的值。
+# space 是读取侧唯一的保护（挂在不可猜路径下），而这个仓库是公开的——
+# 把真值写进测试，等于把它连同 git 历史一起发出去。
+FAKE_SPACE = "EXAMPLE-space-not-a-real-one"
+
+
 def _server_repo(tmp_path: Path, space: str, token: str) -> Path:
     d = tmp_path / "repo"
     d.mkdir()
@@ -145,9 +152,9 @@ def test_local_mode_needs_no_token_at_all(tmp_path: Path, monkeypatch):
 
 def test_token_is_discovered_from_the_local_config_when_the_space_matches(tmp_path: Path, monkeypatch):
     """服务跑在本机时，令牌就在 config.json 里，不该再让人抄一遍。"""
-    repo = _server_repo(tmp_path, "Pez39Q2KiYjpDNBHzZMfUQ", "秘密令牌")
+    repo = _server_repo(tmp_path, FAKE_SPACE, "秘密令牌")
     monkeypatch.delenv("TRACE_CONFIG", raising=False)
-    monkeypatch.setenv("TRACE_URL", "http://127.0.0.1:8123/t/Pez39Q2KiYjpDNBHzZMfUQ")
+    monkeypatch.setenv("TRACE_URL", "http://127.0.0.1:8123/t/" + FAKE_SPACE)
     monkeypatch.setenv("TRACE_TOKEN", "")
     monkeypatch.setenv("TRACE_DATA", str(repo))
     assert M.make_backend().token == "秘密令牌"
@@ -399,3 +406,32 @@ def test_selfcheck_flags_the_ghost_project_left_behind(tmp_path: Path, monkeypat
     M.selfcheck()
     out = capsys.readouterr().out
     assert "空壳项目" in out and "projects" in out
+
+
+def test_no_real_secret_ever_reaches_a_tracked_file():
+    """本仓库是公开的；config.json 里的 space 和 token 一个字节都不能进去。
+
+    这条测试是从一次真实的疏忽里长出来的：我把本机的 space 硬编码进了这个文件，
+    而 space 正是读取侧唯一的保护。令牌至少还会被 401 挡住，space 泄露了就是
+    "谁都能读你的全部科研记录"。所以做成机械检查，不靠人记得。
+    """
+    cfg = ROOT / "config.json"
+    if not cfg.is_file():
+        pytest.skip("这台机器上没有 config.json（客户端模式）")
+    conf = json.loads(cfg.read_text(encoding="utf-8"))
+    secrets = [str(conf.get(k, "")) for k in ("space", "token")]
+    out = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT,
+                         capture_output=True, check=False)
+    if out.returncode != 0:
+        pytest.skip("不在 git 仓库里")
+    for rel in out.stdout.decode("utf-8").split(chr(0)):
+        if not rel:
+            continue
+        f = ROOT / rel
+        try:
+            text = f.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for secret in secrets:
+            if len(secret) >= 8 and secret in text:
+                pytest.fail(f"{rel} 里出现了 config.json 的真实机密 —— 这个仓库是公开的")

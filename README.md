@@ -71,11 +71,16 @@ python trace_cli.py serve                           # 起服务，终端会打�
 > 于是不存在"索引和实际内容不一致"这种状态。新建一步就是新建一个目录——
 > 不需要注册。你可以直接 `mkdir` + `vim note.md`，页面五秒内自己跟上。
 
-**P2 · 只追加.** step 不删除，id 不重编号，父子关系一旦写下不再改。
+**P2 · 只追加.** id 不重编号，父子关系一旦写下不再改。
 可变的只有 `status` 和正文。改 `id` / `parent` 的 API 请求一律 409。
 
 > 这是溯源能成立的前提：笔记里写的"见 002b"、论文脚注里的引用，永远有效。
 > 项目的 slug 同理——改显示名不动目录名，已经发出去的链接不会失效。
+
+删除是这条原则**唯一的例外**，只用于"这条记录本身就不该存在"——误建、测试数据、
+不小心粘进去的令牌。它和 `dead` 是两回事：`dead` 是研究结论，删掉真实的失败
+等于抹掉后来人最需要的线索。删除必须写原因，原因记进项目的 `project.md`；
+代价（id 可能被重用、子步骤变孤儿）每次都会明确报出来。详见 [FORMAT.md](FORMAT.md) 第 8 节。
 
 **P3 · 编译，而不是同步.** 视图是文件系统的纯函数。构建无状态、幂等、可随时删掉重来。
 实时推送推的是"版本变了，重新编译"信号，不是增量 patch。
@@ -357,6 +362,7 @@ Base = `/t/<space>`。读公开，写要 `Authorization: Bearer <token>`。
 | GET | `/api/events` | SSE，推 `{version}` |
 | POST | `/api/p/{项目}/steps` | 建步骤。带 `key` 则幂等——重试不会产生重复 |
 | PATCH | `/api/p/{项目}/steps/{id}` | 改 status/title/body/date/commit/author/tags |
+| DELETE | `/api/p/{项目}/steps/{id}` | 真删目录。`{reason}` 必填 —— 只追加原则的唯一例外 |
 | PUT | `/api/p/{项目}/steps/{id}/files/{path}` | 上传附件到指定文件名（raw body） |
 | POST | `/api/p/{项目}/steps/{id}/files` | 上传附件，服务端定名（`X-Filename` 可选；没给就按内容哈希命名，重复内容自动复用） |
 
