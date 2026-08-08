@@ -8,19 +8,20 @@
     TRACE_URL + TRACE_TOKEN    → 走 HTTPS 打远端服务（agent 在 HPC 上就用这个）
     TRACE_DATA=<仓库路径>       → 直接读写本地文件（agent 和数据在同一台机器上）
 
-HTTP 后端只用标准库，所以这个文件在任何裸 Python 3.10+ 上都能跑；
-只有 MCP 协议层需要 `pip install mcp`。
+零依赖：MCP 是开放协议规范，`mcp` 那个 pip 包只是它的官方 Python SDK 之一。
+stdio 侧就是换行分隔的 JSON-RPC 2.0，这里直接说协议，任何裸 Python 3.10+ 都能跑。
 
 注意：stdio 传输下 stdout 是协议通道，任何诊断输出都必须走 stderr。
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import mimetypes
 import os
+import re
 import sys
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -28,6 +29,9 @@ from pathlib import Path
 from typing import Any
 
 IMG_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".avif"}
+# 和 trace_write.MAX_FILE_BYTES 保持一致。这里单独放一份，是因为 HTTP 后端
+# 不 import trace_write，而大小检查必须在读文件**之前**做。
+MAX_ATTACH_BYTES = 32 * 1024 * 1024
 MARK = {"done": "●", "wip": "○", "dead": "▣"}
 KIND_LABEL = {
     "hpc": "超算", "github": "GitHub", "git": "Git", "dropbox": "Dropbox", "drive": "Drive",
@@ -87,6 +91,12 @@ class HttpBackend:
             raise ToolError(f"{e.code} {detail}") from None
         except urllib.error.URLError as e:
             raise ToolError(f"连不上 {self.base}：{e.reason}") from None
+        except json.JSONDecodeError:
+            # 代理/网关返回 HTML 错误页时会走到这里
+            raise ToolError(f"{self.base} 返回的不是 JSON，可能中间有代理或网关错误页") from None
+        except (TimeoutError, OSError) as e:
+            # 读阶段的超时是裸 TimeoutError，绕开了上面的 URLError 分支
+            raise ToolError(f"请求 {self.base} 失败：{e}") from None
 
     def projects(self):
         return self._call("GET", "/api/projects")["projects"]
@@ -427,8 +437,6 @@ def _why_is_blank(body: str) -> bool:
     """「为什么」这一节是不是还空着。按小节内容判断，不靠正文长度这种粗糙启发式。"""
     global _WHY
     if _WHY is None:
-        import re
-
         _WHY = re.compile(r"##\s*为什么\s*\n(.*?)(?=\n##\s|\Z)", re.S)
     m = _WHY.search(body)
     if not m:
@@ -477,15 +485,41 @@ def t_update_step(be, args) -> str:
     return f"已更新 {project}/{s['id']}  [{s['status']}]  {s['title']}"
 
 
+def _md_ref(path: str, caption: str, is_img: bool) -> str:
+    """拼进正文的 markdown 引用。
+
+    caption 和文件名都是外部输入，零转义直接拼会把语法撑破：
+    引号会提前关掉 title，括号会提前关掉 url。
+    """
+    cap = re.sub(r'["\r\n]+', "'", caption).strip()
+    target = f"<{path}>" if re.search(r"[ ()<>]", path) else path
+    return f'![]({target} "{cap}")' if is_img else f"[{cap}]({target})"
+
+
 def t_attach(be, args) -> str:
     project, sid = args["project"], args["step"]
     name = (args.get("name") or "").strip()
 
     if args.get("path"):
+        if args.get("text") is not None:
+            raise ToolError("path 和 text 只能给一个")   # 原来是静默丢掉 text
         p = Path(args["path"]).expanduser()
-        if not p.is_file():
-            raise ToolError(f"文件不存在: {p}")
-        data = p.read_bytes()
+        try:
+            if not p.is_file():
+                raise ToolError(f"文件不存在: {p}")
+            # 先看大小再读。原来是先 read_bytes 把整个文件读进内存，
+            # 大小闸门在后面才生效——一个 40 GB 的 checkpoint 会先把内存打爆。
+            if p.stat().st_size > MAX_ATTACH_BYTES:
+                raise ToolError(
+                    f"{p.name} 有 {p.stat().st_size / 1048576:.0f} MB，超过 "
+                    f"{MAX_ATTACH_BYTES // 1048576} MB 上限。大文件不要传进来，"
+                    f"用 paths 记下它在哪就行。"
+                )
+            data = p.read_bytes()
+        except OSError as e:
+            # 权限不足、被别的进程独占、路径太长……这些是工具层失败，
+            # 要让模型看得到并改，不该变成协议级错误。
+            raise ToolError(f"读不了 {p}：{e.strerror or e}") from None
         name = name or p.name
     elif args.get("text") is not None:
         data = args["text"].encode("utf-8")
@@ -508,7 +542,7 @@ def t_attach(be, args) -> str:
     msg = f"已{'复用已有' if info.get('reused') else '上传'}附件 {project}/{sid}/{path}（{info['size']} 字节）"
 
     if caption:
-        ref = (f'![]({path} "{caption}")' if is_img else f"[{caption}]({path})")
+        ref = _md_ref(path, caption, is_img)
         cur = be.step(project, sid)["body"] or ""
         if path not in cur:
             be.update(project, sid, {"body": cur.rstrip("\n") + "\n\n" + ref + "\n"})
@@ -584,6 +618,9 @@ def validate_args(schema: dict[str, Any], args: dict[str, Any]) -> None:
         if v is None:
             continue
         want = spec.get("type")
+        # Python 里 bool 是 int 的子类，裸 isinstance 会让 true 混进 integer/number。
+        if want in ("integer", "number") and isinstance(v, bool):
+            raise ToolError(f"参数 {k} 应当是 {want}，收到 boolean")
         py = _JSON_TYPES.get(want)
         if py and not isinstance(v, py):
             raise ToolError(f"参数 {k} 应当是 {want}，收到 {type(v).__name__}")
@@ -624,13 +661,25 @@ def handle(msg: Any, session: Session) -> dict[str, Any] | None:
     """
     if not isinstance(msg, dict):
         return _error(None, -32600, "请求必须是 JSON 对象")
-    is_notification = "id" not in msg
+    has_id = "id" in msg
     mid = msg.get("id")
     method = msg.get("method")
     params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
 
+    # MCP 在 JSON-RPC 之上收紧了一条：请求的 id 不允许是 null。
+    if has_id and mid is None:
+        return _error(None, -32600, "请求的 id 不能是 null")
+    is_notification = not has_id
+
     if not isinstance(method, str):
         return None if is_notification else _error(mid, -32600, "缺少 method")
+
+    # JSON-RPC 2.0 §4.1：通知一律不回，**也不执行**。
+    # 这道闸必须在所有分支之前——只在"未知方法"处判的话，一条没有 id 的
+    # tools/call 会既回一个 id:null 的幽灵响应（官方客户端解析不了），
+    # 又真的把步骤写进磁盘。
+    if is_notification:
+        return None
 
     try:
         if method == "initialize":
@@ -643,9 +692,6 @@ def handle(msg: Any, session: Session) -> dict[str, Any] | None:
                 "instructions": INSTRUCTIONS,
             })
 
-        if method.startswith("notifications/") or method == "initialized":
-            return None                                   # 通知一律不回
-
         if method == "ping":
             return _result(mid, {})
 
@@ -657,23 +703,39 @@ def handle(msg: Any, session: Session) -> dict[str, Any] | None:
 
         if method == "tools/call":
             name = params.get("name")
-            args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+            raw = params.get("arguments", {})
+            if raw is None:
+                raw = {}
+            if not isinstance(raw, dict):
+                # 静默当成 {} 的话，报出来的会是"缺少必填参数 project"，
+                # 和真正的毛病（arguments 根本不是对象）对不上，很难查。
+                return _error(mid, -32602, "arguments 必须是 JSON 对象")
             spec = next((t for t in TOOLS if t["name"] == name), None)
             if spec is None:
                 return _error(mid, -32602, f"未知工具: {name}")
             try:
-                validate_args(spec["inputSchema"], args)
-                text = dispatch(session.get_backend(), name, args)
+                validate_args(spec["inputSchema"], raw)
+                text = dispatch(session.get_backend(), name, raw)
             except ToolError as e:
                 # 工具层的失败用 isError 回，让模型看得到、能改；
                 # JSON-RPC 的 error 只留给协议层的问题。
                 return _result(mid, {"content": [{"type": "text", "text": str(e)}], "isError": True})
+            except Exception as e:
+                # 工具里冒出来的任何异常也走 isError（官方 SDK 就是这么做的）。
+                # 回 JSON-RPC error 会让客户端当成协议级故障直接抛给上层，
+                # 模型既看不到原因也没法自我纠正。真实触发路径：远端超时、
+                # 代理返回 HTML 页导致 JSONDecodeError、读文件时的 PermissionError……
+                traceback.print_exc(file=sys.stderr)
+                return _result(mid, {"content": [{"type": "text",
+                                                  "text": f"工具执行失败：{type(e).__name__}: {e}"}],
+                                     "isError": True})
             return _result(mid, {"content": [{"type": "text", "text": text}], "isError": False})
 
-        return None if is_notification else _error(mid, -32601, f"不支持的方法: {method}")
+        return _error(mid, -32601, f"不支持的方法: {method}")
 
     except Exception as e:                                 # 兜底，绝不让连接因为一条消息断掉
-        return None if is_notification else _error(mid, -32603, f"内部错误: {type(e).__name__}: {e}")
+        traceback.print_exc(file=sys.stderr)
+        return _error(mid, -32603, f"内部错误: {type(e).__name__}: {e}")
 
 
 def serve_stdio(stream_in=None, stream_out=None) -> None:
@@ -692,7 +754,9 @@ def serve_stdio(stream_in=None, stream_out=None) -> None:
             continue
         try:
             msg = json.loads(line)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError, ValueError):
+            # RecursionError 不是 JSONDecodeError 的子类：嵌套上万层的数组
+            # 会让它逃出去、一路把整个循环掀翻，连接直接断。
             emit(_error(None, -32700, "JSON 解析失败"))
             continue
         if isinstance(msg, list):                          # 老版本协议允许批量，逐条处理

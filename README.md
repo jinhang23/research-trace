@@ -98,7 +98,7 @@ trace/
 ├── trace_cli.py      init / projects / new-project / new / check / paths / build / serve / url
 ├── trace_mcp.py      MCP server（手写 JSON-RPC，零依赖；两种后端：远端 HTTP / 本地文件）
 ├── web/              index.html · app.js · md.js · style.css（无构建步骤，不引 CDN）
-├── tests/            152 个 Python 断言 + 25 个 markdown 渲染断言（node --test）
+├── tests/            172 个 Python 断言 + 25 个 markdown 渲染断言（node --test）
 ├── projects/         ← 你的数据（仓库里自带一个示例项目，数字均为虚构，删掉即可）
 │   └── <slug>/
 │       ├── project.md            可选，只有一个 name 字段
@@ -323,7 +323,7 @@ python trace_cli.py check [-P <项目>]              # 校验不变量，打印�
 python trace_cli.py paths [-P <项目>] [--kind hpc] # 列出所有外部产物的位置
 python trace_cli.py build --out dist              # 静态导出，file:// 可直接打开，断网可用
 python trace_cli.py url                           # 打印访问地址与令牌
-python -m pytest tests                            # 152 个断言（内核 / 布局 / 写入 / 多项目 / 路径 / MCP 协议）
+python -m pytest tests                            # 172 个断言（内核 / 布局 / 写入 / 多项目 / 路径 / MCP 协议）
 node --test tests/md.test.js                      # 25 个断言（markdown 渲染）
 ```
 
