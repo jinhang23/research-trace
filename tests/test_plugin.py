@@ -116,3 +116,62 @@ def test_all_blank_gives_an_actionable_error(monkeypatch, tmp_path):
     with pytest.raises(M.ToolError) as e:
         M.make_backend()
     assert "TRACE_DATA" in str(e.value) and "trace.json" in str(e.value)
+
+
+# ------------------------------------------------------------ 令牌不该让人手抄
+# 令牌在 init 时就随机生成好了。本地模式根本用不上；服务在本机时程序能自己找到。
+
+
+def _server_repo(tmp_path: Path, space: str, token: str) -> Path:
+    d = tmp_path / "repo"
+    d.mkdir()
+    (d / "config.json").write_text(json.dumps({"space": space, "token": token}), encoding="utf-8")
+    return d
+
+
+def test_local_mode_needs_no_token_at_all(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("TRACE_CONFIG", raising=False)
+    monkeypatch.setenv("TRACE_DATA", str(tmp_path))
+    for k in ("TRACE_URL", "TRACE_TOKEN"):
+        monkeypatch.setenv(k, "")
+    assert isinstance(M.make_backend(), M.LocalBackend)
+
+
+def test_token_is_discovered_from_the_local_config_when_the_space_matches(tmp_path: Path, monkeypatch):
+    """服务跑在本机时，令牌就在 config.json 里，不该再让人抄一遍。"""
+    repo = _server_repo(tmp_path, "Pez39Q2KiYjpDNBHzZMfUQ", "秘密令牌")
+    monkeypatch.delenv("TRACE_CONFIG", raising=False)
+    monkeypatch.setenv("TRACE_URL", "http://127.0.0.1:8123/t/Pez39Q2KiYjpDNBHzZMfUQ")
+    monkeypatch.setenv("TRACE_TOKEN", "")
+    monkeypatch.setenv("TRACE_DATA", str(repo))
+    assert M.make_backend().token == "秘密令牌"
+
+
+def test_a_token_for_a_different_server_is_never_used(tmp_path: Path, monkeypatch):
+    """本地留着的可能是另一台服务器的令牌，拿去用只会换来莫名其妙的 401。"""
+    repo = _server_repo(tmp_path, "本机的space", "本机的令牌")
+    monkeypatch.delenv("TRACE_CONFIG", raising=False)
+    monkeypatch.setenv("TRACE_URL", "https://别的域名/t/完全不同的space")
+    monkeypatch.setenv("TRACE_TOKEN", "")
+    monkeypatch.setenv("TRACE_DATA", str(repo))
+    assert M.make_backend().token == "", "space 对不上就不能用那个令牌"
+
+
+def test_an_explicit_token_always_wins(tmp_path: Path, monkeypatch):
+    repo = _server_repo(tmp_path, "space1", "自动找到的")
+    monkeypatch.delenv("TRACE_CONFIG", raising=False)
+    monkeypatch.setenv("TRACE_URL", "https://x/t/space1")
+    monkeypatch.setenv("TRACE_TOKEN", "手填的")
+    monkeypatch.setenv("TRACE_DATA", str(repo))
+    assert M.make_backend().token == "手填的"
+
+
+def test_discovery_survives_a_broken_config_json(tmp_path: Path, monkeypatch):
+    d = tmp_path / "repo"
+    d.mkdir()
+    (d / "config.json").write_text("{ 这不是 JSON", encoding="utf-8")
+    monkeypatch.delenv("TRACE_CONFIG", raising=False)
+    monkeypatch.setenv("TRACE_URL", "https://x/t/space1")
+    monkeypatch.setenv("TRACE_TOKEN", "")
+    monkeypatch.setenv("TRACE_DATA", str(d))
+    assert M.make_backend().token == ""      # 不崩，只是找不到

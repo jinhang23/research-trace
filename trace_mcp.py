@@ -213,12 +213,42 @@ def read_config() -> tuple[dict[str, Any], Path | None]:
     return {}, None
 
 
+def discover_token(url: str, hints) -> str:
+    """服务在本机时，令牌本来就在 config.json 里，不该再让人手抄一遍。
+
+    只有 config.json 里的 space 出现在目标 URL 里才用它的令牌——这确认了
+    「这份配置就是那台服务器的配置」。否则本地留着的是另一台服务器的令牌，
+    拿去用只会换来一个莫名其妙的 401。
+    """
+    for hint in hints:
+        if not hint:
+            continue
+        p = Path(str(hint)).expanduser() / "config.json"
+        try:
+            if not p.is_file():
+                continue
+            d = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        space, token = str(d.get("space") or "").strip(), str(d.get("token") or "").strip()
+        if space and token and space in url:
+            return token
+    return ""
+
+
 def make_backend() -> HttpBackend | LocalBackend:
-    cfg, _src = read_config()
+    cfg, src = read_config()
 
     url = (os.environ.get("TRACE_URL") or cfg.get("url") or "").strip()
     if url:
         token = (os.environ.get("TRACE_TOKEN") or cfg.get("token") or "").strip()
+        if not token:
+            token = discover_token(url, [
+                cfg.get("data"),
+                os.environ.get("TRACE_DATA"),
+                src.parent if src else None,
+                Path(__file__).resolve().parent,
+            ])
         return HttpBackend(url, token)
 
     data = (os.environ.get("TRACE_DATA") or cfg.get("data") or "").strip()

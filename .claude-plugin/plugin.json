@@ -15,18 +15,18 @@
   "userConfig": {
     "data_dir": {
       "type": "directory",
-      "title": "本地数据仓目录",
-      "description": "步骤树所在的目录（里面是 projects/）。agent 和数据在同一台机器上时填这个，不需要起服务。留空则用下面的远端地址。"
+      "title": "数据仓目录",
+      "description": "步骤树所在的目录（里面是 projects/）。**多数人只需要填这一项**：agent 和数据在同一台机器上时直接读写文件，不走网络，也就不需要令牌。只有当数据在另一台机器的域名后面时，才改填下面的远端地址。"
     },
     "url": {
       "type": "string",
-      "title": "远端服务地址（可选）",
-      "description": "形如 https://你的域名/t/<space> ，含那段不可猜的 space。填了它就优先于本地目录——agent 在超算上、数据在域名后面时用这个。"
+      "title": "远端服务地址（多数人不用填）",
+      "description": "只在数据放在另一台机器上时才需要。形如 https://你的域名/t/<space> ，含那段不可猜的 space。填了它就优先于上面的本地目录。"
     },
     "token": {
       "type": "string",
-      "title": "写入令牌（配远端时才需要）",
-      "description": "服务器上跑 python trace_cli.py url 可以查到。读是公开的，只有写入需要它。",
+      "title": "写入令牌（多数人不用填）",
+      "description": "你不需要自己想一个——它在建服务时就随机生成好了，写在服务器的 config.json 里，跑 python trace_cli.py url 能查到。三种情况下都可以留空：① 只填了本地目录（不走网络，没有鉴权）；② 服务就跑在本机，程序会自己从 config.json 读；③ 只读不写。只有「写远端服务器」这一种情况才要把它从服务器复制过来。",
       "sensitive": true
     },
     "python": {
