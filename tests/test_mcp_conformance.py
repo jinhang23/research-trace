@@ -178,6 +178,38 @@ def test_path_and_text_together_is_refused(be):
                                         "path": __file__, "text": "会被丢掉", "name": "a.txt"})
 
 
+# ------------------------------------------------------------ 翻译走的是同一条协议路径
+
+
+def test_a_translation_call_through_the_protocol_only_writes_the_translation(be):
+    """协议层这一段也要钉一次：工具处理函数直连时对，不等于 tools/call 那条路对
+    （参数校验、arguments 解包都在中间）。写错了的形状是「原文被译文盖掉」。"""
+    import trace_write as W
+
+    W.create_step(be._sd("alpha"), title="加入标题字段", body="## 为什么\n基线丢了词序")
+    d = be._sd("alpha") / W.load(be._sd("alpha"))["001"].dirname
+    before = (d / "note.md").read_bytes()
+
+    r = M.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                  "params": {"name": "trace_translate",
+                             "arguments": {"project": "alpha", "step": "001", "lang": "en",
+                                           "title": "Add title field",
+                                           "body": "## Why\nThe baseline discards word order."}}},
+                 _session_with(be))
+    assert r["result"]["isError"] is False, r["result"]["content"][0]["text"]
+    assert (d / "note.md").read_bytes() == before, "原文一个字节都不许动"
+    assert (d / "note.en.md").is_file()
+
+
+def test_a_translation_without_a_language_is_refused_by_the_schema(be):
+    """lang 会直接变成文件名的一段，缺了它没有任何合理的默认值可以猜。"""
+    r = M.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                  "params": {"name": "trace_translate",
+                             "arguments": {"project": "alpha", "step": "001", "body": "x"}}},
+                 _session_with(be))
+    assert r["result"]["isError"] is True and "lang" in r["result"]["content"][0]["text"]
+
+
 # ------------------------------------------------------------ 循环健壮性
 
 

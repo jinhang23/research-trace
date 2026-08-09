@@ -276,6 +276,27 @@ def test_the_readme_states_the_real_number_of_tools():
     assert f"{n} 个 MCP 工具" in text(README), f"README 该说 {n} 个 MCP 工具"
 
 
+# 反引号里的 `trace_xxx`。模块名（trace_core / trace_mcp.py …）不在此列——
+# 它们在文档里一律带 `.py` 或者出现在目录树的代码块里，不会被这条正则捞到。
+TOOL_MENTION = re.compile(r"`(trace_[a-z_]+)`")
+
+
+@pytest.mark.parametrize("doc", DOCS, ids=lambda p: p.relative_to(ROOT).as_posix())
+def test_no_doc_names_an_mcp_tool_that_does_not_exist(doc):
+    """比工具表那条更宽：正文散文里点名的工具也必须真的存在。
+
+    表里的名字有 test_the_tool_table_lists_exactly_the_tools_that_exist 盯着，
+    但「补翻译走 `trace_translate`」这种话是写在散文里的——工具还没落地时
+    先把用法写进 SKILL.md，agent 会照着调一个不存在的工具，拿到的是
+    「unknown tool」，而它没有任何理由怀疑文档。
+    """
+    actual = {t["name"] for t in M.TOOLS} | {"trace_core", "trace_write", "trace_mcp",
+                                             "trace_server", "trace_git", "trace_cli"}
+    for m in TOOL_MENTION.finditer(text(doc)):
+        assert m.group(1) in actual, \
+            f"{where(doc)} 点名了 `{m.group(1)}`，trace_mcp.TOOLS 里没有这个工具"
+
+
 # ---------------------------------------------------------------- 小节名与字段名
 # 这些是**精确匹配**的字符串：_append_under 按标题找小节，sections() 按标题切正文。
 # 文档写错一个字，手写出来的文件就和工具写的对不上，而且不会报任何错。
@@ -336,8 +357,14 @@ def test_the_insight_kind_table_matches_the_code(doc):
 
 
 def test_format_md_lists_every_front_matter_key_render_note_can_emit(tmp_path):
-    """判据是 render_note 真写出来的键，不是我照着代码抄的一份清单。"""
-    step = core.Step(id="001", parent="000", status="done", title="t", date="2026-01-01",
+    """判据是 render_note 真写出来的键，不是我照着代码抄的一份清单。
+
+    `lang` 是这么漏掉的：双语上线时 render_note 学会了回写它，而第 2 节的键表
+    还是十一行——照文档写的人不知道自己可以声明正文是什么语言。所以构造的
+    Step 必须把**每一个**可选键都填上，包括 lang。
+    """
+    step = core.Step(id="001", parent="000", status="done", title="t", lang="zh",
+                     date="2026-01-01",
                      commit="c", author="a", key="k", tags=["x"],
                      paths=[{"location": "/blue/x", "note": "n", "kind": "hpc"}],
                      repro=[{"state": "verified", "date": "d", "by": "b", "note": "n"}],
@@ -444,6 +471,302 @@ def test_the_skill_documents_every_field_update_step_accepts():
     body = text(SKILL)
     for field in W.MUTABLE:
         assert f"`{field}`" in body, f"SKILL.md 没提过 PATCH 可以带 {field}"
+
+
+# ---------------------------------------------------------------- 双语
+# FORMAT.md 第 13 节是 agent 写翻译时**唯一**的规范来源，而翻译文件里的每一样
+# 东西都是精确匹配的字符串：文件名的形状、front-matter 里唯一允许的键、
+# 小节标题。对照表错一个字，照着它写出来的译文就评不了级、check 也读不出内容——
+# 而且不会报任何错，只是静静地被当成「什么都没写」。所以这一段全部机械核对。
+
+
+def format_numbered_section(keyword: str) -> str:
+    """取出 FORMAT.md 里标题含 keyword 的那一个编号小节（到下一个编号小节为止）。
+
+    按 `^## <数字>. ` 定位而不是按 `^## `：正文的示例代码块里满是 `## 为什么`
+    这样的行，按后者切会在第一个示例处就截断。
+    """
+    body = text(FORMAT)
+    heads = list(re.finditer(r"^##\s+\d+\.\s.*$", body, re.M))
+    assert heads, "FORMAT.md 没有编号小节了？"
+    for i, m in enumerate(heads):
+        if keyword in m.group(0):
+            end = heads[i + 1].start() if i + 1 < len(heads) else len(body)
+            return body[m.start():end]
+    raise AssertionError(f"FORMAT.md 里找不到标题含 {keyword!r} 的编号小节")
+
+
+# 三列的对照表：| `语义键` | `## 中文标题` | `## 英文标题` |
+TR_NAME_ROW = re.compile(r"^\|\s*`([a-z]+)`\s*\|\s*`##\s+(.+?)`\s*\|\s*`##\s+(.+?)`\s*\|", re.M)
+
+
+def test_the_bilingual_section_name_table_matches_the_code():
+    """**这条是双语这一摊里最要紧的一条。**
+
+    翻译文件能被同样地解析、同样地评级，靠的是 trace_core 里那张封闭词表：
+    `_pick()` 拿 SECTION_NAMES 的值去正文里找标题，找不到就判成「这一节没写」。
+    FORMAT.md 的对照表是 agent 唯一会照抄的东西——它写成 `## Why not`，
+    产出的译文就整篇评不了级，而且一条警告都不会有。
+
+    所以逐字核对，不留任何模糊：步骤的五个小节、项目笔记的四个洞察、
+    以及系统自己写的删除审计小节，三组一次比完。
+    """
+    parsed = {m.group(1): {"zh": m.group(2), "en": m.group(3)}
+              for m in TR_NAME_ROW.finditer(format_numbered_section("双语"))}
+    expected = {**core.SECTION_NAMES, **core.INSIGHT_NAMES, "deleted": core.DELETED_NAME}
+    assert parsed == expected, (
+        "FORMAT.md 第 13 节的小节名对照表和 trace_core 对不上。\n"
+        f"文档: {parsed}\n代码: {expected}")
+
+
+def test_the_skill_spells_out_every_section_name_in_both_languages():
+    """SKILL.md 是 agent 日常记录时读的东西，对照表在那里存了**第二份**。
+
+    第二份就会漂：FORMAT.md 改了、SKILL.md 没跟上，agent 照着 SKILL 写出来的
+    译文评不了级。所以两个方向都要求——词表里的每个名字都得在 SKILL.md 里出现过，
+    而 SKILL.md 里出现的每个 `## 小节名` 也都必须在词表里。
+
+    反例（`## Why not` 这种「写成这样等于没写」的示范）一律只放 FORMAT.md，
+    不要放进 SKILL.md，否则这条会失败。
+    """
+    vocab = {n for names in (*core.SECTION_NAMES.values(), *core.INSIGHT_NAMES.values(),
+                             core.DELETED_NAME) for n in names.values()}
+    spelled = set(re.findall(r"`##\s+([^`]+)`", text(SKILL)))
+    assert vocab - spelled == set(), f"SKILL.md 没写出这些小节名: {sorted(vocab - spelled)}"
+    assert spelled - vocab == set(), f"SKILL.md 写了词表之外的小节名: {sorted(spelled - vocab)}"
+
+
+def test_the_translation_filename_regex_in_format_md_is_the_real_one():
+    """文件名的形状是 scan 的判据（TR_RE），文档里那条正则必须就是它本身。
+
+    抄一份「差不多的」正则进文档，最先出事的是长度上限和首字符规则——
+    照文档造出来的 `note.2en.md` 在磁盘上躺着，页面上永远看不见它。
+    """
+    assert core.TR_RE.pattern in text(FORMAT), \
+        f"FORMAT.md 里没有 core.TR_RE 的原文: {core.TR_RE.pattern}"
+
+
+TR_FILENAME = re.compile(r"\b(note|project)\.([A-Za-z][A-Za-z0-9-]*)\.md\b")
+
+
+@pytest.mark.parametrize("doc", DOCS, ids=lambda p: p.relative_to(ROOT).as_posix())
+def test_every_translation_filename_in_the_docs_is_one_the_scanner_would_pick_up(doc):
+    """文档里出现的每个 `note.<lang>.md` / `project.<lang>.md` 都得是真能被扫到的名字。
+
+    还要求语言码**已经是归一化形式**（norm_lang 的不动点）：文档写 `note.EN.md`，
+    照抄的人在 Linux 上得到的是和 `note.en.md` 并存的第二个文件，
+    同一种语言分裂成两条记录；在 NTFS 上则是一次静默的别名覆盖。
+    """
+    for m in TR_FILENAME.finditer(text(doc)):
+        stem, lang, name = m.group(1), m.group(2), m.group(0)
+        pattern = core.TR_RE if stem == "note" else core.PROJECT_TR_RE
+        assert pattern.match(name), f"{where(doc)} 里的 {name} 不会被 scan 当成译文"
+        assert W.norm_lang(lang) == lang, \
+            f"{where(doc)} 里的 {name} 语言码不是归一化形式（应为 {W.norm_lang(lang)}）"
+
+
+# 「这些键一律忽略」的那一行：`id` · `parent` · … 用 · 连起来的一串反引号词。
+STRUCT_KEY_RUN = re.compile(r"^`[a-z]+`(?:\s*·\s*`[a-z]+`)+\s*$", re.M)
+
+
+@pytest.mark.parametrize("doc", [FORMAT, SKILL], ids=lambda p: p.relative_to(ROOT).as_posix())
+def test_the_ignored_structural_keys_listed_in_the_docs_are_exactly_the_real_ones(doc):
+    """漏列一个键，就等于告诉 agent「这个键写进译文是有效的」——而它其实被丢掉，
+    于是译文里的 `status: done` 看着生效、实际什么也没发生。多列一个则相反，
+    会让人以为 note.md 里也不能写它。两个方向都只有逐字比对能挡住。
+    """
+    runs = STRUCT_KEY_RUN.findall(text(doc))
+    assert len(runs) == 1, f"{where(doc)} 里应当恰好有一行「被忽略的结构键」清单，找到 {len(runs)} 行"
+    listed = tuple(re.findall(r"`([a-z]+)`", runs[0]))
+    assert listed == core.TR_STRUCT_KEYS, \
+        f"{where(doc)} 列的是 {listed}，core.TR_STRUCT_KEYS 是 {core.TR_STRUCT_KEYS}"
+
+
+def bilingual_examples() -> list[tuple[str, str]]:
+    """FORMAT.md 第 13 节里的翻译示例块，返回 [(唯一允许的键, 块原文)]。"""
+    out = []
+    for b in re.findall(r"```[a-z]*\n(.*?)```", format_numbered_section("双语"), re.S):
+        if b.startswith("---\ntitle:"):
+            out.append((core.TR_ONLY_KEYS[0], b))
+        elif b.startswith("---\nname:"):
+            out.append((core.PROJECT_TR_ONLY_KEYS[0], b))
+    return out
+
+
+def test_the_translation_examples_in_format_md_are_clean():
+    """示例是拿来抄的，所以直接喂给真正的翻译解析器：一条警告都不许有
+    （有就说明示例里混进了结构键），而且小节标题必须全部在封闭词表里。
+
+    这比「文档里别写 id:」的词表检查扎实：示例是整块被复制走的，里面任何一行
+    出错都会被原样传播到磁盘上。
+    """
+    examples = bilingual_examples()
+    assert len(examples) >= 2, "FORMAT.md 第 13 节里的翻译示例不见了（步骤和项目笔记各要有一份）"
+    known = set(core.SECTION_KEY_BY_NAME) | set(core.INSIGHT_KEY_BY_NAME) \
+        | set(core.DELETED_NAME.values())
+    for only_key, raw in examples:
+        data, warns = core.parse_translation(raw, (only_key,), "示例")
+        assert not warns, f"FORMAT.md 的翻译示例解析出警告: {warns}"
+        assert data[only_key], f"示例的 front-matter 里没有 `{only_key}:`"
+        for name in core.sections(data["body"]):
+            assert name in known, f"FORMAT.md 的翻译示例用了词表之外的小节名: {name!r}"
+
+
+def test_the_docs_promise_that_any_language_counts_and_the_code_agrees(tmp_path):
+    """FORMAT.md 第 13 节承诺：小节「note.md 或任一译文里写了就算写了」。
+
+    直接把文档里那两个示例的形状摆到磁盘上验一遍——note.md 只写了中文的
+    「为什么/做了什么」，结论只在英文版里。承诺兑现的话这一步不该因为
+    「没写结论」被判 L0，也不该报 missing_conclusion。
+    """
+    d = tmp_path / "steps" / "007_加入标题字段"
+    d.mkdir(parents=True)
+    (d / core.NOTE_NAME).write_text(
+        "---\nid: 007\nstatus: done\ntitle: 加入标题字段\nlang: zh\n"
+        "commit: c1d2e3f\npath: /blue/x | 数据\n---\n\n"
+        "## 为什么\n基线丢掉词序。\n\n## 做了什么\n换成 DistilBERT。\n", encoding="utf-8")
+    (d / "note.en.md").write_text(
+        "---\ntitle: Add title field\n---\n\n## Conclusion\nThe hypothesis holds.\n",
+        encoding="utf-8")
+
+    steps, _files, _warns = core.scan(tmp_path / "steps")
+    assert len(steps) == 1, "译文被当成步骤扫进来了"
+    step = steps[0]
+    assert step.lang == "zh" and "en" in step.tr
+    assert step.tr["en"]["title"] == "Add title field"
+    assert core.traceability(step)["checks"]["conclusion"], \
+        "FORMAT.md 第 13 节承诺「任一语言写了就算写了」，代码没兑现"
+    assert not [w for w in core.lint_body(step) if w["code"] == "missing_conclusion"]
+    assert not [f for f in core.list_files(d) if f["path"] == "note.en.md"], \
+        "FORMAT.md 说译文不是附件，list_files 却把它列进去了"
+
+
+def test_the_docs_promise_that_captions_are_judged_per_file_and_the_code_agrees(tmp_path):
+    """同一节里那条**例外**：图注逐份文件独立判，警告的 where 指到具体文件。
+
+    这条和上一条方向相反，写反了就是把一整份译文里的图变成对读者的黑洞，
+    所以两条都要钉住。
+    """
+    d = tmp_path / "steps" / "007_x"
+    d.mkdir(parents=True)
+    (d / core.NOTE_NAME).write_text(
+        "---\nid: 007\nstatus: done\ntitle: t\n---\n\n"
+        '## 为什么\n因为\n\n## 做了什么\n跑了\n\n## 结论\n成立\n\n'
+        '![](loss_curve.png "第 12 轮之后验证集回升")\n', encoding="utf-8")
+    (d / "note.en.md").write_text(
+        "---\ntitle: T\n---\n\n## Conclusion\nHolds.\n\n![](loss_curve.png)\n",
+        encoding="utf-8")
+
+    steps, _f, _w = core.scan(tmp_path / "steps")
+    figs = [w for w in core.lint_body(steps[0]) if w["code"] == "figure_without_caption"]
+    assert len(figs) == 1, "中文版写了图注就把英文版那张也算过关了——那不是逐份文件判"
+    assert figs[0]["where"] == "007_x/note.en.md", \
+        f"警告的 where 该指到具体文件，实际是 {figs[0]['where']!r}"
+
+
+def test_the_structural_keys_the_docs_call_out_really_are_ignored_and_warned(tmp_path):
+    """FORMAT.md 和 SKILL.md 都说这些键「一律忽略并产出一条警告」。挨个真写一遍。
+
+    这是双语最贵的一条不变量（上一代系统就死在双真相源上），承诺和实现之间
+    不能只靠人读一遍代码来保证。
+    """
+    d = tmp_path / "steps" / "007_x"
+    d.mkdir(parents=True)
+    (d / core.NOTE_NAME).write_text(
+        "---\nid: 007\nparent: 005\nstatus: done\ntitle: 原文\n---\n\n## 为什么\n因为\n",
+        encoding="utf-8")
+    for key, bad in (("id", "999"), ("parent", "001"), ("status", "wip"),
+                     ("date", "2026-01-01"), ("commit", "deadbee"), ("author", "x"),
+                     ("tags", "a, b"), ("path", "/blue/x | y"),
+                     ("repro", "verified | d | b | n"), ("key", "k")):
+        (d / "note.en.md").write_text(
+            f"---\ntitle: T\n{key}: {bad}\n---\n\n## Why\nbecause.\n", encoding="utf-8")
+        steps, _f, warns = core.scan(tmp_path / "steps")
+        s = steps[0]
+        codes = [w["code"] for w in warns]
+        assert "translation_structural_key" in codes, f"译文里的 {key}: 没有报警告"
+        assert s.id == "007" and s.parent == "005" and s.status == "done", \
+            f"译文里的 {key}: 影响到了 note.md 的结构 —— 双真相源回来了"
+        # digest 是算出来的（sha256 of raw bytes，给 expect 用），不是文件里读到的键。
+        assert set(s.tr["en"]) - {"digest"} == {core.TR_ONLY_KEYS[0], "body"}, \
+            f"译文里的 {key}: 被读进了 Step.tr"
+
+
+def test_the_asymmetry_format_md_warns_about_is_real(tmp_path):
+    """FORMAT.md 第 13 节点名了一个不对称：项目译文里的结构键**也**被忽略，
+    但那一侧没有警告通道，一声不吭。
+
+    写进文档是因为手写 project.en.md 的人不会得到任何提示。钉住它有两个方向：
+    真的静默了（文档没骗人），以及真的被忽略了（`name` 之外一个键都没读进来）。
+    哪天 scan_projects 长出警告通道，这条会失败并逼着文档改口。
+    """
+    p = W.create_project(tmp_path, "沉默的一侧")
+    (core.project_dir(tmp_path, p.slug) / "project.en.md").write_text(
+        "---\nname: The quiet side\nid: 999\nstatus: dead\n---\n\n## Ideas\n- a\n",
+        encoding="utf-8")
+    projects = core.scan_projects(tmp_path)
+    tr = projects[0].tr["en"]
+    assert set(tr) - {"digest"} == {core.PROJECT_TR_ONLY_KEYS[0], "body"}, \
+        f"项目译文里的结构键被读进来了: {sorted(tr)}"
+    assert projects[0].slug == p.slug, "项目译文里的键影响到了 project.md —— 双真相源回来了"
+
+
+def test_the_inlined_standard_carries_the_translation_rule_too():
+    """README 说 initialize 的 instructions 内联了格式标准的可执行摘要，
+    「那是唯一无论怎么装都一定送达的通道」。
+
+    `pip install git+…` 只装三个 `.py`，那台机器上根本不存在 FORMAT.md——
+    双语这一段要是没进内联摘要，那台机器上的 agent 只知道有 trace_translate，
+    不知道译文里不能写结构键、也不知道小节名要换成目标语言那一套。
+    """
+    ins = M.INSTRUCTIONS
+    assert "trace_translate" in ins and "trace_untranslated" in ins
+    assert core.TR_ONLY_KEYS[0] in ins, "内联摘要没说译文的 front-matter 里只准有 title"
+    for key in ("why", "conclusion"):
+        assert core.SECTION_NAMES[key]["en"] in ins, \
+            f"内联摘要没给出英文小节名 {core.SECTION_NAMES[key]['en']}"
+
+
+def test_the_untranslated_fields_named_in_the_readme_exist():
+    """README 的端点表点名了 /untranslated 回哪几个字段，agent 会照着取。"""
+    report = M.untranslated_report({"steps": [], "project": "p"}, None, "en")
+    for field in ("missing", "translated", "native", "project_note"):
+        assert field in report, f"README 说 /untranslated 回 {field}，实际没有"
+        assert f"`{field}" in text(README) or field in text(README)
+
+
+# ---------------------------------------------------------------- 前端资源
+# README 承诺「静态导出 file:// 可直接打开、断网可用」，而页面要的脚本是靠
+# STATIC_ASSETS 逐个拷过去的。i18n.js 上线时差点就漏在这里：页面引了它、
+# 导出没拷它，于是导出的页面 window.i18n 是 undefined，第一次 t() 就整页白屏。
+
+
+def test_the_readme_directory_tree_lists_every_file_under_web():
+    """目录结构那段是唯一告诉人「前端由哪几个文件组成」的地方。
+    漏一个的后果不是排版难看，是没人知道界面文案在 i18n.js 里。"""
+    body = text(README)
+    start = body.find("├── web/")
+    assert start != -1, "README 的目录结构里找不到 web/ 那一行"
+    listed = set()
+    for line in body[start:].split("\n")[1:]:
+        m = re.match(r"^│\s+[├└]──\s+(\S+)", line)
+        if not m:
+            break
+        listed.add(m.group(1))
+    actual = {p.name for p in (ROOT / "web").iterdir() if p.is_file()}
+    assert listed == actual, f"README 的 web/ 清单是 {sorted(listed)}，实际是 {sorted(actual)}"
+
+
+def test_the_static_export_ships_every_asset_the_page_loads():
+    """页面 `__ASSET__x` 引什么，build 就必须拷什么，否则断网打开是一片白。"""
+    import trace_cli
+
+    referenced = set(re.findall(r"__ASSET__([A-Za-z0-9_.-]+)", (ROOT / "web" / "index.html").read_text(encoding="utf-8")))
+    assert referenced, "index.html 里一个 __ASSET__ 都没有？"
+    missing = referenced - set(trace_cli.STATIC_ASSETS)
+    assert not missing, f"index.html 引了 {sorted(missing)}，trace_cli.STATIC_ASSETS 没有它们"
+    for name in trace_cli.STATIC_ASSETS:
+        assert (ROOT / "web" / name).is_file(), f"STATIC_ASSETS 里的 {name} 在 web/ 下不存在"
 
 
 # ---------------------------------------------------------------- 交叉引用

@@ -91,6 +91,76 @@ python trace_cli.py serve                           # 起服务，终端会打�
 - **同步状态**：顶栏一个 ⇅ 图标。自动 git 同步失败或者根本没配好时它会变红，
   悬停给出原因和修法，点一下立刻重试一次。平时安静。
 
+## 双语
+
+两件不同的事，分开做：
+
+| | 是什么 | 默认 | 怎么切 |
+|---|---|---|---|
+| **界面文案** | 按钮、标签、提示、错误 toast、L0–L4 的说明 | **英文** | 顶栏的语言开关，选择记在浏览器里 |
+| **记录内容** | `note.md` 的标题和正文、项目洞察 | 你写的那种语言 | 有译文就显示译文，没有就回退到原文并说明 |
+
+界面文案两份都在 `web/i18n.js` 里（零依赖、无构建，`file://` 下照样能切）。
+中文保持不变的有：MCP 工具描述、Python 侧的报错、以及 `FORMAT.md` / `README.md` /
+`SKILL.md` 这些文档本身。
+
+### 记录内容怎么双语
+
+存储是**双文件**：结构只存一份，译文只带正文。
+
+```
+007_加入标题字段/
+├── note.md        ---  id: 007 · parent: 005 · status: done · title: 加入标题字段…
+│                  ##  为什么 / 做了什么 / 结果 / 结论 / 下一步
+└── note.en.md     ---  title: Add title field…            ← front-matter 里只准有 title
+                   ##  Why / What / Result / Conclusion / Next
+```
+
+**译文的 front-matter 里只准有 `title`**（项目笔记是 `name`）。
+`id` / `parent` / `status` / `commit` 这些结构键写进去会被读都不读地丢掉
+（步骤的译文还会报一条警告，项目笔记那一侧是静默的）。
+
+> 这条是硬的，因为它就是上一代系统的死因：同一个事实存在两处，写一处漏一处。
+> 允许 `note.en.md` 里的 `parent:` 生效，等于把双真相源请回来——而且更隐蔽，
+> 两份值平时看着都对，只有改了其中一份才炸。**`note.md` 永远赢。**
+
+小节名有一张封闭词表（`为什么`↔`Why`、`结论`↔`Conclusion`、洞察的 `无效`↔`Doesn't work`…），
+逐字对照表和完整规矩在 [FORMAT.md](FORMAT.md) 第 13 节。
+
+### 翻译怎么补
+
+翻译走**单独一个工具**，它永远不动原文：
+
+```
+trace_translate(project="我的课题", lang="en", step="007",
+                title="Add title field, accuracy 0.943 → 0.951",
+                body="## Why\nThe TF-IDF baseline discards word order.\n")
+
+trace_untranslated(project="我的课题", lang="en")     # 还欠哪些，现算
+```
+
+`trace_new_step` / `trace_update_step` 上**没有** `body_en` 这类参数，这是有意的：
+原文和译文各走各的写入路径，于是「建完步骤马上补翻译」和「过几天回来再补」是
+**同一条路径，只是时机不同**，不需要预先决定用哪一种。
+
+「还没翻译」是**派生状态**——`note.en.md` 在不在，扫一眼就知道，和「有几个子节点」
+一样绝不存储。所以缺翻译**不报警告、不加徽标、不算缺陷**：只写了中文的记录照样是
+可溯源的。它只在界面切到英文而这一步没有英文版时，由页面如实说明并回退到原文。
+
+同理，系统**不判断「翻译过时了」**：要判断就得把翻译当时 `note.md` 的指纹存进译文，
+那是把派生关系变成存储字段（P1 禁止），而且手改一次 `note.md` 那个指纹就变成谎话。
+理由见 [FORMAT.md](FORMAT.md) 第 13 节。
+
+### G4 在双语下仍然成立
+
+```bash
+grep -rn "放弃" projects/          # 中文版里的那句结论
+grep -rn "abandoned" projects/     # 英文版里的同一句
+```
+
+同一步的同一条结论，两种语言各有一份纯文本，各自都能回答「我当年为什么放弃了 X」。
+双语没有引入任何需要程序才能解开的东西——多的只是同一个目录里多一个 `.md`。
+
 ---
 
 ## 四条范式（所有设计都从这里推出来）
@@ -156,10 +226,31 @@ research-trace/                     ← 仓库本身就是插件
 ├── trace_git.py                    debounce 自动 commit + push（同步的是数据仓）
 ├── trace_cli.py                    init / projects / new-project / new / rm / check / paths / build / serve / url
 ├── web/                            无构建步骤，不引 CDN
+│   ├── index.html
+│   ├── style.css
+│   ├── app.js                      视图 + 编辑器 + 交互
+│   ├── md.js                       极简 markdown 渲染器（见 FORMAT.md 第 12 节）
+│   └── i18n.js                     界面文案的中英两份（默认英文，见「双语」一节）
 ├── tests/                          pytest（内核 / 布局 / 写入 / 服务 / MCP / 插件 / 文档）+ node --test（markdown 与前端纯函数）
 ├── FORMAT.md                       记录格式标准：note.md 和 project.md 写什么、怎么可视化、L0–L4 怎么判
 ├── deploy/                         Caddyfile · systemd unit · 部署说明
 └── projects/                       ← 你的数据（上线时用 --data-dir 指到私有仓库）
+```
+
+数据那一侧长这样——**没有索引、没有 manifest，目录结构本身就是数据库**：
+
+```
+projects/
+└── 我的课题/
+    ├── project.md                  项目洞察 + 删除记录
+    ├── project.en.md               ← 可选：项目笔记的英文版
+    └── steps/
+        ├── 001_跑通基线/
+        │   └── note.md
+        └── 007_加入标题字段/
+            ├── note.md             结构 + 主语言正文（唯一权威）
+            ├── note.en.md          ← 可选：只有 title 和译文
+            └── loss_curve.png      附件
 ```
 
 Python 模块留在仓库根，因为这个仓库同时也是一个 pip 包（`pyproject.toml` 在根，
@@ -212,6 +303,8 @@ repro: verified | 2026-08-08 | agent:claude | 干净 split 重跑 3 个种子，
 正文格式不强制，但这五个小节对应科研步骤的完整生命周期。
 标题要和上面**逐字一致**——评级和 `check` 就是按这几个名字去正文里找内容的，
 写成 `## 为什么（承接上一步）` 就等于没写。
+英文写的记录用 `## Why` / `## What` / `## Result` / `## Conclusion` / `## Next`
+这一套（可以顺手加一行 `lang: en` 声明正文是什么语言，不写也不影响解析）。
 完整的写法契约（每个键什么意思、指标表怎么写、图注怎么写、L0–L4 怎么判、
 渲染器认哪些 markdown）在 [FORMAT.md](FORMAT.md)。
 
@@ -329,7 +422,7 @@ python <插件根>/trace_mcp.py --selfcheck --role client --url https://你的�
 
 ## MCP（推荐给 agent 用）
 
-`trace_mcp.py` 把 trace 暴露成 9 个 MCP 工具。比让 agent 自己拼 HTTP 请求好在：
+`trace_mcp.py` 把 trace 暴露成 11 个 MCP 工具。比让 agent 自己拼 HTTP 请求好在：
 参数有 schema（不合法的调用先被拦下）、不用生成 requests/curl 代码、
 中文不会再撞上终端编码。
 
@@ -399,6 +492,8 @@ claude mcp add trace -s user \
 | `trace_update_step` | 改状态/正文/路径；`append` 和 `add_paths` 追加比整组替换安全；`repro` 追加一条复现记录 |
 | `trace_delete_step` | **真删**一步，必须写原因。只用于误建/测试数据/粘进去的令牌——失败的实验请标 `dead` |
 | `trace_attach` | 传附件；**图片必须给 caption**，给了就自动在正文插入引用 |
+| `trace_translate` | 补一份译文（`note.<lang>.md` / `project.<lang>.md`）。**唯一碰翻译的写入口，永远不动原文** |
+| `trace_untranslated` | 还欠哪些翻译。「还没翻译」是文件不存在这个派生事实，没有待办表，现算 |
 
 规矩写在工具描述里，agent 调用时就能看到：先读后写、先建 wip 再开跑、
 必须写「为什么」、失败标 dead 并写清放弃理由、改 `id`/`parent` 直接拒绝。
@@ -406,7 +501,8 @@ claude mcp add trace -s user \
 **格式标准怎么送到 agent 手里。** `pip install git+…` 那条路只打包三个 `.py`，
 那台机器上根本不存在 `FORMAT.md`——所以 MCP 的 `initialize` 返回的 instructions 里
 **内联**了 FORMAT.md 的可执行摘要（五个小节、指标表规则、图注、`[[交叉引用]]`、
-`paths` 格式、L0–L4 判据、`repro` 三态）。那是唯一无论怎么装都一定送达的通道。
+`paths` 格式、L0–L4 判据、`repro` 三态，以及译文的小节名和「只准有 `title`」）。
+那是唯一无论怎么装都一定送达的通道。
 只有当 `FORMAT.md` 真的躺在 `trace_mcp.py` 旁边时，才会再追加一行指向它的**绝对路径**。
 
 MCP 和 REST API 是同一套后端的两个门面，可以混用。
@@ -441,11 +537,16 @@ Base = `/t/<space>`。读公开，写要 `Authorization: Bearer <token>`。
 | GET | `/api/p/{项目}/forest` | 全量：steps（含 lane/row/children/backlinks/files/trace/digest）+ tree + warnings |
 | GET | `/api/p/{项目}/steps/{id}` | 单步 + `lineage`（到根的完整路径） |
 | GET | `/api/search` | 跨项目搜索。`?q=` 或 `?query=`，不给 `project` 就搜全部；回 `hits/total/truncated` |
+| GET | `/api/p/{项目}/untranslated` | 还欠哪些译文。`?lang=en`（默认 `en`）。回 `missing/translated/native/project_note`。**读，所以公开** |
 | GET | `/api/status` | 标题、版本、项目数、步骤数、git 同步状态、`write_protected` |
 | GET | `/api/git` | 自动 git 同步的状态：`ok/state/summary/hint/last_ok_at/pending`。带令牌多给 `detail`（git 原文，含服务器路径） |
 | GET | `/api/events` | SSE，推 `{version}` |
 | POST | `/api/p/{项目}/steps` | 建步骤。带 `key` 则幂等——重试不会产生重复 |
 | PATCH | `/api/p/{项目}/steps/{id}` | 改 status/title/body/date/commit/author/tags/paths；`add_paths` `add_repro` 是追加。带 `expect` 或 `If-Match` 做冲突检测 |
+| PUT | `/api/p/{项目}/steps/{id}/tr/{lang}` | 写这一步的译文 `{title, body}`。**碰不到 `note.md`**；`expect` / `If-Match` 对的是译文自己的 digest |
+| DELETE | `/api/p/{项目}/steps/{id}/tr/{lang}` | 撤掉一个语言版本。原文不受影响，所以不要求写原因 |
+| PUT | `/api/p/{项目}/tr/{lang}` | 写项目笔记的译文 `{name, body}`。`body` 只替换那四个洞察小节，`## Deleted` 逐字保留 |
+| DELETE | `/api/p/{项目}/tr/{lang}` | 撤掉项目笔记的一个语言版本。`project.md` 不受影响 |
 | DELETE | `/api/p/{项目}/steps/{id}` | 真删目录。`{reason}` 必填 —— 只追加原则的唯一例外 |
 | PUT | `/api/p/{项目}/steps/{id}/files/{path}` | 上传附件到指定文件名（raw body） |
 | POST | `/api/p/{项目}/steps/{id}/files` | 上传附件，服务端定名（`X-Filename` 可选；没给就按内容哈希命名，重复内容自动复用） |
@@ -500,6 +601,8 @@ python trace_cli.py new -P <项目> --title "..."    # 新建一步
 python trace_cli.py rm -P <项目> <id> --reason "…" # 真删一步（原因必填）
 python trace_cli.py check [-P <项目>] [--strict]   # 校验不变量 + 打印 L0–L4 与最弱一环
 python trace_cli.py paths [-P <项目>] [--kind hpc] # 列出所有外部产物的位置
+python trace_cli.py tr -P <项目> --lang en        # 还欠哪些英文版
+python trace_cli.py tr -P <项目> --lang en --step 007 --file note.en.md   # 补一份译文
 python trace_cli.py build --out dist              # 静态导出，file:// 可直接打开，断网可用
 python trace_cli.py url                           # 打印访问地址与令牌
 python trace_mcp.py --selfcheck                   # 自检：解释器 / 角色 / 后端 / 读 / 写 / JSON-RPC 握手
@@ -547,7 +650,8 @@ node --test "tests/**/*.test.js"                  # markdown 渲染 + 前端纯�
 多人协作（账号、权限分级、评论、@提醒）· 实时协同编辑（OT / CRDT，两个人同时敲一段
 正文）· 自动捕获（不 hook shell / git / 文件系统）· 重跑与复现执行 ·
 大文件版本管理 · 全文索引服务（`grep` 就够）· 拖拽自由布局（布局一旦手工摆放，
-就不再是文件系统的纯函数了）。
+就不再是文件系统的纯函数了）· 自动机器翻译（译文是内容，谁写谁负责）·
+「翻译过时了」的标记（要算它就得把原文的指纹存进译文，那是把派生关系变成存储字段）。
 
 它们都会把"没有这个工具也能读"变成一句空话。
 

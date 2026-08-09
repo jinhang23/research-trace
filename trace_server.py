@@ -31,6 +31,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
 
 import trace_core as core
+import trace_mcp as mcp          # 只为了 untranslated_report：见 api_untranslated 的注释
 import trace_write as W
 from trace_git import GitSync
 
@@ -254,8 +255,17 @@ def search_hits(forests: list[tuple[str, str, dict[str, Any]]], query: str,
                 limit: int) -> tuple[list[dict[str, Any]], int]:
     """在若干个已经编译好的森林里做子串搜索。纯函数，方便整个丢进线程跑。
 
-    判定规则和 MCP 的 trace_search 一致（id / 标题 / 正文 / 标签，大小写不敏感），
-    人和 agent 搜同一个词必须搜到同一批东西——FORMAT.md 第 0 节的「信息对等」。
+    判定规则和 MCP 的 trace_search 一致（id / 标题 / 正文 / 标签 / **各语言的译文**，
+    大小写不敏感），人和 agent 搜同一个词必须搜到同一批东西——FORMAT.md 第 0 节
+    的「信息对等」。
+
+    **译文也要搜**，这条不是可选项：这套系统的底线是「删掉全部程序，`grep -r` 还能
+    回答『为什么放弃了 X』」，加了双语之后英文的 grep 也要能回答同一个问题。
+    `grep -r abandoned` 命中 note.en.md 而站内搜索命中不了，等于自带的搜索比 grep 弱——
+    信息明明在仓库里，工具却说「没搜到」，而「没搜到」会被读成「没试过」，
+    于是有人再试一遍那条已经走死的路。命中在哪个语言由 `langs` / `snippet_lang` 说清楚，
+    不含糊成一条来路不明的命中。
+
     返回（这一页的命中, 命中总数）：总数照实报，这样前端能说"还有 200 条没显示"，
     而不是让人以为搜完了。
     """
@@ -278,6 +288,29 @@ def search_hits(forests: list[tuple[str, str, dict[str, Any]]], query: str,
                 where.append("tags")
             if q in s["id"].lower():
                 where.append("id")
+
+            # 摘要优先取原文：原文是权威，译文只在原文没命中时才拿来当上下文，
+            # 否则同一条命中在不同语言下会给出两段不一样的摘要。
+            snippet = _snippet(body, at) if at >= 0 else ""
+            snippet_lang = (s.get("lang") or "") if at >= 0 else ""
+            langs: list[str] = []
+            for code in sorted(s.get("tr") or {}):
+                t = (s["tr"] or {})[code]
+                hit = False
+                if q in (t.get("title") or "").lower():
+                    if "tr.title" not in where:
+                        where.append("tr.title")
+                    hit = True
+                k = (t.get("body") or "").lower().find(q)
+                if k >= 0:
+                    if "tr.body" not in where:
+                        where.append("tr.body")
+                    hit = True
+                    if not snippet:
+                        snippet, snippet_lang = _snippet(t.get("body") or "", k), code
+                if hit:
+                    langs.append(code)
+
             if not where:
                 continue
             total += 1
@@ -292,7 +325,11 @@ def search_hits(forests: list[tuple[str, str, dict[str, Any]]], query: str,
                 "date": s.get("date", ""),
                 "tags": list(tags),
                 "where": where,
-                "snippet": _snippet(body, at) if at >= 0 else "",
+                "snippet": snippet,
+                # 命中落在哪些译文里（空 = 只有原文命中），以及上面那段摘要是从
+                # 哪个语言的正文里截的（空 = 原文且原文没声明语言）。
+                "langs": langs,
+                "snippet_lang": snippet_lang,
             })
     return hits, total
 
@@ -592,6 +629,27 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             "version": state.version,
         })
 
+    @app.get(base + "/api/p/{project}/untranslated")
+    async def api_untranslated(project: str, lang: str = "en") -> JSONResponse:
+        """还欠哪些语言版本。**读，所以公开**——和 forest / search 一致。
+
+        判据本身来自 trace_mcp.untranslated_report：REST、MCP、CLI 三个门面共用
+        同一份实现。各写一遍的话，三处对「什么叫还没翻译」的答案迟早分家，
+        而 agent 是照着其中一个的答案去补的。
+
+        lang 走 norm_lang 而不是原样比较：客户端传 EN / zh-hant 时，和文件名
+        （note.en.md / note.zh-Hant.md）对不上就会报「全都没翻译」——一个
+        必然让人去重复翻译的假答案。非法语言码在这里就是 400，不是空结果。
+        """
+        sd(project)
+        lang = W.norm_lang(lang)
+        forest = await state.forest(project)
+        ps = await asyncio.to_thread(core.scan_projects, data_root)
+        p = next((x.to_dict() for x in ps if x.slug == project), None)
+        out = mcp.untranslated_report(forest, p, lang)
+        out["version"] = state.version
+        return JSONResponse(out)
+
     @app.get(base + "/api/git")
     async def api_git(request: Request) -> JSONResponse:
         """最近一次 git 自动同步的结果。
@@ -655,6 +713,7 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             key=payload.get("key", ""),
             tags=payload.get("tags"),
             paths=payload.get("paths"),
+            lang=payload.get("lang", ""),
         )
         if created:
             await touched([f"{project}/{step.id}"])
@@ -690,6 +749,66 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             return JSONResponse(body, status_code=409)
         await touched([f"{project}/{sid}"])
         return JSONResponse(with_digest(steps, step))
+
+    # ---- 翻译 --------------------------------------------------------
+    #
+    # 三条写端点都只碰 note.<lang>.md / project.<lang>.md，原文一个字节都不动。
+    # 这也是刻意的形状：既然翻译永远走不到原文那条路上，「立刻翻译」和「几天后
+    # 补翻译」就是同一次调用，只是发生的时刻不同，不需要在建步骤时先决定。
+    #
+    # expect 对的是**这份译文自己**的 digest（不是 note.md 的）。两条链各管各的：
+    # 正文被改过并不会让手上那份译文的 expect 作废，否则每改一次正文，所有语言的
+    # 译文都得先重读一遍才写得进去。
+
+    @app.put(base + "/api/p/{project}/steps/{sid}/tr/{lang}")
+    async def api_write_translation(project: str, sid: str, lang: str, request: Request) -> JSONResponse:
+        require_token(request)
+        payload = await body_json(request)
+        expect = read_expect(request, payload)
+        info = W.write_translation(sd(project), sid, lang,
+                                   title=payload.get("title", ""),
+                                   body=payload.get("body", ""), expect=expect)
+        await touched([f"{project}/{sid} 的 {info['lang']} 译文"])
+        return JSONResponse(info)
+
+    @app.delete(base + "/api/p/{project}/steps/{sid}/tr/{lang}")
+    async def api_drop_translation(project: str, sid: str, lang: str, request: Request) -> JSONResponse:
+        """撤掉一个语言版本。**这不是 P2 的例外**：只追加约束的是记录本身
+        （id / parent / 结论），译文是原文的衍生物，删掉之后界面自动回退到原文，
+        一个事实都没丢——所以它也不要求写原因。"""
+        require_token(request)
+        info = W.drop_translation(sd(project), sid, lang)
+        await touched([f"{project}/{sid} 的 {info['lang']} 译文已删除"])
+        return JSONResponse(info)
+
+    @app.put(base + "/api/p/{project}/tr/{lang}")
+    async def api_write_project_translation(project: str, lang: str, request: Request) -> JSONResponse:
+        """项目笔记的译文。正文走和中文版同一道闸门：提交的文本只替换那四个洞察
+        小节，磁盘上的 `## 已删除` / `## Deleted` 逐字保留（删除记录是目录没了之后
+        仅存的证据，中文版护得住、英文版护不住说不过去）。"""
+        require_token(request)
+        sd(project)                       # 项目不存在 / slug 不合法就在这儿 404
+        payload = await body_json(request)
+        expect = read_expect(request, payload)
+        info = W.write_project_translation(data_root, project, lang,
+                                           name=payload.get("name", ""),
+                                           body=payload.get("body", ""), expect=expect)
+        await touched([f"project:{project} 的 {info['lang']} 译文"])
+        return JSONResponse(info)
+
+    @app.delete(base + "/api/p/{project}/tr/{lang}")
+    async def api_drop_project_translation(project: str, lang: str, request: Request) -> JSONResponse:
+        """撤掉项目笔记的一个语言版本。理由同步骤译文的 DELETE。
+
+        单独有这条路由，是为了让「删项目译文」也走 trace_write 那一个写入点。
+        没有它的话，要么让人手工去删文件（那就绕过了唯一写入路径），
+        要么在这里自己 unlink 一把——那正是这个仓库用结构杜绝的第二条写入路径。
+        """
+        require_token(request)
+        sd(project)                       # 项目不存在 / slug 不合法就在这儿 404
+        info = W.drop_project_translation(data_root, project, lang)
+        await touched([f"project:{project} 的 {info['lang']} 译文已删除"])
+        return JSONResponse(info)
 
     @app.put(base + "/api/p/{project}/steps/{sid}/files/{relpath:path}")
     async def api_attach(project: str, sid: str, relpath: str, request: Request) -> JSONResponse:

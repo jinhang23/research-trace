@@ -9,6 +9,7 @@ const { test } = require("node:test");
 const assert = require("node:assert");
 
 const U = require("../web/app.js");
+const i18n = require("../web/i18n.js");
 
 /* ------------------------------------------------ 洞察：不许把删除原因卷进提交 */
 
@@ -58,6 +59,16 @@ test("草稿键把项目和步骤都编码进去 —— 不编码的话不同项
   assert.ok(U.draftKey("中文课题", "001").startsWith("trace.draft:"));
 });
 
+test("中英两份正文的草稿各存各的 —— 共用一个键就是写完中文切去写英文再回来发现被盖了", () => {
+  assert.notEqual(U.draftKey("p", "007", "en"), U.draftKey("p", "007"));
+  assert.notEqual(U.draftKey("p", "007", "en"), U.draftKey("p", "007", "ja"));
+});
+
+test("原文的草稿键一个字节都没变 —— 改了的话，升级前写到一半的草稿会变成找不回的孤儿", () => {
+  assert.equal(U.draftKey("p", "007"), "trace.draft:p:007");
+  assert.equal(U.draftKey("p", "007", ""), "trace.draft:p:007");
+});
+
 /* ------------------------------------------------ 跨项目搜索 */
 
 test("matches 覆盖 id / 标题 / 正文 / 标签，且大小写不敏感", () => {
@@ -82,21 +93,85 @@ test("snippet 把换行压成一行 —— 结果列表是定高的一行，多�
   assert.equal(U.snippet("a\n\nb   c", "b"), "a b c");
 });
 
+test("干草堆里包含译文 —— 界面切成英文之后搜 contrastive 一条都搜不到就等于没做双语", () => {
+  const s = { id: "007", title: "对比学习预训练", body: "AGNews 上掉了 2 个点", tags: [],
+              tr: { en: { title: "Contrastive pre-training", body: "Lost 2 points on AGNews" } } };
+  assert.ok(U.matches(s, "contrastive"));
+  assert.ok(U.matches(s, "lost 2 points"));
+  assert.ok(U.matches(s, "对比学习"), "加了译文不该把原文挤出干草堆");
+});
+
+/* ------------------------------------------------ 双语：显示哪一份、说不说明 */
+
+test("有译文就用译文，而且不必对读者说明", () => {
+  const s = { lang: "zh", tr: { en: { title: "Add title field", body: "## Why" } } };
+  const p = U.pickLang(s, "en");
+  assert.equal(p.tr.title, "Add title field");
+  assert.equal(p.fallback, false);
+  assert.equal(p.why, "");
+});
+
+test("没译文但原文就是这个语言 —— 什么都不用说，那本来就是读者要的语言", () => {
+  const p = U.pickLang({ lang: "en", tr: {} }, "en");
+  assert.equal(p.tr, null);
+  assert.equal(p.fallback, false);
+  assert.equal(p.why, "");
+});
+
+test("原文声明了别的语言 —— 可以说清那是哪一种（why=declared）", () => {
+  const p = U.pickLang({ lang: "zh", tr: {} }, "en");
+  assert.equal(p.fallback, true);
+  assert.equal(p.why, "declared");
+});
+
+test("原文没声明 lang —— 只能说「这是原文」，绝不许猜它是哪种语言", () => {
+  // 这一条是「不许猜」那条规矩的落点：正文里有汉字也好、有英文也好，
+  // 没写 lang: 就是不知道，猜错了就是对读者说谎。
+  const p = U.pickLang({ lang: "", body: "## 为什么\n试试", tr: {} }, "en");
+  assert.equal(p.fallback, true);
+  assert.equal(p.why, "unknown", "推断出 zh 就是在猜");
+});
+
+test("小节名认语言只查那张封闭词表，不做语种识别", () => {
+  const T = { zh: i18n.tIn("zh", "template.body"), en: i18n.tIn("en", "template.body") };
+  assert.equal(U.langByHeadings("## 为什么\n因为\n## 结论\n成立\n", T), "zh");
+  assert.equal(U.langByHeadings("## Why\nbecause\n", T), "en");
+  // 满篇汉字但一个已知小节名都没有 → 认不出来，返回空串让调用方自己兜底
+  assert.equal(U.langByHeadings("今天跑了三个种子，结果都一样。", T), "");
+  assert.equal(U.langByHeadings("", T), "");
+});
+
+test("模板里的五个小节名和 i18n 的表逐字一致（i18n 那侧又对着 trace_core.SECTION_NAMES）", () => {
+  const zh = Object.keys(U.headingsIn(i18n.tIn("zh", "template.body")));
+  const en = Object.keys(U.headingsIn(i18n.tIn("en", "template.body")));
+  assert.equal(zh.length, 5);
+  assert.equal(en.length, 5);
+  assert.ok(zh.includes("为什么") && en.includes("Why"));
+});
+
 /* ------------------------------------------------ 等级表 */
 
 test("L0–L4 五级齐全且和 FORMAT.md 第 10 节同序", () => {
   assert.deepEqual(U.LEVELS, ["L0", "L1", "L2", "L3", "L4"]);
-  U.LEVELS.forEach((l) => {
-    assert.ok(U.LEVEL_LABEL[l], l + " 没有中文标签");
-    assert.ok(U.LEVEL_HINT[l], l + " 没有判据说明");
+  // 标签和判据说明搬进了 i18n（这一层没有界面语言，不该替界面决定说哪种话），
+  // 但「每一级都得有话说」这条不变，两种语言都得有。
+  ["en", "zh"].forEach((l) => {
+    U.LEVELS.forEach((lv) => {
+      assert.ok(i18n.tIn(l, "trace.level." + lv) !== "trace.level." + lv, l + " 缺 " + lv + " 的标签");
+      assert.ok(i18n.tIn(l, "trace.level." + lv + ".hint") !== "trace.level." + lv + ".hint",
+                l + " 缺 " + lv + " 的判据说明");
+    });
   });
   assert.ok(U.levelIndex("L0") < U.levelIndex("L4"));
   assert.equal(U.levelIndex("乱写的"), 0, "认不出来的等级按最低算，不能当成最高");
 });
 
-test("四种 repro 状态都有中文标签，failed 也必须有 —— 失败记录是结论不是错误", () => {
-  ["verified", "runnable", "failed", "unknown"].forEach((s) => {
-    assert.ok(U.REPRO_LABEL[s], s + " 没有标签");
+test("四种 repro 状态两种语言都有标签，failed 也必须有 —— 失败记录是结论不是错误", () => {
+  assert.deepEqual(U.REPRO_STATES.slice().sort(), ["failed", "runnable", "unknown", "verified"]);
+  ["en", "zh"].forEach((l) => {
+    U.REPRO_STATES.forEach((s) => {
+      assert.ok(i18n.tIn(l, "trace.repro." + s) !== "trace.repro." + s, l + " 缺 " + s + " 的标签");
+    });
   });
 });
 

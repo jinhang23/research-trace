@@ -9,23 +9,15 @@
 (function (global) {
   "use strict";
 
-  /* FORMAT.md 第 10 节的五级。label 只给人看，任何比较都用下标，不要比字符串。 */
+  /* FORMAT.md 第 10 节的五级。任何比较都用下标，不要比字符串。
+     给人看的标签和判据说明从前写死在这里，现在在 i18n.js 的 trace.level.<L>
+     和 trace.level.<L>.hint 上——这一层是纯函数层，在 node 里没有 DOM 也没有
+     界面语言，让它持有界面文案就等于让它替界面决定说哪种语言。 */
   var LEVELS = ["L0", "L1", "L2", "L3", "L4"];
-  var LEVEL_LABEL = {
-    L0: "不可溯源", L1: "可读", L2: "可定位", L3: "可重跑", L4: "已复现",
-  };
-  var LEVEL_HINT = {
-    L0: "「为什么」或「做了什么」空着，或有图没图注，或 done/dead 却没结论",
-    L1: "看得懂当时的判断，但跑不了",
-    L2: "记了 commit 和产物位置，找得回代码和数据",
-    L3: "有人确认过命令/环境/种子齐全",
-    L4: "有人真跑过，数字在容差内对上了",
-  };
   /* failed 不降级——「试过，跑不起来，因为 checkpoint 被清了」不改变记录本身的
-     完整度，但它是整条链上最该被人看见的一行，所以单独给了个显眼的标签。 */
-  var REPRO_LABEL = {
-    verified: "已复现", runnable: "可重跑", failed: "复现失败", unknown: "状态不明",
-  };
+     完整度，但它是整条链上最该被人看见的一行，所以界面上单独给了个显眼的标签
+     （i18n 的 trace.repro.failed）。这里只留状态本身。 */
+  var REPRO_STATES = ["verified", "runnable", "failed", "unknown"];
 
   /* 必须和 trace_write.INSIGHT_SECTIONS 的四个值逐字一致：服务端的 _merge_insights
      只认这四个标题，前端切错一个字，那一节就会被当成「非洞察小节」留在磁盘上，
@@ -85,15 +77,79 @@
   /* 草稿键。项目和步骤 id 都进键里：同一个浏览器同时开几个项目是常态，
      键撞了就是把 A 项目的草稿恢复到 B 项目的另一步上。两段各自 encodeURIComponent
      之后再用 ':' 拼——不编码的话 slug "a:b" + id "c" 和 slug "a" + id "b:c"
-     会拼成同一个键，用户以为草稿丢了。 */
-  function draftKey(project, id) {
-    return "trace.draft:" + encodeURIComponent(String(project == null ? "" : project))
+     会拼成同一个键，用户以为草稿丢了。
+
+     lang 是同一个道理再走一遍：note.md 和 note.en.md 是两份各自要写的正文，
+     共用一个键就是「写完中文切去写英文，回来发现中文稿被英文稿盖了」。
+     原文（lang 为空）保持老键**一个字节都不变**——改了的话，升级前正写到一半
+     的那份草稿会变成谁也找不到的孤儿。 */
+  function draftKey(project, id, lang) {
+    var base = "trace.draft:" + encodeURIComponent(String(project == null ? "" : project))
       + ":" + encodeURIComponent(String(id == null ? "" : id));
+    lang = String(lang == null ? "" : lang);
+    return lang ? base + ":" + encodeURIComponent(lang) : base;
   }
 
+  /* 当前语言下该显示哪一份，以及要不要跟读者说明。
+   *
+   * 这个函数是「不许猜原文是什么语言」那条规矩的落点：note.md 没写 lang: 时
+   * 返回的是 why="unknown"，界面只能说「显示的是原文」，不能说「显示的是中文原文」。
+   * 一份记录里出现汉字不等于它该被当成中文记录——半句中文注释的英文笔记很常见，
+   * 猜错了就是对读者说谎，而这套系统全部的价值就在于它说的话可信。
+   *
+   *   tr        当前语言的译文（{title, body}），没有就是 null
+   *   fallback  是不是在显示原文
+   *   why       ""         原文本来就是这个语言（note.md 自己声明的），什么都不用说
+   *             "declared" 原文声明了别的语言 —— 可以说清那是哪一种
+   *             "unknown"  原文没声明 —— 只能说「这是原文」
+   */
+  function pickLang(rec, lang) {
+    var tr = (rec && rec.tr && rec.tr[lang]) || null;
+    if (tr) return { tr: tr, fallback: false, why: "" };
+    var own = (rec && rec.lang) || "";
+    if (own && own === lang) return { tr: null, fallback: false, why: "" };
+    return { tr: null, fallback: true, why: own ? "declared" : "unknown" };
+  }
+
+  /* 正文里出现的小节标题（`## X` 的 X）。 */
+  function headingsIn(body) {
+    var out = Object.create(null);
+    String(body == null ? "" : body).split("\n").forEach(function (line) {
+      var m = HEADING_RE.exec(line);
+      if (m) out[m[1]] = 1;
+    });
+    return out;
+  }
+
+  /* 这段正文用的是哪一套小节名。**只查表，不做语种识别。**
+   *
+   * templates 是 {语言: 正文模板}（i18n 的 template.body，逐字对着
+   * trace_core.SECTION_NAMES）。命中哪一套模板的标题就算哪一种——这是在查
+   * 那张封闭词表，不是在猜语言：一份英文笔记里写着「结果：0.943」并不说明
+   * 它该长出中文小节名，而 `## 为什么` 只可能来自中文那一套。
+   * 认不出来返回 ""，让调用方自己决定退到哪儿。
+   */
+  function langByHeadings(body, templates) {
+    var have = headingsIn(body);
+    var langs = Object.keys(templates || {}).sort();   // 产物确定：不吃对象键序
+    for (var i = 0; i < langs.length; i++) {
+      var hs = headingsIn(templates[langs[i]]);
+      for (var h in hs) if (have[h]) return langs[i];
+    }
+    return "";
+  }
+
+  /* 搜索的干草堆里**必须**包含所有译文：整个双语功能的意义就是「英文那一侧
+     也能回答同一个问题」。只搜原文的话，界面切成英文之后搜 "contrastive"
+     一条都搜不到，而那正是人打开搜索框的原因。 */
   function hay(step) {
+    var tr = (step && step.tr) || {}, extra = "";
+    Object.keys(tr).sort().forEach(function (l) {
+      var e = tr[l] || {};
+      extra += " " + (e.title || "") + " " + (e.name || "") + " " + (e.body || "");
+    });
     return (step.id + " " + (step.title || "") + " " + (step.body || "") + " "
-            + (step.tags || []).join(" ")).toLowerCase();
+            + (step.tags || []).join(" ") + extra).toLowerCase();
   }
   function matches(step, q) {
     q = String(q || "").trim().toLowerCase();
@@ -114,11 +170,11 @@
   }
 
   var U = {
-    LEVELS: LEVELS, LEVEL_LABEL: LEVEL_LABEL, LEVEL_HINT: LEVEL_HINT,
-    REPRO_LABEL: REPRO_LABEL, INSIGHT_HEADINGS: INSIGHT_HEADINGS,
+    LEVELS: LEVELS, REPRO_STATES: REPRO_STATES, INSIGHT_HEADINGS: INSIGHT_HEADINGS,
     levelIndex: levelIndex, splitSections: splitSections,
     splitInsightBody: splitInsightBody, foreignHeadings: foreignHeadings,
     draftKey: draftKey, matches: matches, snippet: snippet,
+    pickLang: pickLang, headingsIn: headingsIn, langByHeadings: langByHeadings,
   };
   global.traceUtil = U;
   if (typeof module !== "undefined" && module.exports) module.exports = U;
@@ -150,6 +206,18 @@
   var esc = window.md.esc;
   var $ = function (s) { return document.querySelector(s); };
 
+  /* 界面文案。t() 出纯文本（textContent / title / placeholder / prompt / toast），
+     tHtml() 出 HTML（拼进 innerHTML 的模板）——把 t() 拼进 innerHTML 是这一页
+     唯一能把用户数据变成可执行 HTML 的路径，两者绝不混用。约定和理由都在
+     web/i18n.js 的文件头。
+     这里不做「i18n 没载进来就退回中文」的兜底：静默回退会让漏接线的地方永远
+     发现不了，而少一个 <script> 的后果本来就该在第一秒当场炸。
+     调用一律写全 i18n.t(...) / i18n.tHtml(...)，不做 var t = i18n.t 这种缩写：
+     这个文件里已经有七八个叫 t 的局部变量（s.trace、TOOLS 项、令牌、tagName…），
+     缩写会被就近的那个静默遮住，而遮住之后的报错离现场很远。 */
+  var i18n = window.i18n;
+  function uiLang() { return i18n.lang(); }
+
   var F = { steps: [], order: [], lanes: {}, lane_count: 0, warnings: [], row_h: 28, lane_w: 14,
             tree: { nodes: {}, w: 0, h: 0, node_w: 176, node_h: 58 } };
   var IDX = {};
@@ -169,9 +237,52 @@
     : (window.innerWidth && window.innerWidth < NARROW ? "list" : "graph");
   var zoom = 1;
 
-  var TEMPLATE = "## 为什么\n\n\n## 做了什么\n\n\n## 结果\n\n\n## 结论\n\n\n## 下一步\n";
   var IMG = /\.(png|jpe?g|gif|webp|svg|bmp|avif)$/i;
   var RAIL_PAD = 12;
+
+  /* ---------------------------------------------------------- 内容语言
+   *
+   * 界面语言和内容语言是两件事，这一段是全篇最容易做错的地方。
+   *
+   * `## 为什么` 那五行不是界面文案，它们是要写进 note.md 的**内容**：
+   * trace_core 按这张封闭词表（SECTION_NAMES）去正文里找「为什么」「结论」，
+   * 找不到就判 L0、check 就报缺。所以模板跟的是**这份记录要写成哪种语言**，
+   * 不是读者此刻把界面切成了哪种语言——界面英文的人完全可能用中文记笔记，
+   * 给他插一套英文小节名，等于让他这一步的评级凭空掉到 L0。
+   *
+   * 那「这份记录要写成哪种语言」从哪来？按可信度排：
+   *   1) note.md 自己声明的 lang:（唯一真凭据）
+   *   2) 兄弟/父步骤正文里已经在用的那一套小节名（查 SECTION_NAMES 这张封闭
+   *      词表，不是语种识别——见 U.langByHeadings 的注释）
+   *   3) project.md 声明的 lang:
+   *   4) 界面语言（什么线索都没有时的最后一档）
+   * 而且它在新建对话框里是**可见可改**的一个下拉：猜出来的默认值必须能被
+   * 当场推翻，否则第 4 档那一步猜错就成了没有出口的坑。
+   */
+  var TEMPLATES = { zh: "", en: "" };
+  function templates() {
+    TEMPLATES.zh = i18n.tIn("zh", "template.body");
+    TEMPLATES.en = i18n.tIn("en", "template.body");
+    return TEMPLATES;
+  }
+  function templateBody(l) { return i18n.tIn(l || uiLang(), "template.body"); }
+
+  function guessContentLang(hintStep) {
+    var chain = [];
+    if (hintStep) chain.push(hintStep);
+    // 没给参考步骤（新建根节点）就看最近写的那一步：同一个项目里的小节名分裂
+    // 是最难查的一类问题——评级和 check 只会说「没写结论」，不会说「小节名对不上」。
+    for (var i = F.steps.length - 1; i >= 0 && chain.length < 6; i--) chain.push(F.steps[i]);
+    var byHead = "";
+    for (var j = 0; j < chain.length; j++) {
+      if (chain[j].lang) return chain[j].lang;
+      if (!byHead) byHead = U.langByHeadings(chain[j].body || "", templates());
+    }
+    if (byHead) return byHead;
+    var p = currentProject();
+    if (p && p.lang) return p.lang;
+    return uiLang();
+  }
 
   /* -------------------------------------------------------------- 工具 */
 
@@ -183,7 +294,7 @@
   function paintToken() {
     var b = $("#btn-token");
     b.textContent = token() ? "🔓" : "🔒";
-    b.title = token() ? "已设置写入令牌（点击更换或清除）" : "未设置写入令牌 — 只能浏览";
+    b.title = i18n.t(token() ? "app.token.set" : "app.token.unset");
   }
   function canWrite() { return MODE === "server"; }
 
@@ -235,9 +346,9 @@
     return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
   }
   function human(n) {
-    if (n < 1024) return n + " B";
-    if (n < 1048576) return (n / 1024).toFixed(1) + " KB";
-    return (n / 1048576).toFixed(1) + " MB";
+    if (n < 1024) return i18n.t("unit.b", { n: n });
+    if (n < 1048576) return i18n.t("unit.kb", { n: (n / 1024).toFixed(1) });
+    return i18n.t("unit.mb", { n: (n / 1048576).toFixed(1) });
   }
   function fileURL(s, rel) {
     var p = rel.split("/").map(encodeURIComponent).join("/");
@@ -246,6 +357,59 @@
   }
   function resolverFor(s) { return function (h) { return fileURL(s, h); }; }
   function isAgent(s) { return (s.author || "").indexOf("agent") === 0; }
+
+  /* ---------------------------------------------------------- 内容跟着语言走
+   *
+   * 一步在当前界面语言下该显示的标题和正文。图、列表、详情、面包屑、洞察面板
+   * 全部走这两个函数——漏一处就会出现「树上是英文、点开是中文」。
+   *
+   * 图和附件**不跟着变**：译文是同一步的另一份文字，不是另一个步骤，
+   * `![](fig.png)` 指的还是那一个目录里的那一张图。所以 fileURL / resolverFor
+   * 一个字都没动，note.en.md 里写 `![](loss.png)` 和 note.md 里写它落到同一个
+   * 文件上。这条如果破了，翻译一份就等于把所有图链接指向不存在的地方。
+   */
+  function stepTitle(s) {
+    var pick = U.pickLang(s, uiLang());
+    return (pick.tr && pick.tr.title) || (s && s.title) || "";
+  }
+  function stepBody(s) {
+    var pick = U.pickLang(s, uiLang());
+    return (pick.tr && pick.tr.body) || (s && s.body) || "";
+  }
+  function titleOf(id) { return IDX[id] ? stepTitle(IDX[id]) : ""; }
+
+  function langName(code) {
+    return i18n.has("lang." + code) ? i18n.t("lang." + code) : String(code || "");
+  }
+
+  /* 正文这一栏此刻显示的是不是原文，以及能不能说清原文是哪种语言。
+     只翻了标题、正文还空着的译文也算回退——读者看到的确实是原文。 */
+  function bodyFallback(rec) {
+    var l = uiLang(), pick = U.pickLang(rec, l);
+    if (pick.tr && String(pick.tr.body || "").trim()) return "";
+    if (pick.tr) return (rec.lang && rec.lang !== l) ? "declared" : "unknown";
+    return pick.fallback ? pick.why : "";
+  }
+
+  /* 回退时对读者的如实说明。两档，按「我们究竟知道什么」分：
+   *   declared 原文声明了 lang: 且不是当前语言 → 一整句话，并说清那是哪一种语言
+   *   unknown  原文没声明                     → 只说「这是原文」，绝不猜是哪种
+   *
+   * 第二档做成一个两三个字的徽章（整句在 title 里）而不是一条横幅：绝大多数
+   * 项目根本没在做双语，一个 lang: 都没写，此时每一步顶一条「还没有译文」的
+   * 横幅是纯噪声——而噪声会让第一档那条真正要紧的说明一起被跳过去。
+   */
+  function trNotice(rec, key) {
+    var why = bodyFallback(rec);
+    key = key || "tr.fallback.note";
+    if (!why) return "";
+    if (why === "unknown") {
+      return '<p class="trnote quiet"><span class="trbadge" title="' + esc(i18n.t(key)) + '">'
+        + esc(i18n.t("tr.badge.original")) + "</span></p>";
+    }
+    return '<p class="trnote"><span class="trbadge">' + esc(i18n.t("tr.badge.original")) + "</span>"
+      + i18n.tHtml(key) + ' <span class="trlang">' + esc(langName(rec.lang)) + "</span></p>";
+  }
 
   function selected() { var h = decodeURIComponent(location.hash.slice(1)); return IDX[h] ? h : ""; }
   /* 切换选中会把编辑器整个丢掉重渲染，所以先过一道离开确认。
@@ -265,11 +429,20 @@
 
   /* -------------------------------------------------------------- 项目 */
 
+  /* 项目名同样跟语言走：project.en.md 的 name 就是这个项目的英文名。
+     没有译文就用原名——项目名不像正文，没地方摆一句「这是原文」，
+     而一个突然变成中文的下拉项本身就说明了它没被翻译。 */
+  function projectName(p) {
+    if (!p) return "";
+    var pick = U.pickLang(p, uiLang());
+    return (pick.tr && pick.tr.name) || p.name || p.slug || "";
+  }
+
   function renderProjects() {
-    $("#proj").innerHTML = '<option value="">所有项目 ▸</option>'
+    $("#proj").innerHTML = '<option value="">' + esc(i18n.t("app.proj.all")) + "</option>"
       + PROJECTS.map(function (p) {
           return '<option value="' + esc(p.slug) + '"' + (p.slug === PROJECT ? " selected" : "") + ">"
-            + esc(p.name) + "（" + p.steps + "）</option>";
+            + esc(i18n.t("app.proj.option", { name: projectName(p), n: p.steps })) + "</option>";
         }).join("");
   }
 
@@ -277,8 +450,9 @@
     // 项目索引页的搜索框以前被 CSS 直接隐藏。现在它同时干两件事：
     // 筛项目卡片（下面这段），以及跨项目搜步骤正文（#hitlist）。
     var q = query.trim().toLowerCase();
+    // 项目名的两种写法都能筛到：搜 "对比学习" 和搜 "contrastive" 都该找到同一个项目
     var list = q ? PROJECTS.filter(function (p) {
-      return (p.name + " " + p.slug).toLowerCase().indexOf(q) >= 0;
+      return (p.name + " " + projectName(p) + " " + p.slug).toLowerCase().indexOf(q) >= 0;
     }) : PROJECTS;
     $("#cards").innerHTML = list.map(function (p) {
       var c = p.counts || {};
@@ -288,18 +462,23 @@
           }).join("")
         : '<i class="sg-empty" style="flex:1"></i>';
       return '<a class="pcard" href="' + projectHref(p.slug) + '">'
-        + "<h2>" + esc(p.name) + "</h2>"
+        + "<h2>" + esc(projectName(p)) + "</h2>"
         + '<div class="pbar">' + bar + "</div>"
-        + '<div class="pmeta mono">' + p.steps + " 步 · done " + (c.done || 0)
-        + " / wip " + (c.wip || 0) + " / dead " + (c.dead || 0)
-        + (p.latest ? " · 最近 " + esc(p.latest) : "") + "</div>"
-        + (p.warnings ? '<div class="pwarn">⚠ ' + p.warnings + " 条警告</div>" : "")
+        + '<div class="pmeta mono">'
+        + i18n.tHtml("home.card.meta", {
+            steps: i18n.t("count.steps", { n: p.steps }),
+            done: c.done || 0, wip: c.wip || 0, dead: c.dead || 0,
+          })
+        + (p.latest ? " · " + i18n.tHtml("home.card.latest", { date: p.latest }) : "") + "</div>"
+        + (p.warnings ? '<div class="pwarn">'
+            + i18n.tHtml("home.card.warnings", { warnings: i18n.t("count.warnings", { n: p.warnings }) })
+            + "</div>" : "")
         + "</a>";
     }).join("") || '<p class="placeholder">'
-      + (q ? "没有名字含「" + esc(query.trim()) + "」的项目。<br>正文命中在上面的搜索结果里。"
-           : "还没有项目。点右上角 <b>＋ 项目</b> 新建一个。")
+      + (q ? i18n.tHtml("home.nofilter", { q: query.trim() }) : i18n.tHtml("home.empty"))
       + "</p>";
-    $("#hits").textContent = q ? list.length + " / " + PROJECTS.length + " 个项目" : "";
+    $("#hits").textContent = q
+      ? i18n.t("home.filter.count", { shown: list.length, total: PROJECTS.length }) : "";
   }
 
   /* -------------------------------------------------------------- 数据 */
@@ -371,8 +550,8 @@
       if (!n) return "";
       var pics = (s.files || []).filter(function (f) { return IMG.test(f.path); }).length;
       var other = (s.files || []).length - pics;
-      var marks = (pics ? '<span class="cmk" title="' + pics + ' 张图">🖼' + (pics > 1 ? pics : "") + "</span>" : "")
-        + (other ? '<span class="cmk" title="' + other + ' 个附件">📎' + (other > 1 ? other : "") + "</span>" : "")
+      var marks = (pics ? '<span class="cmk" title="' + esc(i18n.t("count.images", { n: pics })) + '">🖼' + (pics > 1 ? pics : "") + "</span>" : "")
+        + (other ? '<span class="cmk" title="' + esc(i18n.t("count.files", { n: other })) + '">📎' + (other > 1 ? other : "") + "</span>" : "")
         + traceMarks(s);
       return '<div class="card s-' + s.status + '" data-id="' + esc(s.id) + '" tabindex="0"'
         + ' style="left:' + n.x + "px;top:" + n.y + "px;width:" + NW + "px;height:" + NH + 'px">'
@@ -381,7 +560,7 @@
         + (isAgent(s) ? '<span class="cbot" title="' + esc(s.author) + '">🤖</span>' : "")
         + marks
         + '<span class="cdate">' + esc(s.date || "") + "</span></div>"
-        + '<div class="ctitle">' + esc(s.title || "(无标题)") + "</div>"
+        + '<div class="ctitle">' + esc(stepTitle(s) || i18n.t("common.untitled")) + "</div>"
         + "</div>";
     }).join("");
     setZoom(zoom);
@@ -447,9 +626,9 @@
       var pics = (s.files || []).length;
       return '<div class="row s-' + s.status + '" data-id="' + esc(s.id) + '">'
         + '<span class="id s-' + s.status + '">' + esc(s.id) + "</span>"
-        + '<span class="t">' + esc(s.title || "(无标题)") + "</span>"
+        + '<span class="t">' + esc(stepTitle(s) || i18n.t("common.untitled")) + "</span>"
         + traceMarks(s)
-        + (pics ? '<span class="who" title="' + pics + ' 个附件">📎</span>' : "")
+        + (pics ? '<span class="who" title="' + esc(i18n.t("count.files", { n: pics })) + '">📎</span>' : "")
         + (isAgent(s) ? '<span class="who" title="' + esc(s.author) + '">🤖</span>' : "")
         + '<span class="d">' + esc(s.date || "") + "</span>"
         + "</div>";
@@ -469,15 +648,20 @@
    */
   function traceMarks(s) {
     var out = "";
-    var t = s.trace || null;
-    if (t && t.self === "L0") {
-      var why = (t.missing || []).slice(0, 3).join("；") || U.LEVEL_HINT.L0;
-      out += '<span class="cmk lv0" title="L0 不可溯源 — ' + esc(why) + '">L0</span>';
+    var tr = s.trace || null;
+    if (tr && tr.self === "L0") {
+      // missing 是服务端算的中文清单（trace_core，Python 侧不在翻译范围），
+      // 逐条过一遍 i18n.traceMissing 换成本语言的说法，认不出的原样保留——
+      // 老老实实给中文，好过把这一条悄悄吞掉。
+      var why = (tr.missing || []).slice(0, 3).map(function (m) { return i18n.traceMissing(m); })
+        .join(" · ") || i18n.t("trace.level.L0.hint");
+      out += '<span class="cmk lv0" title="' + esc(i18n.t("list.mark.l0", { why: why })) + '">L0</span>';
     }
     var last = (s.repro || [])[(s.repro || []).length - 1];
     if (last && last.state === "failed") {
-      out += '<span class="cmk rfail" title="复现失败'
-        + (last.note ? "：" + esc(last.note) : "") + '">↺✕</span>';
+      out += '<span class="cmk rfail" title="'
+        + esc(last.note ? i18n.t("list.mark.reprofail.note", { note: last.note })
+                        : i18n.t("list.mark.reprofail")) + '">↺✕</span>';
     }
     return out;
   }
@@ -515,14 +699,16 @@
     document.querySelectorAll("#rows .row, #dnodes .card").forEach(function (el) {
       var id = el.getAttribute("data-id"), s = IDX[id];
       if (!s) return;
-      var hay = (id + " " + (s.title || "") + " " + (s.body || "") + " " + (s.tags || []).join(" ")).toLowerCase();
-      var hit = !q || hay.indexOf(q) >= 0;
+      // 判定走 U.matches：以前这里自己又拼了一遍干草堆，于是加上译文之后
+      // 侧栏和跨项目搜索会对同一个词给出两种答案。
+      var hit = U.matches(s, q);
       if (q && hit && el.classList.contains("row")) hits++;
       el.classList.toggle("miss", !!q && !hit);
       el.classList.toggle("faded", !!sel && !chain[id]);
       el.classList.toggle("sel", id === sel);
     });
-    $("#hits").textContent = q ? hits + " / " + F.steps.length : (F.steps.length ? F.steps.length + " 步" : "");
+    $("#hits").textContent = q ? hits + " / " + F.steps.length
+      : (F.steps.length ? i18n.t("count.steps", { n: F.steps.length }) : "");
 
     document.querySelectorAll("#rails [data-id], #dedges [data-id]").forEach(function (el) {
       var id = el.getAttribute("data-id");
@@ -583,12 +769,12 @@
       var b = document.createElement("button");
       b.className = "copy";
       b.type = "button";
-      b.textContent = "复制";
+      b.textContent = i18n.t("common.copy");
       b.addEventListener("click", function () {
         navigator.clipboard.writeText(pre.querySelector("code").textContent).then(function () {
-          b.textContent = "已复制";
-          setTimeout(function () { b.textContent = "复制"; }, 1400);
-        }, function () { toast("复制失败", true); });
+          b.textContent = i18n.t("common.copied");
+          setTimeout(function () { b.textContent = i18n.t("common.copy"); }, 1400);
+        }, function () { toast(i18n.t("toast.copy.failed"), true); });
       });
       pre.appendChild(b);
     });
@@ -618,11 +804,12 @@
     }).join("") + "</nav>";
   }
 
-  var KIND_LABEL = {
-    hpc: "超算", github: "GitHub", git: "Git", dropbox: "Dropbox", drive: "Drive",
-    object: "对象存储", archive: "数据仓库", mlhub: "实验平台", url: "链接",
-    local: "本机", path: "路径",
-  };
+  /* 徽章文案在 i18n 的 path.kind.*；认不出来的 kind 原样显示（trace_core 加了
+     新类型而这边还不认识时，显示裸英文单词好过显示空白）。 */
+  function kindLabel(kind) {
+    var key = "path.kind." + kind;
+    return i18n.has(key) ? i18n.t(key) : String(kind || "");
+  }
 
   /* 外部产物的位置。checkpoint、数据集这些 GB 级的东西不进仓库，
      只在这里记"它在哪"——溯源时最常问的就是这个。 */
@@ -633,11 +820,11 @@
       var loc = esc(p.location);
       var isLink = /^https?:\/\//i.test(p.location);
       return '<div class="pathrow">'
-        + '<span class="pkind k-' + esc(p.kind) + '">' + esc(KIND_LABEL[p.kind] || p.kind) + "</span>"
+        + '<span class="pkind k-' + esc(p.kind) + '">' + esc(kindLabel(p.kind)) + "</span>"
         + (isLink
             ? '<a class="ploc" href="' + loc + '" target="_blank" rel="noopener noreferrer">' + loc + "</a>"
             : '<code class="ploc">' + loc + "</code>")
-        + '<button class="pcopy" type="button" data-copy="' + loc + '" title="复制">⧉</button>'
+        + '<button class="pcopy" type="button" data-copy="' + loc + '" title="' + esc(i18n.t("common.copy")) + '">⧉</button>'
         + (p.note ? '<span class="pnote">' + esc(p.note) + "</span>" : "")
         + "</div>";
     }).join("") + "</div>";
@@ -645,11 +832,14 @@
 
   /* ---------------------------------------------------------- 可溯源性 */
 
+  function levelName(l) { return i18n.t("trace.level." + l); }
+  function reproName(st) { return i18n.t("trace.repro." + st); }
+
   function lvChip(level, extra) {
-    var l = U.LEVEL_LABEL[level] ? level : "L0";
+    var l = U.LEVELS.indexOf(level) >= 0 ? level : "L0";
     return '<span class="lv lv-' + l + (extra ? " " + extra : "") + '" title="'
-      + esc(l + " " + U.LEVEL_LABEL[l] + " — " + U.LEVEL_HINT[l]) + '">'
-      + l + " " + esc(U.LEVEL_LABEL[l]) + "</span>";
+      + esc(i18n.t("trace.chip.title", { level: l, name: levelName(l), hint: i18n.t("trace.level." + l + ".hint") })) + '">'
+      + l + " " + esc(levelName(l)) + "</span>";
   }
 
   /* FORMAT.md 第 10 节算出来的等级，人这一侧的出口。
@@ -668,49 +858,54 @@
     if (!t) return "";
 
     var weak = t.weakest && t.weakest !== s.id ? IDX[t.weakest] : null;
-    var head = '<div class="lvrow">' + lvChip(t.self) + '<span class="lvcap">这一步自己</span>'
+    var head = '<div class="lvrow">' + lvChip(t.self)
+      + '<span class="lvcap">' + esc(i18n.t("trace.self")) + "</span>"
       + '<span class="lvsep">·</span>' + lvChip(t.chain, "chain")
-      + '<span class="lvcap">整条链</span>';
+      + '<span class="lvcap">' + esc(i18n.t("trace.chain")) + "</span>";
     if (weak) {
-      head += '<span class="lvsep">—</span><span class="lvcap">最弱的一环是 '
-        + '<a href="#' + esc(weak.id) + '" data-goto="' + esc(weak.id) + '">' + esc(weak.id) + "</a> "
-        + esc(weak.title || "") + "，先补它</span>";
+      head += '<span class="lvsep">—</span><span class="lvcap">'
+        + i18n.tHtml("trace.weakest", {
+            link: { html: '<a href="#' + esc(weak.id) + '" data-goto="' + esc(weak.id) + '">' + esc(weak.id) + "</a>" },
+            title: stepTitle(weak),
+          })
+        + "</span>";
     } else if (t.weakest === s.id && t.chain !== "L4") {
-      head += '<span class="lvsep">—</span><span class="lvcap">最弱的一环就是这一步</span>';
+      head += '<span class="lvsep">—</span><span class="lvcap">' + esc(i18n.t("trace.weakest.self")) + "</span>";
     }
     head += "</div>";
 
+    // missing 的每一条都是服务端算出来的中文（Python 侧不在翻译范围），
+    // 过一遍 traceMissing 换成本语言的说法；认不出的原样显示，不吞。
     var todo = (t.missing || []).length
       ? '<ul class="lvmiss">' + t.missing.map(function (m) {
-          return "<li>" + esc(m) + "</li>";
+          return "<li>" + esc(i18n.traceMissing(m)) + "</li>";
         }).join("") + "</ul>"
-      : '<p class="dropnote lvok">机械可判的部分都齐了。再往上要有人真去跑一遍。</p>';
+      : '<p class="dropnote lvok">' + esc(i18n.t("trace.ok")) + "</p>";
 
     var chain = (t.lineage || []).length > 1
       ? '<div class="lvchain">' + t.lineage.map(function (e) {
           return '<a class="lvnode lv-' + esc(e.level) + (e.id === s.id ? " here" : "")
             + '" href="#' + esc(e.id) + '" data-goto="' + esc(e.id) + '" title="'
-            + esc((IDX[e.id] || {}).title || "") + '">' + esc(e.id)
+            + esc(titleOf(e.id)) + '">' + esc(e.id)
             + '<i>' + esc(e.level) + "</i></a>";
         }).join('<span class="lvarrow">→</span>') + "</div>"
       : "";
 
     var rp = repro.length
       ? '<div class="repros">' + repro.map(function (r) {
-          var st = U.REPRO_LABEL[r.state] ? r.state : "unknown";
+          var st = U.REPRO_STATES.indexOf(r.state) >= 0 ? r.state : "unknown";
           return '<div class="repro r-' + st + '">'
-            + '<span class="rstate">' + esc(U.REPRO_LABEL[st]) + "</span>"
+            + '<span class="rstate">' + esc(reproName(st)) + "</span>"
             + (r.date ? '<span class="rmeta">' + esc(r.date) + "</span>" : "")
             + (r.by ? '<span class="rmeta">' + esc(r.by) + "</span>" : "")
             + (r.note ? '<span class="rnote">' + esc(r.note) + "</span>" : "")
             + "</div>";
         }).join("") + "</div>"
-      : '<p class="dropnote">还没有人尝试复现。<code>repro:</code> 由审计/复现 agent 写回，'
-        + "失败的记录和成功的一样要留着。</p>";
+      : '<p class="dropnote">' + i18n.tHtml("trace.repro.empty") + "</p>";
 
-    return '<div class="sec tracebox"><h3>可溯源性 · L0–L4</h3>'
+    return '<div class="sec tracebox"><h3>' + esc(i18n.t("trace.title")) + "</h3>"
       + head + todo + chain
-      + '<h4 class="rhead">复现记录 · ' + repro.length + "</h4>" + rp + "</div>";
+      + '<h4 class="rhead">' + esc(i18n.t("trace.repro.head", { n: repro.length })) + "</h4>" + rp + "</div>";
   }
 
   function pathsToText(s) {
@@ -725,45 +920,51 @@
   /* 项目洞察：不属于任何单独一步的沉淀——核心想法、什么有效什么无效、
      踩过的坑。存在 project.md 的正文里，所以照样可 grep、可 diff。
      没选步骤时详情面板就显示它，这也是打开项目时的落地页。 */
-  var INSIGHT_KINDS = [
-    { k: "idea", label: "核心想法", hint: "还没验证但值得记下来的方向" },
-    { k: "works", label: "有效", hint: "确认管用的" },
-    { k: "fails", label: "无效", hint: "确认不管用的——和有效一样重要" },
-    { k: "pitfall", label: "坑", hint: "会反复咬人的问题" },
-  ];
+  /* 四种洞察的语义键。按钮上的字和提示走 i18n（insight.<k> / insight.<k>.hint），
+     而它们**逐字对着 trace_core.INSIGHT_NAMES**（i18n.test.js 钉着这一条），
+     所以「＋ 有效」这个按钮说的词和最终落进 project.md 的小节名一定是同一个。 */
+  var INSIGHT_KINDS = ["idea", "works", "fails", "pitfall"];
+  function insightLabel(k) { return i18n.t("insight." + k); }
 
   function currentProject() {
     for (var i = 0; i < PROJECTS.length; i++) if (PROJECTS[i].slug === PROJECT) return PROJECTS[i];
     return null;
   }
 
+  function keyRow(k, label) {
+    return '<span class="mono">' + k + "</span> " + esc(i18n.t(label));
+  }
+
   function renderInsights(el) {
     var p = currentProject() || { name: PROJECT, body: "" };
-    var body = (p.body || "").trim();
+    // 洞察正文同样跟语言走：project.en.md 里的四个小节是同一批判断的英文那一份。
+    var pick = U.pickLang(p, uiLang());
+    var body = String((pick.tr && pick.tr.body) || p.body || "").trim();
     var acts = canWrite()
-      ? '<div class="acts"><button data-act="edit-insights">✎ 编辑洞察</button>'
+      ? '<div class="acts"><button data-act="edit-insights">' + esc(i18n.t("insight.edit")) + "</button>"
         + INSIGHT_KINDS.map(function (k) {
-            return '<button data-add-insight="' + k.k + '" title="' + esc(k.hint) + '">＋ ' + k.label + "</button>";
+            return '<button data-add-insight="' + k + '" title="' + esc(i18n.t("insight." + k + ".hint")) + '">'
+              + esc(i18n.t("insight.add", { label: insightLabel(k) })) + "</button>";
           }).join("")
-        + '<span class="sp"></span><button data-act="child" class="primary">＋ 新步骤</button></div>'
+        + '<span class="sp"></span><button data-act="child" class="primary">'
+        + esc(i18n.t("app.new")) + "</button></div>"
       : "";
     var content = body
-      ? '<div class="prose">' + window.md.render(body, {
-          resolve: function (h) { return h; },
-        }) + "</div>"
-      : '<p class="dropnote">还没有洞察。<br>'
-        + '这里记的是**不属于任何单独一步**的判断——「回译在这个数据集上一直没用」'
-        + '是三次尝试之后的结论，挂在哪一步都不对。</p>';
+      ? trNotice(p, "tr.fallback.project")
+        + '<div class="prose">' + window.md.render(body, {
+            resolve: function (h) { return h; },
+          }) + "</div>"
+      : '<p class="dropnote">' + i18n.tHtml("insight.empty") + "</p>";
 
     el.innerHTML = '<div class="insights">'
-      + '<h1 class="title">💡 ' + esc(p.name || PROJECT) + " · 洞察</h1>"
-      + '<p class="dropnote">核心想法 · 什么有效什么无效 · 踩过的坑。'
-      + "存在 <code>project.md</code> 里，删掉程序照样能 grep。</p>"
+      + '<h1 class="title">' + esc(i18n.t("insight.title", { name: projectName(p) || PROJECT })) + "</h1>"
+      + '<p class="dropnote">' + i18n.tHtml("insight.lead") + "</p>"
       + acts + content + "</div>"
-      + '<div class="sec"><h3>快捷键</h3><p class="dropnote">'
-      + '<span class="mono">↑ ↓</span> 在步骤间移动 · <span class="mono">g</span> 切换图/列表 · '
-      + '<span class="mono">n</span> 新建步骤 · <span class="mono">e</span> 编辑 · '
-      + '<span class="mono">/</span> 搜索 · <span class="mono">Esc</span> 回到这里</p></div>';
+      + '<div class="sec"><h3>' + esc(i18n.t("keys.title")) + '</h3><p class="dropnote">'
+      + keyRow("↑ ↓", "keys.move") + " · " + keyRow("g", "keys.toggle") + " · "
+      + keyRow("n", "keys.new") + " · " + keyRow("e", "keys.edit") + " · "
+      + keyRow("/", "keys.search") + " · " + keyRow("Esc", "keys.back")
+      + "</p></div>";
     enhanceProse(el);
     el.scrollTop = 0;
   }
@@ -795,23 +996,27 @@
       var p = currentProject() || { body: "" };
       var split = U.splitInsightBody(p.body || "");
       var others = split.others.length
-        ? '<div class="others"><h4>下面这些小节不属于洞察，这次编辑不会动它们</h4>'
+        ? '<div class="others"><h4>' + esc(i18n.t("insight.editor.others")) + "</h4>"
           + split.others.map(function (o) {
               return '<pre class="othersec">' + esc(o.text) + "</pre>";
             }).join("")
-          + '<p class="dropnote">删除步骤时写下的「为什么删的」就落在 <code>## 已删除</code> 里。'
-          + "目录已经没了，这几行是仅存的证据，所以它不进这个编辑框。</p></div>"
+          + '<p class="dropnote">' + i18n.tHtml("insight.editor.others.note") + "</p></div>"
         : "";
       $("#detail").innerHTML =
-        '<div class="edhead"><b>💡 编辑项目洞察</b><span class="sp"></span>'
-        + '<button data-act="save-insights" class="primary">保存 <kbd>Ctrl↵</kbd></button>'
-        + '<button data-act="cancel">取消</button></div>'
+        '<div class="edhead"><b>' + esc(i18n.t("insight.editor.title")) + "</b>"
+        // 这个框改的永远是 project.md 本身（PATCH /api/projects 只写原文）。
+        // 界面切成英文、上面显示的是 project.en.md 时尤其要说清这一点，
+        // 否则人以为自己在改英文版，保存后发现英文版一个字没变。
+        + '<span class="trbadge" title="' + esc(i18n.t("tr.fallback.project")) + '">'
+        + esc(i18n.t("tr.badge.original")) + "</span>"
+        + '<span class="sp"></span>'
+        + '<button data-act="save-insights" class="primary">' + esc(i18n.t("editor.save")) + " <kbd>Ctrl↵</kbd></button>"
+        + '<button data-act="cancel">' + esc(i18n.t("editor.cancel")) + "</button></div>"
         + '<textarea class="editor" id="ed-insights" spellcheck="false" style="min-height:360px">'
         + esc(split.editable)
         + "</textarea>"
         + '<p class="dropnote" id="ed-insights-warn"></p>'
-        + '<p class="dropnote">markdown。提交的只有这四个小节（以及标题之前的引言）。'
-        + "<code>trace_insight</code> 工具往同样的小节里追加，保持它们在，人和 agent 写的就落在同一处。</p>"
+        + '<p class="dropnote">' + i18n.tHtml("insight.editor.hint") + "</p>"
         + others;
       var ta = $("#ed-insights");
       ta.addEventListener("input", paintInsightWarn);
@@ -825,8 +1030,9 @@
     if (!ta || !box) return;
     var bad = U.foreignHeadings(ta.value);
     box.innerHTML = bad.length
-      ? '⚠ <b>' + esc(bad.map(function (h) { return "## " + h; }).join("、"))
-        + "</b> 不是洞察小节，保存时会被丢弃（磁盘上的那一份保持原样）。"
+      ? i18n.tHtml("insight.editor.warn", {
+          sections: bad.map(function (h) { return "## " + h; }).join(" · "),
+        })
       : "";
     box.classList.toggle("warn", !!bad.length);
   }
@@ -835,7 +1041,7 @@
     var ta = $("#ed-insights");
     if (!ta) return;
     patchProject({ insights: ta.value })
-      .then(function () { toast("已保存（只替换了四个洞察小节）"); }).catch(fail);
+      .then(function () { toast(i18n.t("toast.insights.saved")); }).catch(fail);
   }
 
   function renderDetail() {
@@ -849,56 +1055,65 @@
     // 恰恰是最该被那一眼看到的。详细的缺项和复现记录在下面的可溯源性小节里。
     if (s.trace) meta.push(lvChip(s.trace.chain, "mini"));
     if (s.date) meta.push(esc(s.date));
-    if (s.commit) meta.push("commit " + esc(s.commit));
+    if (s.commit) meta.push(esc(i18n.t("detail.meta.commit", { commit: s.commit })));
     if (s.author) meta.push(esc(s.author));
-    if (s.parent) meta.push('parent <a href="#' + esc(s.parent) + '" data-goto="' + esc(s.parent) + '">' + esc(s.parent) + "</a>");
-    if ((s.children || []).length) meta.push(s.children.length + " 个子步骤");
-    (s.tags || []).forEach(function (t) { meta.push('<span class="tag">' + esc(t) + "</span>"); });
+    if (s.parent) {
+      meta.push(i18n.tHtml("detail.meta.parent", {
+        id: { html: '<a href="#' + esc(s.parent) + '" data-goto="' + esc(s.parent) + '">' + esc(s.parent) + "</a>" },
+      }));
+    }
+    if ((s.children || []).length) meta.push(esc(i18n.t("count.children", { n: s.children.length })));
+    (s.tags || []).forEach(function (tag) { meta.push('<span class="tag">' + esc(tag) + "</span>"); });
 
     var acts = "";
     if (canWrite()) {
       acts = '<div class="acts">'
-        + '<button data-act="edit">✎ 编辑正文</button>'
+        + '<button data-act="edit">' + esc(i18n.t("detail.act.edit")) + "</button>"
         + ["wip", "done", "dead"].map(function (st) {
             return '<button data-status="' + st + '"' + (s.status === st ? ' class="on"' : "") + ">" + st + "</button>";
           }).join("")
         + '<span class="sp"></span>'
-        + '<button data-act="delete" class="danger" title="真删这一步。只用于误建/测试数据/粘错的敏感信息——失败的实验请标 dead">删除</button>'
-        + '<button data-act="child" class="primary">＋ 从这里派生</button>'
+        + '<button data-act="delete" class="danger" title="' + esc(i18n.t("detail.act.delete.title")) + '">'
+        + esc(i18n.t("detail.act.delete")) + "</button>"
+        + '<button data-act="child" class="primary">' + esc(i18n.t("detail.act.child")) + "</button>"
         + "</div>";
     }
 
     var paths = renderPaths(s);
-    var body = window.md.render(s.body || "", { resolve: resolverFor(s) });
+    var body = window.md.render(stepBody(s), { resolve: resolverFor(s) });
 
     var back = "";
     if ((s.backlinks || []).length) {
-      back = '<div class="sec"><h3>被这些步骤引用</h3><div class="crumbs">'
+      back = '<div class="sec"><h3>' + esc(i18n.t("detail.backlinks")) + '</h3><div class="crumbs">'
         + s.backlinks.map(function (id) {
             return '<a href="#' + esc(id) + '" data-goto="' + esc(id) + '">' + esc(id) + "</a> "
-              + esc((IDX[id] || {}).title || "");
+              + esc(titleOf(id));
           }).join("<br>")
         + "</div></div>";
     }
 
-    var files = '<div class="sec"><h3>文件 · ' + (s.files || []).length + "</h3>";
+    var files = '<div class="sec"><h3>'
+      + esc(i18n.t("detail.files", { n: (s.files || []).length })) + "</h3>";
     if ((s.files || []).length) {
       files += '<div class="files">' + s.files.map(function (f) {
         var url = fileURL(s, f.path);
         var thumb = IMG.test(f.path)
           ? '<img class="thumb zoomable" src="' + url + '" alt="' + esc(f.path) + '" loading="lazy">' : "";
         return '<div class="file">' + thumb + '<a href="' + url + '" target="_blank" rel="noopener">' + esc(f.path) + "</a>"
-          + '<div class="sz">' + human(f.size) + (canWrite() ? ' · <a href="#" data-rm="' + esc(f.path) + '">删除</a>' : "") + "</div></div>";
+          + '<div class="sz">' + esc(human(f.size))
+          + (canWrite() ? ' · <a href="#" data-rm="' + esc(f.path) + '">' + esc(i18n.t("detail.file.remove")) + "</a>" : "")
+          + "</div></div>";
       }).join("") + "</div>";
     } else {
-      files += '<p class="dropnote">还没有附件。</p>';
+      files += '<p class="dropnote">' + esc(i18n.t("detail.files.empty")) + "</p>";
     }
-    if (canWrite()) files += '<p class="dropnote">把日志、脚本、图拖到本页任意位置即可上传，并自动在正文末尾插入引用。'
-      + '想插在正文中间就进编辑模式，直接 Ctrl+V 粘贴截图。</p>';
+    if (canWrite()) files += '<p class="dropnote">' + i18n.tHtml("detail.files.drop") + "</p>";
     files += "</div>";
 
-    el.innerHTML = crumbs(s) + '<h1 class="title">' + esc(s.title || "(无标题)") + "</h1>"
+    el.innerHTML = crumbs(s)
+      + '<h1 class="title">' + esc(stepTitle(s) || i18n.t("common.untitled")) + "</h1>"
       + '<div class="meta">' + meta.join("") + "</div>" + acts + paths
+      + trNotice(s)
       + '<div class="prose">' + body + "</div>" + back + renderTrace(s) + files;
     enhanceProse(el);
     el.scrollTop = 0;
@@ -915,29 +1130,41 @@
   var draftTimer = null;
   var NEW_DRAFT_ID = "__new__";   // 新建对话框那份草稿的键；真实 id 只可能是数字或 00X~dupN
 
-  function readDraft(id) {
+  /* 中英两份正文各存各的草稿：共用一个键就是「写完中文切去写英文，
+     回来发现中文稿被英文稿盖了」。edLang 为空表示编辑的是 note.md（原文），
+     此时草稿键和从前逐字一样，升级前写到一半的草稿不会变成孤儿。 */
+  function readDraft(id, l) {
     try {
-      var raw = localStorage.getItem(U.draftKey(PROJECT, id));
+      var raw = localStorage.getItem(U.draftKey(PROJECT, id, l || ""));
       return raw ? JSON.parse(raw) : null;
     } catch (e) { return null; }
   }
-  function writeDraft(id, d) {
+  function writeDraft(id, d, l) {
     // 配额满 / 隐私模式下写不进去：草稿是加成，不该反过来拦住人写正文
-    try { localStorage.setItem(U.draftKey(PROJECT, id), JSON.stringify(d)); } catch (e) { /* 忽略 */ }
+    try { localStorage.setItem(U.draftKey(PROJECT, id, l || ""), JSON.stringify(d)); } catch (e) { /* 忽略 */ }
   }
-  function dropDraft(id) {
-    try { localStorage.removeItem(U.draftKey(PROJECT, id)); } catch (e) { /* 忽略 */ }
+  function dropDraft(id, l) {
+    try { localStorage.removeItem(U.draftKey(PROJECT, id, l || "")); } catch (e) { /* 忽略 */ }
   }
 
   function editorState() {
     var b = $("#ed-body");
     if (!b) return null;
     return { title: ($("#ed-title") || {}).value || "", body: b.value,
-             paths: ($("#ed-paths") || {}).value || "" };
+             paths: ($("#ed-paths") || {}).value || "", lang: edLang };
+  }
+  /* 编辑器此刻对着的那一份磁盘内容。译文只有标题和正文——path 是结构信息，
+     翻译文件里一行都不许有（写两份就是双真相源）。 */
+  function editTarget(s, l) {
+    if (!s) return { title: "", body: "", paths: "" };
+    if (!l) return { title: s.title || "", body: s.body || "", paths: pathsToText(s) };
+    var e = (s.tr || {})[l] || {};
+    return { title: e.title || "", body: e.body || "", paths: "" };
   }
   function sameAsStep(s, st) {
-    return !!(s && st && st.title === (s.title || "") && st.body === (s.body || "")
-              && st.paths === pathsToText(s));
+    if (!s || !st) return false;
+    var base = editTarget(s, st.lang || "");
+    return st.title === base.title && st.body === base.body && st.paths === base.paths;
   }
   function isDirty() {
     if (!editing) return false;
@@ -951,11 +1178,13 @@
   function saveDraftNow() {
     var s = IDX[selected()], st = editorState();
     if (!editing || !s || !st) return;
-    if (sameAsStep(s, st)) { dropDraft(s.id); setEdStatus(""); return; }
+    if (sameAsStep(s, st)) { dropDraft(s.id, st.lang); setEdStatus(""); return; }
     st.at = Date.now();
-    st.base = s.digest || "";            // 草稿是基于哪一版写的，恢复时要拿它对账
-    writeDraft(s.id, st);
-    setEdStatus("草稿已存 " + hhmm());
+    // 草稿是基于哪一版写的，恢复时要拿它对账。译文那一侧对的是译文自己的
+    // digest（trDigest），和 note.md 的 digest 是两条独立的链。
+    st.base = st.lang ? (trDigest[trKey(s.id, st.lang)] || "") : (s.digest || "");
+    writeDraft(s.id, st, st.lang);
+    setEdStatus(i18n.t("editor.status.draftSaved", { time: hhmm() }));
   }
   function scheduleDraft() {
     clearTimeout(draftTimer);
@@ -971,7 +1200,9 @@
     saveDraftNow();
     pendingLeave = next;
     var s = IDX[selected()];
-    $("#leave-what").textContent = s ? s.id + "「" + (s.title || "") + "」" : "";
+    // 只有 id、标题和正在编辑的文件名——三样都是标点无关的，不用为它造一条文案
+    $("#leave-what").textContent = s
+      ? s.id + " · " + stepTitle(s) + (edLang ? "  (" + noteFileName(edLang) + ")" : "") : "";
     $("#dlg-leave").showModal();
   }
   function resolveLeave(how) {
@@ -982,8 +1213,8 @@
     if (how === "stay") return;
     if (how === "discard") {
       var s = IDX[selected()];
-      if (s) dropDraft(s.id);
-      toast("草稿已丢弃");
+      if (s) dropDraft(s.id, edLang);
+      toast(i18n.t("toast.draft.discarded"));
     }
     if (next) next();
   }
@@ -1008,6 +1239,15 @@
     // 服务端如果连当前内容一起返回了就直接用；没有就自己再读一次那一步。
     var d = err.data || {};
     var given = d.current || d.server || d.step || null;
+    if (st.lang) {
+      /* 译文的 409。服务端回的 current 是那一份译文（{title, body, digest}）；
+         老服务端可能只回一句话，那就没有两份可比，照常把原话报出来——
+         这里绝不去读 note.md 冒充「服务器版本」，那会让人对着不相干的两段文字选。 */
+      var mineBase = trDigest[trKey(s.id, st.lang)] || "";
+      if (!given || !given.digest || (mineBase && given.digest === mineBase)) { fail(err); return Promise.resolve(); }
+      openConflict(s, st, given, err);
+      return Promise.resolve();
+    }
     var got = given ? Promise.resolve(given) : papi("/steps/" + encodeURIComponent(s.id));
     return got.then(function (server) {
       if (!server || !server.digest || (s.digest && server.digest === s.digest)) {
@@ -1022,12 +1262,15 @@
 
   var conflictCtx = null;
   function openConflict(s, mine, server, err) {
-    conflictCtx = { id: s.id, mine: mine, server: server };
+    conflictCtx = { id: s.id, lang: mine.lang || "", mine: mine, server: server };
     var a = lineSet(server.body), b = lineSet(mine.body);
-    $("#cf-why").textContent = String(err && err.message || "服务器上的内容已经变了");
-    $("#cf-server-meta").textContent =
-      "服务器当前 · " + (server.author || "?") + " · " + (server.date || "") + " · " + (server.digest || "");
-    $("#cf-mine-meta").textContent = "你编辑中的（已存成草稿）";
+    // 服务端那句话是中文（Python 侧不在翻译范围）；它带着 id 和摘要，比一句
+    // 泛泛的「变了」有用，所以有就用它，没有才退到本地文案。
+    $("#cf-why").textContent = String((err && err.message) || i18n.t("conflict.why"));
+    $("#cf-server-meta").textContent = i18n.t("conflict.server.meta", {
+      author: server.author || "?", date: server.date || "", digest: server.digest || "",
+    });
+    $("#cf-mine-meta").textContent = i18n.t("conflict.mine.meta");
     $("#cf-server").innerHTML = diffPane(server.body, b);
     $("#cf-mine").innerHTML = diffPane(mine.body, a);
     $("#dlg-conflict").showModal();
@@ -1044,87 +1287,195 @@
       conflictCtx = null;
       editing = false;
       refresh().then(function () {
-        toast("已保留服务器版本；你的改动留在草稿里，下次打开这一步会问你要不要恢复");
+        toast(i18n.t("toast.conflict.theirs"));
       }).catch(fail);
       return;
     }
     // 用我的覆盖：expect 换成刚读到的那一版，这样只覆盖「我看过的这一版」，
-    // 而不是变成一个永远不检查冲突的强制写。
-    papi("/steps/" + encodeURIComponent(c.id), {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        title: c.mine.title, body: c.mine.body, paths: textToPaths(c.mine.paths),
-        expect: c.server.digest || "",
-      }),
-    }).then(function () {
-      dropDraft(c.id);
+    // 而不是变成一个永远不检查冲突的强制写。译文那一侧同理，只是 expect 对的是
+    // 译文自己的 digest。
+    var go = c.lang
+      ? putTranslation(c.id, c.lang, { title: c.mine.title, body: c.mine.body,
+                                       expect: c.server.digest || "" })
+      : papi("/steps/" + encodeURIComponent(c.id), {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            title: c.mine.title, body: c.mine.body, paths: textToPaths(c.mine.paths),
+            expect: c.server.digest || "",
+          }),
+        });
+    go.then(function () {
+      dropDraft(c.id, c.lang);
       conflictCtx = null;
       editing = false;
-      return refresh().then(refreshProjects).then(function () { toast("已用你的版本覆盖"); });
+      return refresh().then(refreshProjects).then(function () { toast(i18n.t("toast.conflict.mine")); });
     }).catch(fail);
   }
 
   /* -------------------------------------------------------------- 编辑器 */
 
+  /* 工具栏。title 走 i18n（editor.tool.*），插入的占位文字走 editor.ph.*——
+     选中一段文字再点「粗体」不会用到占位符，占位符只在没选中时出现，
+     它是要落进正文的字，所以跟界面语言走是对的（用户此刻正在用这种语言操作）。 */
   var TOOLS = [
-    { k: "bold", html: "<b>B</b>", title: "粗体 (Ctrl+B)", wrap: ["**", "**"], ph: "粗体" },
-    { k: "em", html: "<i>I</i>", title: "斜体 (Ctrl+I)", wrap: ["*", "*"], ph: "斜体" },
-    { k: "code", html: "&lt;/&gt;", title: "行内代码", wrap: ["`", "`"], ph: "code" },
-    { k: "h", html: "H", title: "小节标题", prefix: "## " },
-    { k: "ul", html: "•", title: "无序列表", prefix: "- " },
-    { k: "task", html: "☑", title: "任务列表", prefix: "- [ ] " },
-    { k: "quote", html: "❞", title: "引用", prefix: "> " },
-    { k: "pre", html: "{ }", title: "代码块", block: "```\n\n```", back: 4 },
-    { k: "link", html: "🔗", title: "链接", wrap: ["[", "](url)"], ph: "文字" },
-    { k: "img", html: "🖼", title: "插入图片（也可以直接 Ctrl+V 粘贴截图）" },
-    { k: "table", html: "⊞", title: "插入表格（从 Excel 复制的内容直接粘贴也会自动转表格）" },
-    { k: "hr", html: "—", title: "分隔线", block: "---" },
+    { k: "bold", html: "<b>B</b>", wrap: ["**", "**"], ph: "bold" },
+    { k: "em", html: "<i>I</i>", wrap: ["*", "*"], ph: "em" },
+    { k: "code", html: "&lt;/&gt;", wrap: ["`", "`"], ph: "code" },
+    { k: "h", html: "H", prefix: "## " },
+    { k: "ul", html: "•", prefix: "- " },
+    { k: "task", html: "☑", prefix: "- [ ] " },
+    { k: "quote", html: "❞", prefix: "> " },
+    { k: "pre", html: "{ }", block: "```\n\n```", back: 4 },
+    { k: "link", html: "🔗", wrap: ["[", "](url)"], ph: "link" },
+    { k: "img", html: "🖼" },
+    { k: "table", html: "⊞" },
+    { k: "hr", html: "—", block: "---" },
   ];
+
+  /* ------------------------------------------------------------ 译文的编辑
+   *
+   * edLang 为空 = 编辑 note.md（原文），否则 = 编辑 note.<edLang>.md。
+   * 两条路径分得很开是故意的：补翻译的工具**永远碰不到原文**（这是接口约定），
+   * 所以译文那一侧既不发 paths，也不发 status/date/commit——那些结构键在
+   * 翻译文件里出现一次就是把双真相源请回来。
+   *
+   * 冲突控制两条链各管各的：note.md 的 expect 对 s.digest，译文的 expect 对
+   * **译文自己**的 digest。译文的 digest 目前不在 forest 里（Step.tr 只有
+   * title/body），所以这里缓存 write 接口回给我们的那一个，并在进编辑器时
+   * 尽力从 GET 端点补一次。拿不到就不带 expect——那退化成「谁最后按保存谁赢」，
+   * 但只发生在译文这一份文件上，绝不会影响 note.md 那条链。
+   */
+  var edLang = "";
+  var trDigest = Object.create(null);
+  function trKey(id, l) { return id + "|" + l; }
+  function noteFileName(l) { return l ? "note." + l + ".md" : "note.md"; }
+  function trPath(id, l) {
+    return "/steps/" + encodeURIComponent(id) + "/tr/" + encodeURIComponent(l);
+  }
+
+  function putTranslation(id, l, payload) {
+    return papi(trPath(id, l), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }).then(function (r) {
+      if (r && r.digest) trDigest[trKey(id, l)] = r.digest;
+      return r;
+    });
+  }
+
+  /* 进编辑器时补一次译文的 digest。端点不在（老服务端 / 还没接上）时安静地
+     算了——少一个 expect 只是少一道闸门，不该把编辑器整个挡住。 */
+  function fetchTrDigest(id, l) {
+    if (MODE !== "server" || !l) return Promise.resolve("");
+    return papi(trPath(id, l)).then(function (r) {
+      if (r && r.digest) trDigest[trKey(id, l)] = r.digest;
+      return (r && r.digest) || "";
+    }, function () { return ""; });
+  }
+
+  /* 这一步能编辑哪几个语言版本：原文 + 已有的每一份译文 + 当前界面语言。
+   *
+   * 「当前界面语言」这一档要挡掉一种情况：一份中文笔记没写 lang:，界面又是中文，
+   * 于是我们给它开一个 note.zh.md 的入口——那是把同一份中文抄成两份，正是双真相源。
+   * 所以这里除了看声明的 lang:，还看正文用的是哪一套小节名（查 SECTION_NAMES
+   * 那张封闭词表）。
+   *
+   * 注意这和 trNotice 的判据**故意不一样**：对读者说「这是中文原文」必须有
+   * note.md 亲口声明的 lang:，小节名不能当证据（那是我们替他说话）；而这里只是
+   * 「要不要多给一个按钮」，多给了是骚扰、少给了还能手写文件，代价小得多。
+   */
+  function originLang(s) {
+    return s.lang || U.langByHeadings((s && s.body) || "", templates());
+  }
+  function editLangs(s) {
+    var out = [""], seen = { "": 1 };
+    Object.keys(s.tr || {}).sort().forEach(function (l) { if (!seen[l]) { seen[l] = 1; out.push(l); } });
+    var cur = uiLang();
+    if (!seen[cur] && cur !== originLang(s)) out.push(cur);
+    return out;
+  }
+
+  function langTabs(s) {
+    var langs = editLangs(s);
+    if (langs.length < 2) return "";
+    return '<div class="seg edlang" id="edlang">' + langs.map(function (l) {
+      var label = l ? langName(l) : i18n.t("tr.badge.original");
+      return '<button type="button" data-edlang="' + esc(l) + '"'
+        + (l === edLang ? ' class="on"' : "") + ' title="' + esc(noteFileName(l)) + '">'
+        + esc(label) + "</button>";
+    }).join("") + "</div>";
+  }
 
   /* 上次没写完的那份。不自动套上去——磁盘上那份可能才是新的。 */
   function draftBanner(s) {
-    var d = readDraft(s.id);
+    var d = readDraft(s.id, edLang);
     if (!d || sameAsStep(s, d)) return "";
-    var when = d.at ? new Date(d.at).toLocaleString() : "";
-    var moved = d.base && s.digest && d.base !== s.digest;
+    var when = d.at ? new Date(d.at).toLocaleString(i18n.locale()) : "";
+    var now = edLang ? (trDigest[trKey(s.id, edLang)] || "") : (s.digest || "");
+    var moved = d.base && now && d.base !== now;
     return '<div class="draftbar">'
-      + "<b>发现未保存的草稿</b>" + (when ? '<span class="mono">' + esc(when) + "</span>" : "")
-      + (moved ? '<span class="dwarn">⚠ 这份草稿写的时候，服务器上的正文还是另一版——'
-                 + "此后它被改过，恢复会盖掉那次改动</span>" : "")
+      + "<b>" + esc(i18n.t("editor.draft.found")) + "</b>"
+      + (when ? '<span class="mono">' + esc(when) + "</span>" : "")
+      + (moved ? '<span class="dwarn">' + esc(i18n.t("editor.draft.moved")) + "</span>" : "")
       + '<span class="sp"></span>'
-      + '<button data-draft="restore">恢复草稿</button>'
-      + '<button data-draft="discard">丢弃草稿</button>'
+      + '<button data-draft="restore">' + esc(i18n.t("editor.draft.restore")) + "</button>"
+      + '<button data-draft="discard">' + esc(i18n.t("editor.draft.discard")) + "</button>"
       + "</div>";
   }
 
   function renderEditor(s) {
+    var base = editTarget(s, edLang);
     $("#detail").innerHTML =
-      '<div class="edhead">' + crumbs(s) + '<span class="sp"></span>'
-      + '<button data-act="save" class="primary">保存 <kbd>Ctrl↵</kbd></button>'
-      + '<button data-act="cancel">取消 <kbd>Esc</kbd></button></div>'
+      '<div class="edhead">' + crumbs(s) + langTabs(s) + '<span class="sp"></span>'
+      + '<button data-act="save" class="primary">' + esc(i18n.t("editor.save")) + " <kbd>Ctrl↵</kbd></button>"
+      + '<button data-act="cancel">' + esc(i18n.t("editor.cancel")) + " <kbd>Esc</kbd></button></div>"
       + draftBanner(s)
-      + '<input class="title-input" id="ed-title" value="' + esc(s.title || "") + '" maxlength="200" placeholder="标题：一行说清这一步在干什么">'
-      + '<label class="edpaths">外部路径 · 每行一条，<code>位置 | 说明</code>'
-      + '<textarea id="ed-paths" rows="2" spellcheck="false" placeholder="/blue/组名/用户名/exp/agnews | 训练数据，12 GB">'
-      + esc(pathsToText(s)) + "</textarea></label>"
-      + '<div class="edtools">' + TOOLS.map(function (t) {
-          return '<button type="button" data-md="' + t.k + '" title="' + esc(t.title) + '">' + t.html + "</button>";
+      + '<input class="title-input" id="ed-title" value="' + esc(base.title) + '" maxlength="200" placeholder="'
+      + esc(i18n.t("editor.title.placeholder")) + '">'
+      // 译文里没有外部路径：路径是结构信息，只写在 note.md 里，写两份就是双真相源
+      + (edLang ? ""
+          : '<label class="edpaths">' + i18n.tHtml("editor.paths.label")
+            + '<textarea id="ed-paths" rows="2" spellcheck="false" placeholder="'
+            + esc(i18n.t("editor.paths.placeholder")) + '">' + esc(base.paths) + "</textarea></label>")
+      + '<div class="edtools">' + TOOLS.map(function (x) {
+          return '<button type="button" data-md="' + x.k + '" title="'
+            + esc(i18n.t("editor.tool." + x.k)) + '">' + x.html + "</button>";
         }).join("") + '<span class="sp"></span><span class="edhint mono" id="ed-status"></span></div>'
       + '<div class="edsplit">'
       + '<textarea class="editor" id="ed-body" spellcheck="false"></textarea>'
       + '<div class="prose edpreview" id="ed-preview"></div>'
       + "</div>"
-      + '<p class="dropnote">截图 <b>Ctrl+V</b> 直接粘贴会自动上传并插入；从 Excel / 网页表格复制的内容粘贴会自动转成 markdown 表格；'
-      + '文件也可以拖进编辑框。id 和 parent 不可改——只追加原则是溯源能成立的前提。</p>'
+      + '<p class="dropnote">' + i18n.tHtml("editor.hint") + "</p>"
       + '<input type="file" id="ed-file" multiple accept="image/*,.log,.txt,.csv,.tsv,.json,.py,.sh,.yaml,.yml,.pdf" hidden>';
 
     var ta = $("#ed-body");
-    ta.value = s.body || "";
+    ta.value = base.body;
     bindEditor(ta, s);
     updatePreview(s);
     ta.focus();
     ta.setSelectionRange(ta.value.length, ta.value.length);
+    // digest 晚一步到也没关系：它只在按保存那一刻要用，到了就把草稿提示条重画一次
+    if (edLang && !trDigest[trKey(s.id, edLang)]) {
+      fetchTrDigest(s.id, edLang).then(function (d) {
+        if (d && editing && selected() === s.id) {
+          var bar = $("#detail .draftbar");
+          if (bar) bar.outerHTML = draftBanner(s);
+        }
+      });
+    }
+  }
+
+  /* 切换正在编辑哪个语言版本。切之前把当前这一份钉进它自己的草稿键里——
+     两份稿子各存各的，切来切去一个字都不会丢。 */
+  function switchEditLang(l) {
+    var s = IDX[selected()];
+    if (!s || l === edLang) return;
+    clearTimeout(draftTimer);
+    saveDraftNow();
+    edLang = l;
+    renderEditor(s);
   }
 
   var previewTimer = null;
@@ -1203,7 +1554,7 @@
 
   function uploadIntoEditor(s, files) {
     var ta = $("#ed-body");
-    $("#ed-status").textContent = "上传中…";
+    $("#ed-status").textContent = i18n.t("editor.status.uploading");
     return files.reduce(function (chain, f) {
       return chain.then(function () {
         return uploadAuto(s, f).then(function (info) {
@@ -1217,7 +1568,7 @@
         });
       });
     }, Promise.resolve()).then(function () {
-      $("#ed-status").textContent = "已插入 " + files.length + " 个文件";
+      $("#ed-status").textContent = i18n.t("editor.status.inserted", { n: files.length });
       setTimeout(function () { var e = $("#ed-status"); if (e) e.textContent = ""; }, 2500);
     }).catch(function (e) { $("#ed-status").textContent = ""; fail(e); });
   }
@@ -1246,7 +1597,7 @@
         e.preventDefault();
         insertBlock(ta, tbl);
         schedulePreview(s);
-        toast("已转成 markdown 表格");
+        toast(i18n.t("toast.table.converted"));
       }
     });
 
@@ -1272,17 +1623,18 @@
     $("#detail").querySelectorAll("[data-md]").forEach(function (b) {
       b.addEventListener("click", function (e) {
         e.preventDefault();
-        var t = TOOLS.filter(function (x) { return x.k === b.getAttribute("data-md"); })[0];
-        if (!t) return;
-        if (t.k === "img") { $("#ed-file").click(); return; }
-        if (t.k === "table") {
-          insertBlock(ta, "| 列 1 | 列 2 | 列 3 |\n|---|---|---|\n|  |  |  |\n|  |  |  |");
-        } else if (t.wrap) {
-          wrapSel(ta, t.wrap[0], t.wrap[1], t.ph);
-        } else if (t.prefix) {
-          prefixLines(ta, t.prefix);
-        } else if (t.block) {
-          insertBlock(ta, t.block, t.back);
+        var tool = TOOLS.filter(function (x) { return x.k === b.getAttribute("data-md"); })[0];
+        if (!tool) return;
+        if (tool.k === "img") { $("#ed-file").click(); return; }
+        if (tool.k === "table") {
+          // 表头那三个字是要落进正文的内容，跟的是这一份记录的语言，不是界面语言
+          insertBlock(ta, i18n.tIn(edLang || s.lang || uiLang(), "template.table"));
+        } else if (tool.wrap) {
+          wrapSel(ta, tool.wrap[0], tool.wrap[1], i18n.t("editor.ph." + tool.ph));
+        } else if (tool.prefix) {
+          prefixLines(ta, tool.prefix);
+        } else if (tool.block) {
+          insertBlock(ta, tool.block, tool.back);
         }
         schedulePreview(s);
         scheduleDraft();   // setRangeText 不触发 input 事件，工具栏插入的内容得自己钉
@@ -1296,17 +1648,25 @@
     if (!s || !st) return;
     clearTimeout(draftTimer);
     saveDraftNow();                       // 先钉住：网络失败、409、页面被关都不该让这段字消失
-    return patch(s.id, {
-      title: st.title,
-      body: st.body,
-      paths: textToPaths(st.paths),
-      // 乐观并发控制：expect 是我打开这一步时读到的摘要。这期间别人改过就 409，
-      // 由人来判怎么合，而不是谁最后按保存谁赢。
-      expect: s.digest || "",
-    })
+    /* 两条写入路径。译文那条只发 title 和 body：补翻译的工具碰不到原文，
+       所以它连 paths / status 都不该有能力发出去。 */
+    var go = st.lang
+      ? putTranslation(s.id, st.lang, {
+          title: st.title, body: st.body,
+          expect: trDigest[trKey(s.id, st.lang)] || "",
+        }).then(refresh)
+      : patch(s.id, {
+          title: st.title,
+          body: st.body,
+          paths: textToPaths(st.paths),
+          // 乐观并发控制：expect 是我打开这一步时读到的摘要。这期间别人改过就 409，
+          // 由人来判怎么合，而不是谁最后按保存谁赢。
+          expect: s.digest || "",
+        });
+    return go
       .then(function () {
-        dropDraft(s.id);
-        editing = false; renderDetail(); refreshProjects(); toast("已保存");
+        dropDraft(s.id, st.lang);
+        editing = false; renderDetail(); refreshProjects(); toast(i18n.t("toast.saved"));
       })
       .catch(function (e) {
         if (e && e.status === 409) return handleConflict(s, st, e);
@@ -1327,22 +1687,33 @@
   /* 新建对话框里的正文同样要存草稿：<dialog> 按 Esc 直接就关了，而「为什么」这一段
      常常是先写十分钟才想好标题的。草稿按项目存一份，不区分父节点。 */
   function newDraft() { return readDraft(NEW_DRAFT_ID); }
+  function isPristineTemplate(text) {
+    return text === templateBody("zh") || text === templateBody("en");
+  }
   function saveNewDraft() {
     var b = $("#nf-body");
     if (!b || !$("#dlg-new").open) return;
     var d = { title: $("#nf-title").value, body: b.value, paths: $("#nf-paths").value,
               commit: $("#nf-commit").value, status: $("#nf-status").value,
+              lang: $("#nf-lang").value,
               parent: $("#nf-parent").dataset.pid || "", at: Date.now() };
-    if (!d.title.trim() && d.body === TEMPLATE && !d.paths.trim()) { dropDraft(NEW_DRAFT_ID); return; }
+    // 只有模板原样没动、其余都空时才算「没写东西」。判定要认两种语言的模板，
+    // 否则切一下内容语言就会留下一份「什么都没写」的草稿在下次弹出来。
+    if (!d.title.trim() && isPristineTemplate(d.body) && !d.paths.trim()) { dropDraft(NEW_DRAFT_ID); return; }
     writeDraft(NEW_DRAFT_ID, d);
   }
 
   function openNew(parentId) {
     var p = IDX[parentId];
-    $("#nf-parent").value = p ? p.id + "  " + p.title : "（无 — 新建一棵树的根）";
+    $("#nf-parent").value = p ? p.id + "  " + stepTitle(p) : i18n.t("newstep.parent.none");
     $("#nf-parent").dataset.pid = p ? p.id : "";
     $("#nf-title").value = "";
-    $("#nf-body").value = TEMPLATE;
+    // 内容语言：默认值是从兄弟步骤已经在用的小节名推出来的，用户可以当场改。
+    // 改的是**正文模板**，不是界面。词表之外的语言（ja…）没有模板可插，
+    // 退到 DEFAULT——那几行小节名删掉就是了，比插一套谁也认不出的标题好。
+    var guess = guessContentLang(p);
+    $("#nf-lang").value = i18n.STRINGS[guess] ? guess : i18n.DEFAULT;
+    $("#nf-body").value = templateBody($("#nf-lang").value);
     $("#nf-date").value = todayISO();
     $("#nf-status").value = "wip";
     $("#nf-commit").value = "";
@@ -1352,8 +1723,8 @@
     var d = newDraft();
     $("#nf-draft").hidden = !d;
     if (d) {
-      $("#nf-draft-when").textContent = d.at ? new Date(d.at).toLocaleString() : "";
-      $("#nf-draft-title").textContent = d.title || "(还没写标题)";
+      $("#nf-draft-when").textContent = d.at ? new Date(d.at).toLocaleString(i18n.locale()) : "";
+      $("#nf-draft-title").textContent = d.title || i18n.t("newstep.draft.untitled");
     }
     $("#dlg-new").showModal();
     setTimeout(function () { $("#nf-title").focus(); }, 30);
@@ -1363,21 +1734,22 @@
     var d = newDraft();
     if (!d) return;
     $("#nf-title").value = d.title || "";
-    $("#nf-body").value = d.body || TEMPLATE;
+    $("#nf-body").value = d.body || templateBody($("#nf-lang").value);
     $("#nf-paths").value = d.paths || "";
     $("#nf-commit").value = d.commit || "";
     if (d.status) $("#nf-status").value = d.status;
+    if (d.lang && i18n.STRINGS[d.lang]) $("#nf-lang").value = d.lang;
     if (d.parent && IDX[d.parent]) {
       $("#nf-parent").dataset.pid = d.parent;
-      $("#nf-parent").value = d.parent + "  " + (IDX[d.parent].title || "");
+      $("#nf-parent").value = d.parent + "  " + stepTitle(IDX[d.parent]);
     }
     $("#nf-draft").hidden = true;
-    toast("已恢复草稿");
+    toast(i18n.t("toast.draft.restored"));
   }
 
   function submitNew() {
     var title = $("#nf-title").value.trim();
-    if (!title) { toast("标题不能为空", true); return; }
+    if (!title) { toast(i18n.t("toast.title.required"), true); return; }
     papi("/steps", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1390,6 +1762,11 @@
         author: "human",
         body: $("#nf-body").value,
         paths: textToPaths($("#nf-paths").value),
+        // 把下拉框里选的内容语言**写进 note.md**。不写的话这次选择只影响插入的
+        // 模板，转头就丢了：读的一侧再打开这一步，只能从小节名倒推，而对没翻译
+        // 的记录界面就只能说「这是原文」——说不出是哪种语言的原文。
+        // 这是一个用户看得见、能当场改的下拉框，所以它是**声明**，不是猜。
+        lang: $("#nf-lang").value,
       }),
     }).then(function (step) {
       dropDraft(NEW_DRAFT_ID);
@@ -1397,7 +1774,7 @@
         forceSelect(step.id);
         scrollToSelected();
         refreshProjects();
-        toast("已创建 " + step.id);
+        toast(i18n.t("toast.created", { id: step.id }));
       });
     }).catch(fail);
   }
@@ -1405,6 +1782,16 @@
   /* -------------------------------------------------------------- 事件 */
 
   function onHash() { renderSelection(); renderDetail(); }
+
+  /* 点「编辑正文」时先落在**你此刻正在读的那一份**上：屏幕上显示着英文译文、
+     一按编辑却打开了中文原文，是最容易让人改错文件的一种设计。 */
+  function startEditing() {
+    var s = IDX[selected()];
+    var pick = s ? U.pickLang(s, uiLang()) : null;
+    edLang = (pick && pick.tr) ? uiLang() : "";
+    editing = true;
+    renderDetail();
+  }
 
   document.addEventListener("click", function (e) {
     var zb = e.target.closest("#zoombar button");
@@ -1421,7 +1808,8 @@
     if (cp) {
       e.preventDefault();
       navigator.clipboard.writeText(cp.getAttribute("data-copy"))
-        .then(function () { toast("已复制路径"); }, function () { toast("复制失败", true); });
+        .then(function () { toast(i18n.t("toast.copied.path")); },
+              function () { toast(i18n.t("toast.copy.failed"), true); });
       return;
     }
 
@@ -1438,17 +1826,17 @@
     var dr = e.target.closest("[data-draft]");
     if (dr) {
       e.preventDefault();
-      var ds = IDX[selected()], how = dr.getAttribute("data-draft"), dd = ds && readDraft(ds.id);
+      var ds = IDX[selected()], how = dr.getAttribute("data-draft"), dd = ds && readDraft(ds.id, edLang);
       if (!ds) return;
       if (how === "restore" && dd) {
         $("#ed-title").value = dd.title || "";
         $("#ed-body").value = dd.body || "";
-        $("#ed-paths").value = dd.paths || "";
+        if ($("#ed-paths")) $("#ed-paths").value = dd.paths || "";
         updatePreview(ds);
-        toast("已恢复草稿");
+        toast(i18n.t("toast.draft.restored"));
       } else {
-        dropDraft(ds.id);
-        toast("草稿已丢弃");
+        dropDraft(ds.id, edLang);
+        toast(i18n.t("toast.draft.discarded"));
       }
       // 只找详情面板里那一条：新建对话框的 #nf-draft 用的是同一个类
       var bar = $("#detail .draftbar");
@@ -1458,9 +1846,13 @@
     if (e.target.closest("[data-newdraft]")) {
       e.preventDefault();
       if (e.target.closest("[data-newdraft]").getAttribute("data-newdraft") === "restore") restoreNewDraft();
-      else { dropDraft(NEW_DRAFT_ID); $("#nf-draft").hidden = true; toast("草稿已丢弃"); }
+      else { dropDraft(NEW_DRAFT_ID); $("#nf-draft").hidden = true; toast(i18n.t("toast.draft.discarded")); }
       return;
     }
+    var el = e.target.closest("[data-edlang]");
+    if (el) { e.preventDefault(); switchEditLang(el.getAttribute("data-edlang")); return; }
+    var lg = e.target.closest("[data-lang]");
+    if (lg) { e.preventDefault(); i18n.setLang(lg.getAttribute("data-lang")); return; }
     if (e.target.closest("[data-newproj]")) { e.preventDefault(); newProject(); return; }
     if (e.target.closest("[data-gitretry]")) { e.preventDefault(); retrySync(); return; }
     var gh = e.target.closest("#hitlist a");
@@ -1488,7 +1880,7 @@
     if (rm) {
       e.preventDefault();
       var s0 = IDX[selected()], path = rm.getAttribute("data-rm");
-      if (!s0 || !confirm("删除附件 " + path + "？（步骤本身不会被删除）")) return;
+      if (!s0 || !confirm(i18n.t("confirm.file.delete", { path: path }))) return;
       papi("/steps/" + encodeURIComponent(s0.id) + "/files/" + path.split("/").map(encodeURIComponent).join("/"),
            { method: "DELETE" }).then(refresh).catch(fail);
       return;
@@ -1500,12 +1892,12 @@
     var ai = e.target.closest("[data-add-insight]");
     if (ai) {
       var kind = ai.getAttribute("data-add-insight");
-      var label = INSIGHT_KINDS.filter(function (k) { return k.k === kind; })[0].label;
-      var txt = prompt("记一条「" + label + "」（一句话说清；带上数字更好）：");
+      var label = insightLabel(kind);
+      var txt = prompt(i18n.t("insight.prompt", { label: label }));
       if (!txt || !txt.trim()) return;
       var sid = selected();
       patchProject({ add_insight: { kind: kind, text: txt.trim() + (sid ? " —— [[" + sid + "]]" : "") } })
-        .then(function () { toast("已记入「" + label + "」"); }).catch(fail);
+        .then(function () { toast(i18n.t("toast.insight.added", { label: label })); }).catch(fail);
       return;
     }
 
@@ -1514,7 +1906,7 @@
     var name = act.getAttribute("data-act");
     if (name === "edit-insights") { openInsightEditor(); return; }
     if (name === "save-insights") { saveInsights(); return; }
-    if (name === "edit") { editing = true; renderDetail(); }
+    if (name === "edit") { startEditing(); }
     else if (name === "cancel") { guardLeave(function () { editing = false; renderDetail(); }); }
     else if (name === "child") { openNew(selected()); }
     else if (name === "delete") {
@@ -1522,13 +1914,13 @@
       if (!d) return;
       var kids = (d.children || []).length;
       var why = prompt([
-        "删除 " + d.id + "「" + d.title + "」",
+        i18n.t("confirm.delete.title", { id: d.id, title: stepTitle(d) }),
         "",
-        "这是真删：目录连同附件一起移除，id 可能被下一步重用。",
-        kids ? "⚠ 它有 " + kids + " 个子步骤，会变成孤儿（降级为根）。" : "",
-        "失败的实验请改标 dead，不要删。",
+        i18n.t("confirm.delete.what"),
+        kids ? i18n.t("confirm.delete.children", { n: kids }) : "",
+        i18n.t("confirm.delete.dead"),
         "",
-        "为什么删？（必填，会记进项目的 project.md）",
+        i18n.t("confirm.delete.why"),
       ].filter(Boolean).join("\n"));
       if (!why || !why.trim()) return;
       papi("/steps/" + encodeURIComponent(d.id), {
@@ -1536,11 +1928,14 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ reason: why.trim(), by: "human", date: todayISO() }),
       }).then(function (info) {
-        dropDraft(d.id);          // 目录都没了，留着草稿只会在别的步骤上误弹
+        // 目录都没了，留着草稿只会在别的步骤上误弹——译文那几份草稿一起清
+        dropDraft(d.id);
+        Object.keys(d.tr || {}).forEach(function (l) { dropDraft(d.id, l); });
         forceSelect("");
         return refresh().then(refreshProjects).then(function () {
-          toast("已删除 " + info.id
-                + (info.orphaned.length ? "；" + info.orphaned.join("、") + " 已变成孤儿" : ""));
+          toast(info.orphaned.length
+            ? i18n.t("toast.deleted.orphaned", { id: info.id, ids: info.orphaned.join(" · ") })
+            : i18n.t("toast.deleted", { id: info.id }));
         });
       }).catch(fail);
     }
@@ -1565,8 +1960,18 @@
   });
   $("#btn-new").addEventListener("click", function () { openNew(selected()); });
   $("#btn-token").addEventListener("click", function () {
-    var t = prompt("写入令牌（留空则清除）：", token());
-    if (t !== null) { setToken(t.trim()); toast(t.trim() ? "令牌已保存到本浏览器" : "令牌已清除"); }
+    var got = prompt(i18n.t("confirm.token"), token());
+    if (got !== null) {
+      setToken(got.trim());
+      toast(i18n.t(got.trim() ? "toast.token.saved" : "toast.token.cleared"));
+    }
+  });
+  /* 内容语言只改模板，而且**只在正文还是没动过的模板时**改：人已经开始写了，
+     换语言绝不能把那几行冲掉。 */
+  $("#nf-lang").addEventListener("change", function () {
+    var b = $("#nf-body");
+    if (isPristineTemplate(b.value)) b.value = templateBody($("#nf-lang").value);
+    saveNewDraft();
   });
   $("#nf-ok").addEventListener("click", function (e) { e.preventDefault(); $("#dlg-new").close(); submitNew(); });
   ["#nf-title", "#nf-body", "#nf-paths", "#nf-commit"].forEach(function (sel) {
@@ -1582,9 +1987,10 @@
     if (editing && isDirty()) {
       clearTimeout(draftTimer);
       saveDraftNow();
-      toast("离开了编辑中的内容，已存成草稿");
+      toast(i18n.t("toast.draft.kept"));
     }
     editing = false;
+    edLang = "";
     onHash();
   });
 
@@ -1625,11 +2031,11 @@
       if (e.target.id === "ed-body" || e.target.id === "ed-title" || e.target.id === "ed-paths") {
         if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); saveEditor(); return; }
         if ((e.metaKey || e.ctrlKey) && (e.key === "b" || e.key === "B")) {
-          e.preventDefault(); wrapSel($("#ed-body"), "**", "**", "粗体");
+          e.preventDefault(); wrapSel($("#ed-body"), "**", "**", i18n.t("editor.ph.bold"));
           schedulePreview(IDX[selected()]); scheduleDraft(); return;
         }
         if ((e.metaKey || e.ctrlKey) && (e.key === "i" || e.key === "I")) {
-          e.preventDefault(); wrapSel($("#ed-body"), "*", "*", "斜体");
+          e.preventDefault(); wrapSel($("#ed-body"), "*", "*", i18n.t("editor.ph.em"));
           schedulePreview(IDX[selected()]); scheduleDraft(); return;
         }
         // Esc 从前是直接丢弃。写了十分钟的正文按一下退出全屏/退出输入法就没了，
@@ -1655,7 +2061,7 @@
       localStorage.setItem("trace.view", view);
       applyView(); renderSelection(); scrollToSelected();
     } else if (e.key === "n" && canWrite()) { e.preventDefault(); openNew(selected()); }
-    else if (e.key === "e" && canWrite() && selected()) { e.preventDefault(); editing = true; renderDetail(); }
+    else if (e.key === "e" && canWrite() && selected()) { e.preventDefault(); startEditing(); }
     else if (e.key === "Escape") {
       if (editing) guardLeave(function () { editing = false; renderDetail(); });
       else select("");
@@ -1675,9 +2081,11 @@
       if (editing) return;
       e.preventDefault();
       var s = IDX[selected()];
-      if (!s) { toast("先选一个步骤", true); return; }
+      if (!s) { toast(i18n.t("toast.select.step"), true); return; }
       var files = Array.prototype.slice.call(e.dataTransfer.files || []);
       if (!files.length) return;
+      // 追加进的永远是 note.md 的正文：附件属于这一步，不属于某一种语言，
+      // 而这里没有编辑器摆两份给人选。译文要引用同一张图，在译文里自己写一行即可。
       var body = s.body || "";
       files.reduce(function (chain, f) {
         return chain.then(function () {
@@ -1688,7 +2096,7 @@
         });
       }, Promise.resolve())
         .then(function () { return patch(s.id, { body: body }); })
-        .then(function () { toast("已上传 " + files.length + " 个文件并写入正文"); })
+        .then(function () { toast(i18n.t("toast.uploaded", { n: files.length })); })
         .catch(fail);
     });
   }
@@ -1709,18 +2117,19 @@
 
   function paintScope() {
     var b = $("#btn-scope");
-    b.textContent = scopeAll ? "全部项目" : "本项目";
+    b.textContent = i18n.t(scopeAll ? "app.scope.all" : "app.scope.one");
     b.classList.toggle("on", scopeAll);
-    b.title = scopeAll
-      ? "搜索范围：全部项目（点击只搜当前项目）"
-      : "搜索范围：当前项目（点击搜全部项目）";
+    b.title = i18n.t(scopeAll ? "app.scope.all.title" : "app.scope.one.title");
     b.hidden = MODE !== "server";
   }
   function hitsShown() { return !$("#hitlist").hidden; }
   function showHits() { $("#hitlist").hidden = false; }
   function hideHits() { $("#hitlist").hidden = true; }
 
-  var WHERE_LABEL = { title: "标题", body: "正文", tags: "标签", id: "编号" };
+  function whereLabel(w) {
+    var key = "search.where." + w;
+    return i18n.has(key) ? i18n.t(key) : String(w || "");
+  }
 
   function normalizeHits(d) {
     var arr = Array.isArray(d) ? d : (d.hits || d.results || d.steps || []);
@@ -1784,14 +2193,13 @@
     if (!wantGlobal || q.length < 2) {
       hideHits();
       if (!wantGlobal && q && MODE === "static" && !PROJECT) {
-        $("#hitlist").innerHTML = '<p class="dropnote">静态导出是断网可读的一堆文件，'
-          + "跨项目搜索需要服务端。请在项目页内搜索，或用 <code>grep -r</code>。</p>";
+        $("#hitlist").innerHTML = '<p class="dropnote">' + i18n.tHtml("search.static") + "</p>";
         showHits();
       }
       return;
     }
     var seq = ++gsearchSeq;
-    $("#hitlist").innerHTML = '<p class="dropnote">搜索中…</p>';
+    $("#hitlist").innerHTML = '<p class="dropnote">' + esc(i18n.t("search.searching")) + "</p>";
     showHits();
     searchRemote(q).catch(function () { return searchLocally(q); })
       .then(function (res) {
@@ -1800,14 +2208,16 @@
       })
       .catch(function (e) {
         if (seq !== gsearchSeq) return;
-        $("#hitlist").innerHTML = '<p class="dropnote">搜索失败：' + esc(String(e && e.message || e)) + "</p>";
+        $("#hitlist").innerHTML = '<p class="dropnote">'
+          + i18n.tHtml("search.failed", { error: String((e && e.message) || e) }) + "</p>";
       });
   }
 
   function paintHits(q, hits, total) {
     if (!hits.length) {
-      $("#hitlist").innerHTML = '<p class="dropnote">全部 ' + PROJECTS.length
-        + " 个项目里都没有「" + esc(q) + "」。</p>";
+      $("#hitlist").innerHTML = '<p class="dropnote">'
+        + i18n.tHtml("search.none", { q: q, projects: i18n.t("count.projects", { n: PROJECTS.length }) })
+        + "</p>";
       return;
     }
     var byProj = {}, order = [];
@@ -1815,10 +2225,13 @@
       if (!byProj[h.slug]) { byProj[h.slug] = []; order.push(h.slug); }
       byProj[h.slug].push(h);
     });
-    var more = total > hits.length ? "（共 " + total + " 条，只列前 " + hits.length + " 条）" : "";
-    $("#hitlist").innerHTML = '<div class="hithead">' + hits.length + " 条命中 · "
-      + order.length + " 个项目" + esc(more) + '<span class="sp"></span>'
-      + '<button type="button" id="hit-close">关闭</button></div>'
+    var more = total > hits.length
+      ? i18n.t("search.more", { total: total, shown: hits.length }) : "";
+    $("#hitlist").innerHTML = '<div class="hithead">'
+      + esc(i18n.t("search.head", { hits: i18n.t("count.hits", { n: hits.length }),
+                                    projects: i18n.t("count.projects", { n: order.length }) }))
+      + esc(more) + '<span class="sp"></span>'
+      + '<button type="button" id="hit-close">' + esc(i18n.t("search.close")) + "</button></div>"
       + order.map(function (slug) {
           var rows = byProj[slug];
           return '<div class="hitgroup"><h4>' + esc(rows[0].name || slug)
@@ -1826,14 +2239,14 @@
             + rows.map(function (h) {
                 // 正文没命中时（只命中标题/标签/id）没有片段可截，就说清是哪儿命中的，
                 // 别留一行空白让人以为片段加载失败。
-                var tail = h.body
-                  ? esc(U.snippet(h.body, q))
-                  : (h.where || []).map(function (w) { return WHERE_LABEL[w] || w; }).join(" / ");
+                var where = (h.where || []).map(whereLabel).join(" / ");
+                var tail = h.body ? esc(U.snippet(h.body, q))
+                  : (where ? esc(i18n.t("search.hit.where", { where: where })) : "");
                 return '<a class="hit" href="' + projectHref(slug) + "#" + encodeURIComponent(h.id) + '">'
                   + '<span class="hid s-' + esc(h.status) + '">' + esc(h.id) + "</span>"
-                  + '<span class="ht">' + esc(h.title || "(无标题)") + "</span>"
+                  + '<span class="ht">' + esc(h.title || i18n.t("common.untitled")) + "</span>"
                   + '<span class="hd mono">' + esc(h.date || "") + "</span>"
-                  + (tail ? '<span class="hs">' + (h.body ? tail : "命中：" + esc(tail)) + "</span>" : "")
+                  + (tail ? '<span class="hs">' + tail + "</span>" : "")
                   + "</a>";
               }).join("")
             + "</div>";
@@ -1849,13 +2262,21 @@
      所以这里给一个「平时不吵、出事必见」的指示：正常时只是顶栏一个小箭头（悬停
      能看到最近一次同步了什么），失败时变成一块红色的、点得开、能一键重试的提示。 */
   var GIT = null;
-  // 服务端已经把状态分类过了（state + 人话 summary + 怎么修的 hint），这里只兜底：
-  // 万一对上的是个老服务端，至少别把裸 state 直接甩给用户。
-  var GIT_LABEL = {
-    disabled: "未启用自动同步", misconfigured: "数据仓还没配好", idle: "还没有同步过",
-    clean: "没有要同步的改动", committed: "已提交，还没推到远端",
-    pushed: "已推送到远端", error: "同步失败",
-  };
+  /* 服务端已经把状态分类过了（state + 人话 summary + 怎么修的 hint），但那两句
+     是中文——Python 侧按需求明确不在翻译范围。所以顺序反过来：**本地有这个
+     state 的说法就用本地的**（git.state.* / git.hint.*），只有本地不认识的
+     state 才退回服务端那句中文。这样英文界面上不会突然冒出一句中文，
+     而服务端将来多出一个状态时也不会显示成一个裸英文单词。
+     GIT_STATES 这张表只是「本地认识哪些 state」的清单，文案在 i18n 里。 */
+  var GIT_STATES = ["disabled", "misconfigured", "idle", "clean", "committed", "pushed", "error"];
+  function gitStateText(state) {
+    var key = "git.state." + state;
+    return i18n.has(key) ? i18n.t(key) : "";
+  }
+  function gitHintText(g) {
+    var key = "git.hint." + (g.state || "");
+    return i18n.has(key) ? i18n.t(key) : (g.hint || "");
+  }
 
   function refreshGit() {
     if (MODE !== "server") return Promise.resolve();
@@ -1868,12 +2289,13 @@
 
   function gitText() {
     if (!GIT) return "";
-    var t = GIT.summary || GIT_LABEL[GIT.state] || GIT.state || "";
-    if (GIT.at) t += "（" + GIT.at + "）";
-    if (GIT.pending) t += " · 还有 " + GIT.pending + " 处改动在等";
-    if (GIT.hint) t += "\n怎么修：" + GIT.hint;
-    if (GIT.detail) t += "\ngit 原文：" + GIT.detail;
-    return t;
+    var out = gitStateText(GIT.state) || GIT.summary || GIT.state || "";
+    if (GIT.at) out += " " + i18n.t("git.at", { at: GIT.at });
+    if (GIT.pending) out += " · " + i18n.t("git.pending", { n: GIT.pending });
+    var hint = gitHintText(GIT);
+    if (hint) out += "\n" + i18n.t("git.fix", { hint: hint });
+    if (GIT.detail) out += "\n" + i18n.t("git.raw", { detail: GIT.detail });
+    return out;
   }
 
   function paintGit() {
@@ -1884,20 +2306,21 @@
     var loud = bad && GIT.state !== "disabled" && GIT.state !== "idle";
     dot.hidden = false;
     dot.className = "gitdot g-" + (GIT.state || "idle");
-    dot.title = "数据仓同步 · " + gitText();
+    dot.title = i18n.t("git.title", { text: gitText() });
     // 只有「本来该同步却没同步成」才吵：没开自动同步、刚起服务还没写过，都不是问题
     warn.hidden = !loud;
-    warn.textContent = "⇅ " + (GIT.state === "error" ? "同步失败" : "同步没配好");
-    warn.title = gitText() + "\n（点击立即重试）";
+    warn.textContent = i18n.t(GIT.state === "error" ? "git.warn.error" : "git.warn.misconfigured");
+    warn.title = gitText() + "\n" + i18n.t("git.retry");
   }
 
   function retrySync() {
-    toast("正在同步…");
+    toast(i18n.t("toast.sync.running"));
     api("/api/sync", { method: "POST" }).then(function (r) {
       if (r && r.state) GIT = r;
       paintGit();
       var ok = GIT && (GIT.ok === undefined ? GIT.state !== "error" : GIT.ok);
-      toast((ok ? "同步完成：" : "仍然失败：") + ((GIT && GIT.summary) || ""), !ok);
+      var summary = (GIT && (gitStateText(GIT.state) || GIT.summary)) || "";
+      toast(i18n.t(ok ? "toast.sync.ok" : "toast.sync.failed", { summary: summary }), !ok);
       return refreshGit();
     }).catch(fail);
   }
@@ -1905,7 +2328,7 @@
   /* -------------------------------------------------------------- 启动 */
 
   function newProject() {
-    var name = prompt("项目名：");
+    var name = prompt(i18n.t("confirm.project.name"));
     if (!name || !name.trim()) return;
     api("/api/projects", {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -1913,8 +2336,57 @@
     }).then(function (p) { location.href = projectHref(p.slug); }).catch(fail);
   }
 
-  paintToken();
-  paintScope();
+  /* ------------------------------------------------------------ 界面文案
+   *
+   * index.html 里的静态文案全部由 data-i18n 属性在这里刷进去（选择的理由写在
+   * index.html 的注释里）。首屏和切语言走的是**同一个函数**，所以不存在
+   * 「首屏对了、切换之后漏了一处」这种半吊子状态——那正是手工接线最容易留下的坑。
+   */
+  function paintChrome() {
+    document.documentElement.lang = uiLang();
+    document.querySelectorAll("[data-i18n]").forEach(function (el) {
+      el.textContent = i18n.t(el.getAttribute("data-i18n"));
+    });
+    document.querySelectorAll("[data-i18n-html]").forEach(function (el) {
+      el.innerHTML = i18n.tHtml(el.getAttribute("data-i18n-html"));
+    });
+    document.querySelectorAll("[data-i18n-title]").forEach(function (el) {
+      el.title = i18n.t(el.getAttribute("data-i18n-title"));
+    });
+    document.querySelectorAll("[data-i18n-ph]").forEach(function (el) {
+      el.placeholder = i18n.t(el.getAttribute("data-i18n-ph"));
+    });
+    paintLang();
+    paintToken();
+    paintScope();
+    paintLive();
+    paintGit();
+  }
+  function paintLang() {
+    document.querySelectorAll("#langtoggle button").forEach(function (b) {
+      b.classList.toggle("on", b.getAttribute("data-lang") === uiLang());
+    });
+  }
+  function paintLive() {
+    $("#live").title = i18n.t(MODE === "static" ? "app.live.static" : "app.live");
+  }
+
+  /* 切语言 = 重画整页。唯一的例外是**正在编辑而且有未保存改动**：那时候重画
+     编辑器会把人正在敲的字冲掉，所以只刷顶栏，编辑器保持原样直到它自己结束。
+     不脏的编辑器照常重画——那样按钮和提示也一起跟上了新语言。 */
+  window.addEventListener(i18n.EVENT, function () {
+    var keepEditor = editing && isDirty();
+    paintChrome();
+    renderProjects();
+    if (!PROJECT) { renderHome(); return; }
+    renderRows();
+    renderDiagram();
+    applyView();
+    if (keepEditor) { renderSelection(); return; }
+    onHash();
+  });
+
+  paintChrome();
   if (MODE === "static" || !PROJECT) {
     $("#btn-new").hidden = MODE === "static" || !PROJECT;
     $("#btn-token").hidden = MODE === "static";
@@ -1922,10 +2394,7 @@
   /* 「＋ 项目」以前只长在项目索引页上，而只剩一个项目时那个页面会 302 弹回项目页，
      于是网页端永远建不出第二个项目。现在它在顶栏，任何页面都够得着。 */
   $("#btn-newproj").hidden = MODE === "static";
-  if (MODE === "static") {
-    $("#live").className = "dot";
-    $("#live").title = "静态导出 — 只读";
-  }
+  if (MODE === "static") $("#live").className = "dot";
   $("#lb-close").addEventListener("click", closeLightbox);
 
   function boot(id) {

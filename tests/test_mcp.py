@@ -129,6 +129,158 @@ def test_update_with_nothing_to_change_errors(be):
         call(be, "trace_update_step", project="alpha", step="001")
 
 
+# ------------------------------------------------------------ 翻译
+
+
+def note_dir(be, sid="001"):
+    import trace_write as W
+
+    sd = be._sd("alpha")
+    return sd / W.load(sd)[sid].dirname
+
+
+def test_translate_writes_a_separate_file_and_never_touches_the_original(be):
+    """整套双语设计的地基。译文要是能写进 note.md，「原文永远赢」就成了空话，
+    而这正是上一代系统（父子关系存两处）的死法。"""
+    call(be, "trace_new_step", project="alpha", title="加入标题字段",
+         body="## 为什么\n基线的 TF-IDF 丢掉词序")
+    before = (note_dir(be) / "note.md").read_bytes()
+    out = call(be, "trace_translate", project="alpha", step="001", lang="en",
+               title="Add title field", body="## Why\nThe TF-IDF baseline discards word order.")
+    assert "note.en.md" in out and "原文" in out
+    assert (note_dir(be) / "note.md").read_bytes() == before
+    assert "## Why" in (note_dir(be) / "note.en.md").read_text(encoding="utf-8")
+    assert be.step("alpha", "001")["tr"]["en"]["title"] == "Add title field"
+
+
+def test_translating_later_is_the_same_call_as_translating_now(be):
+    """「立刻」和「延迟」必须是同一条路径——否则建步骤时就得先决定要不要双语，
+    而那个决定往往几天后才做得出来。这里就是同一次调用发生在两个时刻。"""
+    call(be, "trace_new_step", project="alpha", title="x", body="## 为什么\n因为")
+    call(be, "trace_translate", project="alpha", step="001", lang="en", body="## Why\nv1")
+    call(be, "trace_update_step", project="alpha", step="001", status="done",
+         append="## 结果\n0.951")
+    call(be, "trace_translate", project="alpha", step="001", lang="en",
+         body="## Why\nv1\n\n## Result\n0.951")
+    s = be.step("alpha", "001")
+    assert "0.951" in s["body"] and "0.951" in s["tr"]["en"]["body"]
+
+
+def test_translate_without_a_step_translates_the_project_note(be):
+    out = call(be, "trace_translate", project="alpha", lang="en",
+               title="My topic", body="## Works\n- dedup helps")
+    assert "project.en.md" in out
+    text = (be.root / "projects" / "alpha" / "project.en.md").read_text(encoding="utf-8")
+    assert "name: My topic" in text and "## Works" in text
+
+
+def test_translate_refuses_a_body_that_carries_its_own_front_matter(be):
+    """结构键从函数形状上就进不了译文的 front-matter，所以 agent 拼的那一段 `---`
+    会原样落进正文：不报错、不生效、看着却像写上了。静默地什么都没发生最难查。"""
+    call(be, "trace_new_step", project="alpha", title="x")
+    with pytest.raises(M.ToolError, match="front-matter"):
+        call(be, "trace_translate", project="alpha", step="001", lang="en",
+             body="---\nid: 001\nparent: none\n---\n\n## Why\nbecause")
+    assert not (note_dir(be) / "note.en.md").exists(), "拒绝之后不该已经写了半份"
+
+
+def test_translate_rejects_a_language_the_original_already_declares(be):
+    """原文声明了 lang: en 还写一份 en 译文，两份就会各说各话——同一个事实两处存储。"""
+    call(be, "trace_new_step", project="alpha", title="x", body="## Why\nbecause")
+    note = note_dir(be) / "note.md"
+    note.write_text(note.read_text(encoding="utf-8").replace("status:", "lang: en\nstatus:", 1),
+                    encoding="utf-8")
+    with pytest.raises(M.ToolError, match="lang"):
+        call(be, "trace_translate", project="alpha", step="001", lang="en", body="## Why\nagain")
+
+
+def test_untranslated_says_what_is_still_missing_and_stops_saying_it(be):
+    """延迟翻译能落地全靠它：隔几天回来，agent 得先知道还欠哪些。"""
+    call(be, "trace_new_step", project="alpha", title="第一步")
+    call(be, "trace_new_step", project="alpha", title="第二步")
+    out = call(be, "trace_untranslated", project="alpha", lang="en")
+    assert "002" in out and "第二步" in out and "还缺 2" in out
+    assert "project.en.md" in out
+
+    call(be, "trace_translate", project="alpha", step="002", lang="en", title="Second")
+    out = call(be, "trace_untranslated", project="alpha", lang="en")
+    assert "002" not in out.split("项目笔记")[0], "补完的那一步不该还挂在缺翻译清单上"
+
+
+def test_untranslated_defaults_to_english(be):
+    call(be, "trace_new_step", project="alpha", title="x")
+    assert "en" in call(be, "trace_untranslated", project="alpha")
+
+
+def test_untranslated_does_not_ask_for_a_translation_that_would_be_refused(be):
+    """原文就是 en 的步骤，写 en 译文会被拒。列进「还缺」等于派 agent 去做
+    一件必然失败的事，而它会照做、失败、然后重试。"""
+    call(be, "trace_new_step", project="alpha", title="English step", body="## Why\nbecause")
+    note = note_dir(be) / "note.md"
+    note.write_text(note.read_text(encoding="utf-8").replace("status:", "lang: en\nstatus:", 1),
+                    encoding="utf-8")
+    out = call(be, "trace_untranslated", project="alpha", lang="en")
+    assert "还缺 0" in out and "原文就是 en" in out
+
+
+def test_search_finds_a_word_that_only_lives_in_the_translation(be):
+    """G4 加了双语之后的形态：`grep -r abandoned` 命中 note.en.md，trace_search
+    也必须命中——否则 agent 拿到「没搜到」，而它会把这四个字读成「没试过」。"""
+    call(be, "trace_new_step", project="alpha", title="对比学习", status="dead",
+         body="## 结论\n没有提升，放弃这条路。")
+    call(be, "trace_translate", project="alpha", step="001", lang="en",
+         title="Contrastive pretraining",
+         body="## Conclusion\nNo gain at all. This line is abandoned.")
+    out = call(be, "trace_search", query="abandoned")
+    assert "alpha/001" in out and "命中 en 译文" in out
+    assert "abandoned" in out, "摘要要给上下文，不然还得再读一遍全文"
+
+
+def test_reading_a_step_says_which_translations_exist(be):
+    """不知道已经有 en 版就重写一遍，等于把别人的译文覆盖掉。"""
+    call(be, "trace_new_step", project="alpha", title="x", body="## 为什么\n因为")
+    call(be, "trace_translate", project="alpha", step="001", lang="en", title="X")
+    assert "已有译文: en" in call(be, "trace_read", project="alpha", step="001")
+
+
+def test_the_tool_description_carries_the_section_table(be):
+    """agent 手上没有别的地方能知道这张对照表：pip 装的机器上不存在 FORMAT.md，
+    而小节名是精确匹配的——写成 `## Why not` 评级和 check 就都找不到内容。"""
+    import trace_core as core  # noqa: PLC0415
+
+    desc = next(t for t in M.TOOLS if t["name"] == "trace_translate")["description"]
+    for names in core.SECTION_NAMES.values():
+        for lang in ("zh", "en"):
+            assert names[lang] in desc, f"{names[lang]} 没写进 trace_translate 的描述"
+    for names in core.INSIGHT_NAMES.values():
+        assert names["en"] in desc, f"{names['en']} 没写进 trace_translate 的描述"
+
+
+def test_the_structural_key_list_matches_the_core_side(be):
+    """trace_mcp 留了一份字面量（远端后端那条路上可能没有 trace_core）。
+    两份对不上时，工具描述会向 agent 承诺一件内核并不执行的事。"""
+    import trace_core as core  # noqa: PLC0415
+
+    assert set(M.TR_STRUCT_KEYS) == set(core.TR_STRUCT_KEYS)
+
+
+def test_the_instructions_tell_agents_how_bilingual_works(be):
+    """initialize 的 instructions 是唯一无论怎么装都一定送达的通道。"""
+    text = M.INSTRUCTIONS
+    assert "trace_translate" in text and "note.en.md" in text
+    assert "双真相源" in text, "「结构键只认原文」的理由要说出来，不然 agent 会觉得是多余的规矩"
+    assert "trace_untranslated" in text
+
+
+def test_why_is_blank_understands_english_section_names(be):
+    """认死中文的话，一份英文 note.md 会被整篇判成「没写为什么」，
+    每建一步吃一条假警告——而假警告会让真警告也被忽略。"""
+    assert M._why_is_blank("## Why\n\n## What\n") is True
+    assert M._why_is_blank("## Why\nThe baseline discards word order.\n") is False
+    assert M._why_is_blank("## 为什么\n（承接上一步）") is True
+    assert M._why_is_blank("## 为什么\n因为验证集有重复样本") is False
+
+
 # ------------------------------------------------------------ 附件
 
 
@@ -517,6 +669,50 @@ class FakeHttp(M.HttpBackend):
         if self.on_patch:
             raise M.ToolError(self.on_patch)
         return {}
+
+
+class RecordingHttp(M.HttpBackend):
+    """只记下「打了哪个 URL」，不碰网络。"""
+
+    def __init__(self):
+        super().__init__("https://例子/t/s", "token")
+        self.calls: list = []
+
+    def _call(self, method, path, payload=None, raw=None, headers=None):
+        self.calls.append((method, path, payload))
+        return {"id": "001", "lang": "en", "path": "note.en.md", "digest": "d",
+                "project": "alpha", "total": 0, "translated": 0, "native": 0,
+                "missing": [], "project_note": {"missing": True, "native": False, "name": ""}}
+
+
+def test_the_remote_backend_calls_urls_the_server_really_serves(tmp_path: Path, monkeypatch):
+    """MCP 的两个后端是同一套语义的两个门面。远端那侧拼错一个 URL 的症状很坏：
+    本地模式（作者的机器）一切正常，HPC 上走 TRACE_URL 的 agent 全是 404，
+    而 404 在工具层被报成「工具执行失败」，看不出是路由错了还是数据没了。"""
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient  # noqa: PLC0415
+
+    import trace_core as core  # noqa: PLC0415
+    import trace_server as S  # noqa: PLC0415
+    import trace_write as W  # noqa: PLC0415
+
+    monkeypatch.setattr(S, "ROOT", tmp_path)
+    app = S.create_app({"data_dir": ".", "space": "", "token": "t", "git": {"enabled": False}})
+    core.ensure_layout(tmp_path)
+    W.create_project(tmp_path, "alpha")
+    W.create_step(core.steps_dir_of(tmp_path, "alpha"), title="x")
+
+    be = RecordingHttp()
+    be.translate("alpha", "001", "en", {"title": "T", "body": "## Why\nx"})
+    be.translate_project("alpha", "en", {"name": "N", "body": "## Works\n- a"})
+    be.untranslated("alpha", "en")
+    assert [c[1] for c in be.calls] == ["/api/p/alpha/steps/001/tr/en",
+                                        "/api/p/alpha/tr/en",
+                                        "/api/p/alpha/untranslated?lang=en"]
+    with TestClient(app) as c:
+        for method, path, payload in be.calls:
+            r = c.request(method, path, json=payload, headers={"Authorization": "Bearer t"})
+            assert r.status_code == 200, f"{method} {path} → {r.status_code} {r.text[:120]}"
 
 
 def test_write_probe_reports_a_missing_token_instead_of_passing():

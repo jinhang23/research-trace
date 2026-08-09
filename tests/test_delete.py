@@ -51,6 +51,23 @@ def test_the_directory_and_its_attachments_are_really_gone(proj):
     assert list(d.rglob("secret.env")) == [], "敏感文件必须真的没了"
 
 
+def test_every_language_version_goes_with_the_step(proj):
+    """删除是 rmtree 整个目录，所以译文本来就被带走了——但"本来就"是靠不住的：
+    哪天有人改成"只删 note.md 和附件"，磁盘上就会留下一份没有原文的孤儿英文记录，
+    scan 静默跳过它（目录里没有 note.md），于是它谁也看不见、grep 却还搜得到。
+    files_removed 也必须把译文算进去，否则报出来的数字和真消失的份数对不上。"""
+    _root, d = proj
+    s, _ = W.create_step(d, title="要删的")
+    W.write_translation(d, s.id, "en", title="To be deleted", body="## Why\nbecause.")
+    W.write_translation(d, s.id, "ja", title="削除予定")
+    W.attach_auto(d, s.id, b"\x89PNG", filename="fig.png", mime="image/png")
+
+    info = W.delete_step(d, s.id, "误建")
+    assert info["files_removed"] == 4, "note.md + 两份译文 + 一个附件"
+    assert not (d / s.dirname).exists()
+    assert list(d.rglob("note.*.md")) == [], "译文不能留下孤儿"
+
+
 def test_deleting_a_nonexistent_step_is_a_404(proj):
     _root, d = proj
     with pytest.raises(W.NotFound):

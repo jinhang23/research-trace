@@ -102,6 +102,15 @@ button:hover { background: var(--hi); }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 button.on { background: var(--hi); border-color: var(--accent); }
 
+/* 语言开关。顶栏已经有搜索、项目选择、令牌、同步状态四样东西了，所以它是
+   全栏最小的一个控件：两个两字宽的格子，复用视图切换那套 .seg 的样子——
+   同一种「两选一」在同一条栏上长成两副面孔，人得多想一次才知道它是干嘛的。
+   它必须一直在（找语言开关的人正是看不懂当前语言的人），所以不做成折叠菜单。 */
+.seg.lang button {
+  padding: 4px 7px; font-size: 11px; line-height: 15px; min-width: 26px;
+  font-family: var(--mono); letter-spacing: .02em;
+}
+
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
 .dot.live { background: var(--done); }
 .dot.off { background: var(--dead); }
@@ -417,6 +426,18 @@ dialog input, dialog select, dialog textarea {
 dialog textarea { font-family: var(--mono); font-size: 12.5px; line-height: 1.7; resize: vertical; }
 dialog .row2 { display: flex; gap: 12px; }
 dialog .row2 label { flex: 1; }
+/* 正文标题那一行：左边「正文」，右边一个决定**模板用哪种语言**的小下拉。
+   它跟的是内容语言，不是界面语言，所以放在正文旁边而不是顶栏（见 app.js）。 */
+dialog .bodyhead {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; color: var(--muted); margin-bottom: 4px;
+}
+dialog .bodyhead .sp { flex: 1; }
+dialog select.minisel {
+  display: inline-block; width: auto; margin-top: 0; padding: 2px 6px;
+  font-size: 11.5px; cursor: pointer;
+}
+dialog #nf-body { margin-bottom: 11px; }
 dialog .hint { font-size: 11.5px; color: var(--muted); line-height: 1.7; background: var(--hi); padding: 8px 10px; border-radius: 5px; margin: 0 0 14px; }
 dialog menu { display: flex; justify-content: flex-end; gap: 8px; padding: 0; margin: 0; }
 
@@ -605,6 +626,33 @@ button.danger:hover { background: color-mix(in srgb, var(--dead) 12%, transparen
   font-family: var(--mono); font-size: 9px; padding: 0 3px; border-radius: 2px;
   font-style: normal; margin-right: 0; border-top-width: 1px; }
 
+/* ---------------------------------------------------------------- 双语 */
+
+/* 「你现在读到的是原文」这句话的两种分量：
+     .trnote        原文声明了别的语言 —— 一整句，因为这条是真的有信息量
+     .trnote.quiet  原文没声明        —— 只剩一个徽章，整句话在 title 里
+   第二种压到最小是刻意的：绝大多数项目根本没在做双语（一个 lang: 都没写），
+   每一步顶一条横幅说「还没有译文」是纯噪声，而噪声会让第一种一起被跳过去。
+   两种都不是警告，所以既不用 --wip 也不用 --dead：它是一句说明，不是一个问题。 */
+.trnote {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px;
+  margin: 0 0 12px; font-size: 12px; line-height: 1.7; color: var(--muted);
+}
+.trnote.quiet { margin-bottom: 8px; }
+.trbadge {
+  flex: 0 0 auto; font-family: var(--mono); font-size: 10px; padding: 1px 6px;
+  border: 1px dashed var(--rule); border-radius: 3px; color: var(--muted);
+  cursor: default;
+}
+.trlang { color: var(--ink); }
+.edhead .trbadge { margin-left: 8px; }
+
+/* 编辑器里的「正在编辑哪一份」。和顶栏的语言开关长得一样但意思完全不同——
+   那个换的是界面，这个换的是**正在写的文件**（note.md / note.en.md），
+   所以它长在编辑器头上、挨着面包屑，而不是长在顶栏。 */
+.seg.edlang { margin-left: 10px; }
+.seg.edlang button { padding: 3px 9px; font-size: 11.5px; }
+
 /* ---------------------------------------------------------------- 草稿 / 冲突 */
 
 .draftbar {
@@ -688,9 +736,16 @@ button.danger:hover { background: color-mix(in srgb, var(--dead) 12%, transparen
   #top { flex-wrap: wrap; gap: 6px; padding: 6px 8px; }
   /* 第一行放项目/视图/新建，第二行是搜索框 + 令牌和状态灯。order 把后三个拽到
      搜索框那一行，否则它们自己占掉第三行，顶栏在 812px 高的屏上白吃掉一整行。 */
-  #top .grow { order: 10; flex: 1 1 55%; }
+  /* 基准从 55% 降到 40%：换行是按 flex-basis 算的，55% 的时候语言开关那 54px
+     刚好把第二行挤爆，顶栏从两行变三行——在 812px 高的屏上白吃掉 34px。
+     搜索框仍然是这一行里唯一会伸缩的东西，实际渲染宽度不受影响。 */
+  #top .grow { order: 10; flex: 1 1 40%; }
+  /* 语言开关跟着令牌一起被拽到搜索框那一行：它必须一直在，但两个字宽的东西
+     不值得在第一行里挤掉「＋ 新步骤」。 */
+  #langtoggle { order: 11; }
   #btn-token { order: 11; }
   #gitdot, #gitwarn, #live { order: 12; }
+  .seg.lang button { padding: 4px 6px; }
   #proj { max-width: 33vw; padding: 5px 4px; }
   #btn-new, #btn-newproj, #btn-token { padding: 5px 7px; font-size: 12.5px; }
   .seg button { padding: 5px 8px; }

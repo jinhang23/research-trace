@@ -184,6 +184,41 @@ def test_note_md_cannot_be_overwritten_through_a_filename_alias(alias):
         W.safe_relpath(alias)
 
 
+# 翻译文件和 note.md 一样是**记录本身**。老守卫只认 note.md 的别名，于是传一个
+# 叫 note.en.md 的附件照样能顶掉整份英文记录——而附件上传是公开写接口里最容易
+# 被当成"随便传点什么"的那一个。别名的四种形状（大小写 / 尾随点空格 / ADS 冒号 /
+# 组合）在这里逐一钉住。
+@pytest.mark.parametrize("alias", [
+    "note.en.md", "NOTE.EN.MD", "Note.En.Md", "note.zh-Hant.md",
+    "note.en.md ", "note.en.md.", "note.en.md:evil", "note.EN.md. .",
+    "project.md", "project.en.md", "PROJECT.EN.MD", "project.en.md.",
+])
+def test_a_translation_file_cannot_be_uploaded_as_an_attachment(alias):
+    with pytest.raises(W.WriteError):
+        W.safe_relpath(alias)
+
+
+@pytest.mark.parametrize("ok", ["note.md.txt", "notes.en.md", "note..md", "note.en2.md.bak",
+                                "figs/note.en.md"])
+def test_the_translation_guard_does_not_eat_ordinary_attachments(ok):
+    """守卫只认「顶层的记录文件名」这一种形状。扩得过宽会让正常附件传不上来，
+    而 `sub/note.en.md` 和 `sub/note.md` 一样是别人的文件（既有断言钉着这条）。"""
+    assert W.safe_relpath(ok)
+
+
+def test_uploading_a_translation_alias_leaves_the_english_record_untouched(tmp_path: Path):
+    """走完整条上传路径确认一遍：挡的不只是 safe_relpath 的返回值。"""
+    d = mkroot(tmp_path)
+    s, _ = W.create_step(d, title="半年的记录")
+    W.write_translation(d, s.id, "en", title="Half a year of records", body="## Why\nbecause.")
+    tr = d / s.dirname / "note.en.md"
+    before = tr.read_bytes()
+    for alias in ("note.en.md", "NOTE.EN.MD", "note.en.md."):
+        with pytest.raises(W.WriteError):
+            W.attach_file(d, s.id, alias, b"PWNED")
+    assert tr.read_bytes() == before
+
+
 def test_uploading_a_note_md_alias_leaves_the_record_untouched(tmp_path: Path):
     """走完整条上传路径确认一遍：需求 1 里 agent/脚本用的就是这个接口。"""
     d = mkroot(tmp_path)

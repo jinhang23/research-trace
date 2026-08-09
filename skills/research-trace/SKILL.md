@@ -6,7 +6,7 @@ description: "记录与查询科研步骤树（trace 系统，支持多项目）
 # trace — 科研步骤树
 
 **如果 `trace_*` 这组 MCP 工具可用，优先用它们**——参数有 schema、不用自己拼请求、
-中文不会撞终端编码。九个工具：
+中文不会撞终端编码。十一个工具：
 
 | 工具 | 什么时候用 |
 |---|---|
@@ -19,6 +19,8 @@ description: "记录与查询科研步骤树（trace 系统，支持多项目）
 | `trace_update_step` | 改状态 / 追加正文 / 追加产物路径 / 追加一条 `repro` |
 | `trace_delete_step` | 真删。只用于误建、测试数据、粘进去的令牌 |
 | `trace_attach` | 传附件。**图片必须给 `caption`** |
+| `trace_translate` | 补一份译文。**唯一碰翻译的写入口，它永远不动原文** |
+| `trace_untranslated` | 还欠哪些翻译（现算，没有待办表） |
 
 下面的 REST 用法是没有 MCP 时的退路。配置来自三个环境变量：
 
@@ -55,8 +57,10 @@ description: "记录与查询科研步骤树（trace 系统，支持多项目）
 | `paths` | 外部产物的位置，`位置 \| 说明`。整组替换；`add_paths` 是追加 |
 | `repro` | 复现记录，**只能追加**。见「复现记录」一节 |
 | `digest` | `sha256(note.md 原始字节)[:12]`。用来做冲突检测，见「别覆盖掉别人的写入」 |
+| `lang` | 只读。`note.md` **自己**是什么语言（`zh` / `en` …）。不写就是没声明，系统不猜；写入接口没有这个参数，要声明就手写进 `note.md` |
+| `tr` | 这一步的全部译文，按语言码：`{"en": {"title": …, "body": …}}`。只读，改它走 `trace_translate` |
 
-派生字段（`children` `backlinks` `files` `lineage` `lane` `row` `tree` `trace`）由服务端算出，
+派生字段（`children` `backlinks` `files` `lineage` `lane` `row` `tree` `trace` `tr`）由服务端算出，
 **不要试图写它们**。
 
 ## 规矩
@@ -206,6 +210,74 @@ call("PATCH", "/api/projects/" + PROJ,
 `project.md` 里还有一个 `## 已删除` 小节，由系统在删除步骤时自己写。
 **永远不要动它**——目录已经没了，那一行是「为什么删的」仅存的证据。
 
+## 补翻译（`trace_translate`）
+
+一条记录可以有多个语言版本：`note.md` 是原文（结构 + 正文），
+`note.<lang>.md` 只带一个 `title` 和译文。项目笔记同理 `project.<lang>.md`。
+
+### 什么时候补
+
+**不要每写一步就顺手翻。**缺翻译不是缺陷——`check` 不为它报警告，评级也不受影响
+（小节「任一语言写了就算写了」）。该补的时机是这几个：
+
+- 用户明说了要（「把这几步翻成英文」「这个项目要给外面的人看」）
+- 这个项目里已经有别的步骤有 `en` 版了——别让同一个项目一半有一半没有
+- 一步已经收尾（`done` / `dead`）且结论重要。**`wip` 不要翻**，正文还会变，
+  翻了就得跟着改
+
+顺序上先 `trace_untranslated(project=…, lang="en")` 看还欠哪些，再逐个补。
+它是「延迟翻译」唯一的落地方式：没有任何地方存着一张待办表，欠不欠是现算的
+（`note.en.md` 这个文件在不在）。
+
+### 怎么调
+
+```
+trace_untranslated(project="我的课题", lang="en")
+
+trace_translate(project="我的课题", lang="en", step="007",
+                title="Add title field, accuracy 0.943 → 0.951",
+                body="## Why\nThe TF-IDF baseline discards word order.\n"
+                     "## Result\n| Model | Accuracy |\n|---|---|\n| TF-IDF | 0.897 |\n")
+
+trace_translate(project="我的课题", lang="en",          # 省略 step = 翻项目笔记
+                title="My topic", body="## Ideas\n- …\n")
+```
+
+- `lang` 是短语言码：`en` / `ja` / `zh-Hant`，它直接变成文件名的一段
+- `title` **走参数**，不要自己在 `body` 里拼 `---` 那一段
+- 翻译只碰译文文件，`note.md` 一个字节都不动。所以
+  `trace_new_step` / `trace_update_step` 上**没有** `body_en` 这类参数，别去找
+- `expect` 对的是**译文自己**的 digest，不是 `note.md` 的
+
+### 绝不要往翻译文件里写结构字段
+
+`id` · `parent` · `status` · `date` · `commit` · `author` · `tags` · `path` · `repro` · `key`
+
+这十个键写进译文会被**一律忽略**，并产出一条警告。
+
+**理由不是洁癖。**上一代系统就是死在双真相源上：同一个事实存在两个地方，
+写一处漏一处，页面上永远有一半是错的。要改状态、改 commit、加 `repro`，
+一律走 `trace_update_step` 改 `note.md`。译文里只有 `title` 和正文。
+
+### 小节名逐字照抄
+
+评级和 `check` 是按小节名去正文里找内容的，写错一个字就等于没写：
+
+| 语义 | 中文 | 英文 |
+|---|---|---|
+| 步骤正文 | `## 为什么` `## 做了什么` `## 结果` `## 结论` `## 下一步` | `## Why` `## What` `## Result` `## Conclusion` `## Next` |
+| 项目洞察 | `## 核心想法` `## 有效` `## 无效` `## 坑` | `## Ideas` `## Works` `## Doesn't work` `## Pitfalls` |
+| 删除审计 | `## 已删除` | `## Deleted` |
+
+封闭词表目前只有中文和英文。翻成别的语言照样存得下、`grep` 得到，
+但小节名不在表里，评级读不出内容（也不会掉级，原文写了就够了）。
+
+**译文里的图也要写图注。**图注是**逐份文件**判的——中文版写了图注、英文版
+`![](loss.png)` 光秃秃，读英文版的人和 agent 拿到的就是零信息，这一步的等级会真的掉。
+其余小节不是这样（任一语言写了就算写了）。
+
+完整规矩见 `FORMAT.md` 第 13 节。
+
 ## 跨项目搜索
 
 「之前好像在某个课题里试过对比学习，最后放弃了」——不给 `project` 就是搜全部：
@@ -229,6 +301,7 @@ Base = `TRACE_URL`（形如 `https://你的域名/t/<space>`）。
 | GET | `/api/p/{项目}/forest` — 全量 steps（含 `trace` `digest`）+ tree + warnings | — |
 | GET | `/api/p/{项目}/steps/{id}` — 含 `lineage` `files` `backlinks` `trace` `digest` | — |
 | GET | `/api/search` — 跨项目搜索，`?q=` 或 `?query=` | — |
+| GET | `/api/p/{项目}/untranslated` — 还欠哪些译文，`?lang=en` | — |
 | GET | `/api/status` — 版本、项目数、步骤数、git 同步状态、`write_protected` | — |
 | GET | `/api/git` — 自动 git 同步的状态（`ok` / `summary` / `hint`） | — |
 | POST | `/api/projects` — `{name}` | Bearer |
@@ -236,6 +309,9 @@ Base = `TRACE_URL`（形如 `https://你的域名/t/<space>`）。
 | POST | `/api/p/{项目}/steps` — `{parent, title, status, body, date, commit, author, key, tags, paths}` | Bearer |
 | PATCH | `/api/p/{项目}/steps/{id}` — `status` `title` `body` `date` `commit` `author` `tags` `paths` `add_paths` `add_repro`；可带 `expect` | Bearer |
 | DELETE | `/api/p/{项目}/steps/{id}` — `{reason}` 必填 | Bearer |
+| PUT | `/api/p/{项目}/steps/{id}/tr/{lang}` — 这一步的译文 `{title, body}`；可带 `expect`（对的是**译文自己**的 digest） | Bearer |
+| DELETE | `/api/p/{项目}/steps/{id}/tr/{lang}` — 撤掉一个语言版本，原文不受影响 | Bearer |
+| PUT | `/api/p/{项目}/tr/{lang}` — 项目笔记的译文 `{name, body}`；`body` 只替换那四个洞察小节 | Bearer |
 | PUT | `/api/p/{项目}/steps/{id}/files/{相对路径}` — raw body，自己定文件名 | Bearer |
 | POST | `/api/p/{项目}/steps/{id}/files` — raw body，服务端定名；`X-Filename` 头可选（需 URL 编码），不给就按内容哈希命名 | Bearer |
 | DELETE | `/api/p/{项目}/steps/{id}/files/{相对路径}` — 删一个附件 | Bearer |
@@ -303,3 +379,7 @@ call("PATCH", p(f"/steps/{step['id']}"), {"status": "done", "expect": step["dige
   旧状态名（`draft` `ongoing` `success` `failed`），一律 400
 - 不要把结果塞进 `title`——`title` 是一行摘要，数字放正文的「结果」小节
 - 不要整组替换 `paths` 或 `body` 而不带 `expect`——用 `add_paths` / `append`
+- 不要往译文（`note.<lang>.md`）里写 `id` / `parent` / `status` / `commit` 这类结构字段，
+  也不要把两种语言塞进同一份 `note.md`——结构只有 `note.md` 说了算，
+  译文只有 `title` 和正文
+- 不要因为「还没翻译」就去补一条警告或标记：那是派生状态，不是缺陷

@@ -11,6 +11,10 @@ CLI、网页表单、agent API 全部调这里，不允许任何一方绕过去�
 唯一的例外是 delete_step()：真删目录，用来处理"这条记录本身就不该存在"
 （误建、测试数据、粘进去的令牌）。它和 status=dead 是两件事——dead 是研究结论。
 代价（id 可能被重用、子步骤变孤儿）在那个函数的说明里写清楚了。
+
+双语（note.<lang>.md）同样只有一条写入路径：write_translation /
+write_project_translation / drop_translation。它们碰不到原文，也写不出结构键——
+见文件下半部分「翻译」那一节的长注释。
 """
 
 from __future__ import annotations
@@ -49,6 +53,7 @@ from trace_core import (
     build_children,
     id_key,
     fmt_id,
+    parse_note,
     path_kind,
     project_dir,
     projects_root,
@@ -58,6 +63,34 @@ from trace_core import (
     steps_dir_of,
     validate,
 )
+
+# 双语用到的那几张表，权威定义在 trace_core —— 读侧要按同一张表解析翻译文件，
+# 两边各存一份就是双真相源的开端。
+#
+# 兜底分支只为一种情形存在：trace_core 还没长出这几个名字时本模块仍要能被导入
+# （否则整个包连测试都起不来）。core 一旦有了，import 成功，下面这份永远走不到，
+# 也就不可能和 core 分道扬镳——绝不能改成「两边都定义，谁先谁赢」。
+try:
+    from trace_core import (
+        DELETED_NAME,
+        INSIGHT_NAMES,
+        PROJECT_TR_ONLY_KEYS,
+        PROJECT_TR_RE,
+        TR_ONLY_KEYS,
+        TR_RE,
+    )
+except ImportError:      # pragma: no cover - 仅在 core 尚未加入双语常量时
+    INSIGHT_NAMES = {
+        "idea":    {"zh": "核心想法", "en": "Ideas"},
+        "works":   {"zh": "有效",     "en": "Works"},
+        "fails":   {"zh": "无效",     "en": "Doesn't work"},
+        "pitfall": {"zh": "坑",       "en": "Pitfalls"},
+    }
+    DELETED_NAME = {"zh": "已删除", "en": "Deleted"}
+    TR_RE = re.compile(r"^note\.([A-Za-z][A-Za-z0-9-]{0,34})\.md$")
+    PROJECT_TR_RE = re.compile(r"^project\.([A-Za-z][A-Za-z0-9-]{0,34})\.md$")
+    TR_ONLY_KEYS = ("title",)
+    PROJECT_TR_ONLY_KEYS = ("name",)
 
 MAX_SLUG = 40
 MAX_FILE_BYTES = 32 * 1024 * 1024
@@ -333,12 +366,12 @@ def create_project(root: Path, name: str) -> Project:
 
 # 项目级的沉淀。它不属于任何单独一步——「回译在这个数据集上一直没用」是三次
 # 尝试之后的判断，挂在哪一步都不对。所以放在 project.md 的正文里。
-INSIGHT_SECTIONS = {
-    "idea": "核心想法",
-    "works": "有效",
-    "fails": "无效",
-    "pitfall": "坑",
-}
+#
+# 这里只是把 core 那张封闭词表投影成「kind → 中文小节名」，因为 web/app.js、
+# MCP 的内联标准和 FORMAT.md 的对照表都钉着 INSIGHT_SECTIONS 这个名字。
+# 投影而不是再抄一份：抄一份就会有一天两边对不上，而对不上的表现是
+# trace_insight 往一个新建的空小节里追加，旧洞察还留在原来那个小节里。
+INSIGHT_SECTIONS = {k: v["zh"] for k, v in INSIGHT_NAMES.items()}
 INSIGHT_TEMPLATE = "\n\n".join(f"## {t}" for t in INSIGHT_SECTIONS.values()) + "\n"
 INSIGHT_HEADINGS = frozenset(INSIGHT_SECTIONS.values())
 
@@ -363,7 +396,18 @@ def _split_sections(body: str) -> list[tuple[str | None, list[str]]]:
     return out
 
 
-def _merge_insights(old_body: str, submitted: str) -> str:
+def insight_headings(lang: str = "zh") -> frozenset[str] | None:
+    """某个语言下「算洞察」的四个小节名；这个语言没有封闭词表时返回 None。
+
+    翻译文件用的是译过的小节名（`## Ideas` 而不是 `## 核心想法`），所以合并
+    「哪些小节可以被整体替换」必须按语言查表，否则在 project.en.md 上会一条也
+    认不出来，提交的正文被整份丢掉——静默的空写，比覆盖更难发现。
+    """
+    names = {v[lang] for v in INSIGHT_NAMES.values() if lang in v}
+    return frozenset(names) if len(names) == len(INSIGHT_NAMES) else None
+
+
+def _merge_insights(old_body: str, submitted: str, lang: str = "zh") -> str:
     """整体替换洞察时，只换那四个洞察小节，其余小节逐字保留。
 
     为什么不能整段覆盖：网页那个「编辑洞察」框是用**打开页面那一刻**的正文预填的，
@@ -375,11 +419,22 @@ def _merge_insights(old_body: str, submitted: str) -> str:
     合并规则是「磁盘上的非洞察小节永远赢」：提交文本里出现的同名小节（比如用户
     把整段正文连「## 已删除」一起贴回来了）直接丢弃，不参与合并。
     这样不管上层怎么调这个函数，都不可能从这条路毁掉删除记录。
+
+    `lang` 决定按哪套小节名判定，于是同一条保护也罩得住 project.en.md 里手写的
+    `## Deleted`。**词表之外的语言**（INSIGHT_NAMES 只封了 zh/en）没法分辨哪一节
+    是洞察、哪一节是删除记录，此时按提交的正文整份写：那个语言的文件从来不由
+    本模块自己写入任何东西（_log_deletion 只写 project.md），所以没有「系统写下的
+    证据」会被吃掉；里面的内容全是写的人自己放进去的，由他自己负责。
     """
+    headings = insight_headings(lang)
+    if headings is None:
+        return "\n\n".join(
+            t for t in ("\n".join(blk).strip("\n") for _h, blk in _split_sections(submitted))
+            if t.strip())
     keep = [blk for h, blk in _split_sections(old_body)
-            if h is not None and h not in INSIGHT_HEADINGS]
+            if h is not None and h not in headings]
     fresh = [blk for h, blk in _split_sections(submitted)
-             if h is None or h in INSIGHT_HEADINGS]
+             if h is None or h in headings]
     chunks = []
     for blk in fresh + keep:
         t = "\n".join(blk).strip("\n")
@@ -390,8 +445,6 @@ def _merge_insights(old_body: str, submitted: str) -> str:
 
 def _read_project_note(d: Path) -> tuple[dict[str, str], str]:
     """读 project.md。非 UTF-8 就拒绝——继续写下去会把原文替换成一串问号。"""
-    from trace_core import parse_note
-
     note = d / PROJECT_NOTE
     if not note.is_file():
         return {}, ""
@@ -399,10 +452,16 @@ def _read_project_note(d: Path) -> tuple[dict[str, str], str]:
     return meta, body
 
 
-def _write_project_note(d: Path, name: str, body: str) -> None:
+def _write_project_note(d: Path, name: str, body: str, lang: str = "") -> None:
+    """回写 project.md。
+
+    `lang` 要**原样带回去**：它是这份笔记自己声明的主语言，翻译文件靠它判断
+    「哪个语言不需要翻译」。这个函数是全量重写 front-matter 的，不显式带上就等于
+    每次改一条洞察都把用户手写的 `lang:` 悄悄删掉一次。
+    """
     body = body.strip()
-    text = f"---\nname: {name}\n---\n\n{body}\n" if body else f"---\nname: {name}\n---\n\n"
-    write_atomic(d / PROJECT_NOTE, _utf8_bytes(text, "项目笔记"))
+    head = f"---\nname: {name}\n" + (f"lang: {lang}\n" if lang else "") + "---\n\n"
+    write_atomic(d / PROJECT_NOTE, _utf8_bytes(head + (f"{body}\n" if body else ""), "项目笔记"))
 
 
 def update_project(root: Path, slug: str, *, name: str | None = None,
@@ -438,7 +497,7 @@ def update_project(root: Path, slug: str, *, name: str | None = None,
                 raise WriteError("洞察内容不能为空")
             body = _append_under(body, heading, "- " + text)
 
-        _write_project_note(d, final_name, body)
+        _write_project_note(d, final_name, body, (meta.get("lang") or "").strip())
     return Project(slug=slug, name=final_name, body=body.strip())
 
 
@@ -473,8 +532,8 @@ def rename_project(root: Path, slug: str, name: str) -> Project:
     if not d.is_dir():
         raise NotFound(f"项目 {slug} 不存在")
     with project_lock(d):
-        _meta, body = _read_project_note(d)
-        _write_project_note(d, name, body)
+        meta, body = _read_project_note(d)
+        _write_project_note(d, name, body, (meta.get("lang") or "").strip())
     return Project(slug=slug, name=name, body=body)
 
 
@@ -534,8 +593,12 @@ def render_note(step: Step) -> str:
         lines.append(f"parent: {step.parent}")
     lines.append(f"status: {step.status}")
     lines.append(f"title: {step.title}")
-    for k in ("date", "commit", "author", "key"):
-        v = getattr(step, k)
+    # lang 也要写回去。它是这份 note.md 自己声明的主语言，翻译文件靠它判断
+    # 「这个语言不用翻」。render_note 是全量重写 front-matter 的，漏掉一个键
+    # 就等于每次在网页上点一下 done 都把用户手写的那一行悄悄删掉。
+    # getattr 兜底：core 里还没有这个字段时（或纯手工造的 Step）当没写。
+    for k in ("lang", "date", "commit", "author", "key"):
+        v = getattr(step, k, "")
         if v:
             lines.append(f"{k}: {v}")
     if step.tags:
@@ -603,6 +666,7 @@ def create_step(
     key: str = "",
     tags: list[str] | None = None,
     paths: Any = None,
+    lang: str = "",
 ) -> tuple[Step, bool]:
     """新建一步。返回 (step, created)；created=False 表示命中幂等键返回了既有步骤。
 
@@ -650,6 +714,11 @@ def create_step(
             paths=norm_paths(paths),
             body=(BODY_TEMPLATE if body is None else body),
             dirname=f"{sid}_{slugify(title)}",
+            # 主语言是**声明**出来的，不是猜出来的。没有这个参数的时候，
+            # 读的一侧只能从小节名反推（封闭词表，还算确定），而网页上人明明
+            # 在下拉框里选过「用英文写」——那次选择必须落盘，否则界面就只能
+            # 对后来的读者说「这是原文」而说不出是哪种语言的原文。
+            lang=norm_lang(lang) if _clean_line(lang) else "",
         )
 
         text = _utf8_bytes(render_note(step), "正文")
@@ -667,7 +736,7 @@ def create_step(
 # ---------------------------------------------------------------- 修改
 
 MUTABLE = ("status", "title", "body", "date", "commit", "author", "tags",
-           "paths", "add_paths", "add_repro")
+           "paths", "add_paths", "add_repro", "lang")
 
 
 def norm_repro(raw: Any) -> list[dict[str, str]]:
@@ -779,6 +848,11 @@ def _update_step_locked(steps_dir: Path, sid: str, patch: dict[str, Any], expect
         step.paths = step.paths + [p for p in norm_paths(patch["add_paths"]) if p["location"] not in seen]
     if "add_repro" in patch:                                # 只追加：复现历史不覆盖
         step.repro = step.repro + norm_repro(patch["add_repro"])
+    if "lang" in patch:
+        # 空串是**撤回声明**（回到「原文，语种不详」），不是非法值——
+        # 写错了要能改回来，否则一个手滑的 lang: ja 会永久留在那儿。
+        raw = _clean_line(patch["lang"])
+        step.lang = norm_lang(raw) if raw else ""
 
     # 目录名不跟着 title 改：目录名里的 id 是给 shell 补全用的，
     # 改名会让所有已经发出去的相对链接失效。
@@ -820,6 +894,9 @@ def delete_step(steps_dir: Path, sid: str, reason: str, by: str = "", date: str 
                       if k != sid and re.search(rf"\[\[\s*{re.escape(sid)}\s*\]\]", s.body))
 
         d = steps_dir / target.dirname
+        # rglob 数的是目录里所有文件，所以 note.md、每一份 note.<lang>.md 和全部
+        # 附件都算进 files_removed —— 报出去的数字必须和磁盘上真消失的份数对得上，
+        # 「删掉一步会连译文一起没」这件事也就自然被说出来了。
         files = sum(1 for _ in d.rglob("*") if _.is_file())
 
         # **先记原因，再删目录。** 反过来写的话，rmtree 半途失败（Windows 上
@@ -874,9 +951,13 @@ def _log_deletion(project_dir_: Path, sid: str, title: str, reason: str, by: str
     meta, body = _read_project_note(project_dir_)
     stamp = " · ".join(x for x in (date.strip(), by.strip()) if x.strip())
     entry = f"- `{sid}` {title}".rstrip() + f" —— {reason}" + (f"（{stamp}）" if stamp else "")
-    body = _append_under(body, "已删除", entry)
+    # 小节名跟着**这份文件自己**的语言走：删除记录必须和它旁边的洞察是同一套标题，
+    # 否则一份 `lang: en` 的 project.md 里会同时冒出 `## Deleted` 和 `## 已删除`，
+    # 而 G4 那句「grep 得到为什么删的」就得看运气搜对哪一个词。
+    body = _append_under(body, DELETED_NAME.get((meta.get("lang") or "").strip(),
+                                                DELETED_NAME["zh"]), entry)
     name = (meta.get("name") or project_dir_.name).strip()
-    _write_project_note(project_dir_, name, body)
+    _write_project_note(project_dir_, name, body, (meta.get("lang") or "").strip())
     return entry
 
 
@@ -887,7 +968,8 @@ def _mark_deletion_incomplete(project_dir_: Path, entry: str, exc: BaseException
         if entry not in body:
             return
         body = body.replace(entry, entry + f"  ⚠ 删除未完成，目录里还有残留：{exc}", 1)
-        _write_project_note(project_dir_, (meta.get("name") or project_dir_.name).strip(), body)
+        _write_project_note(project_dir_, (meta.get("name") or project_dir_.name).strip(),
+                            body, (meta.get("lang") or "").strip())
     except (WriteError, OSError):
         pass    # 标注失败也不能盖掉真正的删除错误——那条才是调用方要看的
 
@@ -901,6 +983,275 @@ def append_body(steps_dir: Path, sid: str, text: str) -> Step:
             raise NotFound(f"步骤 {sid} 不存在")
         body = by_id[sid].body.rstrip("\n") + "\n\n" + text.strip("\n") + "\n"
         return update_step(steps_dir, sid, {"body": body})
+
+
+# ---------------------------------------------------------------- 翻译
+#
+# 存储是双文件：note.md 带结构 + 主语言正文，note.<lang>.md 只带一个 title 和译文。
+# 翻译文件里**不许**出现任何结构键（id / parent / status / date / commit / …）。
+# 这不是洁癖：上一代系统（ai-training-logbook）的死因就是同一个事实存在两处，
+# 写一处漏一处。所以这里从函数形状上杜绝——渲染翻译文件的 _render_translation
+# 只接受**一个**键名，调用方连传第二个键的地方都没有；正文里的换行也在
+# _clean_line 里被压平，`title: x\nid: 999` 注不进去。
+#
+# 「还没翻译」是派生状态（文件不存在），绝不存。
+#
+# ── 翻译要不要进 digest / expect 的冲突控制链？────────────────────────────
+#
+# 结论：**每个翻译文件有自己的 expect，但翻译不进 note.md 那条链**，也就是说
+# 系统不会知道「note.md 改了、note.en.md 过时了」。理由，按重要性排：
+#
+# 1. 「过时」算不出来。要算就得把翻译当时 note.md 的指纹写进翻译文件——那是把
+#    派生关系变成存储字段（P1 明令禁止），而且正是双真相源的形状：FORMAT.md
+#    鼓励人直接 `vim note.md`（页面五秒内自己跟上），手改之后那个指纹立刻变成
+#    一句谎话，系统却会理直气壮地按它显示「已是最新」。错的状态比没有状态更贵。
+# 2. 退而求其次拿 mtime 比更糟：git checkout、rsync、云盘同步、从备份恢复都会
+#    重排 mtime，于是「翻译过时」在最常见的几种操作之后集体误报。误报的告警
+#    等于没有告警——这正是 check 默认不把内容层缺陷算成失败的同一条理由。
+# 3. 反过来让 update_step 在「有翻译」时拦一道或报个错，等于让译文挡住原文的
+#    写入路径，方向正好反了：note.md 永远赢，翻译是可选的衍生物。用户明确不要
+#    「缺翻译」的警告，「过时」比它更容易变成天天红的一片。
+# 4. 真要这个功能，P1 兼容的做法是人自己在译文里写一句（那是可 grep 的文本，
+#    G4 成立），或者外部工具同时读两份文件现算——都不需要这个系统存一个状态位。
+#
+# 于是 expect 只解决同一份文件上的并发覆盖（两个人同时翻同一步），
+# 翻译的 expect 对的是**翻译文件自己**的 digest，和 note.md 那条链各管各的。
+
+# 语言码同时是**文件名的一段**，所以它的校验既是格式问题也是路径安全问题。
+# 形状和 core 的 TR_RE 一致：字母开头，随后是字母/数字/连字符，总长 ≤ 35。
+# 收尾用 \Z 而不是 $：Python 的 `$` 会在**结尾的换行之前**也匹配，于是 "en\n"
+# 能通过一条看起来严丝合缝的正则，落到文件名里就是一个带换行的文件（Linux 上合法）。
+_LANG_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]{0,34}\Z")
+
+
+def norm_lang(lang: str) -> str:
+    """校验并归一化语言码。不合法一律 WriteError，绝不「尽量修好再用」。
+
+    这个字符串是调用方（人或 agent）给的，直接拼进 `note.<lang>.md`。
+    上面那条正则一次挡掉一整类东西：路径分隔符、`..`、`C:` 盘符、控制字符、
+    空串、超长、以及**尾随空格和点**（Windows 打开文件前会把它们剥掉，于是
+    `en.` 和 `en` 是同一个磁盘文件——safe_relpath 里已经为附件踩过这个坑）。
+
+    大小写**归一化而不是拒绝**，理由：NTFS / APFS 上 `note.EN.md` 和 `note.en.md`
+    是同一个文件，Linux 上却是两个。放任大小写自由，同一次调用在两个平台上的
+    结果不一样：Windows 上是一次静默的别名覆盖（返回的 lang 是 EN，被改写的
+    文件却叫 en），Linux 上是同一种语言分裂成 tr["EN"] 和 tr["en"] 两条记录。
+    归一化让「一种语言 ⇒ 恰好一个文件名」在所有平台上成立，而且比拒绝友好——
+    agent 顺手写个 `EN` 不该报错。归一化按 BCP-47 的惯例来（语言小写、四字母的
+    文字段首字母大写、两字母的地区段大写），所以 `zh-hant` 和 `ZH-HANT` 都落到
+    `note.zh-Hant.md` 这一个名字上。
+    """
+    # 只剥空格，不用 str.strip()：后者连 \n 和 \x1c-\x1f 都算空白，于是
+    # `"en\n"`、`"en\x1f"` 会被悄悄「修好」成 en。语言码要变成文件名，
+    # 收到控制字符只说明调用方那边有 bug，该当场说出来而不是替它擦干净。
+    raw = str(lang or "").strip(" ")
+    if not _LANG_RE.match(raw):
+        raise WriteError(
+            f"语言码不合法: {lang!r}。只允许字母开头、由字母/数字/连字符组成、"
+            "不超过 35 个字符（en / ja / zh-Hant 这样的短码）。"
+            "它会直接变成文件名的一段，所以路径分隔符、..、盘符、"
+            "结尾的空格和点都不接受——Windows 会把结尾的空格和点剥掉，"
+            "于是它会悄悄改写同目录下的另一个文件。")
+    if any(not part for part in raw.split("-")):
+        raise WriteError(f"语言码里有空的子段: {lang!r}（`en-` / `zh--Hant` 这种写法）。")
+
+    parts = raw.split("-")
+    out = [parts[0].lower()]
+    for p in parts[1:]:
+        out.append(p.title() if len(p) == 4 else p.upper() if len(p) == 2 else p.lower())
+    norm = "-".join(out)
+
+    if norm == "md":
+        # note.md.md：既像「note.md 的翻译」又像一个附件，而 TR_RE 会把它读成
+        # 一种叫 md 的语言。没有任何语言叫 md，出现它只可能是把扩展名当成了语言码。
+        raise WriteError(
+            "语言码不能是 md：那会造出 note.md.md，看起来像 note.md 的备份，"
+            "实际会被当成一种叫「md」的语言。要写英文版请传 lang=\"en\"。")
+    if norm in WIN_RESERVED:
+        # 按目前的命名（note.<lang>.md）设备名其实碰不着——Windows 只看第一个点
+        # 之前那一段，也就是 note/project。但语言码是调用方完全控制的字符串，
+        # 一旦哪天命名方案变了这就变成活的漏洞，而拒掉的代价是零：
+        # 只有 con/nul/aux 这类极冷门的 ISO 639-3 码会被误伤。
+        raise WriteError(
+            f"语言码 {norm!r} 撞上了 Windows 的设备名（CON/PRN/AUX/NUL/COM1-9/LPT1-9）。"
+            "这类名字在文件名里随时会打开设备而不是文件，请换一个。")
+    return norm
+
+
+def _render_translation(key: str, value: str, body: str) -> str:
+    """翻译文件的唯一渲染器。**只接受一个键**——这就是「结构键进不来」的实现方式。
+
+    key 取自 core 的 TR_ONLY_KEYS / PROJECT_TR_ONLY_KEYS，value 过 _clean_line
+    压掉换行（否则 `title: x\\nid: 999` 就能在 front-matter 里凭空多出一行 id）。
+    front-matter 的 `---` 围栏永远写，哪怕没有 title：省掉它会让 parse_note
+    报一条 no_front_matter 警告，于是每份只有正文的译文都在页面顶栏挂一条黄字。
+    """
+    value = _clean_line(value)
+    head = "---\n" + (f"{key}: {value}\n" if value else "") + "---\n\n"
+    body = str(body or "").replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    return head + (f"{body}\n" if body else "")
+
+
+def _translation_name(stem: str, lang: str) -> str:
+    return f"{stem}.{lang}.md"
+
+
+def _declared_lang(meta: dict[str, str]) -> str:
+    """原文自己声明的主语言，读不出合法语言码就当没声明。"""
+    try:
+        return norm_lang(meta.get("lang", ""))
+    except WriteError:
+        return ""
+
+
+def _guard_same_lang(declared: str, lang: str, what: str) -> None:
+    """不许给「原文已经是这个语言」的记录再写一份同语言译文。
+
+    那份文件会和 note.md 的正文各说各话，而且两边都会被读侧当成有效内容
+    （小节算不算「写了」是 note.md 或任一译文里有它）——同一个事实两处存储，
+    正是这套双语设计一开始就要绕开的那个坑。
+    """
+    if declared and declared == lang:
+        raise WriteError(
+            f"{what}自己声明的就是 {lang}（front-matter 的 lang:），"
+            f"再写一份 {lang} 译文会和正文各说各话。改正文请走正文那条路。")
+
+
+def write_translation(steps_dir: Path, sid: str, lang: str, *,
+                      title: str = "", body: str = "", expect: str = "") -> dict[str, Any]:
+    """写 note.<lang>.md。它**只碰翻译文件**，一个字节都到不了 note.md。
+
+    于是「建完步骤马上补翻译」和「过几天再补」是同一条代码路径，只是调用时机不同。
+
+    `expect` 对的是**翻译文件自己**的 digest（不是 note.md 的，理由见本节顶部
+    那段长注释）。文件还不存在时 digest 是空串，而空的 expect 一律当「不检查」
+    ——和 update_step 的约定一致，所以这个接口表达不了「只在还没有译文时创建」。
+    """
+    lang = norm_lang(lang)
+    expect = str(expect or "").strip()
+    if not _clean_line(title) and not str(body or "").strip():
+        raise WriteError(
+            f"翻译的标题和正文不能同时为空。写一份空的 note.{lang}.md 会让界面认为"
+            f"「这一步已经有 {lang} 版了」，于是不再回退到原文，读者看到的是一片空白。"
+            "要撤掉某个语言版本请用 drop_translation。")
+
+    with project_lock(steps_dir.parent):
+        d, _step = _translation_target(steps_dir, sid)
+        target = d / _translation_name("note", lang)
+        _guard_same_lang(_declared_lang(_note_meta(d / NOTE_NAME)), lang, f"步骤 {sid}")
+        _check_translation_expect(target, expect, "这一步的译文")
+        write_atomic(target, _utf8_bytes(
+            _render_translation(TR_ONLY_KEYS[0], title, body), f"{lang} 译文"))
+    return {"id": sid, "lang": lang, "path": target.name,
+            "digest": digest_of(target), "written": True}
+
+
+def drop_translation(steps_dir: Path, sid: str, lang: str) -> dict[str, Any]:
+    """删掉某一个语言版本。删的是译文，note.md 不受影响。
+
+    这不是 P2 的例外：只追加约束的是**记录本身**（id / parent / 结论），
+    译文是原文的衍生物，删掉它之后界面自动回退到原文，一个事实都没丢。
+    """
+    lang = norm_lang(lang)
+    with project_lock(steps_dir.parent):
+        d, _step = _translation_target(steps_dir, sid)
+        target = d / _translation_name("note", lang)
+        if not target.is_file():
+            raise NotFound(f"步骤 {sid} 没有 {lang} 译文")
+        target.unlink()
+    return {"id": sid, "lang": lang, "path": target.name, "removed": True}
+
+
+def write_project_translation(root: Path, slug: str, lang: str, *,
+                              name: str = "", body: str = "", expect: str = "") -> dict[str, Any]:
+    """写 project.<lang>.md。front-matter 里只有 name，其余结构一律不重复。
+
+    正文走和中文版同一道闸门：**提交的文本只能替换那四个洞察小节**，磁盘上
+    其它小节（尤其是手写的 `## Deleted`）逐字保留，提交里同名的那一节直接丢弃。
+    删除记录是目录没了之后仅存的证据，中文版护得住、英文版护不住是说不过去的。
+    """
+    lang = norm_lang(lang)
+    expect = str(expect or "").strip()
+    d = project_dir(root, slug)
+    if not d.is_dir():
+        raise NotFound(f"项目 {slug} 不存在")
+
+    with project_lock(d):
+        _guard_same_lang(_declared_lang(_note_meta(d / PROJECT_NOTE)), lang, f"项目 {slug}")
+        target = d / _translation_name("project", lang)
+        _check_translation_expect(target, expect, "这个项目的译文")
+
+        old_meta, old_body = ({}, "")
+        if target.is_file():
+            old_meta, old_body, _w = parse_note(read_text_strict(target, f"{lang} 项目译文"))
+        merged = _merge_insights(old_body, str(body or "").replace("\r\n", "\n").replace("\r", "\n"),
+                                 lang)
+        final_name = _clean_line(name) or _clean_line(old_meta.get(PROJECT_TR_ONLY_KEYS[0], ""))
+        if not final_name and not merged.strip():
+            raise WriteError(
+                f"项目名和正文不能同时为空。空的 project.{lang}.md 会让界面认为"
+                "已经有这个语言版本了，于是不再回退到原文。")
+        write_atomic(target, _utf8_bytes(
+            _render_translation(PROJECT_TR_ONLY_KEYS[0], final_name, merged), f"{lang} 项目译文"))
+    return {"slug": slug, "lang": lang, "path": target.name,
+            "digest": digest_of(target), "written": True}
+
+
+def drop_project_translation(root: Path, slug: str, lang: str) -> dict[str, Any]:
+    """删掉项目笔记的某个语言版本。project.md 不受影响。
+
+    和 drop_translation 同一个理由；单独存在只是因为项目笔记不在 steps_dir 下。
+    没有它的话，服务端要么让人手工去删文件（那就没有唯一写入路径了），
+    要么自己 unlink 一把——那正是这个仓库用结构杜绝的第二条写入路径。
+    """
+    lang = norm_lang(lang)
+    d = project_dir(root, slug)
+    if not d.is_dir():
+        raise NotFound(f"项目 {slug} 不存在")
+    with project_lock(d):
+        target = d / _translation_name("project", lang)
+        if not target.is_file():
+            raise NotFound(f"项目 {slug} 没有 {lang} 译文")
+        target.unlink()
+    return {"slug": slug, "lang": lang, "path": target.name, "removed": True}
+
+
+def _translation_target(steps_dir: Path, sid: str) -> tuple[Path, Step]:
+    """解析出「该往哪个步骤目录写译文」。调用方必须已经拿着项目锁。"""
+    by_id = load(steps_dir)
+    if sid not in by_id:
+        raise NotFound(f"步骤 {sid} 不存在")
+    step = by_id[sid]
+    if "~" in step.id:
+        # 和 update_step 同一条理由：`001~dup2` 是「两个目录用了同一个 id」时贴的
+        # 临时显示标签，纯派生。往它身上挂译文，等于把译文绑在一个下次扫描就可能
+        # 换目录的标签上——两个同号目录谁先被 iterdir 读到，谁就是 001。
+        raise Conflict(
+            f"{sid} 不是这一步真正的 id，只是「有两个目录用了同一个 id」时的临时标签。"
+            "请先在文件系统里把两个同号目录之一改成新号，再来写它的译文。")
+    return steps_dir / step.dirname, step
+
+
+def _note_meta(note_path: Path) -> dict[str, str]:
+    """只取原文的 front-matter（顺带确认它是 UTF-8）。文件不在就当空的。"""
+    if not note_path.is_file():
+        return {}
+    meta, _body, _w = parse_note(read_text_strict(note_path, note_path.name))
+    return meta
+
+
+def _check_translation_expect(target: Path, expect: str, what: str) -> None:
+    """译文文件的乐观并发控制 + 非 UTF-8 拒绝改写。两件事都只看这一个文件。"""
+    if target.is_file():
+        read_text_strict(target, what)      # 不是 UTF-8 就别动它，等人先转码
+    if not expect:
+        return
+    current = digest_of(target)
+    if current != expect:
+        raise Conflict(
+            f"{what}在你读到它之后被改过（你拿的是 {expect}，磁盘上现在是 {current!r}）。"
+            "别直接重试——先重新读一遍，把你的改动合到最新内容上再存，"
+            "否则会把这期间别人写进去的整段译文抹掉。")
 
 
 # ---------------------------------------------------------------- 附件
@@ -961,15 +1312,33 @@ def safe_relpath(relpath: str) -> str:
     if not parts:
         raise WriteError("文件名不能为空")
     out = "/".join(parts)
-    if len(parts) == 1 and fs_key(parts[0]) == fs_key(NOTE_NAME):
-        # 只挡步骤目录顶层的 note.md（子目录里的 note.md 是普通附件，
+    if len(parts) == 1 and is_record_filename(parts[0]):
+        # 只挡步骤目录顶层的记录文件（子目录里的 note.md 是普通附件，
         # list_files 也只在顶层排除它）。这里必须按规范化之后比较：
         # 逐字节比 "note.md" 的话，NOTE.MD 一路通过，写完整条记录就被上传的字节替换掉了。
         raise WriteError(
-            f"{parts[0]!r} 在大小写不敏感的文件系统上就是这一步的 note.md，"
-            "上传它会把整条记录替换成文件内容。改记录请用 PATCH /api/steps/{id}；"
-            "如果这真是一个附件，请换个名字。")
+            f"{parts[0]!r} 在大小写不敏感的文件系统上就是这一步的记录本身"
+            "（note.md 或它的某个语言版本 note.<lang>.md），"
+            "上传它会把整条记录替换成文件内容。改记录请用 PATCH /api/steps/{id}，"
+            "改译文请用补翻译那条路；如果这真是一个附件，请换个名字。")
     return out
+
+
+def is_record_filename(name: str) -> bool:
+    """这个名字是不是「记录本身」——note.md / note.<lang>.md / project(.<lang>).md。
+
+    附件上传必须挡住它们的**全部别名形式**。老守卫只认 note.md 的别名，于是传一个
+    叫 `note.en.md` 的附件照样能顶掉整份英文记录（`NOTE.EN.MD`、`note.en.md.`、
+    `note.en.md:x` 同理）。走 fs_key 之后大小写、尾随空格与点、NTFS 备用数据流
+    这三种别名一次性收口，再拿 core 的 TR_RE / PROJECT_TR_RE 判形状——
+    判定规则和读侧认译文用的是同一张表，不会一边认一边不认。
+
+    project.md 及其译文在步骤目录里其实碰不到（附件只落在步骤目录下），
+    一起挡是因为这个函数迟早会被别处复用，而漏一种形状的代价是整份记录。
+    """
+    key = fs_key(name)
+    return (key in (fs_key(NOTE_NAME), fs_key(PROJECT_NOTE))
+            or bool(TR_RE.match(key)) or bool(PROJECT_TR_RE.match(key)))
 
 
 def resolve_attachment(steps_dir: Path, by_id: dict[str, Step], sid: str, relpath: str) -> Path:

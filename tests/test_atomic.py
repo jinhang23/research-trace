@@ -237,6 +237,88 @@ def test_expect_carried_inside_the_patch_is_honoured_not_rejected(proj):
     assert W.load(d)[s.id].status == "dead"
 
 
+# ------------------------------------------------------ 译文和原文一视同仁
+
+
+def tr_of(steps_dir: Path, step, lang: str) -> Path:
+    return steps_dir / step.dirname / f"note.{lang}.md"
+
+
+def test_a_translation_that_cannot_be_encoded_leaves_the_old_one_intact(proj):
+    """译文走的是同一个 write_atomic。少走一步就是「英文版被截成 0 字节」，
+    而那份文件同样承载正文——半年后 grep 英文关键词，什么都搜不到。"""
+    _root, d = proj
+    s, _ = W.create_step(d, title="x")
+    W.write_translation(d, s.id, "en", title="T", body="## Why\nbecause.")
+    before = tr_of(d, s, "en").read_bytes()
+
+    with pytest.raises(W.WriteError):
+        W.write_translation(d, s.id, "en", title="T", body=LONE_SURROGATE)
+
+    assert tr_of(d, s, "en").read_bytes() == before
+    assert sorted(p.name for p in (d / s.dirname).iterdir()) == ["note.en.md", core.NOTE_NAME], \
+        "临时文件不许残留"
+
+
+def test_a_non_utf8_translation_is_refused_instead_of_being_rewritten(proj):
+    """和 note.md 一视同仁：GBK 存的译文照写回去，原始字节就永久变成一串问号。"""
+    _root, d = proj
+    s, _ = W.create_step(d, title="x")
+    tr = tr_of(d, s, "zh-Hant")
+    tr.write_bytes("---\ntitle: 標題\n---\n\n## 為什麼\n中文\n".encode("big5"))
+    raw = tr.read_bytes()
+    with pytest.raises(W.WriteError, match="UTF-8"):
+        W.write_translation(d, s.id, "zh-Hant", title="新標題")
+    assert tr.read_bytes() == raw, "原始字节必须还在，等人手工转码"
+
+
+def test_the_translation_expect_is_about_the_translation_file_itself(proj):
+    """译文的 expect 对的是**这份译文自己**的 digest，不是 note.md 的。
+
+    「note.md 改了所以 note.en.md 过时了」刻意**不做**：要知道这件事就得把翻译
+    当时 note.md 的指纹存进译文，那是把派生关系变成存储字段（P1），而 FORMAT.md
+    鼓励人直接 vim note.md——手改一次那个指纹就变成一句谎话。
+    """
+    _root, d = proj
+    s, _ = W.create_step(d, title="x")
+    W.write_translation(d, s.id, "en", title="first", body="## Why\nv1")
+    stale = W.digest_of(tr_of(d, s, "en"))
+
+    W.write_translation(d, s.id, "en", title="second", body="## Why\nv2")   # 别人先落盘
+    after = tr_of(d, s, "en").read_bytes()
+    with pytest.raises(W.Conflict, match="重新读一遍"):
+        W.write_translation(d, s.id, "en", title="mine", body="## Why\nv3", expect=stale)
+    assert tr_of(d, s, "en").read_bytes() == after, "冲突时一个字节都不许写"
+
+    fresh = W.digest_of(tr_of(d, s, "en"))
+    W.write_translation(d, s.id, "en", title="third", body="## Why\nv4", expect=fresh)
+    assert "v4" in tr_of(d, s, "en").read_text(encoding="utf-8")
+
+
+def test_rewriting_the_note_does_not_invalidate_the_translations_expect(proj):
+    """两条链各管各的。原文一改就让译文的 expect 全部作废的话，凡是先改正文
+    再补翻译的正常节奏都会撞 409，而那次冲突里没有任何人的改动会被吃掉。"""
+    _root, d = proj
+    s, _ = W.create_step(d, title="x")
+    W.write_translation(d, s.id, "en", title="T", body="## Why\nv1")
+    cur = W.digest_of(tr_of(d, s, "en"))
+
+    W.update_step(d, s.id, {"body": "## 为什么\n改过的正文"})
+    W.write_translation(d, s.id, "en", title="T", body="## Why\nv2", expect=cur)
+    assert "v2" in tr_of(d, s, "en").read_text(encoding="utf-8")
+
+
+def test_a_project_translation_is_written_atomically_too(proj):
+    root, _d = proj
+    W.write_project_translation(root, "课题", "en", name="Topic", body="## Ideas\n- a")
+    note = core.project_dir(root, "课题") / "project.en.md"
+    before = note.read_bytes()
+    with pytest.raises(W.WriteError):
+        W.write_project_translation(root, "课题", "en", name="Topic",
+                                    body="## Ideas\n" + LONE_SURROGATE)
+    assert note.read_bytes() == before
+
+
 # ------------------------------------------------------ 跨进程互斥
 
 # 独立进程里建一步。用一个 go 文件当发令枪，保证它们真的在抢。

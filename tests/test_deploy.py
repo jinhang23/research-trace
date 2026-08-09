@@ -256,6 +256,113 @@ def test_check_warns_about_a_dead_step_without_a_conclusion(graded, capsys):
     assert "dead" in out and "结论" in out
 
 
+# ------------------------------------------------------------ 翻译（trace tr）
+# 「还没翻译」是文件不存在这个派生事实，没有任何地方存着待办表。所以必须有一条
+# 命令能现算出「还欠哪些」——否则「延迟翻译」这条路上，人隔几天回来就无从下手。
+
+
+def tr_args(**kw):
+    return type("A", (), {"project": None, "lang": "en", "step": None, "project_note": False,
+                          "file": None, "title": None, "drop": False, **kw})()
+
+
+def test_tr_lists_the_steps_that_still_have_no_translation(graded, capsys):
+    assert cli.cmd_tr(tr_args()) == 0
+    out = capsys.readouterr().out
+    assert "还缺 3 份" in out
+    assert "001" in out and "基线" in out, "光给 id 的话还得再查一遍才知道要翻什么"
+    assert "project.en.md" in out
+
+
+def test_tr_writes_a_whole_translated_file_including_its_title(graded, tmp_path: Path, capsys):
+    """人和 agent 手上真正存在的东西是一份写好的 note.en.md。逼他们先手工把
+    front-matter 剥掉只会剥错，所以这里整份收下，只采用 title。"""
+    src = tmp_path / "note.en.md"
+    src.write_text("---\ntitle: Baseline\n---\n\n## Why\nEstablish the baseline.\n", encoding="utf-8")
+    assert cli.cmd_tr(tr_args(step="001", file=str(src))) == 0
+    capsys.readouterr()
+
+    sd = core.steps_dir_of(graded, "第一个课题")
+    made = next(sd.glob("001_*")) / "note.en.md"
+    text = made.read_text(encoding="utf-8")
+    assert "title: Baseline" in text and "## Why" in text
+    assert "基线" in (next(sd.glob("001_*")) / "note.md").read_text(encoding="utf-8"), "原文没动"
+
+    assert cli.cmd_tr(tr_args()) == 0
+    assert "还缺 2 份" in capsys.readouterr().out
+
+
+def test_tr_says_out_loud_which_structural_keys_it_threw_away(graded, tmp_path: Path, capsys):
+    """静默丢弃等于让人以为 parent 写进去生效了。译文里的结构键读都不读，
+    但必须吵一声——这是「note.md 永远赢」唯一能被人看见的地方。"""
+    src = tmp_path / "note.en.md"
+    src.write_text("---\ntitle: Baseline\nparent: 007\nstatus: done\n---\n\n## Why\nx\n",
+                   encoding="utf-8")
+    cli.cmd_tr(tr_args(step="001", file=str(src)))
+    out = capsys.readouterr().out
+    assert "parent" in out and "双真相源" in out
+    made = next(core.steps_dir_of(graded, "第一个课题").glob("001_*")) / "note.en.md"
+    assert "parent" not in made.read_text(encoding="utf-8"), "被吵过的键更不许落盘"
+
+
+def test_tr_translates_the_project_note_too(graded, tmp_path: Path, capsys):
+    src = tmp_path / "project.en.md"
+    src.write_text("---\nname: My topic\n---\n\n## Works\n- dedup helps\n", encoding="utf-8")
+    assert cli.cmd_tr(tr_args(project_note=True, file=str(src))) == 0
+    capsys.readouterr()
+    text = (core.project_dir(graded, "第一个课题") / "project.en.md").read_text(encoding="utf-8")
+    assert "name: My topic" in text and "## Works" in text
+
+
+def test_tr_drops_a_language_without_touching_the_original(graded, tmp_path: Path, capsys):
+    src = tmp_path / "note.en.md"
+    src.write_text("---\ntitle: Baseline\n---\n\n## Why\nx\n", encoding="utf-8")
+    cli.cmd_tr(tr_args(step="001", file=str(src)))
+    assert cli.cmd_tr(tr_args(step="001", drop=True)) == 0
+    capsys.readouterr()
+    d = next(core.steps_dir_of(graded, "第一个课题").glob("001_*"))
+    assert not (d / "note.en.md").exists()
+    assert (d / "note.md").is_file()
+
+
+def test_tr_refuses_a_non_utf8_translation_instead_of_writing_mojibake(graded, tmp_path: Path):
+    """定死按 UTF-8 回写会把原文替换成一串 �，那是不可逆的损失。和 note.md 一个规矩。"""
+    import trace_write as W
+
+    src = tmp_path / "note.en.md"
+    src.write_bytes("---\ntitle: 标题\n---\n\n## Why\n正文\n".encode("utf-16"))
+    with pytest.raises(W.WriteError, match="UTF-8"):
+        cli.cmd_tr(tr_args(step="001", file=str(src)))
+
+
+def test_tr_needs_to_be_told_where_the_translation_goes(graded, tmp_path: Path):
+    """--file 而不说翻的是哪一步，最贴心的猜法（默认翻项目笔记）恰好是最坏的：
+    一份步骤译文会被静默写成项目笔记。"""
+    import trace_write as W
+
+    src = tmp_path / "x.md"
+    src.write_text("## Why\nx\n", encoding="utf-8")
+    with pytest.raises(W.WriteError, match="--step"):
+        cli.cmd_tr(tr_args(file=str(src)))
+
+
+def test_check_still_says_nothing_about_missing_translations(graded, capsys):
+    """用户明确没选「缺翻译报警告」这一项，这条钉的就是那个决定。
+    L0–L4 问的是「这个结果追不追得到」，不是「翻译全不全」——只写了中文的记录
+    一样是可溯源的，为它挂一条黄字只会让真警告一起被忽略。"""
+    assert cli.cmd_check(check_args()) == 0
+    assert cli.cmd_check(check_args(strict=True)) == 1      # 内容层缺陷仍然拦得住
+    out = capsys.readouterr().out
+    assert "翻译" not in out and "note.en.md" not in out
+
+
+def test_the_static_export_ships_the_i18n_table(sandbox, tmp_path: Path):
+    """漏了 i18n.js 就是白屏：index.html 里的 <script> 是写死的，
+    window.i18n 缺席时 app.js 第一次调 t() 就抛，而 file:// 下没有日志可看。"""
+    assert "i18n.js" in cli.STATIC_ASSETS
+    assert (cli.WEB / "i18n.js").is_file(), "STATIC_ASSETS 里写了一个不存在的文件"
+
+
 def test_check_stays_green_by_default_but_strict_fails(graded, capsys):
     """默认不因内容缺陷失败（wip 天天红一片只会训练大家忽略警告），--strict 才拦。"""
     assert cli.cmd_check(check_args()) == 0

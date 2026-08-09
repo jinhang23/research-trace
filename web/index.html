@@ -1,5 +1,7 @@
 <!doctype html>
-<html lang="zh">
+<!-- lang 的初值就是 i18n.DEFAULT（en）。app.js 启动时会按 localStorage 里存的偏好
+     覆盖它，切换语言时也跟着改——浏览器的断词、朗读、拼写检查都看这一个属性。 -->
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -8,28 +10,52 @@
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='3' r='2.2' fill='%23777'/><circle cx='4' cy='13' r='2.2' fill='%23999'/><circle cx='12' cy='13' r='2.2' fill='%23555'/><path d='M8 5v3M8 8h4v3M8 8H4v3' stroke='%23888' fill='none' stroke-width='1.4'/></svg>">
 <link rel="stylesheet" href="__ASSET__style.css">
 </head>
+
+<!-- 静态文案怎么进这一页：**结构留在 HTML 里，字全部由 data-i18n 在启动时刷进去**。
+     元素本身不带任何一种语言的文字（不是「先写英文再翻」）。
+     三条理由：
+       1) 一份文案只有一处真相。把英文写死在标签里、再让 JS 覆盖，等于同一句话
+          存了两份——改 i18n.js 而忘了改这里，页面上就永远是那句旧的。
+       2) 结构还看得见。全改成 JS 生成的话，「顶栏上到底有哪些控件」就得去读
+          一千行 app.js 才知道；对着这个文件能一眼看完。
+       3) 刷新只有一条路径。切语言时 paintChrome() 重跑一遍同样的属性扫描，
+          和首屏走的是同一段代码，不存在「首屏对了、切换后漏了一处」。
+     四种属性分别对应四个目的地：
+       data-i18n       → textContent（纯文本）
+       data-i18n-html  → innerHTML（走 tHtml，**粗体** / `代码` / 换行会展开）
+       data-i18n-title → title=
+       data-i18n-ph    → placeholder=
+     文案里出现 ** 或反引号或 \n 的一律用 -html，否则会把标记原样显示出来。 -->
 <body>
 
 <header id="top">
-  <select id="proj" title="切换项目"></select>
+  <select id="proj" data-i18n-title="app.proj.switch"></select>
   <div class="grow">
-    <input id="search" type="search" placeholder="搜索 id / 标题 / 正文 / 标签   （按 / 聚焦）" autocomplete="off" spellcheck="false">
-    <!-- 搜索范围。agent 的 trace_search 不给 project 就搜全部，人这边也得有同一个能力 -->
-    <button id="btn-scope" type="button">本项目</button>
+    <input id="search" type="search" data-i18n-ph="app.search.placeholder" autocomplete="off" spellcheck="false">
+    <!-- 搜索范围。agent 的 trace_search 不给 project 就搜全部，人这边也得有同一个能力。
+         文案由 paintScope() 按当前范围写，所以这里不挂 data-i18n -->
+    <button id="btn-scope" type="button"></button>
     <span id="hits" class="mono"></span>
   </div>
   <div class="seg" id="viewtoggle">
-    <button data-view="graph" title="图视图">图</button><button data-view="list" title="列表视图">列表</button>
+    <button data-view="graph" data-i18n="app.view.graph" data-i18n-title="app.view.graph.title"></button><button data-view="list" data-i18n="app.view.list" data-i18n-title="app.view.list.title"></button>
   </div>
-  <button id="btn-new" title="从选中节点派生新步骤（n）">＋ 新步骤</button>
+  <button id="btn-new" data-i18n="app.new" data-i18n-title="app.new.title"></button>
   <!-- 新建项目必须在顶栏：只剩一个项目时项目索引页会 302 弹回项目页，
        按钮长在那个页面上就等于永远点不到 -->
-  <button id="btn-newproj" data-newproj="1" title="新建一个项目">＋ 项目</button>
-  <button id="btn-token" title="设置写入令牌">🔒</button>
+  <button id="btn-newproj" data-newproj="1" data-i18n="app.newproj" data-i18n-title="app.newproj.title"></button>
+  <!-- 语言开关。顶栏已经有搜索、项目选择、令牌、同步状态了，所以它只有两个
+       两字宽的格子：按钮上写的是**语言自己的名字**（EN / 中），不翻译——
+       在一个自己看不懂的界面里找语言开关时，你要找的正是母语那两个字。
+       完整名字（English / 中文）在 title 里。 -->
+  <div class="seg lang" id="langtoggle" data-i18n-title="app.lang.title">
+    <button type="button" data-lang="en" data-i18n-title="lang.en">EN</button><button type="button" data-lang="zh" data-i18n-title="lang.zh">中</button>
+  </div>
+  <button id="btn-token" data-i18n-title="app.token.title">🔒</button>
   <!-- 数据仓同步：平时只是一个小箭头，失败时旁边那块红的会露出来 -->
   <span id="gitdot" class="gitdot" hidden></span>
-  <button id="gitwarn" data-gitretry="1" hidden>⇅ 同步失败</button>
-  <span id="live" class="dot" title="实时连接"></span>
+  <button id="gitwarn" data-gitretry="1" hidden></button>
+  <span id="live" class="dot"></span>
 </header>
 
 <!-- 跨项目搜索结果。挂在顶栏下面而不是抢走详情面板：搜索是「顺手查一下」，
@@ -42,7 +68,7 @@
 <section id="home" hidden>
   <div class="home-head">
     <h1>__TITLE__</h1>
-    <button data-newproj="1" class="primary">＋ 新建项目</button>
+    <button data-newproj="1" class="primary" data-i18n="home.new"></button>
   </div>
   <div id="cards"></div>
 </section>
@@ -62,21 +88,22 @@
         <svg id="rails" xmlns="http://www.w3.org/2000/svg" width="0" height="0" aria-hidden="true"></svg>
         <div id="rows"></div>
       </div>
-      <p id="empty" hidden>这个项目还没有步骤。点右上角 <b>＋ 新步骤</b> 开始。</p>
+      <p id="empty" hidden data-i18n-html="list.empty"></p>
     </div>
     <footer id="legend">
-      <span><i class="lg done"></i>done 实线</span>
-      <span><i class="lg wip"></i>wip 虚线</span>
-      <span><i class="lg dead"></i>dead 点线</span>
-      <!-- 字形标记是第四个通道：不抢线型（status）也不抢不透明度（祖先链/搜索） -->
-      <span class="lgm"><i class="cmk lv0">L0</i>链断了</span>
-      <span class="lgm"><i class="cmk rfail">↺✕</i>复现失败</span>
+      <span><i class="lg done"></i><span data-i18n="list.legend.done"></span></span>
+      <span><i class="lg wip"></i><span data-i18n="list.legend.wip"></span></span>
+      <span><i class="lg dead"></i><span data-i18n="list.legend.dead"></span></span>
+      <!-- 字形标记是第四个通道：不抢线型（status）也不抢不透明度（祖先链/搜索）。
+           ↺✕ 和 L0 两种字形在两种语言里都不翻——它们是记号，不是词 -->
+      <span class="lgm"><i class="cmk lv0">L0</i><span data-i18n="list.legend.l0"></span></span>
+      <span class="lgm"><i class="cmk rfail">↺✕</i><span data-i18n="list.legend.reprofail"></span></span>
       <span class="sp"></span>
       <span id="zoombar">
-        <button data-zoom="out" title="缩小">−</button>
-        <button data-zoom="reset" title="回到 100%"><span id="zoomval">100%</span></button>
-        <button data-zoom="in" title="放大">＋</button>
-        <button data-zoom="fit" title="适应宽度">适应</button>
+        <button data-zoom="out" data-i18n-title="list.zoom.out">−</button>
+        <button data-zoom="reset" data-i18n-title="list.zoom.reset"><span id="zoomval">100%</span></button>
+        <button data-zoom="in" data-i18n-title="list.zoom.in">＋</button>
+        <button data-zoom="fit" data-i18n-title="list.zoom.fit" data-i18n="list.zoom.fit.label"></button>
       </span>
     </footer>
   </section>
@@ -86,35 +113,49 @@
 
 <dialog id="dlg-new">
   <form method="dialog">
-    <h2>新建步骤</h2>
+    <h2 data-i18n="newstep.title"></h2>
     <div id="nf-draft" class="draftbar" hidden>
-      <b>上次没写完</b><span class="mono" id="nf-draft-when"></span>
+      <b data-i18n="newstep.draft.found"></b><span class="mono" id="nf-draft-when"></span>
       <span id="nf-draft-title"></span>
       <span class="sp"></span>
-      <button type="button" data-newdraft="restore">恢复</button>
-      <button type="button" data-newdraft="discard">丢弃</button>
+      <button type="button" data-newdraft="restore" data-i18n="newstep.draft.restore"></button>
+      <button type="button" data-newdraft="discard" data-i18n="newstep.draft.discard"></button>
     </div>
-    <label>派生自 <input id="nf-parent" class="mono" readonly></label>
-    <label>标题 <input id="nf-title" maxlength="200" required placeholder="一行说清这一步在干什么"></label>
+    <!-- 每个 label 里的字都包在自己的 <span> 里：data-i18n 写的是 textContent，
+         直接挂在 <label> 上会把里面的 <input> 一起冲掉 -->
+    <label><span data-i18n="newstep.parent"></span><input id="nf-parent" class="mono" readonly></label>
+    <label><span data-i18n="newstep.field.title"></span><input id="nf-title" maxlength="200" required data-i18n-ph="newstep.title.placeholder"></label>
     <div class="row2">
-      <label>状态
+      <label><span data-i18n="newstep.field.status"></span>
         <select id="nf-status">
-          <option value="wip">wip — 在做</option>
-          <option value="done">done — 有结论</option>
-          <option value="dead">dead — 此路不通</option>
+          <option value="wip" data-i18n="newstep.status.wip"></option>
+          <option value="done" data-i18n="newstep.status.done"></option>
+          <option value="dead" data-i18n="newstep.status.dead"></option>
         </select>
       </label>
-      <label>日期 <input id="nf-date" class="mono" type="date"></label>
+      <label><span data-i18n="newstep.field.date"></span><input id="nf-date" class="mono" type="date"></label>
     </div>
-    <label>commit <input id="nf-commit" class="mono" placeholder="可留空"></label>
-    <label>外部路径 · 每行一条，<code>位置 | 说明</code>
-      <textarea id="nf-paths" rows="2" spellcheck="false" placeholder="/blue/组名/用户名/exp/agnews | 训练数据，12 GB&#10;https://github.com/你/仓库/tree/9b7d112 | 跑这一步的代码"></textarea>
+    <label><span data-i18n="newstep.field.commit"></span><input id="nf-commit" class="mono" data-i18n-ph="newstep.commit.placeholder"></label>
+    <label><span data-i18n-html="editor.paths.label"></span>
+      <textarea id="nf-paths" rows="2" spellcheck="false" data-i18n-ph="newstep.paths.placeholder"></textarea>
     </label>
-    <label>正文 <textarea id="nf-body" rows="12" spellcheck="false"></textarea></label>
-    <p class="hint">「为什么」是整个系统里唯一无法自动生成的字段——日志能自动存，commit 能自动记，只有「我当时为什么决定试这个」必须你写。</p>
+    <!-- 正文语言 ≠ 界面语言。界面是英文的人完全可能用中文记笔记，而这几个小节
+         标题是要写进 note.md 的**内容**，写错了 trace_core 就找不到「为什么」，
+         评级和 check 一起失灵。所以这里给一个显式的选择，默认值由
+         guessContentLang() 从兄弟步骤已经在用的小节名推出来（见 app.js）。 -->
+    <div class="bodyhead">
+      <span data-i18n="newstep.field.body"></span>
+      <span class="sp"></span>
+      <select id="nf-lang" class="minisel" data-i18n-title="app.lang.title">
+        <option value="zh" data-i18n="lang.zh"></option>
+        <option value="en" data-i18n="lang.en"></option>
+      </select>
+    </div>
+    <textarea id="nf-body" rows="12" spellcheck="false"></textarea>
+    <p class="hint" data-i18n="newstep.hint"></p>
     <menu>
-      <button value="cancel">取消</button>
-      <button id="nf-ok" value="ok" class="primary">创建</button>
+      <button value="cancel" data-i18n="newstep.cancel"></button>
+      <button id="nf-ok" value="ok" class="primary" data-i18n="newstep.create"></button>
     </menu>
   </form>
 </dialog>
@@ -123,14 +164,12 @@
      「这段我不要了，别再拿草稿烦我」 -->
 <dialog id="dlg-leave">
   <div class="dlgbody">
-    <h2>还有没保存的改动</h2>
-    <p class="hint"><b id="leave-what" class="mono"></b><br>
-      内容已经自动存进这台机器的浏览器草稿里，离开不会丢。
-      下次打开这一步会问你要不要恢复。</p>
+    <h2 data-i18n="leave.title"></h2>
+    <p class="hint"><b id="leave-what" class="mono"></b><br><span data-i18n="leave.hint"></span></p>
     <menu>
-      <button type="button" data-leave="stay" class="primary">继续编辑</button>
-      <button type="button" data-leave="keep">离开（保留草稿）</button>
-      <button type="button" data-leave="discard" class="danger">丢弃草稿并离开</button>
+      <button type="button" data-leave="stay" class="primary" data-i18n="leave.stay"></button>
+      <button type="button" data-leave="keep" data-i18n="leave.keep"></button>
+      <button type="button" data-leave="discard" class="danger" data-i18n="leave.discard"></button>
     </menu>
   </div>
 </dialog>
@@ -138,7 +177,7 @@
 <!-- 保存冲突。不静默覆盖也不静默丢弃：两边都是人写的字，摆出来让人判 -->
 <dialog id="dlg-conflict">
   <div class="dlgbody">
-    <h2>这一步在你编辑期间被改过</h2>
+    <h2 data-i18n="conflict.title"></h2>
     <p class="hint" id="cf-why"></p>
     <div class="cfsplit">
       <div class="cfpane">
@@ -150,18 +189,17 @@
         <div class="cfbody mono" id="cf-mine"></div>
       </div>
     </div>
-    <p class="hint">高亮的是两边不一样的行。选哪个都不会丢东西：保留服务器版本时，
-      你的这份仍然留在浏览器草稿里。</p>
+    <p class="hint" data-i18n="conflict.hint"></p>
     <menu>
-      <button type="button" data-conflict="cancel" class="primary">回编辑器再看看</button>
-      <button type="button" data-conflict="theirs">保留服务器版本</button>
-      <button type="button" data-conflict="mine" class="danger">用我的覆盖</button>
+      <button type="button" data-conflict="cancel" class="primary" data-i18n="conflict.cancel"></button>
+      <button type="button" data-conflict="theirs" data-i18n="conflict.theirs"></button>
+      <button type="button" data-conflict="mine" class="danger" data-i18n="conflict.mine"></button>
     </menu>
   </div>
 </dialog>
 
 <div id="lightbox" hidden>
-  <button id="lb-close" title="关闭（Esc）">×</button>
+  <button id="lb-close" data-i18n-title="common.close">×</button>
   <img id="lb-img" alt="">
   <div id="lb-cap"></div>
 </div>
@@ -169,6 +207,9 @@
 <script id="forest-data" type="application/json">__DATA__</script>
 <script id="projects-data" type="application/json">__PROJECTS__</script>
 <script>window.TRACE_BASE = "__BASE__"; window.TRACE_MODE = "__MODE__"; window.TRACE_PROJECT = "__PROJECT__";</script>
+<!-- i18n.js 必须排在 app.js 之前：app.js 第一次 paintChrome() 就要 window.i18n。
+     它和 md.js 互不依赖，谁前谁后都行。 -->
+<script src="__ASSET__i18n.js"></script>
 <script src="__ASSET__md.js"></script>
 <script src="__ASSET__app.js"></script>
 </body>

@@ -74,6 +74,13 @@ WRITES = [
     ("POST", "/api/p/课题/steps/001/files", {}),
     ("DELETE", "/api/p/课题/steps/001/files/a.txt", {}),
     ("POST", "/api/sync", {}),
+    # 译文也是磁盘上的文件。「它碰不到原文」不等于「谁都能写」——
+    # 一个不设防的 PUT .../tr/en 足够让任何人往每一步挂一份自己写的英文版，
+    # 而界面默认就是英文，读者第一眼看到的就是它。
+    ("PUT", "/api/p/课题/steps/001/tr/en", {"title": "Anyone can write this"}),
+    ("DELETE", "/api/p/课题/steps/001/tr/en", {}),
+    ("PUT", "/api/p/课题/tr/en", {"name": "Anyone can rename this"}),
+    ("DELETE", "/api/p/课题/tr/en", {}),
 ]
 
 
@@ -587,3 +594,181 @@ def test_search_also_answers_to_the_mcp_parameter_name(client):
     """MCP 那边的参数叫 query。照着 trace_search 抄的人不该拿到空结果还以为真没记过。"""
     mkstep(client, title="MMseqs2 聚类")
     assert client.get("/api/search", params={"query": "MMseqs2"}).json()["total"] == 1
+
+
+# ------------------------------------------------------- 搜索要搜到译文
+
+
+def test_search_finds_a_word_that_only_exists_in_the_translation(client):
+    """底线是「删掉全部程序，grep -r 还能回答为什么放弃了 X」。双语之后英文的
+    grep 也要能回答同一个问题——`grep -r abandoned` 命中 note.en.md 而站内搜索
+    命中不了的话，自带的搜索就比 grep 弱，而「没搜到」会被读成「没试过」。"""
+    mkstep(client, title="对比学习", body="## 结论\n没有提升，放弃这条路。")
+    W.write_translation(client.sd, "001", "en",
+                        title="Contrastive pretraining",
+                        body="## Conclusion\nNo gain. This line is abandoned.")
+    d = client.get("/api/search", params={"q": "abandoned"}).json()
+    assert d["total"] == 1, "只有英文版里有的词也必须搜得到"
+    hit = d["hits"][0]
+    assert hit["langs"] == ["en"], "要说清命中落在哪个语言，不能是一条来路不明的命中"
+    assert hit["snippet_lang"] == "en" and "abandoned" in hit["snippet"]
+    assert "tr.body" in hit["where"]
+
+
+def test_search_still_prefers_the_original_for_the_snippet(client):
+    """原文是权威。两边都命中时给译文的摘要，会让同一条命中在不同语言下长得不一样。"""
+    mkstep(client, title="x", body="## 结论\nMMseqs2 聚类之后再说")
+    W.write_translation(client.sd, "001", "en", title="x", body="## Conclusion\nMMseqs2 later")
+    hit = client.get("/api/search", params={"q": "MMseqs2"}).json()["hits"][0]
+    assert "聚类" in hit["snippet"], "摘要该取自原文"
+    assert hit["langs"] == ["en"], "但命中也落在英文版里这件事仍然要说出来"
+
+
+def test_the_hit_shape_is_the_same_for_a_step_without_translations(client):
+    """新加的两个字段对单语记录必须是空的，不是 None——前端只需要认一种形状。"""
+    mkstep(client, title="只有中文", body="正文")
+    hit = client.get("/api/search", params={"q": "只有中文"}).json()["hits"][0]
+    assert hit["langs"] == [] and hit["snippet_lang"] == ""
+
+
+# ------------------------------------------------------- 译文的读写端点
+
+
+def tr_path(client, sid: str, lang: str) -> Path:
+    return client.sd / W.load(client.sd)[sid].dirname / f"note.{lang}.md"
+
+
+def test_writing_a_translation_does_not_touch_the_original(client):
+    """整套双语设计的地基：译文和原文各写各的文件。这一条塌了，
+    「立刻翻译」和「延迟翻译」就不再是同一条路径，原文也不再是唯一权威。"""
+    mkstep(client, title="加入标题字段", body="## 为什么\n基线丢掉了词序")
+    before = note_of(client, "001").read_bytes()
+    r = client.put("/api/p/课题/steps/001/tr/en",
+                   json={"title": "Add title field", "body": "## Why\nTF-IDF drops word order."},
+                   headers=AUTH)
+    assert r.status_code == 200 and r.json()["path"] == "note.en.md"
+    assert note_of(client, "001").read_bytes() == before, "原文一个字节都不许动"
+    assert "## Why" in tr_path(client, "001", "en").read_text(encoding="utf-8")
+
+
+def test_the_forest_carries_the_translation_and_the_declared_language(client):
+    """网页要能切语言，前提是首屏那份 forest 里就带着译文——否则每切一次语言
+    都要按步骤各拉一次。core 已经算好了，这条钉的是「服务端确实透传了」。"""
+    mkstep(client, title="中文标题", body="## 为什么\n因为")
+    client.put("/api/p/课题/steps/001/tr/en", json={"title": "English title", "body": "## Why\nBecause"},
+               headers=AUTH)
+    s = client.get("/api/p/课题/forest").json()["steps"][0]
+    assert s["tr"]["en"]["title"] == "English title"
+    assert "Because" in s["tr"]["en"]["body"]
+    assert s["lang"] == "", "note.md 没声明 lang 就是空串，绝不去猜"
+    assert client.get("/api/p/课题/steps/001").json()["tr"]["en"]["title"] == "English title"
+
+
+def test_dropping_a_translation_leaves_the_original_alone(client):
+    """撤掉一个语言版本不是 P2 的例外：译文是原文的衍生物，删掉之后界面回退到
+    原文，一个事实都没丢——所以它也不该要求写原因。"""
+    mkstep(client, title="x", body="## 为什么\n原文还在")
+    client.put("/api/p/课题/steps/001/tr/en", json={"title": "x", "body": "## Why\nhere"}, headers=AUTH)
+    r = client.request("DELETE", "/api/p/课题/steps/001/tr/en", headers=AUTH)
+    assert r.status_code == 200 and r.json()["removed"] is True
+    assert not tr_path(client, "001", "en").exists()
+    assert "原文还在" in note_of(client, "001").read_text(encoding="utf-8")
+    assert client.request("DELETE", "/api/p/课题/steps/001/tr/en",
+                          headers=AUTH).status_code == 404, "已经没有的语言版本要 404"
+
+
+def test_a_stale_translation_save_is_rejected(client):
+    """译文自己也会被两个人同时改（网页一边、agent 一边），一样要挡。"""
+    mkstep(client, title="x")
+    first = client.put("/api/p/课题/steps/001/tr/en", json={"body": "## Why\nv1"},
+                       headers=AUTH).json()["digest"]
+    client.put("/api/p/课题/steps/001/tr/en", json={"body": "## Why\nv2"}, headers=AUTH)
+    r = client.put("/api/p/课题/steps/001/tr/en",
+                   json={"body": "## Why\nv3", "expect": first}, headers=AUTH)
+    assert r.status_code == 409
+    assert "v2" in tr_path(client, "001", "en").read_text(encoding="utf-8"), "被拒的写入不许改磁盘"
+
+
+def test_editing_the_original_does_not_invalidate_the_translations_expect(client):
+    """两条链各管各的。译文的 expect 要是对着 note.md 的 digest，那么每改一次正文，
+    所有语言的译文都得先重读一遍才写得进去——而正文和译文常常是两个人在改。"""
+    mkstep(client, title="x", body="v1")
+    d = client.put("/api/p/课题/steps/001/tr/en", json={"body": "## Why\nen"},
+                   headers=AUTH).json()["digest"]
+    client.patch("/api/p/课题/steps/001", json={"body": "v2 正文改过了"}, headers=AUTH)
+    assert client.put("/api/p/课题/steps/001/tr/en",
+                      json={"body": "## Why\nen2", "expect": d}, headers=AUTH).status_code == 200
+
+
+def test_a_bad_language_code_is_refused_instead_of_becoming_a_filename(client):
+    """lang 直接变成文件名的一段。放过 ../ 就是任意写；放过结尾的点，Windows 会把它
+    剥掉，于是 `en.` 悄悄改写的是 note.en.md。"""
+    mkstep(client, title="x")
+    # 路由层就接不住带斜杠的（%2F 解不出一段合法路径），剩下的由 norm_lang 拦成 400
+    assert client.put("/api/p/课题/steps/001/tr/..%2F..%2Fevil",
+                      json={"title": "x"}, headers=AUTH).status_code == 404
+    for junk in ("en.", "md", "CON"):
+        r = client.put(f"/api/p/课题/steps/001/tr/{junk}", json={"title": "x"}, headers=AUTH)
+        assert r.status_code == 400, f"{junk} 不该被当成语言码收下"
+    assert not (client.root / "evil.md").exists()
+    assert not list((client.sd / W.load(client.sd)["001"].dirname).glob("note.*.md"))
+
+
+def test_the_project_note_translation_lands_next_to_project_md(client):
+    r = client.put("/api/p/课题/tr/en",
+                   json={"name": "My topic", "body": "## Works\n- dedup helps"}, headers=AUTH)
+    assert r.status_code == 200 and r.json()["path"] == "project.en.md"
+    text = (core.project_dir(client.root, "课题") / "project.en.md").read_text(encoding="utf-8")
+    assert "name: My topic" in text and "## Works" in text
+    assert "id:" not in text, "译文里只准有 name，结构键连写都不写"
+
+
+def test_a_translation_bumps_the_version_so_open_pages_refresh(client):
+    mkstep(client, title="x")
+    before = client.get("/api/p/课题/forest").json()["version"]
+    client.put("/api/p/课题/steps/001/tr/en", json={"title": "x"}, headers=AUTH)
+    assert client.get("/api/p/课题/forest").json()["version"] != before
+
+
+# ------------------------------------------------------- 还欠哪些翻译
+
+
+def test_untranslated_is_public_and_lists_what_is_missing(client):
+    """读一律公开，和 forest / search 一致。"""
+    mkstep(client, title="第一步")
+    mkstep(client, title="第二步")
+    client.put("/api/p/课题/steps/001/tr/en", json={"title": "First"}, headers=AUTH)
+
+    d = client.get("/api/p/课题/untranslated").json()          # 不带令牌
+    assert d["lang"] == "en" and d["total"] == 2 and d["translated"] == 1
+    assert [m["id"] for m in d["missing"]] == ["002"]
+    assert d["missing"][0]["title"] == "第二步", "光给 id 的话还得再查一遍才知道要翻什么"
+    assert d["project_note"]["missing"] is True
+
+
+def test_untranslated_does_not_ask_you_to_translate_a_step_that_is_already_english(client):
+    """原文自己声明了 lang: en 时，写同语言译文会被 trace_write 拒绝。
+    把它列进「还缺」等于派 agent 去做一件必然失败的事。"""
+    mkstep(client, title="English step")
+    note = note_of(client, "001")
+    note.write_text(note.read_text(encoding="utf-8").replace("status:", "lang: en\nstatus:", 1),
+                    encoding="utf-8")
+    d = client.get("/api/p/课题/untranslated", params={"lang": "en"}).json()
+    assert d["missing"] == [] and d["native"] == 1
+
+
+def test_untranslated_normalizes_the_language_code(client):
+    """EN 和 en 是同一个文件（NTFS 上真的是同一个）。不归一化的话，传 EN 会得到
+    「一份译文都没有」——一个必然让人把所有东西重翻一遍的假答案。"""
+    mkstep(client, title="x")
+    client.put("/api/p/课题/steps/001/tr/en", json={"title": "x"}, headers=AUTH)
+    d = client.get("/api/p/课题/untranslated", params={"lang": "EN"}).json()
+    assert d["lang"] == "en" and d["translated"] == 1 and d["missing"] == []
+
+
+def test_untranslated_rejects_a_junk_language_code(client):
+    assert client.get("/api/p/课题/untranslated", params={"lang": "../x"}).status_code == 400
+
+
+def test_untranslated_on_a_missing_project_is_a_404(client):
+    assert client.get("/api/p/没有这个/untranslated").status_code == 404

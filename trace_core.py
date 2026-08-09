@@ -57,7 +57,46 @@ LEVELS = ("L0", "L1", "L2", "L3", "L4")
 LEVEL_LABEL = {
     "L0": "不可溯源", "L1": "可读", "L2": "可定位", "L3": "可重跑", "L4": "已复现",
 }
-SECTIONS = ("为什么", "做了什么", "结果", "结论", "下一步")
+# 小节名的中英对照，是全流程**唯一**的一份词表：评级、lint、网页取名字都从这里取。
+#
+# 为什么必须是一张**封闭**词表，而不是让翻译文件自由起标题：翻译文件也要被解析、
+# 被评级，「这一段到底是不是『为什么』」必须机械可判。靠猜（关键词、语义相似度、
+# 字符集探测）只要判错一次，一条写全了的记录就会被报成 L0——评级一旦会撒谎，
+# 人就不再看它，这比没有评级更糟。
+SECTION_NAMES = {
+    "why":        {"zh": "为什么",   "en": "Why"},
+    "what":       {"zh": "做了什么", "en": "What"},
+    "result":     {"zh": "结果",     "en": "Result"},
+    "conclusion": {"zh": "结论",     "en": "Conclusion"},
+    "next":       {"zh": "下一步",   "en": "Next"},
+}
+# 中文骨架（FORMAT.md 第 2 节那份示例逐字对着它，test_docs 会核）。
+SECTIONS = tuple(v["zh"] for v in SECTION_NAMES.values())
+# 标题 → 语义键的反查。给要「认出一个标题是哪一节」的调用方用（网页、写入侧）。
+SECTION_KEY_BY_NAME = {n: k for k, names in SECTION_NAMES.items() for n in names.values()}
+
+# 项目洞察的四个小节，以及由系统自己写的「已删除」。同样是封闭词表，理由同上。
+INSIGHT_NAMES = {
+    "idea":    {"zh": "核心想法", "en": "Ideas"},
+    "works":   {"zh": "有效",     "en": "Works"},
+    "fails":   {"zh": "无效",     "en": "Doesn't work"},
+    "pitfall": {"zh": "坑",       "en": "Pitfalls"},
+}
+INSIGHT_KEY_BY_NAME = {n: k for k, names in INSIGHT_NAMES.items() for n in names.values()}
+DELETED_NAME = {"zh": "已删除", "en": "Deleted"}
+
+# ---------------------------------------------------------------- 翻译文件
+#
+# 存储是**双文件**：note.md 带结构 + 主语言正文，note.<lang>.md 只带 title 和译文。
+# 「还没翻译」是派生状态（文件不存在），和 children / files 一样绝不存储。
+TR_RE = re.compile(r"^note\.([A-Za-z][A-Za-z0-9-]{0,34})\.md\Z")
+PROJECT_TR_RE = re.compile(r"^project\.([A-Za-z][A-Za-z0-9-]{0,34})\.md\Z")
+TR_ONLY_KEYS = ("title",)            # 步骤的翻译文件里唯一允许的键
+PROJECT_TR_ONLY_KEYS = ("name",)     # 项目的翻译文件里唯一允许的键
+
+# 结构键：只有 note.md / project.md 说了算。翻译文件里写了也一律忽略（见 parse_translation）。
+TR_STRUCT_KEYS = ("id", "parent", "status", "date", "commit", "author",
+                  "tags", "path", "repro", "key")
 
 _HPC_RE = re.compile(r"^(/blue/|/orange/|/red/|/scratch/|/gpfs/|/lustre/|/work/)", re.I)
 _WIN_RE = re.compile(r"^[a-z]:[\\/]", re.I)
@@ -145,6 +184,24 @@ def _filled(text: str) -> bool:
     return bool(t)
 
 
+def _pick(sec: dict[str, str], key: str) -> str:
+    """在一份切好的小节表里按语义键取内容。**全流程只有这一处做标题 → 语义的映射。**"""
+    for name in SECTION_NAMES[key].values():
+        t = sec.get(name, "")
+        if _filled(t):
+            return t
+    return ""
+
+
+def section_text(body: str, key: str) -> str:
+    """按**语义键**（why / what / conclusion …）取小节内容，中英标题都认。
+
+    调用方一律走这里而不是 `sections(body)["为什么"]`：note.md 本身也可能是英文写的
+    （`lang: en`），硬编码中文标题会把它整篇判成「什么都没写」。
+    """
+    return _pick(sections(body), key)
+
+
 def parse_paths(raw: str) -> list[dict[str, str]]:
     """每行一条 `<位置> | <说明>`。说明是自由文本，校验和、大小、"哪台机器"都往里写。"""
     out: list[dict[str, str]] = []
@@ -205,6 +262,13 @@ class Step:
     repro: list[dict[str, str]] = field(default_factory=list)
     body: str = ""
     dirname: str = ""
+    # note.md 自己声明的语言（front-matter 的 `lang:`）。**没声明就是空串**，
+    # 界面照实说「原文」——绝不去猜（字符集探测、语种识别）：猜错时界面会对读者
+    # 撒谎（说「这是中文原文」而它其实是英文），而读者没有任何办法发现。
+    lang: str = ""
+    # 所有翻译，按语言码：{"en": {"title": ..., "body": ...}}。
+    # 派生自 note.<lang>.md 是否存在，绝不写进 note.md（P1：文件即数据库）。
+    tr: dict[str, dict[str, str]] = field(default_factory=dict)
     # note.md 原始字节的 sha256 前 12 位。乐观并发控制用：客户端把读到的这个值
     # 当 expect 传回来，写侧（trace_write.digest_of）用同一个公式重算，对不上就 409。
     # 公式必须和 trace_write.digest_of 逐字一致，否则冲突检测会变成永久误报。
@@ -227,6 +291,9 @@ class Step:
             "body": self.body,
             "dirname": self.dirname,
             "digest": self.digest,
+            "lang": self.lang,
+            # 按语言码排序输出：静态导出要求逐字节确定，扫描顺序不能漏进产物。
+            "tr": {k: dict(self.tr[k]) for k in sorted(self.tr)},
         }
 
 
@@ -240,9 +307,13 @@ class Project:
     name: str = ""
     body: str = ""
     created: str = ""
+    lang: str = ""                                              # project.md 声明的语言，同样不猜
+    tr: dict[str, dict[str, str]] = field(default_factory=dict)  # {"en": {"name":…, "body":…}}
 
     def to_dict(self) -> dict[str, Any]:
-        return {"slug": self.slug, "name": self.name or self.slug, "body": self.body, "created": self.created}
+        return {"slug": self.slug, "name": self.name or self.slug, "body": self.body,
+                "created": self.created, "lang": self.lang,
+                "tr": {k: dict(self.tr[k]) for k in sorted(self.tr)}}
 
 
 # ---------------------------------------------------------------- 项目
@@ -302,12 +373,20 @@ def scan_projects(root: Path) -> list[Project]:
                     meta["name"] = (meta.get("name") or d.name).strip() + "  ⚠ 编码有问题"
             except OSError:
                 pass
+        # 项目的译文（project.<lang>.md，只准带 name）。
+        # 这里丢掉 scan_translations 的警告，是因为 scan_projects 的签名
+        # （-> list[Project]）被 CLI / server / MCP / write 四处依赖，加不了警告通道；
+        # 而**忽略结构键**这条硬规矩由 parse_translation 保证，和能不能报警无关。
+        # 需要在写入时告诉用户「这个键会被丢掉」的话，直接调 parse_translation。
+        tr, _w = scan_translations(d, PROJECT_TR_RE, PROJECT_TR_ONLY_KEYS, d.name, PROJECT_NOTE)
         out.append(
             Project(
                 slug=d.name,
                 name=(meta.get("name") or d.name).strip(),
                 body=body,
                 created=(meta.get("created") or "").strip(),
+                lang=(meta.get("lang") or "").strip(),
+                tr=tr,
             )
         )
     return out
@@ -365,6 +444,37 @@ def parse_note(text: str) -> tuple[dict[str, str], str, list[dict[str, str]]]:
     return meta, body, warnings
 
 
+def parse_translation(
+    text: str, only_keys: tuple[str, ...] = TR_ONLY_KEYS, where: str = "",
+    source: str = NOTE_NAME,
+) -> tuple[dict[str, str], list[dict[str, str]]]:
+    """解析一份翻译文件（note.<lang>.md / project.<lang>.md）。
+
+    只取 `only_keys`（步骤是 `title`，项目是 `name`）加正文，**结构键一律丢掉**。
+
+    这是整个双语功能最要紧的一道防线。上一代系统（ai-training-logbook）的死因是
+    双真相源：父子关系同时存在于两个地方，写了一处漏另一处，页面上永远有一半是错的。
+    翻译文件里的 `parent: 006` 若能生效，同一个错误原样回来——而且更隐蔽，因为
+    两份值平时看着都对，只有改了其中一份才炸。所以这里不是「note.md 优先」这种
+    合并策略（合并策略意味着两边都是来源），而是**读都不读**，并且吵一声让人删掉它。
+    """
+    meta, body, warns = parse_note(text)
+    data: dict[str, str] = {k: (meta.get(k) or "").strip() for k in only_keys}
+    for k in TR_STRUCT_KEYS:
+        if k in meta:
+            warns.append(warn(
+                "warn", "translation_structural_key",
+                f"翻译文件里的 `{k}:` 已被忽略——这个键在 {source} 里已经有了，"
+                f"写两份就是双真相源（改一处漏一处，两边永远不知道谁对）。"
+                f"结构只认 {source}，翻译文件里请只留 "
+                f"{'/'.join(only_keys)} 和正文",
+                where))
+    data["body"] = body
+    for w in warns:
+        w["where"] = w["where"] or where
+    return data, warns
+
+
 def _parse_tags(raw: str) -> list[str]:
     raw = raw.strip().strip("[]")
     return [t.strip() for t in raw.replace("，", ",").split(",") if t.strip()]
@@ -412,6 +522,9 @@ def build_step(dirname: str, meta: dict[str, str], body: str) -> tuple[Step, lis
         repro=parse_repro(meta.get("repro", "")),
         body=body,
         dirname=dirname,
+        # 没写就是空串。**不做任何猜测**：字符集探测能把一段引用了中文论文标题的
+        # 英文笔记判成中文，界面于是对读者说「这是原文」——错的元信息比没有元信息坏。
+        lang=(meta.get("lang") or "").strip(),
     )
     return step, warnings
 
@@ -420,9 +533,13 @@ def build_step(dirname: str, meta: dict[str, str], body: str) -> tuple[Step, lis
 
 
 def list_files(step_dir: Path) -> list[dict[str, Any]]:
-    """该目录下的附件清单（递归，排除 note.md 与点开头的文件）。
+    """该目录下的附件清单（递归，排除本层的 note.md / note.<lang>.md 与点开头的文件）。
 
     必须是派生字段——一旦写进 note 就会和实际目录漂移。
+
+    翻译文件和 note.md 一样是**记录本身**，不是附件：漏排除的话 note.en.md 会出现在
+    附件区，被当成可以下载、可以删的文件，删掉就等于悄悄删了英文版正文。
+    只排本层——嵌套目录里的 note.en.md 是别人的文件（既有断言钉着 sub/note.md 要在清单里）。
     """
     out: list[dict[str, Any]] = []
     root_str = str(step_dir)
@@ -431,7 +548,7 @@ def list_files(step_dir: Path) -> list[dict[str, Any]]:
         for n in sorted(names):
             if n.startswith("."):
                 continue
-            if root == root_str and n == NOTE_NAME:
+            if root == root_str and (n == NOTE_NAME or TR_RE.match(n)):
                 continue
             p = Path(root) / n
             try:
@@ -466,6 +583,47 @@ def decode_note(raw: bytes, where: str = "") -> tuple[str, list[dict[str, str]]]
             where)]
 
 
+def scan_translations(
+    d: Path, pattern: re.Pattern[str], only_keys: tuple[str, ...],
+    where_prefix: str = "", source: str = NOTE_NAME,
+) -> tuple[dict[str, dict[str, str]], list[dict[str, str]]]:
+    """收一个目录下的翻译文件，返回 {语言码: {title/name, body}} + 警告。
+
+    只看**本层**，和 note.md 一样：嵌套目录里的 note.en.md 是附件，不是这一步的译文。
+    语言码原样取自文件名（`zh-Hant` 的大小写有意义，不做归一化）。
+    """
+    out: dict[str, dict[str, str]] = {}
+    warnings: list[dict[str, str]] = []
+    try:
+        with os.scandir(d) as it:
+            # 排序是为了产物确定：目录项的原始顺序由文件系统决定，同一份数据在两台
+            # 机器上可以不一样，而 P3 要求两次编译逐字节一致。
+            entries = sorted((e.name for e in it if e.is_file()))
+    except OSError:
+        return out, warnings
+    for name in entries:
+        m = pattern.match(name)
+        if not m:
+            continue
+        where = f"{where_prefix}/{name}" if where_prefix else name
+        try:
+            raw = (d / name).read_bytes()
+        except OSError as exc:
+            warnings.append(warn("error", "unreadable", f"无法读取: {exc}", where))
+            continue
+        text, w0 = decode_note(raw, where)
+        data, w1 = parse_translation(text, only_keys, where, source)
+        # 每份译文自己的摘要。**不是**为了记「译文是不是过时了」——那要存
+        # note.md 当时的指纹，是把派生关系变成存储字段（P1 禁止），而且人手工
+        # vim 一次 note.md 那个数就变成谎话。这里的 digest 只回答一个问题：
+        # 「我读到的这一份，和我要覆盖的那一份，是同一份吗」——也就是 expect。
+        # 没有它，网页首屏拿不到译文的 expect，译文的保存就退化成「谁最后按谁赢」。
+        data["digest"] = hashlib.sha256(raw).hexdigest()[:12]
+        out[m.group(1)] = data
+        warnings.extend(w0 + w1)
+    return out, warnings
+
+
 def scan(steps_dir: Path, with_files: bool = True) -> tuple[list[Step], dict[str, list[dict]], list[dict[str, str]]]:
     """读目录，找 note.md。没有 note.md 的目录静默跳过（允许临时目录共存）。
 
@@ -494,9 +652,11 @@ def scan(steps_dir: Path, with_files: bool = True) -> tuple[list[Step], dict[str
         meta, body, w1 = parse_note(text)
         step, w2 = build_step(entry.name, meta, body)
         step.digest = hashlib.sha256(raw).hexdigest()[:12]
+        # 翻译和 note.md 一起扫出来，不管 with_files——译文是内容，不是附件。
+        step.tr, w3 = scan_translations(entry, TR_RE, TR_ONLY_KEYS, entry.name)
         for w in w0 + w1 + w2:
             w["where"] = w["where"] or entry.name
-        warnings.extend(w0 + w1 + w2)
+        warnings.extend(w0 + w1 + w2 + w3)
         steps.append(step)
         files[entry.name] = list_files(entry) if with_files else []
     return steps, files, warnings
@@ -511,14 +671,23 @@ def signature(steps_dir: Path) -> str:
     改一条洞察不涨 version、SSE 不推送，另一台机器上的洞察面板一直是旧的。
     """
     h = hashlib.sha1()
-    note = steps_dir.parent / PROJECT_NOTE
+    # project.md 和它的译文 project.<lang>.md 都在 steps/ 的上一级。步骤那边的
+    # note.<lang>.md 不用单列——os.walk 本来就把步骤目录里的每个文件都算进去了。
+    has_project_note = False
+    tr_names: list[str] = []
     try:
-        st = note.stat()
-        h.update(PROJECT_NOTE.encode("utf-8"))
+        with os.scandir(steps_dir.parent) as it:
+            tr_names = sorted(e.name for e in it if e.is_file() and PROJECT_TR_RE.match(e.name))
+    except OSError:
+        pass
+    for name in [PROJECT_NOTE] + tr_names:
+        try:
+            st = (steps_dir.parent / name).stat()
+        except OSError:
+            continue
+        h.update(name.encode("utf-8"))
         h.update(f"{st.st_mtime_ns}:{st.st_size}".encode("ascii"))
         has_project_note = True
-    except OSError:
-        has_project_note = False
     if not steps_dir.is_dir():
         # 没有 steps 目录时仍要区分「project.md 也没有」和「只有 project.md」，
         # 否则新建项目后写洞察照样不涨版本。
@@ -818,6 +987,18 @@ def compute_backlinks(by_id: dict[str, Step]) -> dict[str, list[str]]:
 _IMG_IN_BODY = re.compile(r'!\[([^\]]*)\]\(\s*(?:<([^>]*)>|([^)\s]+))(?:\s+"([^"]*)")?\s*\)')
 
 
+def note_bodies(step: Step) -> list[tuple[str, str]]:
+    """这一步的全部正文：note.md 一份，每个翻译文件一份。返回 [(文件名, 正文)]。
+
+    顺序固定（note.md 在前，其余按语言码升序），因为它会决定警告的先后，
+    而警告要进静态导出产物（P3 要求逐字节确定）。
+    """
+    out = [(NOTE_NAME, step.body)]
+    out += [(f"note.{lang}.md", (step.tr.get(lang) or {}).get("body", ""))
+            for lang in sorted(step.tr)]
+    return out
+
+
 def _lint_figures(step: Step) -> list[dict[str, str]]:
     """图片必须有图注。理由是这个系统有两类读者——
 
@@ -826,32 +1007,57 @@ def _lint_figures(step: Step) -> list[dict[str, str]]:
 
     图注是这张图对文本读者唯一的信息来源，所以它不是装饰，是内容。
 
+    **图注是逐个文件独立判的**，这一点和小节检查（「任一语言写了就算写了」）相反，
+    差别值得说清楚：小节问的是「这个判断有没有被记下来」——记在中文版里，它就存在，
+    英文读者看不懂只是语言问题，信息没丢。图注问的是「这张图对**正在读这一份文件的
+    读者**说了什么」——中文版写了图注、英文版只有一个光秃秃的 `![](loss.png)`，
+    那个读英文版的人（和只被喂了英文版的 agent）拿到的就是零信息。同一张图，
+    两份文件里各自是一次独立的信息传递，所以各判各的。
+
     单独拆出来是因为 traceability() 要用它判 captions，而 lint_body() 已经
     扩到「所有内容层缺陷」——traceability 若调 lint_body 就会把「没写结论」
     也算成图注问题，而且两者会互相递归。
     """
     out: list[dict[str, str]] = []
-    for alt, angle, bare, title in _IMG_IN_BODY.findall(step.body):
-        src = angle or bare
-        if not (alt.strip() or title.strip()):
-            out.append(
-                warn("warn", "figure_without_caption",
-                     f'图片 {src} 没有图注。写成 ![](……  "这张图说明了什么") —— '
-                     f"没有图注的话，图里的结论对文本读者和 agent 都是丢失的",
-                     step.dirname)
-            )
+    for fname, body in note_bodies(step):
+        where = step.dirname if fname == NOTE_NAME else f"{step.dirname}/{fname}"
+        for alt, angle, bare, title in _IMG_IN_BODY.findall(body):
+            src = angle or bare
+            if not (alt.strip() or title.strip()):
+                out.append(
+                    warn("warn", "figure_without_caption",
+                         f'{fname} 里的图片 {src} 没有图注。写成 ![](……  "这张图说明了什么") —— '
+                         f"没有图注的话，图里的结论对文本读者和 agent 都是丢失的",
+                         where)
+                )
     return out
 
 
-# 内容层缺陷：小节名 → (警告 code, 为什么这条缺了要紧)。
+# 内容层缺陷：小节的**语义键** → (警告 code, 为什么这条缺了要紧)。
+# 存语义键而不是中文标题，这样同一条检查对中文版和英文版同时成立（见 SECTION_NAMES）。
 # 只对 done / dead 生效——wip 是"还在写"，对着一个刚建出来的空模板报警只会训练
 # 大家忽略警告；而一旦作者宣布这一步有结果了（done）或者放弃了（dead），
 # 这条记录就是最终形态，删掉全部程序之后能不能读懂它，此刻定生死（G4）。
 _CONTENT_CHECKS = (
-    ("为什么", "missing_why", "为什么做这一步——这是唯一无法从代码和数据里自动生成的字段，丢了就永远补不回来"),
-    ("做了什么", "missing_what", "做了什么——重跑要靠它，只有标题的话别人（和半年后的你）无从下手"),
-    ("结论", "missing_conclusion", "结论——假设到底成不成立"),
+    ("why", "missing_why", "为什么做这一步——这是唯一无法从代码和数据里自动生成的字段，丢了就永远补不回来"),
+    ("what", "missing_what", "做了什么——重跑要靠它，只有标题的话别人（和半年后的你）无从下手"),
+    ("conclusion", "missing_conclusion", "结论——假设到底成不成立"),
 )
+
+
+def _all_sections(step: Step) -> list[dict[str, str]]:
+    """note.md 和每个译文各切一份小节表。切好一次给所有检查用（正文解析是热点）。"""
+    return [sections(body) for _, body in note_bodies(step)]
+
+
+def _wrote(secs: list[dict[str, str]], key: str) -> bool:
+    """这一节写了没有：**任何一种语言里写了就算写了**。
+
+    L0–L4 问的是「这个结果追不追得到」，不是「翻译全不全」。只写了中文的记录
+    照样是可溯源的；反过来，只写了英文的也是。把「没翻译」算成缺陷会得到一个
+    每加一门语言就集体掉级的评级，那等于惩罚翻译。
+    """
+    return any(_pick(s, key) for s in secs)
 
 
 def lint_body(step: Step) -> list[dict[str, str]]:
@@ -870,12 +1076,14 @@ def lint_body(step: Step) -> list[dict[str, str]]:
     """
     out = _lint_figures(step)
     if step.status in ("done", "dead"):
-        sec = sections(step.body)
-        for name, code, why in _CONTENT_CHECKS:
-            if not _filled(sec.get(name, "")):
+        secs = _all_sections(step)
+        for key, code, why in _CONTENT_CHECKS:
+            # 只有**所有**语言都缺这一节才报。中文版写了结论、英文版还没翻，
+            # 结论并没有丢——报一条「没写结论」是假警报，而假警报会让人连真的一起忽略。
+            if not _wrote(secs, key):
                 out.append(
                     warn("warn", code,
-                         f"状态是 {step.status} 却没写「{name}」：{why}",
+                         f"状态是 {step.status} 却没写「{SECTION_NAMES[key]['zh']}」：{why}",
                          step.dirname)
                 )
     return out
@@ -898,11 +1106,15 @@ def traceability(step: Step) -> dict[str, Any]:
     `repro: failed` 不降级——"试过，跑不起来"不改变记录本身的完整度，
     但它是最该被看见的一条，所以单独作为一个状态返回。
     """
-    sec = sections(step.body)
+    secs = _all_sections(step)
     checks = {
-        "why": _filled(sec.get("为什么", "")),
-        "what": _filled(sec.get("做了什么", "")),
-        "conclusion": step.status == "wip" or _filled(sec.get("结论", "")),
+        # 小节：任一语言写了就算写了（见 _wrote）。
+        "why": _wrote(secs, "why"),
+        "what": _wrote(secs, "what"),
+        "conclusion": step.status == "wip" or _wrote(secs, "conclusion"),
+        # 图注：逐个文件独立（见 _lint_figures）。译文里漏了图注会真的把等级压下去，
+        # 这是有意的——对读英文版的人来说，那张图确实什么都没说。补一句图注的成本
+        # 是一行，而缺了就是整张图的信息对一半读者不存在。
         "captions": not _lint_figures(step),
         "commit": bool(step.commit.strip()),
         "paths": bool(step.paths),

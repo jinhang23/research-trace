@@ -5,6 +5,7 @@
     python trace_cli.py new-project --name "SMARTAffinity"
     python trace_cli.py new -P <项目> --title "..."       新建一步
     python trace_cli.py check [-P <项目>]                 校验不变量
+    python trace_cli.py tr [-P <项目>] [--lang en]        还缺哪些语言版本 / 补一份译文
     python trace_cli.py build [--out dist]               静态导出，file:// 可直接打开
     python trace_cli.py serve [--port 8100]              起服务
     python trace_cli.py url                              打印访问地址与写入令牌
@@ -24,7 +25,10 @@ import trace_mcp as mcp
 import trace_write as W
 from trace_server import CONFIG_PATH, ROOT, WEB, load_config, make_config
 
-STATIC_ASSETS = ("style.css", "app.js", "md.js")
+# 静态导出要拷进去的前端文件。**漏一个就是白屏**：index.html 里那几个 <script>
+# 是写死的，i18n.js 缺席时 window.i18n 是 undefined，app.js 第一次调 t() 就抛，
+# 整页什么都不画（而 file:// 下没有服务端日志可看）。
+STATIC_ASSETS = ("style.css", "app.js", "md.js", "i18n.js")
 
 # 默认把数据仓放在代码仓**外面**。项目自己的不变量是「代码仓公开、数据仓私有」，
 # 而 data_dir="." 正好违反它：README 的「30 秒上手」照默认跑一遍，未发表的实验记录
@@ -302,6 +306,91 @@ def cmd_paths(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- 翻译
+
+
+def _read_translation_file(path: Path, only_keys: tuple[str, ...], source: str) -> tuple[str, str]:
+    """读一份写好的译文，拆成（front-matter 里那一个键, 正文）。
+
+    整份文件读进来（而不是只收正文），是因为人和 agent 手上真正存在的东西就是
+    一份 `note.en.md`——逼他们先手工把 front-matter 剥掉，只会剥错。
+    结构键在这里就报出来：走 core.parse_translation 是为了让「哪些键会被丢掉」
+    的判断只有一份实现，和读侧（网页顶栏、check）说的是同一句话。
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise W.WriteError(
+            f"{path} 不是 UTF-8（第 {exc.start} 个字节解不开）。"
+            "Windows 上 cmd.exe 的 `>` 是 GBK、PowerShell 5.1 的 `>` 是 UTF-16LE——"
+            "先转成 UTF-8 再来，别让工具替你猜（猜错就是一串不可逆的 �）。") from None
+    except OSError as exc:
+        raise W.WriteError(f"读不了 {path}：{exc.strerror or exc}") from None
+
+    data, warns = core.parse_translation(text, only_keys=only_keys,
+                                         where=path.name, source=source)
+    for w in warns:
+        print(f"⚠ {w['message']}")
+    return data.get(only_keys[0], ""), data["body"]
+
+
+def cmd_tr(args) -> int:
+    """列出缺翻译的步骤，或者从一份写好的文件补一版进去。
+
+    **check 里没有「缺翻译」这一条**，这里也不把它算成缺陷：L0–L4 问的是
+    「这个结果追不追得到」，不是「翻译全不全」，只写了中文的记录一样是可溯源的。
+    这个子命令回答的是另一个问题——「我隔了几天回来，还欠哪些」。
+    """
+    cfg = load_config()
+    root = data_root(cfg)
+    slug = pick_project(root, args.project)
+    lang = W.norm_lang(args.lang)
+    sd = core.steps_dir_of(root, slug)
+
+    if args.drop:
+        if not args.step:
+            raise W.WriteError("--drop 要配 --step：项目笔记的译文目前只能手工删文件")
+        info = W.drop_translation(sd, args.step, lang)
+        print(f"已删除 {slug}/{info['id']} 的 {lang} 译文（{info['path']}）。原文没动。")
+        return 0
+
+    if args.file:
+        path = Path(args.file).expanduser()
+        if args.step and args.project_note:
+            raise W.WriteError("--step 和 --project-note 只能给一个")
+        if args.project_note:
+            name, body = _read_translation_file(path, core.PROJECT_TR_ONLY_KEYS, core.PROJECT_NOTE)
+            info = W.write_project_translation(root, slug, lang,
+                                               name=args.title or name, body=body)
+            print(f"已写入 {slug}/{info['path']}（项目笔记的 {lang} 版）。原文没动。")
+            return 0
+        if not args.step:
+            raise W.WriteError("--file 要配 --step <id>（或 --project-note 翻译项目笔记）")
+        title, body = _read_translation_file(path, core.TR_ONLY_KEYS, core.NOTE_NAME)
+        info = W.write_translation(sd, args.step, lang, title=args.title or title, body=body)
+        print(f"已写入 {slug}/{info['id']}/{info['path']}。原文没动。")
+        return 0
+
+    if args.step or args.project_note or args.title:
+        raise W.WriteError("要补一份翻译请同时给 --file <写好的译文>；"
+                           "不给 --file 就是列出还缺哪些")
+
+    f = core.compile_forest(sd, with_files=False)
+    p = next((x.to_dict() for x in core.scan_projects(root) if x.slug == slug), None)
+    r = mcp.untranslated_report(f, p, lang)
+    print(f"[{slug}] {lang} 翻译：{r['total']} 步里已有 {r['translated']} 份译文"
+          + (f"，另有 {r['native']} 步原文就是 {lang}" if r["native"] else "")
+          + f"，还缺 {len(r['missing'])} 份")
+    for m in r["missing"]:
+        print(f"  {m['id']:<6} [{m['status']:<4}] {m['title']}")
+    note = r["project_note"]
+    print(f"  项目笔记 project.{lang}.md: "
+          + ("还没有" if note["missing"] else ("原文就是这个语言" if note["native"] else "已有")))
+    if r["missing"] or note["missing"]:
+        print(f"\n补一份：trace_cli.py tr -P {slug} --lang {lang} --step <id> --file <译文.md>")
+    return 0
+
+
 def _histogram(levels: list[str]) -> str:
     c = {k: 0 for k in LEVELS}
     for x in levels:
@@ -513,6 +602,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-P", "--project", default=None)
     p.add_argument("--kind", default=None, help="只看某一类：hpc / github / dropbox / object / url …")
     p.set_defaults(fn=cmd_paths)
+
+    p = sub.add_parser("tr", help="列出还缺哪些语言版本，或从一份写好的译文补一版进去")
+    p.add_argument("-P", "--project", default=None)
+    p.add_argument("--lang", default="en", metavar="语言码", help="短语言码，默认 en（ja / zh-Hant 同理）")
+    p.add_argument("--step", default=None, help="哪一步。补翻译时给它；不给且带 --file 就要显式 --project-note")
+    p.add_argument("--project-note", action="store_true", help="翻译项目笔记 project.<lang>.md")
+    p.add_argument("--file", default=None, metavar="路径",
+                   help="写好的译文（可以整份带 front-matter，只有 title/name 会被采用）")
+    p.add_argument("--title", default=None, help="覆盖译文里的标题（项目笔记则是显示名）")
+    p.add_argument("--drop", action="store_true", help="删掉这一步的该语言版本。原文不受影响")
+    p.set_defaults(fn=cmd_tr)
 
     p = sub.add_parser("check", help="校验不变量，并按 FORMAT.md 给出 L0–L4 可溯源性等级")
     p.add_argument("-P", "--project", default=None)

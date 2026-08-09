@@ -53,6 +53,24 @@ BODY_TEMPLATE = (
     "## 做了什么\n\n## 结果\n\n## 结论\n\n## 下一步\n"
 )
 
+# 译文的 front-matter 里**只准**出现 title（项目笔记是 name）。下面这些是结构键，
+# 它们在 note.md / project.md 里已经有了；写进译文就是双真相源，读侧一律忽略并报警告。
+# 这里留一份字面量而不是 import trace_core，是因为远端后端那条路上这个文件可能是
+# 单独拷过去的（只有 TRACE_URL，没有 trace_core）。tests/test_mcp.py 拿 core 的
+# TR_STRUCT_KEYS 逐字核对这一份，漂移会当场被测出来。
+TR_STRUCT_KEYS = ("id", "parent", "status", "date", "commit", "author",
+                  "tags", "path", "repro", "key")
+
+# 小节名的中英对照。agent 手上**没有别的地方**能知道这张表：FORMAT.md 在 pip 装的
+# 机器上根本不存在，而小节名是精确匹配的——写成 `## Why not`，评级和 check 就都
+# 找不到内容。所以它必须出现在工具描述里。同样由测试对着 trace_core.SECTION_NAMES /
+# INSIGHT_NAMES 逐字核对。
+SECTION_TABLE = (
+    "  中文 为什么 / 做了什么 / 结果 / 结论 / 下一步\n"
+    "  英文 Why / What / Result / Conclusion / Next\n"
+    "  项目笔记的洞察 中文 核心想法 / 有效 / 无效 / 坑；英文 Ideas / Works / Doesn't work / Pitfalls"
+)
+
 
 class ToolError(Exception):
     pass
@@ -217,6 +235,18 @@ class HttpBackend:
         return self._call("POST", f"/api/p/{urllib.parse.quote(project)}/steps/{urllib.parse.quote(sid)}/files",
                           raw=data, headers=h)
 
+    def translate(self, project, sid, lang, payload):
+        return self._call("PUT", f"/api/p/{urllib.parse.quote(project)}/steps/"
+                                 f"{urllib.parse.quote(sid)}/tr/{urllib.parse.quote(lang)}", payload)
+
+    def translate_project(self, project, lang, payload):
+        return self._call("PUT", f"/api/p/{urllib.parse.quote(project)}/tr/"
+                                 f"{urllib.parse.quote(lang)}", payload)
+
+    def untranslated(self, project, lang):
+        return self._call("GET", f"/api/p/{urllib.parse.quote(project)}/untranslated"
+                                 f"?lang={urllib.parse.quote(lang)}")
+
 
 class LocalBackend:
     """直接读写文件。agent 和数据在同一台机器上时用这个，不需要起服务。"""
@@ -296,6 +326,7 @@ class LocalBackend:
             date=payload.get("date", ""), commit=payload.get("commit", ""),
             author=payload.get("author", ""), key=payload.get("key", ""),
             tags=payload.get("tags"), paths=payload.get("paths"),
+            lang=payload.get("lang", ""),
         )
         d = step.to_dict()
         d["created"] = created
@@ -311,6 +342,26 @@ class LocalBackend:
 
     def attach(self, project, sid, data, name, mime):
         return self._guard(self.W.attach_auto, self._sd(project), sid, data, filename=name or "", mime=mime)
+
+    # 翻译这三条**不碰原文**：write_translation / write_project_translation 只写
+    # note.<lang>.md / project.<lang>.md，note.md 一个字节都不动。远端后端那三条
+    # 打的是同名 REST 端点，两个门面走的是同一个 trace_write 函数。
+
+    def translate(self, project, sid, lang, payload):
+        return self._guard(self.W.write_translation, self._sd(project), sid, lang,
+                           title=payload.get("title", ""), body=payload.get("body", ""),
+                           expect=payload.get("expect", ""))
+
+    def translate_project(self, project, lang, payload):
+        self._sd(project)          # 项目不存在时给和别的工具一样的报错
+        return self._guard(self.W.write_project_translation, self.root, project, lang,
+                           name=payload.get("name", ""), body=payload.get("body", ""),
+                           expect=payload.get("expect", ""))
+
+    def untranslated(self, project, lang):
+        lang = self._guard(self.W.norm_lang, lang)
+        p = next((x.to_dict() for x in self.core.scan_projects(self.root) if x.slug == project), None)
+        return untranslated_report(self.forest(project), p, lang)
 
 
 # 配置文件的查找顺序。有它才能让插件的 .mcp.json 保持静态——
@@ -404,6 +455,54 @@ def make_backend() -> HttpBackend | LocalBackend:
     )
 
 
+# ---------------------------------------------------------------- 缺哪些翻译
+
+
+def untranslated_report(forest: dict[str, Any], project: dict[str, Any] | None,
+                        lang: str) -> dict[str, Any]:
+    """哪些步骤还没有 `lang` 版。**纯函数，也是这个判据的唯一一份实现。**
+
+    三个门面共用它：REST 的 `/untranslated`、MCP 的 trace_untranslated、
+    CLI 的 `trace tr`。各写一遍的话，三处对「什么叫还没翻译」的答案迟早会分家
+    （最容易分的就是下面那条 native 规则），而 agent 是照着其中一个的答案去补的。
+
+    「还没翻译」是**派生状态**：文件不存在就是没有，不存储、也不进 check 的警告
+    （用户明确不要那一项）。这里只回答「还欠哪些」，不做价值判断。
+
+    原文自己就声明了这个语言（front-matter 的 `lang: en`）的步骤**不算缺**：
+    给它写一份同语言译文会和正文各说各话，trace_write 那边本来就会拒绝，
+    列进来只会让 agent 去做一件必然失败的事。
+    """
+    lang = str(lang or "")
+    steps = forest.get("steps") or []
+    missing: list[dict[str, str]] = []
+    translated = native = 0
+    for s in steps:
+        if (s.get("lang") or "") == lang:
+            native += 1
+        elif lang in (s.get("tr") or {}):
+            translated += 1
+        else:
+            missing.append({"id": s.get("id", ""), "title": s.get("title", ""),
+                            "status": s.get("status", "")})
+    p = project or {}
+    note = {
+        "name": p.get("name", ""),
+        "native": (p.get("lang") or "") == lang,
+        "translated": lang in (p.get("tr") or {}),
+    }
+    note["missing"] = not (note["native"] or note["translated"])
+    return {
+        "project": p.get("slug") or forest.get("project") or "",
+        "lang": lang,
+        "total": len(steps),
+        "translated": translated,
+        "native": native,
+        "missing": missing,
+        "project_note": note,
+    }
+
+
 # ---------------------------------------------------------------- 渲染
 
 def _fmt_tree(forest: dict, header: str) -> str:
@@ -461,6 +560,12 @@ def _fmt_step(project: str, s: dict) -> str:
         r = t.get("repro")
         if r:
             head.append(f"    复现: {r['state']} {r.get('date', '')} {r.get('by', '')} — {r.get('note', '')}".rstrip(" —"))
+    if s.get("lang"):
+        head.append(f"  原文语言: {s['lang']}")
+    if s.get("tr"):
+        # 有哪些译文得说出来，否则 agent 补翻译前唯一的办法是猜或者再调一次
+        # trace_untranslated；而不知道已经有 en 版就重写一遍，等于把别人的译文覆盖掉。
+        head.append("  已有译文: " + ", ".join(sorted(s["tr"])) + "（正文见 note.<语言>.md）")
     if s.get("children"):
         head.append("  子步骤: " + ", ".join(s["children"]))
     if s.get("backlinks"):
@@ -576,7 +681,9 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "trace_search",
-        "description": "在标题、正文、标签里搜关键词。用来回答「之前是不是试过 X」「为什么放弃了 Y」。",
+        "description": ("在标题、正文、标签、以及各语言的译文里搜关键词。"
+                        "用来回答「之前是不是试过 X」「为什么放弃了 Y」。"
+                        "英文词搜得到英文译文，命中落在译文里时结果行上会标出是哪个语言。"),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -609,6 +716,7 @@ TOOLS: list[dict[str, Any]] = [
                 "key": {"type": "string", "description": "幂等键，防止重试造出重复步骤"},
                 "tags": {"type": "array", "items": {"type": "string"}},
                 "paths": {"type": "array", "items": {"type": "string"}, "description": PATHS_DESC},
+                "lang": {"type": "string", "description": "这份记录用什么语言写的（en / zh / ja …）。**声明**出来，别让读的一侧去猜——没有它，界面对没翻译的记录只能说「这是原文」，说不出是哪种语言的原文。"},
             },
             "required": ["project", "title"],
         },
@@ -634,6 +742,7 @@ TOOLS: list[dict[str, Any]] = [
                 "commit": {"type": "string"},
                 "tags": {"type": "array", "items": {"type": "string"}},
                 "paths": {"type": "array", "items": {"type": "string"}, "description": "整组替换。" + PATHS_DESC},
+                "lang": {"type": "string", "description": "这份记录用什么语言写的（en / zh / ja …）。补一句声明，界面就不必对读者说「这是原文」而说不出是哪种语言；空串是撤回声明。"},
                 "add_paths": {"type": "array", "items": {"type": "string"},
                               "description": "追加（按位置去重），比整组替换安全。" + PATHS_DESC},
                 "repro": {
@@ -675,6 +784,63 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["project", "step"],
         },
     },
+    {
+        "name": "trace_translate",
+        "description": (
+            "给一步（或项目笔记）补一份翻译，落成 `note.<lang>.md` / `project.<lang>.md`。\n"
+            "**这是唯一碰翻译的写入口，而且它永远不动原文**——一个字节都到不了 note.md。"
+            "反过来，trace_new_step / trace_update_step 也没有 body_en 这类参数，"
+            "原文和译文各走各的路。于是「建完步骤马上调」就是立刻翻译，"
+            "「过几天回来再调」就是延迟翻译，**同一条路径，只是时机不同**，"
+            "不需要预先决定用哪一种。\n"
+            "省略 step 就是翻译**项目笔记**（project.<lang>.md），这时 title 写的是项目显示名。\n"
+            "翻译文件的 front-matter 里**只准有 title:**（项目笔记是 name:），而且由 title 参数写，"
+            "不要自己在 body 里拼 `---` 那一段。id / parent / status / date / commit / author / "
+            "tags / path / repro / key 这些结构键写进译文会被**一律忽略**并产出一条警告——"
+            "它们在原文里已经有了，写两份就是双真相源（改一处漏一处，两边永远不知道谁对）。\n"
+            "正文的小节名要用**目标语言的那一套**，逐字一致（评级和 check 就是按这几个名字"
+            "去正文里找内容的，写成 `## Why not` 等于没写）：\n" + SECTION_TABLE + "\n"
+            "还欠哪些翻译用 trace_untranslated 查。缺翻译不是缺陷，不报警告；"
+            "只写了中文的记录照样是可溯源的。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string"},
+                "lang": {"type": "string",
+                         "description": "短语言码：en / ja / zh-Hant。它会直接变成文件名的一段"},
+                "step": {"type": "string",
+                         "description": "步骤 id，如 004b。**省略就是翻译项目笔记** project.<lang>.md"},
+                "title": {"type": "string",
+                          "description": "译好的标题；翻译项目笔记时它是项目显示名（写进 name:）"},
+                "body": {"type": "string",
+                         "description": "译好的正文，**不要带 front-matter**。翻译项目笔记时"
+                                        "只会替换那四个洞察小节，`## 已删除` / `## Deleted` 逐字保留"},
+                "expect": {"type": "string",
+                           "description": "乐观并发控制：**这份译文自己**的 digest（不是 note.md 的）。"
+                                          "不给就是不检查"},
+            },
+            "required": ["project", "lang"],
+        },
+    },
+    {
+        "name": "trace_untranslated",
+        "description": (
+            "列出还没有某个语言版本的步骤（id + 标题），以及项目笔记有没有。\n"
+            "**「延迟翻译」靠它落地**：隔几天回到一个项目，你得先知道还欠哪些，"
+            "才谈得上补——「还没翻译」是文件不存在这个派生事实，没有任何地方存着一张待办表。\n"
+            "原文自己就声明了这个语言的步骤不算缺（给它写同语言译文会被拒绝）。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string"},
+                "lang": {"type": "string", "default": "en",
+                         "description": "短语言码，默认 en"},
+            },
+            "required": ["project"],
+        },
+    },
 ]
 
 
@@ -708,6 +874,14 @@ def t_read(be, args) -> str:
 
 
 def t_search(be, args) -> str:
+    """id / 标题 / 正文 / 标签 / **各语言的译文**里搜。
+
+    译文也搜，理由和 REST 那侧的 search_hits 一字不差：这套系统的底线是
+    「删掉全部程序，grep -r 还能回答『为什么放弃了 X』」，双语之后英文的 grep
+    也要能回答同一个问题。`grep -r abandoned` 命中 note.en.md 而 trace_search
+    命中不了的话，agent 会得到「没搜到」，而它会把这四个字读成「没试过」，
+    然后重跑一条已经走死的路。命中落在译文里时结果行上会标出是哪个语言。
+    """
     q = args["query"].strip().lower()
     if not q:
         raise ToolError("query 不能为空")
@@ -715,15 +889,23 @@ def t_search(be, args) -> str:
     hits = []
     for slug in slugs:
         for s in be.forest(slug)["steps"]:
+            tr = s.get("tr") or {}
             hay = " ".join([s["id"], s["title"], s["body"], " ".join(s["tags"])]).lower()
-            if q not in hay:
+            langs = [c for c in sorted(tr)
+                     if q in ((tr[c].get("title") or "") + "\n" + (tr[c].get("body") or "")).lower()]
+            if q not in hay and not langs:
                 continue
-            where = s["body"].lower().find(q)
+            # 摘要优先取原文（它才是权威），原文没命中时才退到第一份命中的译文。
+            src, where = s["body"], s["body"].lower().find(q)
+            if where < 0 and langs:
+                src = tr[langs[0]].get("body") or ""
+                where = src.lower().find(q)
             snippet = ""
             if where >= 0:
                 a = max(0, where - 60)
-                snippet = ("…" if a else "") + s["body"][a:where + 140].replace("\n", " ") + "…"
+                snippet = ("…" if a else "") + src[a:where + 140].replace("\n", " ") + "…"
             hits.append(f"{slug}/{s['id']}  [{s['status']}]  {s['title']}"
+                        + (f"   （命中 {'/'.join(langs)} 译文）" if langs else "")
                         + (f"\n    {snippet}" if snippet else ""))
     if not hits:
         return f"没有搜到「{args['query']}」。"
@@ -734,14 +916,23 @@ _WHY = None
 
 
 def _why_is_blank(body: str) -> bool:
-    """「为什么」这一节是不是还空着。按小节内容判断，不靠正文长度这种粗糙启发式。"""
+    """「为什么」这一节是不是还空着。按小节内容判断，不靠正文长度这种粗糙启发式。
+
+    走 core.section_text 而不是一条写死中文的正则：小节名是**中英两套**
+    （`## 为什么` 和 `## Why` 是同一节），认死中文的话，一份用英文写的 note.md
+    会被整篇判成「没写为什么」，于是每建一步都吃一条假警告——而假警告的代价是
+    真警告也跟着被忽略。core 拿不到时（只把 trace_mcp.py 单独拷过去、走远端后端的
+    机器）退回原来那条中文正则，那种机器上的记录本来也只有中文。
+    """
     global _WHY
-    if _WHY is None:
-        _WHY = re.compile(r"##\s*为什么\s*\n(.*?)(?=\n##\s|\Z)", re.S)
-    m = _WHY.search(body)
-    if not m:
-        return True                     # 压根没有这一节
-    text = m.group(1).strip()
+    try:
+        import trace_core as _core
+        text = _core.section_text(body, "why").strip()
+    except Exception:
+        if _WHY is None:
+            _WHY = re.compile(r"##\s*为什么\s*\n(.*?)(?=\n##\s|\Z)", re.S)
+        m = _WHY.search(body)
+        text = m.group(1).strip() if m else ""
     return not text or text.startswith(("（", "("))   # 空的，或者还是模板里的占位括号
 
 
@@ -786,7 +977,7 @@ def t_new_step(be, args) -> str:
         # 已经有项目时不这么做——那种情况下项目名对不上多半是笔误。
         be.create_project(project)
 
-    payload = {k: args[k] for k in ("parent", "title", "status", "body", "date", "commit", "key", "tags", "paths")
+    payload = {k: args[k] for k in ("parent", "title", "status", "body", "date", "commit", "key", "tags", "paths", "lang")
                if k in args and args[k] not in (None, "")}
     payload.setdefault("status", "wip")
     payload["author"] = args.get("author") or DEFAULT_AUTHOR
@@ -810,7 +1001,7 @@ def t_update_step(be, args) -> str:
                 f"{locked} 不可修改。只追加是这套系统的地基——笔记里写的「见 003b」、"
                 f"论文脚注里的引用能一直有效，靠的就是 id 和 parent 不变。"
             )
-    patch = {k: args[k] for k in ("status", "title", "date", "commit", "tags", "paths", "add_paths")
+    patch = {k: args[k] for k in ("status", "title", "date", "commit", "tags", "paths", "add_paths", "lang")
              if k in args and args[k] is not None}
     if args.get("repro"):
         patch["add_repro"] = [args["repro"]]
@@ -892,6 +1083,65 @@ def t_attach(be, args) -> str:
     return msg
 
 
+def _reject_front_matter(body: str) -> None:
+    """body 里自己拼了 front-matter 就当场拒绝，而不是让它变成正文里的一坨文本。
+
+    结构键从函数形状上就进不了译文的 front-matter（trace_write 的渲染器只接受
+    一个键名），所以 agent 拼的那一段 `---` 会原样落进**正文**——不报错、不生效、
+    看着却像已经写上了。这种「静默地什么都没发生」比报错难查得多，
+    所以在这里就说清楚：title 走参数，body 只放正文。
+    """
+    lines = str(body or "").lstrip("﻿").split("\n")
+    if not lines or lines[0].strip() != "---":
+        return
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        key = line.split(":", 1)[0].strip().lower()
+        if key in TR_STRUCT_KEYS or key in ("title", "name"):
+            raise ToolError(
+                f"body 里带了 front-matter（`{key}:`）。翻译文件的 front-matter 只允许一个 "
+                "title:（项目笔记是 name:），而且由 title 参数写。"
+                "结构字段一律只认原文，写进译文会被忽略并报警告——"
+                "把开头那段 `---` 删掉，body 只放正文。")
+
+
+def t_translate(be, args) -> str:
+    project, lang = args["project"], args["lang"]
+    sid = (args.get("step") or "").strip()
+    _reject_front_matter(args.get("body") or "")
+    common = {"body": args.get("body", ""), "expect": args.get("expect", "")}
+    if sid:
+        info = be.translate(project, sid, lang, {"title": args.get("title", ""), **common})
+        what = f"{project}/{info['id']}"
+    else:
+        # 项目笔记那一侧的键叫 name（它是项目显示名），但工具只暴露一个 title 参数：
+        # 多一个只在省略 step 时才有意义的参数，等于多一处能填错的地方。
+        info = be.translate_project(project, lang, {"name": args.get("title", ""), **common})
+        what = f"{project} 的项目笔记"
+    return (f"已写入 {what} 的 {info['lang']} 译文（{info['path']}，digest {info['digest']}）。"
+            f"原文一个字节都没动。")
+
+
+def t_untranslated(be, args) -> str:
+    lang = (args.get("lang") or "en").strip()
+    r = be.untranslated(args["project"], lang)
+    lang = r["lang"]
+    head = (f"{r['project']} · {lang} 翻译：{r['total']} 步里已有 {r['translated']} 份译文"
+            + (f"，另有 {r['native']} 步原文就是 {lang}" if r["native"] else "")
+            + f"，还缺 {len(r['missing'])} 份。")
+    lines = [head]
+    if r["missing"]:
+        lines += ["", f"还没有 {lang} 版的步骤："]
+        lines += [f"  {m['id']:<6} [{m['status']}]  {m['title']}" for m in r["missing"]]
+    note = r["project_note"]
+    lines += ["", "项目笔记 project.{}.md：{}".format(
+        lang, "还没有" if note["missing"] else ("原文就是这个语言" if note["native"] else "已有"))]
+    if r["missing"] or note["missing"]:
+        lines.append("补一份用 trace_translate（省略 step 就是翻译项目笔记）。")
+    return "\n".join(lines)
+
+
 HANDLERS = {
     "trace_projects": t_projects,
     "trace_new_project": t_new_project,
@@ -902,6 +1152,8 @@ HANDLERS = {
     "trace_new_step": t_new_step,
     "trace_update_step": t_update_step,
     "trace_attach": t_attach,
+    "trace_translate": t_translate,
+    "trace_untranslated": t_untranslated,
 }
 
 
@@ -925,7 +1177,7 @@ def dispatch(backend, name: str, args: dict[str, Any]) -> str:
 # 的客户端连上来跑一遍互操作。
 
 SERVER_NAME = "trace"
-SERVER_VERSION = "1.2.0"
+SERVER_VERSION = "1.3.0"
 
 # 收到客户端要的版本就原样回它（前提是我们认识），否则回我们最新的。
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
@@ -983,6 +1235,19 @@ FORMAT_ESSENTIALS = (
     "脚注、setext 标题、四空格缩进代码块（用围栏）。数学公式不做渲染，原样保留——"
     "`$\\alpha$` 人和你都读得到原文，但不会变成排版好的公式，所以别指望它显示效果。"
     "文件名带空格时图片要写成 `![](<loss curve.png> \"图注\")`。"
+    # ⑩ 双语。这一条也只在这份摘要里 —— 译文的写法（哪个文件、哪些键、小节名叫什么）
+    # 一样是「照文档写」才写得对的东西，而 pip 装的机器上没有文档。
+    "⑩ 双语是**另一个文件**，不是原文里的字段：一步的英文版是同目录下的 "
+    "`note.en.md`，项目笔记的是 `project.en.md`（`note.<短语言码>.md`，ja / zh-Hant 同理）。"
+    "写它只有 trace_translate 一条路，它碰不到原文；还欠哪些用 trace_untranslated 查。"
+    "译文的 front-matter **只准有 `title:`**（项目笔记是 `name:`），其余结构一律不重复——"
+    "id / parent / status / date / commit / author / tags / path / repro / key 写进去会被"
+    "忽略并报一条警告，因为那些在原文里已经有了，写两份就是双真相源。"
+    "译文正文的小节名用目标语言那一套，和原文一一对应：为什么=Why、做了什么=What、"
+    "结果=Result、结论=Conclusion、下一步=Next；项目洞察 核心想法=Ideas、有效=Works、"
+    "无效=Doesn't work、坑=Pitfalls。"
+    "「还没翻译」是「文件不存在」这个派生事实，不存储、不报警告、也不影响评级——"
+    "一个小节只要 note.md **或任一译文**里写了就算写了，只有中文的记录照样可溯源。"
 )
 
 INSTRUCTIONS = (
@@ -993,7 +1258,10 @@ INSTRUCTIONS = (
     "④ 失败也要记，标 dead 并写清放弃理由，死胡同是这里最有价值的部分；"
     "⑤ 图必须给 caption，你看不到图，图注是它唯一的信息来源；"
     "⑥ 产物落在哪（超算路径、GitHub、对象存储）用 paths 记下来；"
-    "⑦ id 和 parent 写下就不可改。\n\n"
+    "⑦ id 和 parent 写下就不可改；"
+    "⑧ 要双语就用 trace_translate 单独补一份译文（`note.en.md`），它碰不到原文——"
+    "建完步骤马上调就是立刻翻译，过几天再调就是延迟翻译，同一条路径；"
+    "隔了几天先用 trace_untranslated 看还欠哪些。\n\n"
     + FORMAT_ESSENTIALS
 )
 

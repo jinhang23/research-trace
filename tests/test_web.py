@@ -29,6 +29,84 @@ CSS = (WEB / "style.css").read_text(encoding="utf-8")
 NODE = shutil.which("node")
 needs_node = pytest.mark.skipif(NODE is None, reason="这台机器没有 node，跳过 JS 断言")
 
+# 只认汉字和中文标点。全角 ＋ − ↺ 这些是**字形**不是词（i18n 表里两种语言都用
+# 同一个 ＋），把它们也算成「没翻译的中文」会让这条断言变成一句狼来了。
+CJK = re.compile(r"[　-〿㐀-䶿一-鿿]")
+
+
+def js_string_literals(src: str) -> list[tuple[int, str]]:
+    """扫出 JS 源码里的字符串字面量，跳过注释和正则。返回 [(行号, 内容)]。
+
+    双语这一层唯一能机械查证的事就是「界面上的字有没有真的都走 i18n」——
+    只在源码里 grep 中文会把满篇的中文注释一起抓进来（这个仓库的注释是中文的，
+    而且按规矩必须是中文），所以得先把注释和正则摘掉，只看字面量。
+    """
+    out: list[tuple[int, str]] = []
+    i, n, line, prev = 0, len(src), 1, ""
+    while i < n:
+        c = src[i]
+        if c == "\n":
+            line += 1
+            i += 1
+            continue
+        if c == "/" and src[i + 1:i + 2] == "/":
+            j = src.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if c == "/" and src[i + 1:i + 2] == "*":
+            j = src.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            line += src.count("\n", i, j)
+            i = j
+            continue
+        if c == "/" and (prev == "" or prev in "(,=:[!&|?{};+-*%~^<>"):
+            j, in_class = i + 1, False
+            while j < n:
+                if src[j] == "\\":
+                    j += 2
+                    continue
+                if src[j] == "[":
+                    in_class = True
+                elif src[j] == "]":
+                    in_class = False
+                elif src[j] == "\n" or (src[j] == "/" and not in_class):
+                    break
+                j += 1
+            i, prev = j + 1, "/"
+            continue
+        if c in "\"'`":
+            quote, j, buf = c, i + 1, []
+            while j < n:
+                if src[j] == "\\":
+                    buf.append(src[j:j + 2])
+                    j += 2
+                    continue
+                if src[j] == quote or (src[j] == "\n" and quote != "`"):
+                    break
+                if src[j] == "\n":
+                    line += 1
+                buf.append(src[j])
+                j += 1
+            out.append((line, "".join(buf)))
+            i, prev = j + 1, quote
+            continue
+        if not c.isspace():
+            prev = c
+        i += 1
+    return out
+
+
+def i18n_keys() -> dict[str, set[str]]:
+    """从 i18n.js 里取两种语言各自的 key 集合（用 node 读，不用正则猜）。"""
+    r = subprocess.run(
+        [NODE, "-e", "const i=require('./web/i18n.js');"
+                     "console.log(JSON.stringify({en:Object.keys(i.STRINGS.en),"
+                     "zh:Object.keys(i.STRINGS.zh)}))"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(ROOT))
+    assert r.returncode == 0, r.stderr
+    got = json.loads(r.stdout)
+    return {k: set(v) for k, v in got.items()}
+
 
 # ---------------------------------------------------------------- node
 
@@ -68,7 +146,7 @@ CSS_REMOTE = re.compile(r"""url\(\s*['"]?(?:https?:)?//""", re.I)
 
 def test_no_external_resource_is_referenced_anywhere_in_web():
     """静态导出要能 file:// 断网打开：CDN、字体、图标库一个都不许有。"""
-    for name in ("index.html", "app.js", "style.css", "md.js"):
+    for name in ("index.html", "app.js", "style.css", "md.js", "i18n.js"):
         text = (WEB / name).read_text(encoding="utf-8")
         assert not EXTERNAL.search(text), f"{name} 里有指向外部主机的 src/href"
         assert not CSS_REMOTE.search(text), f"{name} 里有指向外部主机的 url()"
@@ -76,7 +154,7 @@ def test_no_external_resource_is_referenced_anywhere_in_web():
 
 
 def test_static_export_is_self_contained(tmp_path: Path, monkeypatch):
-    """导出的 HTML 只引用同目录下的三个资源文件，而且它们都真的被拷过去了。"""
+    """导出的 HTML 只引用同目录下的那几个资源文件，而且它们都真的被拷过去了。"""
     import trace_cli  # noqa: PLC0415  —— 只在这条测试里需要
 
     data = tmp_path / "data"
@@ -123,7 +201,7 @@ def test_all_repro_records_are_shown_including_failed():
     m = re.search(r"function renderTrace[\s\S]*?\n  \}\n", APP)
     body = m.group(0)
     assert "s.repro" in body and "repro.map(" in body, "repro 记录没有整列出来"
-    assert "REPRO_LABEL" in body
+    assert "reproName(" in body, "状态标签没走 i18n（trace.repro.*）"
     assert '"failed"' not in body.replace("r-failed", ""), "不该在渲染时按状态过滤记录"
 
 
@@ -246,7 +324,8 @@ def test_the_back_button_pins_the_draft_instead_of_dropping_it():
 
 def test_a_successful_save_clears_the_draft():
     save = re.search(r"function saveEditor[\s\S]*?\n  \}\n", APP).group(0)
-    assert "dropDraft(s.id)" in save, "保存成功后不清草稿，下次打开会一直问要不要恢复"
+    # 清的必须是**这一个语言版本**那份草稿：中英两份各存各的（见 U.draftKey）
+    assert "dropDraft(s.id, st.lang)" in save, "保存成功后不清草稿，下次打开会一直问要不要恢复"
 
 
 # ---------------------------------------------------------------- 冲突
@@ -301,16 +380,25 @@ def test_git_indicator_stays_quiet_when_sync_is_simply_off():
     assert '!== "disabled"' in m and '!== "idle"' in m
 
 
+@needs_node
 def test_git_states_the_client_knows_cover_what_the_syncer_can_report():
-    """服务端多一个状态、前端不认识，就会在顶栏显示一个裸英文单词。"""
+    """服务端多一个状态、前端不认识，就会在顶栏显示一个裸英文单词。
+
+    双语之后这条更硬：服务端的 summary/hint 是中文（Python 侧不在翻译范围），
+    英文界面上优先用本地的 git.state.*，本地缺一个就会当场掉回中文。
+    """
     import trace_git  # noqa: PLC0415
 
     states = set(re.findall(r'_record\(\s*"([a-z_]+)"', (ROOT / "trace_git.py").read_text(encoding="utf-8")))
     states |= set(re.findall(r'^\s+"([a-z_]+)",\s*$', (ROOT / "trace_git.py").read_text(encoding="utf-8"), re.M))
-    known = set(re.findall(r"(\w+):", re.search(r"var GIT_LABEL = \{([\s\S]*?)\};", APP).group(1)))
-    missing = {s for s in states if s in trace_git.OK_STATES or s in
-               {"disabled", "misconfigured", "idle", "error", "committed"}} - known
-    assert not missing, f"网页不认识这些同步状态：{missing}"
+    known = set(json.loads(re.search(r"var GIT_STATES = (\[[^\]]*\]);", APP).group(1)))
+    want = {s for s in states if s in trace_git.OK_STATES or s in
+            {"disabled", "misconfigured", "idle", "error", "committed"}}
+    assert not want - known, f"网页不认识这些同步状态：{want - known}"
+    keys = i18n_keys()
+    for state in known:
+        for lang in ("en", "zh"):
+            assert "git.state." + state in keys[lang], f"{lang} 缺 git.state.{state} 的说法"
 
 
 def test_the_export_does_not_offer_server_only_controls():
@@ -365,6 +453,20 @@ def test_insight_headings_match_the_writer_side():
     assert set(got) == set(W.INSIGHT_SECTIONS.values())
 
 
+def test_the_insight_buttons_say_the_same_words_that_land_in_project_md():
+    """「＋ 有效」这个按钮上的字，必须就是最终写进 project.md 的那个小节名。
+
+    差一个字，人点了按钮却在别的小节里找不到自己刚记的那条。
+    i18n 那一侧对着 trace_core.INSIGHT_NAMES 逐字核过，这里核的是
+    app.js 用的语义键和 core 的四个键一致。
+    """
+    import trace_core as core  # noqa: PLC0415
+
+    m = re.search(r"var INSIGHT_KINDS = (\[[^\]]*\]);", APP)
+    assert m, "四种洞察的语义键不见了"
+    assert set(json.loads(m.group(1))) == set(core.INSIGHT_NAMES)
+
+
 def test_levels_match_the_core_side():
     import trace_core as core  # noqa: PLC0415
 
@@ -373,11 +475,195 @@ def test_levels_match_the_core_side():
     assert json.loads(m.group(1)) == list(core.LEVELS)
 
 
+@needs_node
 def test_repro_states_match_the_core_side():
     import trace_core as core  # noqa: PLC0415
 
-    m = re.search(r"var REPRO_LABEL = \{([\s\S]*?)\};", APP)
+    m = re.search(r"var REPRO_STATES = (\[[^\]]*\]);", APP)
     assert m
-    got = set(re.findall(r"(\w+):", m.group(1)))
+    got = set(json.loads(m.group(1)))
     assert set(core.REPRO_STATES) <= got, "core 新增了一个 repro 状态，网页不认识它"
     assert "unknown" in got, "parse_repro 会把认不出来的状态归成 unknown"
+    # 标签搬进了 i18n，那就得两种语言都有——少一条，界面上会显示成一个裸 key
+    keys = i18n_keys()
+    for state in got:
+        for lang in ("en", "zh"):
+            assert "trace.repro." + state in keys[lang], f"{lang} 缺 trace.repro.{state}"
+
+
+# ---------------------------------------------------------------- 双语
+
+
+@needs_node
+def test_the_page_loads_i18n_before_app_js():
+    """app.js 第一次 paintChrome() 就要 window.i18n；顺序反了就是整页白屏。"""
+    order = re.findall(r'<script src="__ASSET__([^"]+)"', HTML)
+    assert "i18n.js" in order, "页面根本没有载入文案表"
+    assert order.index("i18n.js") < order.index("app.js")
+
+
+@needs_node
+def test_every_script_the_page_loads_is_shipped_by_the_static_export():
+    """静态导出漏拷一个脚本 = file:// 打开时白屏，而且是断网之后才发现。"""
+    import trace_cli  # noqa: PLC0415
+
+    want = re.findall(r'<script src="__ASSET__([^"]+)"', HTML)
+    missing = [x for x in want if x not in trace_cli.STATIC_ASSETS]
+    assert not missing, f"这些脚本页面要用，导出却不拷：{missing}"
+
+
+def test_no_ui_text_is_hardcoded_in_the_page():
+    """index.html 里不许再有写死的界面文案——一份文案只能有一处真相。
+
+    注释是中文的（仓库规矩），所以先摘掉注释再看。剩下的中文只允许语言开关上
+    那个「中」字：它是语言的自称，两种界面里都念同一个音，翻译它没有意义。
+    """
+    stripped = re.sub(r"<!--[\s\S]*?-->", "", HTML)
+    leftover = {ch for ch in CJK.findall(stripped)}
+    assert leftover <= {"中"}, f"index.html 里还有写死的中文：{leftover}"
+
+
+@needs_node
+def test_no_ui_text_is_hardcoded_in_app_js():
+    """app.js 的字符串字面量里不许再有界面文案。
+
+    唯一的例外是 INSIGHT_HEADINGS：那四个字符串不是界面文案，是 project.md 里
+    真实的小节名（必须和 trace_write.INSIGHT_SECTIONS 逐字一致），
+    切换界面语言不该让它们变——变了就切错小节，用户在框里删不掉自己看见的东西。
+    """
+    allowed = set(re.search(r"var INSIGHT_HEADINGS = \[([^\]]*)\];", APP).group(1).replace('"', "").split(", "))
+    bad = [(n, s) for n, s in js_string_literals(APP) if CJK.search(s) and s.strip() not in allowed]
+    assert not bad, "app.js 里还有没走 i18n 的中文文案：" + "; ".join(f"{n}:{s[:40]}" for n, s in bad)
+
+
+@needs_node
+def test_every_key_the_page_asks_for_exists_in_both_languages():
+    """data-i18n 写错一个字母，页面上就会显示一个点分的 key。两种语言都得有。"""
+    keys = i18n_keys()
+    want = set(re.findall(r'data-i18n(?:-html|-title|-ph)?="([^"]+)"', HTML))
+    assert want, "页面上一个 data-i18n 都没有"
+    for lang in ("en", "zh"):
+        assert not want - keys[lang], f"{lang} 缺这些 key：{sorted(want - keys[lang])}"
+
+
+@needs_node
+def test_keys_used_from_js_exist_in_both_languages():
+    """app.js 里写死的那些 key 同样要两种语言都在。
+
+    只认**当场闭合**的字面量（i18n.t("x.y") / i18n.t("x.y", {…})）；
+    拼出来的（"trace.level." + l）由各自对着 core 的一致性测试盯着，
+    见 test_repro_states_match_the_core_side / test_git_states_...。
+    """
+    keys = i18n_keys()
+    used = set(re.findall(r'i18n\.t(?:Html)?(?:In)?\(\s*(?:"[a-z]{2}",\s*)?"([a-z][\w.]*)"\s*[,)]', APP))
+    assert len(used) > 60, f"只找到 {len(used)} 个 key，扫描八成没生效"
+    for lang in ("en", "zh"):
+        assert not used - keys[lang], f"{lang} 缺这些 key：{sorted(used - keys[lang])}"
+
+
+def test_the_language_switch_is_in_the_header_and_always_reachable():
+    """找语言开关的人正是看不懂当前语言的人，所以它不能藏在折叠菜单里。"""
+    header = HTML.split("</header>")[0]
+    assert 'id="langtoggle"' in header
+    assert 'data-lang="en"' in header and 'data-lang="zh"' in header
+    stripped = re.sub(r"/\*[\s\S]*?\*/", "", CSS)
+    for sel, decl in re.findall(r"([^{}]+)\{([^}]*)\}", stripped):
+        if "#langtoggle" not in sel:
+            continue
+        assert "display: none" not in decl and "visibility: hidden" not in decl, \
+            f"这条规则把语言开关藏了：{sel.strip()}"
+
+
+def test_switching_the_language_repaints_and_updates_the_html_lang_attribute():
+    """切了语言页面不重画就是「刷新一下才生效」；<html lang> 不跟着改，
+    浏览器的断词、朗读、拼写检查全按旧语言来。"""
+    assert "i18n.setLang(" in APP, "开关没有真的写进 localStorage"
+    m = re.search(r'window\.addEventListener\(i18n\.EVENT, function \(\) \{([\s\S]*?)\n  \}\);', APP)
+    assert m, "没有监听 tracelang 事件"
+    body = m.group(1)
+    assert "paintChrome()" in body
+    assert "renderRows()" in body and "renderDiagram()" in body, "树/列表上的标题没跟着换语言"
+    assert "document.documentElement.lang" in APP
+
+
+def test_switching_the_language_never_eats_text_being_typed():
+    """切语言会把编辑器整个重渲染——正在敲的字必须留住。"""
+    m = re.search(r'window\.addEventListener\(i18n\.EVENT, function \(\) \{([\s\S]*?)\n  \}\);', APP)
+    assert "editing && isDirty()" in m.group(1), "脏编辑器没有被保护"
+
+
+# ---------------------------------------------------------------- 双语 · 内容
+
+
+def test_the_view_shows_the_translation_and_says_so_when_it_cannot():
+    """有译文显示译文，没有就显示原文并如实说明——而且不许猜原文是什么语言。"""
+    assert "function stepTitle" in APP and "function stepBody" in APP
+    for fn in ("renderRows", "renderDiagram", "renderDetail"):
+        body = re.search(r"function " + fn + r"[\s\S]*?\n  \}\n", APP).group(0)
+        assert "stepTitle(s)" in body, f"{fn} 里的标题没跟着语言走"
+    detail = re.search(r"function renderDetail[\s\S]*?\n  \}\n", APP).group(0)
+    assert "stepBody(s)" in detail and "trNotice(s)" in detail
+    notice = re.search(r"function trNotice[\s\S]*?\n  \}\n", APP).group(0)
+    assert '"unknown"' in notice, "没声明 lang 的那一档不见了"
+    assert "langName(rec.lang)" in notice, "声明了 lang 的那一档应当说清是哪种语言"
+
+
+def test_figures_and_attachments_still_point_at_the_same_step_directory():
+    """译文是同一步的另一份文字。fileURL 一旦跟着语言变，翻译一份就等于
+    把所有图链接指向不存在的地方。"""
+    body = re.search(r"function fileURL[\s\S]*?\n  \}\n", APP).group(0)
+    for word in ("uiLang", "edLang", "pickLang", "tr["):
+        assert word not in body, f"fileURL 里混进了语言：{word}"
+
+
+def test_the_body_template_follows_the_content_language_not_the_interface():
+    """界面英文的人未必用英文记笔记。给他插一套英文小节名，
+    trace_core 就找不到「为什么」，这一步的评级凭空掉到 L0。"""
+    assert "function guessContentLang" in APP
+    g = re.search(r"function guessContentLang[\s\S]*?\n  \}\n", APP).group(0)
+    assert "langByHeadings" in g, "没有按兄弟步骤已经在用的小节名来定"
+    assert ".lang" in g, "note.md 自己声明的 lang 才是第一顺位"
+    # 模板一律走显式指定语言的 tIn，绝不走跟界面语言的 t
+    assert 'i18n.t("template.body")' not in APP
+    assert 'templateBody(' in APP
+    tb = re.search(r"function templateBody[\s\S]*?\n  \}\n|function templateBody[^\n]*\n", APP).group(0)
+    assert "tIn(" in tb
+
+
+def test_the_new_step_dialog_lets_you_correct_the_guessed_content_language():
+    """猜出来的默认值必须能当场推翻，否则猜错就是一个没有出口的坑。"""
+    assert 'id="nf-lang"' in HTML
+    m = re.search(r'\$\("#nf-lang"\)\.addEventListener\("change", function \(\) \{([\s\S]*?)\n  \}\);', APP)
+    assert m, "内容语言的下拉没有接线"
+    assert "isPristineTemplate" in m.group(1), "换语言会把人已经写下的正文冲掉"
+
+
+# ---------------------------------------------------------------- 双语 · 编辑
+
+
+def test_translations_are_written_through_their_own_endpoint():
+    """补翻译的工具永远碰不到原文：译文那条路径只发 title 和 body。"""
+    assert "function putTranslation" in APP
+    p = re.search(r"function putTranslation[\s\S]*?\n  \}\n", APP).group(0)
+    assert '"/tr/"' in APP and 'method: "PUT"' in p
+    save = re.search(r"function saveEditor[\s\S]*?\n  \}\n", APP).group(0)
+    assert "st.lang" in save, "保存时不分是原文还是译文"
+    tr_branch = save.split("st.lang")[1].split("papi(")[0]
+    for forbidden in ("paths:", "status:", "date:", "commit:"):
+        assert forbidden not in tr_branch, f"译文的写入路径上出现了结构键：{forbidden}"
+
+
+def test_the_editor_can_switch_which_language_version_it_edits():
+    assert "function switchEditLang" in APP and 'data-edlang' in APP
+    m = re.search(r"function switchEditLang[\s\S]*?\n  \}\n", APP).group(0)
+    assert "saveDraftNow()" in m, "切语言前不存草稿 = 切一下丢一份"
+
+
+def test_translation_saves_carry_their_own_expect():
+    """乐观并发控制在译文这一份文件上同样成立，而且对的是译文自己的 digest——
+    拿 note.md 的摘要去对译文，是一次永远对不上的误报。"""
+    save = re.search(r"function saveEditor[\s\S]*?\n  \}\n", APP).group(0)
+    assert "expect: trDigest[trKey(s.id, st.lang)]" in save
+    assert "expect: s.digest" in save, "原文那条链不受影响"
+    r = re.search(r"function resolveConflict[\s\S]*?\n  \}\n", APP).group(0)
+    assert "putTranslation(c.id, c.lang" in r, "409 之后「用我的覆盖」不支持译文"
