@@ -421,6 +421,335 @@ def test_every_repro_example_in_the_docs_is_accepted_by_the_parser():
     assert seen >= 4, f"只扫到 {seen} 条 repro 示例，扫描器可疑"
 
 
+# ------------------------------------------------- front-matter 的四个结构化键
+# `path` / `input` / `code` / `moved` 的值都是**竖线分段**的行式格式，判定规则细到
+# 「整段全是 k=v 才算属性」。文档里每一条示例都是拿来整块复制的，所以直接喂给真解析器，
+# 而不是靠人再读一遍规则。判据全部来自 trace_core 的解析器和 trace_write 的校验器。
+
+
+def front_matter_lines(key: str) -> list[tuple[Path, str]]:
+    """扫出所有文档里 `<key>: …` 的原样写法。
+
+    以 `<` 开头的跳过：那是**语法模板**（`code: <kind> | <位置> | <k=v …>`），
+    不是可以照抄的示例。模板和示例混在一起检查，只会逼着文档不敢写语法说明。
+    """
+    pat = re.compile(r"^\s*%s:\s*(\S.*?)\s*$" % key, re.M)
+    return [(doc, m.group(1)) for doc in DOCS for m in pat.finditer(text(doc))
+            if not m.group(1).startswith("<")]
+
+
+def test_every_path_example_in_the_docs_round_trips_through_the_parser():
+    """`path:` 的示例必须：解析得出位置、被写入侧的校验器接受、并且**回写后逐字不变**。
+
+    回写这一步是要紧的：任何一次无关编辑（在网页上改个标题）都会让写入侧用
+    format_path 重新拼这一行。拼出来和原来不一样，就意味着文档教的写法一过工具
+    就会被改写——role 掉了、校验和掉了，而且一声不吭。
+    """
+    seen = 0
+    for doc, raw in front_matter_lines("path"):
+        got = core.parse_paths(raw)
+        assert got, f"{where(doc)} 的 `path: {raw}` 解析不出任何东西"
+        p = got[0]
+        assert p["location"], f"{where(doc)} 的 `path: {raw}` 没有位置"
+        assert core.format_path(p) == raw, (
+            f"{where(doc)} 的 path 回写后变了样:\n  原文: {raw}\n  回写: {core.format_path(p)}")
+        # 写入侧的值域校验（size/n 要整数、日期要 YYYY-MM-DD、属性值不含空白与竖线）
+        assert W.norm_paths(raw)[0]["location"] == p["location"]
+        seen += 1
+    assert seen >= 8, f"只扫到 {seen} 条 path 示例，扫描器可疑"
+
+
+def test_the_documented_path_roles_are_exactly_the_ones_the_parser_accepts():
+    """判定规则那句话里的四个词就是 core.PATH_ROLES 本身。
+
+    多写一个（比如 `log`），照着写的人得到的是一段被并进「说明」的文字——一个字没丢，
+    但它永远不会是 role，而且不会有任何警告。少写一个则相反：有效的写法没人知道。
+    顺序也要对上，那张表就是照着常量列的。
+    """
+    pat = re.compile(r"恰好\*\*是\s*((?:`[a-z]+`\s*/?\s*)+)之一", re.S)
+    for doc in (FORMAT, README, SKILL):
+        runs = pat.findall(text(doc))
+        assert runs, f"{where(doc)} 里找不到 path 的 role 判定规则那句话"
+        for run in runs:
+            assert tuple(re.findall(r"`([a-z]+)`", run)) == core.PATH_ROLES, \
+                f"{where(doc)} 列的 role 和 core.PATH_ROLES={list(core.PATH_ROLES)} 对不上"
+
+
+def test_the_known_path_attributes_in_format_md_are_the_ones_the_writer_knows():
+    """已知属性表的第一列 = trace_write.PATH_ATTR_ORDER。
+
+    文档多列一个（`bytes`）→ 照着写的属性谁也不认识，只会被原样留着；
+    少列一个 → 那个属性没人会用。两个方向都只有逐字比对挡得住。
+    """
+    listed = table_first_column(format_numbered_section("东西在哪"), "| 属性 |")
+    assert set(listed) == set(W.PATH_ATTR_ORDER), \
+        f"FORMAT.md 列的属性是 {sorted(listed)}，trace_write.PATH_ATTR_ORDER 是 {sorted(W.PATH_ATTR_ORDER)}"
+
+
+def test_every_code_example_in_the_docs_parses_and_actually_locates_the_code():
+    """`code:` 是 L2 的新判据，所以文档里的每条示例都必须真的**定位得到代码**。
+
+    一条 `code: snapshot | | manifest=…`（漏了目录）看着像模像样，照抄的人却拿不到 L2
+    ——而 L2 恰恰是这个键存在的全部理由。
+    """
+    seen = 0
+    for doc, raw in front_matter_lines("code"):
+        got = core.parse_code(raw)
+        assert got, f"{where(doc)} 的 `code: {raw}` 解析不出任何东西"
+        rec = got[0]
+        assert rec["kind"] in core.CODE_KINDS, \
+            f"{where(doc)} 的 code kind {rec['kind']!r} 不在 {list(core.CODE_KINDS)} 里"
+        assert core.format_code(rec) == raw, \
+            f"{where(doc)} 的 code 回写后变了样: {raw!r} → {core.format_code(rec)!r}"
+        step = core.Step(id="001", code=[rec], dirname="001_x")
+        assert core.code_located(step), \
+            f"{where(doc)} 的 `code: {raw}` 定位不到代码，照抄的人到不了 L2"
+        seen += 1
+    assert seen >= 3, f"只扫到 {seen} 条 code 示例，三种 kind 至少各要有一条"
+
+
+def table_first_column(section: str, header: str) -> list[str]:
+    """取出某张表第一列里的反引号词。`header` 是那张表表头的开头（如 `| kind |`）。"""
+    start = section.find(header)
+    assert start != -1, f"找不到表头 {header!r} 的那张表"
+    out: list[str] = []
+    for line in section[start:].split("\n")[2:]:      # 跳过表头和分隔行
+        if not line.startswith("|"):
+            break
+        out += re.findall(r"`([a-z0-9]+)`", line.split("|")[1])
+    return out
+
+
+def test_the_documented_code_kinds_are_exactly_the_ones_the_parser_knows():
+    """`kind` 是闭词表：写一个表外的词，`code_located` 只会退回「记了位置就算」，
+    于是文档教出来的那种写法在 L2 判据上和作者以为的不是一回事。"""
+    listed = table_first_column(format_numbered_section("东西在哪"), "| kind |")
+    assert tuple(listed) == core.CODE_KINDS, \
+        f"FORMAT.md 第 7 节的 kind 表是 {listed}，core.CODE_KINDS 是 {list(core.CODE_KINDS)}"
+
+
+def test_the_documented_path_roles_table_matches_the_constant():
+    """判定规则那句话之外，第 7.2 节还有一张逐个解释 role 的表——两处都得对。"""
+    listed = table_first_column(format_numbered_section("东西在哪"), "| role |")
+    assert tuple(listed) == core.PATH_ROLES, \
+        f"FORMAT.md 第 7.2 节的 role 表是 {listed}，core.PATH_ROLES 是 {list(core.PATH_ROLES)}"
+
+
+def test_every_input_example_in_the_docs_parses_into_a_step_and_a_note():
+    """`input:` 的右半边（消费的是哪份产物）是这个键一半的价值——写成
+    `input: 013` 而不写文件名，半年后还是得靠猜。所以文档的示例必须两边都有。"""
+    seen = 0
+    for doc, raw in front_matter_lines("input"):
+        got = core.parse_inputs(raw)
+        assert got and got[0]["step"], f"{where(doc)} 的 `input: {raw}` 没解析出步骤 id"
+        assert got[0]["note"], \
+            f"{where(doc)} 的 `input: {raw}` 没写清消费的是哪份产物，示例不该这么教"
+        assert core.format_input(got[0]) == raw
+        seen += 1
+    assert seen >= 3, f"只扫到 {seen} 条 input 示例，扫描器可疑"
+
+
+def test_every_moved_example_in_the_docs_is_a_complete_audit_record():
+    """`moved:` 的五段里，**原因**是唯一无法自动生成的那一段（reason 空的话
+    move_step 直接拒绝）。文档示例漏写原因，等于在教一种服务端会 400 的写法。"""
+    seen = 0
+    for doc, raw in front_matter_lines("moved"):
+        got = core.parse_moved(raw)
+        assert got, f"{where(doc)} 的 `moved: {raw}` 解析不出来"
+        m = got[0]
+        assert re.match(r"^\d{4}-\d{2}-\d{2}$", m["date"]), \
+            f"{where(doc)} 的 moved 日期不是 YYYY-MM-DD: {m['date']!r}"
+        assert m["reason"], f"{where(doc)} 的 moved 示例没写原因，而写入侧要求必填"
+        assert m["from"] != m["to"], f"{where(doc)} 的 moved 示例是一次空操作"
+        assert core.format_moved(m) == raw
+        seen += 1
+    assert seen >= 2, f"只扫到 {seen} 条 moved 示例，扫描器可疑"
+
+
+def test_the_docs_list_exactly_the_repeatable_front_matter_keys():
+    """「可以重复多行」的键是闭集合（core.MULTI_KEYS）。文档漏一个，那个键写两行
+    就会被后写的覆盖掉前一行——而且不报错，只是安静地丢一半。"""
+    m = re.search(r"可以重复的键恰好是这五个：((?:\s*`[a-z]+`)+)", text(FORMAT))
+    assert m, "FORMAT.md 第 2 节里找不到「可以重复的键」那句话"
+    assert tuple(re.findall(r"`([a-z]+)`", m.group(1))) == core.MULTI_KEYS, \
+        f"FORMAT.md 列的是 {re.findall(r'`([a-z]+)`', m.group(1))}，core.MULTI_KEYS 是 {list(core.MULTI_KEYS)}"
+
+
+def test_the_front_matter_key_order_in_format_md_is_the_order_render_note_emits():
+    """FORMAT.md 第 2 节承诺「写回文件时键的顺序是固定的」并把顺序印了出来。
+
+    这句话是有代价的承诺：静态导出要逐字节确定，而人照着这个顺序手写的文件
+    过一次工具之后不该被重排得面目全非。所以判据是 render_note 真写出来的顺序，
+    不是照着代码抄的一份清单。
+    """
+    step = core.Step(id="001", parent="000", status="done", title="t", lang="zh",
+                     date="2026-01-01", commit="c", author="a", key="k", tags=["x"],
+                     moved=[{"date": "2026-01-02", "from": "000", "to": "001b",
+                             "by": "human", "reason": "r"}],
+                     inputs=[{"step": "000", "note": "a.csv"}],
+                     paths=[{"location": "/blue/x", "note": "n", "kind": "hpc",
+                             "role": "output", "attrs": {}}],
+                     code=[{"kind": "snapshot", "location": "/o/s", "attrs": {}, "note": ""}],
+                     repro=[{"state": "verified", "date": "d", "by": "b", "note": "n"}],
+                     body="", dirname="001_t")
+    emitted = [line.split(":", 1)[0]
+               for line in W.render_note(step).split("\n---", 1)[0].split("\n")
+               if ":" in line]
+    m = re.search(r"写回文件时键的顺序是固定的（((?:[^）]|\n)+)）", text(FORMAT))
+    assert m, "FORMAT.md 第 2 节里找不到那句「键的顺序是固定的」"
+    assert re.findall(r"`([a-z]+)`", m.group(1)) == emitted, \
+        f"FORMAT.md 写的顺序和 render_note 实际写出来的 {emitted} 对不上"
+
+
+# ------------------------------------------------- 洞察的 id 与取代
+
+
+def test_the_project_note_example_in_format_md_carries_a_real_supersede_edge():
+    """第 11 节讲 id 与取代，示例里那条 `· 取代 pN` 必须真能被解析器读回来。
+
+    这一段最容易写成一句读不回来的话：取代词、`·`、id 的形状任何一样对不上，
+    解析出来的就只是一行普通文字——文档看着讲得很清楚，照着写的人却得不到任何效果。
+    「被取代」还必须是**派生**的：磁盘上只有取代者身上写着那半句。
+    """
+    block = next(b for b in re.findall(r"```markdown\n(.*?)```", text(FORMAT), re.S)
+                 if b.startswith("---\nname:"))
+    insights = core.parse_insights(block)
+    items = [it for rows in insights.values() for it in rows]
+    assert items, "FORMAT.md 第 11 节的示例里一条洞察都没解析出来"
+    sup = [it for it in items if it["supersedes"]]
+    assert sup, "示例里没有一条带 `· 取代 pN` —— 那一段规矩就没有可抄的样例"
+    target = sup[0]["supersedes"][0]
+    old = next((it for it in items if it["id"] == target), None)
+    assert old is not None, f"示例里的 `取代 {target}` 指向一条不存在的洞察"
+    assert old["superseded_by"] == [sup[0]["id"]], \
+        "「被谁取代」没有被派生出来（它只能从取代者身上反推，磁盘上不该有第二份）"
+    assert core.SUPERSEDE_NAMES["zh"] not in old["raw"], \
+        "被取代的那一行上也写了取代词 —— 双真相源回来了"
+    ids = [it["id"] for it in items if it["id"]]
+    assert len(ids) == len(set(ids)), "示例里的洞察 id 有重复（id 在整个 project.md 内唯一）"
+    for iid in ids:
+        assert re.fullmatch(core.INSIGHT_ID_RE, iid), f"示例里的 id {iid!r} 形状不合法"
+
+
+def test_the_insight_id_shape_in_format_md_is_the_real_one():
+    """和翻译文件名那条同一个理由：文档里抄一份「差不多的」正则，照着造出来的 id
+    写得进去、读不回来，而这条洞察从此没有把手。"""
+    assert core.INSIGHT_ID_RE in text(FORMAT), \
+        f"FORMAT.md 里没有 core.INSIGHT_ID_RE 的原文: {core.INSIGHT_ID_RE}"
+
+
+@pytest.mark.parametrize("lang", sorted(core.SUPERSEDE_NAMES))
+def test_both_supersede_words_are_spelled_out_in_format_md(lang):
+    """中英两套取代词都要写出来——译文里写错一个词，那条取代关系就不存在了。"""
+    assert core.SUPERSEDE_NAMES[lang] in text(FORMAT), \
+        f"FORMAT.md 没写出 {lang} 的取代词 {core.SUPERSEDE_NAMES[lang]!r}"
+
+
+# ------------------------------------------------- 两处解析器修正的承诺
+
+
+def test_the_subheading_example_in_format_md_is_not_judged_empty():
+    """第 3 节承诺「一节的内容包含它下面所有更深的标题」，并把那段
+    `## 做了什么` + `### 1 · …` 原样印在文档里。
+
+    这条承诺兑现不了的后果不是排版难看：照着写的记录会被判成「什么都没写」→ L0，
+    作者只能靠猜发现问题，然后补一句废话引言把评级骗上去。**评级一旦逼着人写废话，
+    它就开始撒谎了。**所以直接把文档那一段喂给真评级器。
+    """
+    blocks = [b for b in re.findall(r"```markdown\n(.*?)```", text(FORMAT), re.S)
+              if b.lstrip().startswith("## " + core.SECTION_NAMES["what"]["zh"]) and "\n### " in b]
+    assert blocks, "FORMAT.md 第 3 节的子标题示例不见了"
+    body = ("## %s\n因为要验证一个假设。\n\n" % core.SECTION_NAMES["why"]["zh"]
+            + blocks[0]
+            + "\n## %s\n成立。\n" % core.SECTION_NAMES["conclusion"]["zh"])
+    step = core.Step(id="001", status="done", title="t", body=body, dirname="001_t")
+    t = core.traceability(step)
+    assert t["checks"]["what"], \
+        "「做了什么」下面只有子标题就被判成没写 —— 第 3 节的承诺没兑现"
+    assert t["level"] != "L0", f"照文档写出来的记录被判成 {t['level']}"
+    # 而且这一段**不该**触发那条只提示的诊断：子标题下面是有正文的。
+    assert not [w for w in core.lint_body(step) if w["code"] == "section_without_prose"], \
+        "文档示例自己触发了 section_without_prose，那条诊断的判据和文档说的不一致"
+
+
+def test_the_hint_only_diagnostics_named_in_format_md_really_do_not_change_the_level():
+    """第 3 / 6 / 10 节反复承诺这六条「只提示、不影响 L0–L4」。
+
+    这是一条**很容易在实现里被顺手违反**的承诺（把新检查塞进 traceability 只要一行），
+    而违反之后的表现是「明明补齐了 commit 和 path 却上不了 L2」，没人猜得到原因。
+    所以拿一份**故意犯全部六条**的记录去跑评级：等级必须和干净版本一模一样。
+    """
+    codes = set(re.findall(r"`([a-z]+_[a-z_]+)`", format_numbered_section("五个小节"))) \
+        | set(re.findall(r"`([a-z]+_[a-z_]+)`", format_numbered_section("三种关系")))
+    assert {"section_without_prose", "table_without_explanation", "code_without_explanation",
+            "dangling_input", "self_input", "input_cycle"} <= codes, \
+        f"FORMAT.md 第 3 / 6 节没列全那六条提示级诊断，只找到 {sorted(codes)}"
+
+    clean = core.Step(id="002", status="done", title="t", commit="c1d2e3f",
+                      paths=[{"location": "/blue/x", "note": "n", "kind": "hpc"}],
+                      body="## 为什么\n因为。\n\n## 做了什么\n跑了 `a.py`。\n\n## 结论\n成立。\n",
+                      dirname="002_t")
+    dirty = core.Step(id="002", status="done", title="t", commit="c1d2e3f",
+                      paths=[{"location": "/blue/x", "note": "n", "kind": "hpc"}],
+                      inputs=[{"step": "002", "note": "自指"},
+                              {"step": "999", "note": "不存在的一步"}],
+                      body="## 为什么\n因为。\n\n## 做了什么\n### 子标题\n跑了。\n\n"
+                           "## 结果\n| a | b |\n|---|---|\n| 1 | 2 |\n\n"
+                           "```bash\necho hi\n```\n\n## 结论\n成立。\n",
+                      dirname="002_t")
+    assert core.traceability(dirty)["level"] == core.traceability(clean)["level"] == "L2", \
+        "六条提示级诊断里有人把等级拉下来了"
+
+    got = {w["code"] for w in core.lint_body(dirty)}
+    assert {"table_without_explanation", "code_without_explanation"} <= got, \
+        f"表格/代码块缺说明没有被报出来: {sorted(got)}"
+    warns = {w["code"] for w in core.validate_inputs({"002": dirty})}
+    assert {"self_input", "dangling_input"} <= warns, f"input 的检查没报出来: {sorted(warns)}"
+    assert all(w["level"] == "warn" for w in core.lint_body(dirty)), \
+        "写法诊断里出现了 error 级 —— 文档说它们只是提示"
+
+
+def test_format_md_promises_l2_for_a_snapshot_and_the_code_agrees():
+    """第 7 / 10 节的核心主张：代码不在 git 里时，「快照目录 + 逐文件校验和」
+    也能上 L2。这是 `code:` 存在的全部理由，所以直接验一遍——
+
+    顺带钉住反面：**只有 manifest 没有目录位置不算数**（「东西在哪」没被回答），
+    以及有没有 manifest **不额外分级**（那是 L3/L4 的事，硬塞进 L2 会造出一个
+    机械判不清的半级）。
+    """
+    def step(code):
+        return core.Step(id="001", status="done", title="t", code=code,
+                         paths=[{"location": "/blue/x", "note": "n", "kind": "hpc"}],
+                         body="## 为什么\n因为。\n\n## 做了什么\n跑了。\n\n## 结论\n成立。\n",
+                         dirname="001_t")
+
+    bare = {"kind": "snapshot", "location": "/orange/lab/snap", "attrs": {}, "note": ""}
+    with_manifest = {**bare, "attrs": {"manifest": "MANIFEST.md5", "n": "43"}}
+    homeless = {"kind": "snapshot", "location": "", "attrs": {"manifest": "MANIFEST.md5"},
+                "note": ""}
+
+    assert core.traceability(step([bare]))["level"] == "L2"
+    assert core.traceability(step([with_manifest]))["level"] == "L2", \
+        "有 manifest 反而不是 L2？"
+    assert core.traceability(step([homeless]))["level"] == "L1", \
+        "没记快照目录也给了 L2 —— 「可定位」这一级就名不副实了"
+    assert core.traceability(step([]))["level"] == "L1"
+
+
+def test_the_commit_shorthand_is_derived_and_never_written_twice():
+    """第 7 节承诺：`commit:` 等价于一条 `code: git`，但**文件里只存一份**。
+
+    这是这个仓库最贵的一条不变量（上一代系统死于双真相源）。所以两个方向都钉：
+    读侧派生得出那一条，写侧回写时绝不把它落盘。
+    """
+    step = core.Step(id="001", commit="c1d2e3f", dirname="001_t")
+    derived = [c for c in core.code_records(step) if c.get("from") == "commit"]
+    assert len(derived) == 1 and derived[0]["kind"] == "git", "commit 没有被折算成一条 code"
+    assert core.code_located(step), "只写了 commit 就定位不到代码了"
+    assert "code:" not in W.render_note(step), \
+        "render_note 把派生出来的那条 code: git 也写进了文件 —— 双真相源回来了"
+
+
 def test_the_metric_table_example_gets_what_format_md_promises(tmp_path):
     """FORMAT.md §4 一边要求「有方差就写 `0.943 ± 0.004`」，一边承诺「整列是数字
     就自动右对齐 + 底纹条」。这两句曾经互相打脸：渲染器的数值正则只认前缀 `±`，
@@ -725,6 +1054,43 @@ def test_the_inlined_standard_carries_the_translation_rule_too():
     for key in ("why", "conclusion"):
         assert core.SECTION_NAMES[key]["en"] in ins, \
             f"内联摘要没给出英文小节名 {core.SECTION_NAMES[key]['en']}"
+
+
+def test_the_skill_tells_the_truth_about_what_the_create_endpoint_accepts():
+    """`trace_new_step` 的 schema 上有 `inputs` / `code`，而 REST 的建步骤端点
+    （`POST …/steps`）目前**不读**它们——远端模式下这两个字段会被静默丢掉。
+
+    静默丢字段是最坏的一类缺陷：agent 以为记上了，磁盘上什么都没有，而且没有报错。
+    在服务端补齐之前，SKILL.md 必须明说「建完再 PATCH 补一次」。
+    这条测试两个方向都盯着：端点补上了却没删那段注意事项，同样失败——
+    留着一句过时的警告会让 agent 一直多发一个请求。
+    """
+    src = (ROOT / "trace_server.py").read_text(encoding="utf-8")
+    m = re.search(r"async def api_create\(.*?\n\n", src, re.S)
+    assert m, "trace_server.py 里找不到建步骤那条路由了（函数名变了？）"
+    accepts = all(f'payload.get("{k}")' in m.group(0) for k in ("inputs", "code"))
+    warned = "还没接" in text(SKILL)
+    assert accepts != warned, (
+        "POST …/steps 已经收 inputs/code 了，请删掉 SKILL.md 里那段「还没接」的注意事项"
+        if accepts else
+        "POST …/steps 仍然丢掉 inputs/code，SKILL.md 必须明说这件事（agent 会以为记上了）")
+
+
+def test_the_inlined_standard_carries_the_four_structured_keys():
+    """同一条通道上的第二件事：`input` / `code` / `moved` / 结构化的 `path`。
+
+    `pip install git+…` 装出来的机器上没有 FORMAT.md，那里的 agent 只认得 instructions
+    里写了的东西。这四个键要是没进内联摘要，那台机器上的 agent 会：把数据依赖写进
+    正文（读不回来）、代码不在 git 里时干脆不记（永远停在 L1）、改 parent 时不知道
+    要写原因（直接被拒），以及把「12 GB」写进 `size=`（写入侧 400）。
+    """
+    ins = M.INSTRUCTIONS
+    for key in ("input", "code", "moved"):
+        assert f"{key}:" in ins, f"内联摘要没提过 `{key}:` 这个键"
+    assert any(k in ins for k in core.CODE_KINDS if k != "git"), \
+        "内联摘要只说了 git —— 代码不在 git 里的那条路没送到 agent 手上"
+    assert "checked" in ins and "missing" in ins, \
+        "内联摘要没说 path 的 checked= / missing="
 
 
 def test_the_untranslated_fields_named_in_the_readme_exist():

@@ -368,3 +368,159 @@ def test_check_stays_green_by_default_but_strict_fails(graded, capsys):
     assert cli.cmd_check(check_args()) == 0
     assert cli.cmd_check(check_args(strict=True)) == 1
     assert "--strict" in capsys.readouterr().out
+
+
+# ------------------------------------------------------------ check 的三档
+# 新加的三条诊断（小节下面只有子标题、表格/代码块没配说明）都是 warn 级，
+# 但它们**一条都不影响 L0–L4**。混在一起打，人会以为「表格没写说明」和
+# 「dead 没写结论」一样严重，然后开始整体忽略这一段——那正是警告失效的方式。
+
+
+def test_check_separates_hints_from_things_that_cost_you_a_level(graded, capsys):
+    import trace_write as W
+
+    sd = core.steps_dir_of(graded, "第一个课题")
+    W.create_step(sd, title="带表格的", status="done",
+                  body="## 为什么\n试试\n## 做了什么\n跑\n"
+                       "## 结果\n\n| a | b |\n|---|---|\n| 1 | 2 |\n"
+                       "## 结论\n有用\n")
+    assert cli.cmd_check(check_args()) == 0
+    out = capsys.readouterr().out
+    assert "写法提示" in out and "不影响 L0–L4" in out
+    assert "表格" in out.split("写法提示")[1], "提示要归到提示那一档里，不混进 ⚠"
+
+
+def test_hints_alone_do_not_make_strict_fail(sandbox, tmp_path: Path, monkeypatch, capsys):
+    """--strict 是给 CI 用的闸门。用「这张表没配一句说明」拦住一次合并，
+    只会让人加 --no-verify —— 然后真正的缺陷也一起漏过去了。"""
+    import trace_write as W
+
+    data = tmp_path / "hints"
+    data.mkdir()
+    init(sandbox, data_dir=str(data))
+    monkeypatch.setattr(cli, "load_config", lambda: {"data_dir": str(data)})
+    sd = core.steps_dir_of(data, "第一个课题")
+    W.create_step(sd, title="全都写了", status="done", commit="abc",
+                  paths=["/blue/x | output | 训练集"],
+                  body="## 为什么\n试试\n## 做了什么\n\n```bash\npython train.py\n```\n"
+                       "## 结果\n0.94\n## 结论\n有用\n## 下一步\n继续\n")
+    assert cli.cmd_check(check_args(strict=True)) == 0
+    assert "写法提示" in capsys.readouterr().out
+
+
+# ------------------------------------------------------------ mv（移动）
+
+
+def mv_args(**kw):
+    return type("A", (), {"project": None, "parent": None, "by": "human", "date": "", **kw})()
+
+
+def test_mv_moves_the_step_and_writes_why(graded, capsys):
+    assert cli.cmd_mv(mv_args(id="003", parent="001", reason="003 的输入来自 001，不是 002")) == 0
+    out = capsys.readouterr().out
+    assert "moved:" in out and "003 的输入来自 001" in out
+    import trace_write as W
+    sd = core.steps_dir_of(graded, "第一个课题")
+    assert W.load(sd)["003"].parent == "001"
+
+
+def test_mv_without_a_reason_is_impossible(graded):
+    """原因不是可选项：移完这棵树就和创建顺序对不上了，
+    「为什么 003 挂在 001 下面」只有那句话答得了。"""
+    with pytest.raises(SystemExit):        # argparse 的 required=True
+        cli.main(["mv", "003", "--parent", "001"])
+
+
+def test_mv_says_how_many_steps_came_along(graded, capsys):
+    cli.cmd_mv(mv_args(id="002", parent=None, reason="002 那一支其实是独立的一条线"))
+    assert "后代" in capsys.readouterr().out, "移的是一步还是一支，是两个决定"
+
+
+# ------------------------------------------------------------ paths --check
+
+
+def paths_args(**kw):
+    return type("A", (), {"project": None, "kind": None, "missing": False,
+                          "check": False, "count": False, **kw})()
+
+
+def test_paths_check_writes_back_only_what_this_machine_can_see(sandbox, tmp_path: Path,
+                                                                monkeypatch, capsys):
+    """**够不着 ≠ 不存在。** /blue/… 多半挂在超算上，在这台机器上跑一遍不该把
+    一份好好的记录盖上「已确认不存在」。"""
+    import trace_write as W
+
+    data = tmp_path / "d"
+    data.mkdir()
+    init(sandbox, data_dir=str(data))
+    monkeypatch.setattr(cli, "load_config", lambda: {"data_dir": str(data)})
+    live = tmp_path / "还在.pt"
+    live.write_bytes(b"x" * 5)
+    gone = tmp_path / "没了"
+    sd = core.steps_dir_of(data, "第一个课题")
+    W.create_step(sd, title="a", paths=[f"{live} | output | 权重", f"{gone} | output | 删掉的",
+                                        "/blue/没挂上的/x | input | 超算上的",
+                                        "s3://bucket/k | output | 远端"])
+    assert cli.cmd_paths(paths_args(check=True)) == 0
+    rows = {p["location"]: p for p in W.load(sd)["001"].paths}
+    assert rows[str(live)]["state"] == "present" and rows[str(live)]["size"] == 5
+    assert rows[str(gone)]["state"] == "missing"
+    assert rows["/blue/没挂上的/x"]["state"] == "" and rows["s3://bucket/k"]["state"] == ""
+    out = capsys.readouterr().out
+    assert "够不着" in out and "已确认不存在" in out
+    assert str(gone) in out
+
+
+def test_new_can_write_inputs_and_a_code_snapshot(sandbox, tmp_path: Path, monkeypatch, capsys):
+    """⑤ 的落点之一：代码不在 git 里时，快照目录也要能从命令行写进去——
+    否则人还是只能把它塞进 --commit，而那一格里躺着一个不是 commit 的东西。"""
+    import trace_write as W
+
+    data = tmp_path / "d4"
+    data.mkdir()
+    init(sandbox, data_dir=str(data))
+    monkeypatch.setattr(cli, "load_config", lambda: {"data_dir": str(data)})
+    new_args = type("A", (), {"project": None, "parent": None, "status": "wip", "date": "",
+                              "commit": "", "author": "human", "tags": "", "path": None,
+                              "title": "配对", "input": ["001 | pocket.csv"],
+                              "code": ["snapshot | /orange/snap/20260809 | manifest=MANIFEST.md5"]})()
+    sd = core.steps_dir_of(data, "第一个课题")
+    W.create_step(sd, title="上游")
+    assert cli.cmd_new(new_args) == 0
+    text = (sd / W.load(sd)["002"].dirname / core.NOTE_NAME).read_text(encoding="utf-8")
+    assert "input: 001 | pocket.csv" in text
+    assert "code: snapshot | /orange/snap/20260809 | manifest=MANIFEST.md5" in text
+
+
+def test_paths_missing_lists_only_what_vanished_and_never_deletes_it(sandbox, tmp_path: Path,
+                                                                     monkeypatch, capsys):
+    import trace_write as W
+
+    data = tmp_path / "d2"
+    data.mkdir()
+    init(sandbox, data_dir=str(data))
+    monkeypatch.setattr(cli, "load_config", lambda: {"data_dir": str(data)})
+    sd = core.steps_dir_of(data, "第一个课题")
+    W.create_step(sd, title="a", paths=[
+        "/orange/在 | output | 还在的 | checked=2026-08-09",
+        "/blue/没了 | input | 57 GB 的那个 | size=61203283968 missing=2026-08-09"])
+    assert cli.cmd_paths(paths_args(missing=True)) == 0
+    out = capsys.readouterr().out
+    assert "/blue/没了" in out and "/orange/在" not in out
+    assert "57 GB" in out or "GB" in out, "大小要看得见——「没了的那个有多大」是要留的信息"
+    assert len(W.load(sd)["001"].paths) == 2, "--missing 只是过滤显示，一行都不删"
+
+
+def test_paths_shows_the_role_and_the_last_verdict(sandbox, tmp_path: Path, monkeypatch, capsys):
+    import trace_write as W
+
+    data = tmp_path / "d3"
+    data.mkdir()
+    init(sandbox, data_dir=str(data))
+    monkeypatch.setattr(cli, "load_config", lambda: {"data_dir": str(data)})
+    sd = core.steps_dir_of(data, "第一个课题")
+    W.create_step(sd, title="a", paths=["/orange/pockets | output | 纯 RNA 口袋 | n=4554 size=620756992"])
+    cli.cmd_paths(paths_args())
+    out = capsys.readouterr().out
+    assert "产物" in out and "4554 条" in out and "MB" in out
+    assert "从未核对过" in out, "没查过和查过说「还在」是两回事，不能长得一样"

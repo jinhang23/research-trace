@@ -36,6 +36,22 @@ function values(lang) {
 function placeholders(s) {
   return [...String(s).matchAll(/\{(\w+)\}/g)].map((m) => m[1]).sort();
 }
+/* 复数值取 other 那一支当代表：断言「这条文案说了什么」时，单复数不影响措辞。 */
+function one(lang, key) {
+  const v = i18n.STRINGS[lang][key];
+  return typeof v === "string" ? v : v.other;
+}
+/* 上面那条「en/zh key 集合完全相同」只发现得了「加了一边忘了另一边」，
+   发现不了「整组都忘了加」——那种情况下两边一样地缺，测试全绿，而接线的人
+   在页面上拿到一屏 key 名。所以每一组新文案都要在这里点名。 */
+function needKeys(keys, why) {
+  for (const k of keys) {
+    for (const lang of ["en", "zh"]) {
+      assert.ok(k in i18n.STRINGS[lang], `${lang} 少了 ${k} —— ${why}`);
+      assert.ok(one(lang, k).trim().length > 0, `${lang}.${k} 是空的`);
+    }
+  }
+}
 
 /* ------------------------------------------------ 最重要的一条：两边一样全 */
 
@@ -270,6 +286,199 @@ test("认不出来的 missing 条目原样显示 —— 老实给中文，好过
   assert.equal(i18n.traceMissing("以后新加的某一条"), "以后新加的某一条");
   assert.equal(i18n.traceMissing(""), "");
   noStore();
+});
+
+/* ------------------------------------------------ 六条改动各自的文案
+ *
+ * 这一节按「网页上会怎么呈现」组织，不按 key 前缀组织：每一组问的是
+ * “接线的人要画这块界面，手里的字够不够”。缺一个 key 的后果不是少一句话，
+ * 是那块界面上出现一个点分的 key 名。
+ */
+
+test("① 移动审计：展示行、徽章、对话框、四类报错都有文案", () => {
+  needKeys([
+    "move.act", "move.act.title", "move.badge", "move.badge.title",
+    "move.head", "move.entry", "move.entry.nobody",
+    "move.from.root", "move.to.root", "move.by.human",
+    "move.dialog.title", "move.dialog.hint",
+    "move.field.parent", "move.parent.none", "move.parent.current",
+    "move.field.reason", "move.reason.placeholder", "move.reason.required",
+    "move.submit", "move.cancel",
+    "move.err.reason", "move.err.self", "move.err.cycle",
+    "move.err.descendant", "move.err.noop", "move.err.project", "move.err.missing",
+    "count.moves", "toast.moved", "toast.moved.root",
+  ], "移动记录要能展示、能发起、能被拒绝，缺一环这个功能就只有一半");
+
+  // 「2026-08-09 从 014 移到 013b —— 原因（谁）」这一行要能整句拼出来
+  assert.deepEqual(placeholders(one("en", "move.entry")),
+    ["by", "date", "from", "reason", "to"].sort());
+});
+
+test("① 「原因必填」的文案要说清为什么必填，不是只写「必填」", () => {
+  // 复述规则（“这一项是必填的”）不解释任何事；这套文案的性格是解释「为什么」。
+  assert.match(one("zh", "move.reason.required"), /必填/);
+  assert.match(one("en", "move.reason.required"), /Required/);
+  for (const lang of ["en", "zh"]) {
+    assert.ok(one(lang, "move.reason.required").length > 40,
+      `${lang}.move.reason.required 太短了，说不出「为什么必填」`);
+  }
+});
+
+test("① editor.hint 不再说 parent 不可改 —— P2 重新定义之后那句话是错的", () => {
+  // 旧文案：「`id` 和 `parent` 不可改」。parent 现在可改（带审计），
+  // 界面上留着旧承诺会让人不敢用移动功能，或者用了之后以为记录坏了。
+  assert.match(one("zh", "editor.hint"), /可以移动/);
+  assert.match(one("en", "editor.hint"), /can be moved/);
+  assert.ok(!/和\s*`?parent`?\s*不可改/.test(one("zh", "editor.hint")),
+    "editor.hint 还在说 parent 不可改");
+  // id 那一半仍然成立，不能一起松掉
+  assert.match(one("zh", "editor.hint"), /`id` 不可改/);
+  assert.match(one("en", "editor.hint"), /`id` never changes/);
+});
+
+test("② 数据依赖：两个方向的清单、数据流视图、三类警告都有文案", () => {
+  needKeys([
+    "input.lead", "input.parent.tip",
+    "input.head", "input.empty", "input.entry", "input.entry.bare",
+    "input.consumers.head", "input.consumers.empty",
+    "input.warn.missing", "input.warn.self", "input.warn.cycle",
+    "app.view.flow", "app.view.flow.title",
+    "flow.title", "flow.lead",
+    "flow.legend.tree", "flow.legend.data", "flow.legend.both", "flow.empty",
+    "editor.inputs.label", "editor.inputs.placeholder", "editor.inputs.hint",
+    "newstep.field.inputs", "detail.meta.inputs",
+    "count.inputs", "count.consumers",
+  ], "数据流是 DAG、树是单父，两个方向的清单都要能画出来");
+});
+
+test("② 最要紧的那一句：parent 和 input 是两件事，两种语言都要说出来", () => {
+  // 这一句不写，读者只会把 input 当成「第二个 parent」，然后开始怀疑树错了。
+  const en = one("en", "input.lead"), zh = one("zh", "input.lead");
+  for (const s of [en, zh]) {
+    assert.match(s, /parent/);
+    assert.match(s, /input/);
+  }
+  assert.match(en, /bytes/, "英文里要点明 input 说的是字节从哪来");
+  assert.match(zh, /字节/, "中文里要点明 input 说的是字节从哪来");
+});
+
+test("③ 结构化路径：四个 role、大小条目数校验和、三种核对状态都有文案", () => {
+  needKeys([
+    "path.role.input", "path.role.script", "path.role.output", "path.role.evidence",
+    "path.role.input.title", "path.role.script.title",
+    "path.role.output.title", "path.role.evidence.title", "path.role.none",
+    "path.n", "path.checksum", "path.checksum.title",
+    "path.checked", "path.checked.title",
+    "path.missing", "path.missing.badge", "path.missing.title",
+    "path.unchecked", "path.unchecked.title", "path.summary.missing",
+    "path.attr.unknown.title",
+    "editor.paths.hint",
+  ], "结构化 path 的每一段都得有个说法，否则机器读出来了人还是看不懂");
+
+  for (const lang of ["en", "zh"]) {
+    const roles = ["input", "script", "output", "evidence"]
+      .map((r) => one(lang, "path.role." + r));
+    assert.equal(new Set(roles).size, 4, `${lang} 的四个 role 名字撞了：${roles.join(" / ")}`);
+  }
+});
+
+test("③ 57 GB 的目录要显示成 57 GB —— 只有 MB 的话那个数没人读得出来", () => {
+  needKeys(["unit.gb", "unit.tb"], "size= 是字节数，最大的那条是 57 GB");
+  for (const lang of ["en", "zh"]) {
+    assert.match(one(lang, "unit.gb"), /\{n\}/);
+    assert.match(one(lang, "unit.tb"), /\{n\}/);
+  }
+});
+
+test("③ 「已不存在」要显眼但不惊悚：不说错误、不说失败，并写明这一行不删", () => {
+  // 目录没了是一条**发现**（P4：失败是一等公民），不是这条记录出了错。
+  // 用红色警告词会让人第一反应去「修」它——而唯一能“修”的方法就是删掉那一行。
+  for (const lang of ["en", "zh"]) {
+    const badge = one(lang, "path.missing.badge");
+    assert.ok(!/error|fail|错误|失败|警告|invalid/i.test(badge),
+      `${lang}.path.missing.badge 用了报错口吻：${badge}`);
+  }
+  assert.match(one("zh", "path.missing.title"), /不删/);
+  assert.match(one("en", "path.missing.title"), /stays/);
+});
+
+test("④ 洞察：id、取代双向、折叠展开、编辑都有文案", () => {
+  needKeys([
+    "insight.id", "insight.id.title",
+    "insight.superseded", "insight.supersedes", "insight.badge.superseded",
+    "insight.superseded.title", "insight.superseded.show", "insight.superseded.hide",
+    "insight.item.edit", "insight.item.edit.prompt",
+    "insight.supersede.act", "insight.supersede.prompt", "insight.supersede.hint",
+    "insight.warn.missing",
+    "toast.insight.updated", "toast.insight.superseded",
+  ], "取代关系只写在取代者身上，被取代那一侧是派生的——但界面上两侧都要说得出来");
+});
+
+test("④ 「被取代」是折叠不是删除 —— 文案必须说清旧的那条还在", () => {
+  assert.match(one("zh", "insight.superseded.title"), /留着/);
+  assert.match(one("en", "insight.superseded.title"), /Kept/);
+  // 「编辑」和「取代」是两件事，界面要给出选哪个的依据
+  assert.ok(one("zh", "insight.supersede.hint").includes("取代")
+         && one("zh", "insight.supersede.hint").includes("编辑"),
+    "insight.supersede.hint 没说清什么时候用哪个");
+});
+
+test("⑤ code：三种 kind、manifest、文件数都有文案", () => {
+  needKeys([
+    "code.head", "code.kind.git", "code.kind.snapshot", "code.kind.container",
+    "code.kind.git.title", "code.kind.snapshot.title", "code.kind.container.title",
+    "code.manifest", "code.manifest.title", "code.files", "code.empty",
+    "code.from.commit", "code.from.commit.title", "code.l2.note",
+    "editor.code.label", "editor.code.placeholder", "editor.code.hint",
+    "newstep.field.code", "detail.meta.code",
+  ], "代码不在 git 里的时候也要能上 L2，界面上就得先说得出「不在 git 里」是什么样");
+});
+
+test("⑤ L2 的说法要跟着放宽：不能只提 commit，快照也算", () => {
+  // 判据放宽了而文案还写着「记了 commit」，用户会以为自己那条 L2 是判错的。
+  assert.match(one("en", "trace.level.L2.hint"), /snapshot/);
+  assert.match(one("zh", "trace.level.L2.hint"), /快照/);
+  assert.match(one("en", "trace.missing.commit"), /snapshot/);
+  assert.match(one("zh", "trace.missing.commit"), /快照/);
+  // 「不比 commit 差」那句话是这条改动的全部理由，要真的写出来
+  for (const lang of ["en", "zh"]) assert.match(one(lang, "code.l2.note"), /commit/);
+});
+
+test("⑤ 服务端把 missing 从「commit」改写成「代码位置」时，界面上仍是同一句话", () => {
+  // MISSING_MATCH 认的是 trace_core 里的中文原文。⑤ 之后那句话的措辞可能变，
+  // 两种写法必须落到同一条译文——否则英文界面上会突然漏出中文（认不出就原样显示）。
+  withStore({ "trace.lang": "en" });
+  const a = i18n.traceMissing("没记 commit——找不回当时的代码");
+  const b = i18n.traceMissing("没记代码位置——commit、快照、镜像 digest 有一个就行");
+  assert.equal(a, b, "两种措辞认到了不同的译文");
+  assert.ok(!/[一-鿿]/.test(a), "英文界面上漏出中文：" + a);
+  noStore();
+});
+
+test("⑥ 新诊断有文案，并且写明「只是提示，不影响等级」", () => {
+  needKeys([
+    "lint.head", "lint.badge", "lint.note",
+    "lint.level.error", "lint.level.warn", "lint.level.hint",
+    "lint.subheads", "lint.table.nodesc", "lint.pre.nodesc",
+  ], "提示级诊断如果看起来和降级警告一样，人会去「修」一件根本没坏的事");
+
+  assert.match(one("zh", "lint.note"), /不影响等级/);
+  assert.match(one("en", "lint.note"), /change the level/);
+  // 「哪一节」得说得出来，否则提示指不到地方
+  assert.deepEqual(placeholders(one("en", "lint.subheads")), ["section"]);
+  assert.deepEqual(placeholders(one("zh", "lint.subheads")), ["section"]);
+});
+
+test("title= 里不写 ** 和 ` —— 那些地方走 t()，标记不会展开，只会原样显示给用户", () => {
+  // tHtml 才展开行内标记；tooltip / placeholder 是 textContent 级的目的地。
+  // 这条以前靠自觉，这一轮新增了二十多条 .title，改成机器管。
+  for (const lang of ["en", "zh"]) {
+    for (const [k, v] of values(lang)) {
+      if (!/\.title$/.test(k) && !/placeholder$/.test(k)) continue;
+      assert.ok(!/[`]/.test(v) && !/\*\*/.test(v),
+        `${lang}.${k} 在 tooltip/placeholder 里写了行内标记：${v}`);
+    }
+  }
 });
 
 /* ------------------------------------------------ 载入方式 */

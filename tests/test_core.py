@@ -111,6 +111,96 @@ def test_lint_ignores_text_without_images():
     assert core.lint_body(S("001", body="## 结论\n没有图，只有字。")) == []
 
 
+# --------------------------------------------- 小节的切法（子标题不该结束上一节）
+
+
+def test_a_subheading_does_not_end_its_parent_section():
+    """**这条钉的是一个在制造假 L0 的 bug。**
+
+    用户那一节以 `### 1 · 统计口袋蛋白含量` 开头、标题下没有直接的散文，于是
+    「做了什么」被判成空的 → L0，他只能补一句废话引言把评级骗上去。
+    markdown 的常识语义是「更深的标题连同它下面的内容都算上一节的内容」。
+    """
+    body = ("## 为什么\n先看看口袋里有什么。\n\n"
+            "## 做了什么\n### 1 · 统计口袋蛋白含量\n跑了 count.py，逐个口袋数残基。\n")
+    assert "count.py" in core.section_text(body, "what")
+    t = core.traceability(core.Step(id="001", status="wip", body=body, dirname="001_x"))
+    assert t["level"] != "L0", "写全了却被判 L0，正是这条要防的"
+
+
+def test_a_top_level_title_does_not_swallow_the_five_sections():
+    """修法是「层级不深于本节的标题才结束本节」，不是「只认 `##`」——
+    以 `# 标题` 开头的笔记里，`## 为什么` 必须仍然是自己的一节。"""
+    sec = core.sections("# 007 加入标题字段\n引言\n\n## 为什么\n因为 X\n\n## 做了什么\n跑了 Y\n")
+    assert sec["为什么"] == "因为 X"
+    assert sec["做了什么"] == "跑了 Y"
+    assert "引言" in sec["007 加入标题字段"], "一级标题自己那一节仍然拿得到全部内容"
+
+
+def test_a_section_with_only_subheadings_is_a_hint_never_a_downgrade():
+    """真的一个字都没写时提示一句——用户当时是靠猜才发现问题出在哪的。
+    但**不降级**：等级问的是「追不追得到」，不是「写得顺不顺」。"""
+    body = "## 为什么\n想试试。\n\n## 做了什么\n### 第一步\n### 第二步\n"
+    ws = core.lint_body(core.Step(id="001", status="wip", body=body, dirname="001_x"))
+    assert codes(ws) == ["section_without_prose"]
+    assert ws[0]["level"] == "warn"
+    assert "做了什么" in ws[0]["message"] and "只有子标题" in ws[0]["message"]
+    assert core.traceability(core.Step(id="001", status="wip", body=body))["level"] == "L1", \
+        "只提示，不降级"
+
+
+def test_a_section_with_prose_under_the_subheading_says_nothing():
+    body = "## 做了什么\n### 1 · 统计\n跑了 count.py。\n"
+    assert core.lint_body(core.Step(id="001", status="wip", body=body, dirname="001_x")) == []
+
+
+# --------------------------------------------- 表格 / 代码块的说明（只提示）
+
+
+def _lint(body, status="wip"):
+    return codes(core.lint_body(core.Step(id="001", status=status, body=body, dirname="001_x")))
+
+
+def test_a_table_with_no_explanation_anywhere_in_its_section_is_hinted():
+    assert _lint("## 结果\n| 模型 | 准确率 |\n|---|---|\n| A | 0.9 |\n") == ["table_without_explanation"]
+
+
+def test_a_table_explained_anywhere_in_the_same_section_is_silent():
+    """判据刻意选得宽（同一节里有任何说明文字就闭嘴）：宁可少报，也不要在
+    「一句引言 + 几个 `###` 各摆一张表」这种完全正常的写法上吵个不停。"""
+    assert _lint("## 结果\n三个模型的对比如下。\n\n| 模型 | 准确率 |\n|---|---|\n| A | 0.9 |\n") == []
+    assert _lint("## 结果\n对比如下。\n\n### 表一\n| a | b |\n|---|---|\n| 1 | 2 |\n"
+                 "\n### 表二\n| a | b |\n|---|---|\n| 3 | 4 |\n") == []
+
+
+def test_a_captioned_figure_counts_as_the_explanation():
+    """FORMAT.md 自己推荐的写法就是「指标表 + 带图注的曲线」（示例项目 002 就是这样）。
+    在推荐写法上误报，是让人从此忽略警告最快的办法。图注本来就是解释性文字，
+    而且是这一节里质量最高的那一句。"""
+    body = ('## 结果\n| 模型 | 准确率 |\n|---|---|\n| A | 0.9 |\n\n'
+            '![](loss.png "第 12 轮之后验证集回升，再往后是纯过拟合")\n')
+    assert _lint(body) == []
+    assert _lint(body.replace(' "第 12 轮之后验证集回升，再往后是纯过拟合"', '')) == \
+        ["figure_without_caption", "table_without_explanation"], \
+        "图注一去掉，这一节就真的什么也没说了"
+
+
+def test_a_bare_code_block_is_hinted_and_a_described_one_is_not():
+    assert _lint("## 做了什么\n```bash\npython train.py\n```\n") == ["code_without_explanation"]
+    assert _lint("## 做了什么\n- 超参与 [[002]] 一致\n\n```bash\npython train.py\n```\n") == []
+
+
+def test_these_hints_never_touch_the_level():
+    """明确的取舍：表格和代码块 LLM 本来就读得到，缺的只是一句结论；
+    图注不同——不写就是零信息，所以只有图注会压等级。"""
+    body = ("## 为什么\n因为 X。\n\n## 做了什么\n```bash\npython train.py\n```\n\n"
+            "## 结论\n成立。\n")
+    step = core.Step(id="001", status="done", body=body, commit="abc", dirname="001_x",
+                     paths=[{"location": "/blue/a", "note": "", "kind": "hpc"}])
+    assert core.traceability(step)["level"] == "L2"
+    assert codes(core.lint_body(step)) == ["code_without_explanation"]
+
+
 # --------------------------------------------- 内容层缺陷（G4：删掉程序还得读得懂）
 
 

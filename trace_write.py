@@ -4,9 +4,20 @@ CLI、网页表单、agent API 全部调这里，不允许任何一方绕过去�
 上一代系统的 bug 根源就是存在第二条写入路径（直接 sqlite3 INSERT），
 导致父子关系只写进了一半的地方。这里用"只有一个函数会创建 note.md"来杜绝。
 
-只追加原则（P2）在这里强制：
-  * id 由服务端分配，正常情况下不重编号；
-  * parent 一旦写下就不可改（update_step 直接抛 Conflict）。
+只追加原则（P2）在这里强制。要紧的是它到底约束什么：
+
+  **只追加的地基是「不丢历史」，不是「不能改结构」——记下来就不丢。**
+
+  * id 由服务端分配，写下就不再改（笔记里的 `[[003b]]`、论文脚注里的引用要永远
+    有效），update_step 里改 id 一律 409；
+  * parent **可以改**，但只能走 move_step，而且必须写原因：每次移动都往
+    front-matter 追加一条 `moved:` 审计，只追加不覆盖。
+    update_step 里改 parent 仍然 409，只是提示改成「请用 move_step 并写原因」。
+
+  为什么给 parent 开这个口子：没有移动能力，逼出来的是更坏的东西。真实用例里
+  一整条支挂错了父节点，用户只能把两个节点的**正文对调**才让网站显示正确——
+  于是创建日期和内容脱节，而那件事一条审计记录都没留下。能移动 + 必须写原因，
+  历史反而更完整。
 
 唯一的例外是 delete_step()：真删目录，用来处理"这条记录本身就不该存在"
 （误建、测试数据、粘进去的令牌）。它和 status=dead 是两件事——dead 是研究结论。
@@ -44,16 +55,32 @@ except ImportError:       # pragma: no cover - POSIX
     msvcrt = None         # type: ignore[assignment]
 
 from trace_core import (
+    CODE_KINDS,
     NOTE_NAME,
+    PATH_ROLES,
     PROJECT_NOTE,
     STATUSES,
     DEFAULT_STATUS,
+    INSIGHT_ID_PREFIX,
+    SUPERSEDES_WORD,
     Project,
     Step,
     build_children,
-    id_key,
+    find_insight,
     fmt_id,
+    format_code,
+    format_input,
+    format_insight,
+    format_moved,
+    format_path,
+    id_key,
+    next_insight_id,
+    parse_code,
+    parse_inputs,
+    parse_insights,
+    parse_moved,
     parse_note,
+    parse_paths,
     path_kind,
     project_dir,
     projects_root,
@@ -63,6 +90,14 @@ from trace_core import (
     steps_dir_of,
     validate,
 )
+
+# 上面这一串里，`format_* / parse_* / *_insight*` 是这一版新加的**共用**函数：
+# path / input / code / moved 四种行和项目洞察的那一行，解析和序列化**都在 core**，
+# 写入侧一行都不重写。读侧和写侧共用同一对函数是硬要求——各写一份的话，
+# 「写进去的行读不回来」只会在某个属性上悄悄发生，而磁盘上那一行看着完全正常。
+# 写入侧在这里只做一件 core 不该管的事：**校验**。core 面对残缺输入要尽量读出
+# 东西来（十年后的日志一定是残缺的），写入侧面对不合法输入要当场拒绝。
+# SUPERSEDES_WORD 是重导出，MCP / 服务端要拿它拼提示文案。
 
 # 双语用到的那几张表，权威定义在 trace_core —— 读侧要按同一张表解析翻译文件，
 # 两边各存一份就是双真相源的开端。
@@ -464,18 +499,228 @@ def _write_project_note(d: Path, name: str, body: str, lang: str = "") -> None:
     write_atomic(d / PROJECT_NOTE, _utf8_bytes(head + (f"{body}\n" if body else ""), "项目笔记"))
 
 
-def update_project(root: Path, slug: str, *, name: str | None = None,
-                   insights: str | None = None,
-                   add: tuple[str, str] | None = None) -> Project:
-    """改项目的显示名和/或洞察正文。
+# ---------------------------------------------------------------- 洞察的 id
+#
+# 一条洞察要能被**重新锚定**（证据从 013 搬到了 013b，那句「见 [[013]]」就得跟着改）
+# 和**被取代**（「PDBFixer 误杀 1,099 个」后来查清是 944 个）。两件事都需要能指着
+# 某一条说「就是它」，所以每条洞察带一个 id，写在行首的反引号里：
+#
+#     - `p3` PDBFixer 误杀 944 个带修饰残基，见 [[013b]] · 取代 p1
+#     - `p1` PDBFixer 误杀 1,099 个
+#
+# 三个刻意的选择：
+#   * 写法和 `## 已删除` 里的 `` `002` `` 一致 —— 人扫一眼就知道那是个标识符；
+#   * 前缀 p 让它和步骤 id（纯数字开头）永远不会撞，`grep -n '`p1`'` 也就只捞洞察；
+#   * **「p1 已被取代」是派生的**，只写在取代者那一行上，绝不在 p1 那行上再写一份
+#     状态位。被取代的那条**永远不删**：它是当时的判断，删掉就没人知道数字为什么变了。
+# 解析（谁是 id、谁取代了谁）和渲染（那一行长什么样）都在 core，这里只管
+# **分配、校验、落盘**。读写各写一份解析，迟早会出现「写得进去、读不回来」的洞察。
 
-    `add=(kind, text)` 往对应小节追加一条，小节不存在就补出来。
-    `insights=…` 整体替换，但**只替换那四个洞察小节**（见 _merge_insights）。
-    **目录名（= URL 里的 slug）永远不动**——改了会让所有已发出的链接失效。
+
+def alloc_insight_id(*bodies: str) -> str:
+    """下一个洞察 id。和 alloc_id 同一个思路：扫一遍现有的，取最大数字 + 1。
+
+    要**跨全部语言版本**一起扫（原文 + 译文）：同一条洞察在 project.md 和
+    project.en.md 里是同一个 id，只看一份就会撞号，而撞号之后「· 取代 p2」
+    同时指向两条不同的记录，读的人无从分辨。
+
+    取 max+1 而不是「第一个空位」：被取代的洞察不删，但整组替换那条路
+    （`insights=…`）仍然可能让某个 id 从文件里消失，复用它会让别处那句
+    「· 取代 p2」指到一条完全不相干的记录上。
+    """
+    top = 0
+    pat = re.compile(re.escape(INSIGHT_ID_PREFIX) + r"(\d+)$")
+    for b in bodies:
+        m = pat.match(next_insight_id(b, INSIGHT_ID_PREFIX))
+        if m:
+            top = max(top, int(m.group(1)))
+    return f"{INSIGHT_ID_PREFIX}{top}"
+
+
+def _insight_heading(kind: str, lang: str) -> str:
+    names = INSIGHT_NAMES.get(kind)
+    if names is None:
+        raise WriteError(f"洞察类型必须是 {'/'.join(INSIGHT_SECTIONS)} 之一，收到 {kind!r}")
+    heading = names.get(lang or "zh")
+    if not heading:
+        raise WriteError(
+            f"语言 {lang!r} 还没有洞察小节的封闭词表（目前只有 zh / en）。"
+            "要让这个语言参与，先把它加进 trace_core.INSIGHT_NAMES。")
+    return heading
+
+
+def _norm_supersedes(raw: Any, iid: str, corpus: list[str]) -> list[str]:
+    """校验「取代了谁」。指向不存在的 id 直接拒绝——那一行是要被折叠显示的。"""
+    if isinstance(raw, str) or raw is None:
+        ids = [x for x in re.split(r"[,，\s]+", str(raw or "")) if x]
+    else:
+        ids = [_clean_line(x) for x in raw if _clean_line(x)]
+    if not ids:
+        return []
+    known = {it["id"] for b in corpus for items in parse_insights(b).values()
+             for it in items if it["id"]}
+    for x in ids:
+        if x == iid:
+            raise WriteError(f"{x} 不能取代它自己。")
+        if x not in known:
+            raise WriteError(
+                f"找不到要被取代的洞察 {x!r}。「· 取代 {x}」是给读的人看的指路牌，"
+                "指向一条不存在的记录比不写更糟。先确认那条洞察的 id（行首反引号里那个）。")
+    return ids
+
+
+def _clean_insight_text(text: Any) -> str:
+    """洞察是**一行**——它要能被 grep 一行捞出来，所以换行一律压成空格。"""
+    out = re.sub(r"\s*\n\s*", " ", str(text or "")).strip()
+    if not out:
+        raise WriteError("洞察内容不能为空")
+    return out
+
+
+def _insight_add(body: str, corpus: list[str], kind: str, text: Any,
+                 supersedes: Any, lang: str) -> tuple[str, dict[str, Any]]:
+    iid = alloc_insight_id(*corpus)
+    line = "- " + format_insight(_clean_insight_text(text), iid,
+                                 _norm_supersedes(supersedes, iid, corpus), lang)
+    return _append_under(body, _insight_heading(kind, lang), line), {"id": iid, "line": line}
+
+
+def _insight_edit(body: str, iid: str, text: Any, supersedes: Any,
+                  lang: str, corpus: list[str]) -> tuple[str, dict[str, Any]]:
+    """就地改写一条既有洞察。**只改这一行**，不换小节、不删别的行。
+
+    重新锚定走的就是这条路：把文本里的 `[[013]]` 改成 `[[013b]]`，id 不变，
+    于是别处那句「· 取代 p1」还指得对。
+    """
+    iid = _clean_line(iid)
+    hit = find_insight(body, iid)
+    if hit is None:
+        raise NotFound(
+            f"这个项目的洞察里没有 {iid!r}。id 写在行首的反引号里（`- \\`p1\\` …`），"
+            "只有走工具写进去的洞察才有——手写的老条目没有 id，改它请用整体替换那条路。")
+    new_text = hit["text"] if text is None else _clean_insight_text(text)
+    # supersedes 不给就**保留原样**：改一句措辞不该顺手把「它取代了谁」抹掉。
+    new_sup = (hit["supersedes"] if supersedes is None
+               else _norm_supersedes(supersedes, iid, corpus))
+    lines = (body or "").split("\n")
+    # 只换这一行的内容，缩进和 `- ` 之外的东西一概不动。
+    indent = re.match(r"^(\s*[-*]\s+)", lines[hit["line"]])
+    lines[hit["line"]] = (indent.group(1) if indent else "- ") + format_insight(
+        new_text, iid, new_sup, lang)
+    return "\n".join(lines), {"id": iid, "line": lines[hit["line"]], "kind": hit["kind"]}
+
+
+def _project_translation_body(d: Path, lang: str) -> tuple[dict[str, str], str, Path]:
+    target = d / _translation_name("project", lang)
+    if not target.is_file():
+        return {}, "", target
+    meta, body, _w = parse_note(read_text_strict(target, f"{lang} 项目译文"))
+    return meta, body, target
+
+
+def _edit_insights(root: Path, slug: str, lang: str, fn) -> dict[str, Any]:
+    """洞察类改动的公共外壳：锁、读、语言路由、回写。
+
+    `fn(body, corpus, vocab) -> (新正文, info)`；corpus 是**分配和校验 id 时要看的
+    全部正文**，vocab 是小节名和「取代」该用哪套词表的语言。
+    译文那一侧要连原文一起看：同一条洞察在 project.md 和 project.en.md 里是同一个 id，
+    只在译文里分配就会和原文撞号，而撞号之后「· 取代 p2」就指向两条不同的记录。
+
+    vocab 在写原文时取 `project.md` 自己声明的 `lang:`（一份 `lang: en` 的项目笔记
+    里的小节叫 `## Pitfalls`，往里追加中文标题会凭空多出一个空小节），
+    写译文时就是译文自己的语言。
     """
     d = project_dir(root, slug)
     if not d.is_dir():
         raise NotFound(f"项目 {slug} 不存在")
+    with project_lock(d):
+        meta, base = _read_project_note(d)
+        if not lang:
+            body, info = fn(base, [base], (meta.get("lang") or "").strip() or "zh")
+            _write_project_note(d, (meta.get("name") or slug).strip(), body,
+                                (meta.get("lang") or "").strip())
+            path = PROJECT_NOTE
+        else:
+            lang = norm_lang(lang)
+            _guard_same_lang(_declared_lang(meta), lang, f"项目 {slug}")
+            tmeta, tbody, target = _project_translation_body(d, lang)
+            body, info = fn(tbody, [base, tbody], lang)
+            write_atomic(target, _utf8_bytes(_render_translation(
+                PROJECT_TR_ONLY_KEYS[0], tmeta.get(PROJECT_TR_ONLY_KEYS[0], ""), body),
+                f"{lang} 项目译文"))
+            path = target.name
+    return {"slug": slug, "lang": lang, "path": path, **info}
+
+
+def add_insight(root: Path, slug: str, kind: str, text: str, *,
+                supersedes: str = "", lang: str = "") -> dict[str, Any]:
+    """追加一条洞察并**分配一个 id**，返回 {"id", "line", …}。
+
+    调用方拿得到 id 这件事是必须的：不知道刚写的那条叫什么，就没法在下一次
+    「查清楚了，其实是 944 个」时说出「· 取代 p1」。
+    """
+    return _edit_insights(root, slug, lang,
+                          lambda body, corpus, vocab: _insight_add(body, corpus, kind, text,
+                                                                   supersedes, vocab))
+
+
+def update_insight(root: Path, slug: str, insight_id: str, *, text: str | None = None,
+                   supersedes: str | None = None, lang: str = "") -> dict[str, Any]:
+    """改写一条既有洞察（重新锚定、更正措辞、补上「取代了谁」）。**不删任何东西。**"""
+    return _edit_insights(root, slug, lang,
+                          lambda body, corpus, vocab: _insight_edit(body, insight_id, text,
+                                                                    supersedes, vocab, corpus))
+
+
+def update_project(root: Path, slug: str, *, name: str | None = None,
+                   insights: str | None = None,
+                   add: tuple[str, str] | dict[str, Any] | None = None,
+                   insight_id: str = "", supersedes: str = "",
+                   lang: str = "") -> Project:
+    """改项目的显示名和/或洞察正文。
+
+    `add=(kind, text)`（也接受 `{"kind","text","id","supersedes"}`）往对应小节追加
+    一条并分配 id；带 `insight_id=` 时改的是那一条既有洞察，不新增。
+    `insights=…` 整体替换，但**只替换那四个洞察小节**（见 _merge_insights）。
+    `lang=` 让洞察落在 `project.<lang>.md` 上（显示名和整体替换请走翻译那条路）。
+    **目录名（= URL 里的 slug）永远不动**——改了会让所有已发出的链接失效。
+
+    分配到的 id 挂在返回值的 `.insight_id` 上——Project 是 core 的数据类，
+    不该为了带回一个写入侧的返回值就往它身上加字段（那会进 to_dict、进 API 契约、
+    进静态导出）。要结构化的返回值请直接用 add_insight / update_insight。
+    """
+    d = project_dir(root, slug)
+    if not d.is_dir():
+        raise NotFound(f"项目 {slug} 不存在")
+
+    if isinstance(add, dict):
+        add_kind = add.get("kind")
+        add_text = add.get("text", "")
+        insight_id = _clean_line(add.get("id") or insight_id)
+        supersedes = add.get("supersedes") or supersedes
+    elif add is not None:
+        add_kind, add_text = add
+    else:
+        add_kind = add_text = None
+
+    if lang and (name is not None or insights is not None):
+        raise WriteError(
+            "lang 只作用于洞察那一条。改译文的项目名或整段洞察请用 write_project_translation"
+            "——两条路各自有自己的 expect，混在一起就没法做冲突检测了。")
+
+    info: dict[str, Any] = {}
+    if lang:
+        # 译文那一侧自己有锁和回写，走同一套 _edit_insights。
+        if insight_id:
+            info = update_insight(root, slug, insight_id, text=add_text,
+                                  supersedes=supersedes or None, lang=lang)
+        elif add_kind is not None:
+            info = add_insight(root, slug, add_kind, add_text,
+                               supersedes=supersedes, lang=lang)
+        meta, body = _read_project_note(d)
+        p = Project(slug=slug, name=(meta.get("name") or slug).strip(), body=body.strip())
+        p.insight_id = info.get("id", "")       # type: ignore[attr-defined]
+        return p
 
     with project_lock(d):
         meta, body = _read_project_note(d)
@@ -487,18 +732,17 @@ def update_project(root: Path, slug: str, *, name: str | None = None,
         if insights is not None:
             body = _merge_insights(
                 body, str(insights).replace("\r\n", "\n").replace("\r", "\n"))
-        if add is not None:
-            kind, text = add
-            heading = INSIGHT_SECTIONS.get(kind)
-            if heading is None:
-                raise WriteError(f"洞察类型必须是 {'/'.join(INSIGHT_SECTIONS)} 之一，收到 {kind!r}")
-            text = re.sub(r"\s*\n\s*", " ", str(text or "")).strip()
-            if not text:
-                raise WriteError("洞察内容不能为空")
-            body = _append_under(body, heading, "- " + text)
+        if insight_id:
+            body, info = _insight_edit(body, insight_id, add_text, supersedes or None,
+                                       (meta.get("lang") or "zh").strip() or "zh", [body])
+        elif add_kind is not None:
+            body, info = _insight_add(body, [body], add_kind, add_text, supersedes,
+                                      (meta.get("lang") or "zh").strip() or "zh")
 
         _write_project_note(d, final_name, body, (meta.get("lang") or "").strip())
-    return Project(slug=slug, name=final_name, body=body.strip())
+    p = Project(slug=slug, name=final_name, body=body.strip())
+    p.insight_id = info.get("id", "")           # type: ignore[attr-defined]
+    return p
 
 
 def _append_under(body: str, heading: str, line: str) -> str:
@@ -586,6 +830,36 @@ def alloc_id(by_id: dict[str, Step], parent: str | None) -> str:
     return nxt  # 一个父节点有 25 个以上分支时退回新号段
 
 
+# ------------------------------------------------- 结构化 front-matter 行
+#
+# path / input / code / moved 四种行的共同形状：一行一条、可重复、竖线分段、
+# 人能直接读、`grep -rn "^path:"` 捞得出来（G4）。解析和序列化在 core（见文件顶部
+# 那段说明），这里只有写入侧的校验和「怎么排序才确定」。
+_ATTR_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]*$")
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_STEP_ID_RE = re.compile(r"^\d+[a-z]*$")
+# parent 里表示「没有父节点」的几种写法，和 core.build_step 那一份一致。
+_ROOT_WORDS = ("", "-", "none", "null")
+# 属性的输出顺序。P3 要求同样的输入两次构建逐字节一致，而 core.format_path 是按
+# dict 的迭代顺序拼的——于是「顺序固定」这件事落在构造这个 dict 的人身上，也就是
+# 这里。表里没有的（半年后有人写的 `nodes=…`）排在后面，按键名字典序。
+PATH_ATTR_ORDER = ("n", "size", "md5", "sha256", "checked", "missing")
+
+
+def _ordered_attrs(attrs: dict[str, Any], what: str) -> dict[str, str]:
+    """校验属性并按固定顺序重排。值里有空白或竖线一律拒绝：那会把一行劈开。"""
+    clean = {str(k): _clean_line(v) for k, v in (attrs or {}).items()}
+    for k, v in clean.items():
+        if not _ATTR_KEY_RE.match(k):
+            raise WriteError(f"{what}的属性名 {k!r} 不合法：只允许字母开头、字母/数字/下划线/点/连字符。")
+        if not v or re.search(r"\s|\|", v):
+            raise WriteError(
+                f"{what}的属性 {k}={v!r} 里有空白或竖线。这一行是竖线分段的，"
+                "带空白的值读回来会变成说明文字，带竖线的会把这一行劈成两半。")
+    known = [k for k in PATH_ATTR_ORDER if k in clean]
+    return {k: clean[k] for k in known + sorted(k for k in clean if k not in PATH_ATTR_ORDER)}
+
+
 def render_note(step: Step) -> str:
     """序列化成 note.md。键顺序固定，保证同样的数据永远产出同样的字节。"""
     lines = ["---", f"id: {step.id}"]
@@ -603,9 +877,20 @@ def render_note(step: Step) -> str:
             lines.append(f"{k}: {v}")
     if step.tags:
         lines.append("tags: " + ", ".join(step.tags))
+    # getattr 兜底的理由和上面 lang 那一条一样：纯手工造出来的 Step（测试、
+    # 演算）可能连字段都没有，而漏掉一个键就等于每改一次状态删掉一次数据。
+    for m in getattr(step, "moved", None) or []:
+        lines.append("moved: " + format_moved(m))
+    for i in getattr(step, "inputs", None) or []:
+        lines.append("input: " + format_input(i))
     for p in step.paths:
-        note = p.get("note", "").strip()
-        lines.append(f"path: {p['location']}" + (f" | {note}" if note else ""))
+        lines.append("path: " + format_path(p))
+    # `commit:` 上面已经写过了，这里**不再多写一条 `code: git`**：那是同一个事实的
+    # 第二份拷贝，正是上一代系统的死因。「commit 等价于一条 code: git」由读侧
+    # （core.code_records）现算，所以派生出来的那条（from == "commit"）要跳过。
+    for c in getattr(step, "code", None) or []:
+        if str(c.get("from", "code")) != "commit":
+            lines.append("code: " + format_code(c))
     for r in step.repro:
         lines.append("repro: " + " | ".join([r.get("state", "unknown"), r.get("date", ""),
                                              r.get("by", ""), r.get("note", "")]).rstrip(" |"))
@@ -627,12 +912,93 @@ def _clean_line(v: Any) -> str:
     return re.sub(r"[\r\n]+", " ", str(v or "")).strip()
 
 
-def norm_paths(raw: Any) -> list[dict[str, str]]:
-    """把外部传来的路径规整成 [{location, note, kind}]。
+def norm_paths(raw: Any) -> list[dict[str, Any]]:
+    """把外部传来的路径规整成 [{location, note, role, attrs, kind}]。
 
-    接受 "位置 | 说明" 这样的字符串，也接受 {"location":…, "note":…} 这样的字典，
-    单条也可以不套列表——agent 和人怎么写都能接住。
+    接受三种写法，agent 和人怎么写都能接住：
+      * `"位置 | 说明"` 或结构化的一整行 `"位置 | output | 说明 | n=4 size=12"`；
+      * `{"location"/"loc", "note"/"desc", "role", "size", "n", "md5", "checked", …}`；
+      * 单条不套列表。
     kind 是派生的，从位置形状猜出来，不存也不接受外部传入。
+    """
+    if not raw:
+        return []
+    items = [raw] if isinstance(raw, (str, dict)) else list(raw)
+    out: list[dict[str, Any]] = []
+    for item in items:
+        if isinstance(item, dict):
+            loc = _clean_line(item.get("location") if item.get("location") is not None
+                              else item.get("loc"))
+            note = _clean_line(item.get("note") if item.get("note") is not None
+                               else item.get("desc"))
+            role = _clean_line(item.get("role")).lower()
+            attrs = {_clean_line(k): _clean_line(v)
+                     for k, v in dict(item.get("attrs") or {}).items()}
+            # 已知属性也接受平铺在顶层——`{"loc": …, "size": 620756992}` 是调用方
+            # 最自然的写法。未知的顶层键**不**当属性（那样一个拼错的字段会被静默
+            # 当成机器字段写进去），要写没见过的属性请显式放进 attrs。
+            for k in PATH_ATTR_ORDER:
+                if item.get(k) not in (None, ""):
+                    attrs[k] = _clean_line(item[k])
+        else:
+            parsed = parse_paths(str(item).replace("\n", " "))
+            if not parsed:
+                continue
+            loc, note = _clean_line(parsed[0]["location"]), _clean_line(parsed[0]["note"])
+            role, attrs = parsed[0]["role"], dict(parsed[0]["attrs"])
+        if not loc:
+            continue
+        if role and role not in PATH_ROLES:
+            raise WriteError(f"path 的 role 必须是 {'/'.join(PATH_ROLES)} 之一，收到 {role!r}")
+        out.append(_path_row(loc, note, role, attrs))
+    return out
+
+
+def _path_row(loc: str, note: str, role: str, attrs: dict[str, Any]) -> dict[str, Any]:
+    """一条结构化 path。**派生字段一律现算**，不接受调用方传进来。
+
+    kind / size / n / checksum / state 都是从 location 和 attrs 推出来的，
+    存两份就会有一天对不上（`size=12` 而 size 字段写着 99）。所以这里的做法是：
+    校验属性 → 排好序 → 交给 core.parse_paths 重新读一遍，读出来的就是权威形状。
+    多花一次解析，换「写侧和读侧看到的一模一样」。
+    """
+    # 已知属性的值域先查：`size=12 GB` 同时犯了两个错（不是整数、带空白），
+    # 而「要是整数、格式化成 592 MB 是显示层的事」才是调用方需要的那句话。
+    attrs = {str(k): _clean_line(v) for k, v in (attrs or {}).items()}
+    for k in ("size", "n"):
+        if k in attrs and not re.fullmatch(r"\d+", attrs[k]):
+            raise WriteError(
+                f"path 的 {k} 要是非负整数（{'size 是字节数' if k == 'size' else 'n 是条目数'}），"
+                f"收到 {attrs[k]!r}。格式化成「592 MB」是显示层的事，存进文件的永远是数。")
+    for k in ("checked", "missing"):
+        if k in attrs and not _DATE_RE.match(attrs[k]):
+            raise WriteError(f"path 的 {k} 要写成 YYYY-MM-DD，收到 {attrs[k]!r}")
+    attrs = _ordered_attrs(attrs, "路径")
+    row = format_path({"location": loc, "note": note, "role": role, "attrs": attrs})
+    got = parse_paths(row)
+    if not got or got[0]["location"] != loc or got[0]["note"] != note:
+        # 读不回原样只可能是位置或说明里混进了竖线/角色词，那会静默改变语义。
+        raise WriteError(
+            f"这条路径读回来和写进去的不一样: {row!r}。位置和说明里不要出现竖线，"
+            f"说明也不要单独写成 {'/'.join(PATH_ROLES)} 里的一个词——那会被当成 role。")
+    return got[0]
+
+
+def norm_inputs(raw: Any) -> list[dict[str, str]]:
+    """数据依赖规整成 [{step, note}]。
+
+    **不检查目标步骤存不存在**，这是想清楚之后的选择：
+
+      * 建立顺序不定。agent 常常先建 016（今天跑的这一步）再回头补 013b，
+        要求先有后引会逼着调用方排序，或者干脆不写 input——那就什么都没记下。
+      * 和 parent 的既有处理一致。指向不存在的 id 的 parent 在读侧降级为根 + 一条
+        `dangling_parent` 警告，从不拒绝写入；「残缺输入产出部分结果」是这套系统的
+        明文约定，输入依赖没有理由比父子关系更严。
+      * 删掉一步之后引用变悬空是**已经明确接受的代价**（FORMAT.md 第 8 节）。
+        写入侧拦不住它，只能让读侧说出来。
+
+    但 id 的**形状**必须查：`input: 十三` 不是悬空引用，是笔误，而且它永远不可能
+    指向任何东西。悬空的留给读侧报警告（见报告里的接缝清单）。
     """
     if not raw:
         return []
@@ -640,14 +1006,79 @@ def norm_paths(raw: Any) -> list[dict[str, str]]:
     out: list[dict[str, str]] = []
     for item in items:
         if isinstance(item, dict):
-            loc, note = _clean_line(item.get("location")), _clean_line(item.get("note"))
+            sid = _clean_line(item.get("step") if item.get("step") is not None else item.get("id"))
+            note = _clean_line(item.get("note"))
         else:
-            head, _, tail = str(item).partition("|")
-            loc, note = _clean_line(head), _clean_line(tail)
-        if not loc:
+            got = parse_inputs(str(item).replace("\n", " "))
+            if not got:
+                continue
+            sid, note = _clean_line(got[0]["step"]), _clean_line(got[0]["note"])
+        if not sid:
             continue
-        out.append({"location": loc, "note": note, "kind": path_kind(loc)})
+        if not _STEP_ID_RE.match(sid):
+            raise WriteError(
+                f"input 指向的步骤 id 形状不对: {sid!r}（应该是 013 / 013b 这样的三位数字加可选字母）。")
+        out.append({"step": sid, "note": note})
     return out
+
+
+def norm_code(raw: Any) -> list[dict[str, Any]]:
+    """代码位置规整成 [{kind, location, note, attrs}]。
+
+    kind 是封闭词表 git / snapshot / container。`commit:` 不走这里、也不会被翻译成
+    一条 `code: git` 落盘——同一个事实存两处正是这套系统要杜绝的东西，所以
+    读侧派生出来的那条（`from == "commit"`）在这里被直接丢掉：调用方把
+    `GET .../steps/{id}` 拿到的 code 原样 PATCH 回来是最自然的写法，不能因此多出一行。
+    """
+    if not raw:
+        return []
+    items = [raw] if isinstance(raw, (str, dict)) else list(raw)
+    out: list[dict[str, Any]] = []
+    for item in items:
+        if isinstance(item, dict):
+            if str(item.get("from", "")) == "commit":
+                continue
+            kind = _clean_line(item.get("kind")).lower()
+            loc = _clean_line(item.get("location") if item.get("location") is not None
+                              else item.get("loc"))
+            note = _clean_line(item.get("note") if item.get("note") is not None
+                               else item.get("desc"))
+            attrs = dict(item.get("attrs") or {})
+        else:
+            got = parse_code(str(item).replace("\n", " "))
+            if not got:
+                continue
+            kind, loc = got[0]["kind"], _clean_line(got[0]["location"])
+            note, attrs = _clean_line(got[0]["note"]), dict(got[0]["attrs"])
+        if not kind and not loc:
+            continue
+        if kind not in CODE_KINDS:
+            raise WriteError(
+                f"code 的类型必须是 {'/'.join(CODE_KINDS)} 之一，收到 {kind!r}。"
+                "代码在 git 里就写 git，是个快照目录就写 snapshot，是镜像就写 container。"
+                "（读侧对没见过的 kind 是宽容的——十年后多出一种形态很正常——"
+                "但写入侧当场就能问清楚，没有理由让一个笔误落盘。）")
+        if not loc:
+            raise WriteError("code 要写清位置：仓库地址、快照目录、镜像名——不然它答不了「代码在哪」。")
+        out.append({"kind": kind, "location": loc, "note": note,
+                    "attrs": _ordered_attrs(attrs, "代码位置"), "from": "code"})
+    return out
+
+
+def _hydrate(step: Step, text: str) -> Step:
+    """改写一份既有 note.md 之前，把 **validate() 改写过的字段**从原文读回来。
+
+    render_note 是全量重写 front-matter 的，而 load() 给出的 Step 已经过 validate：
+    悬空的 parent 被降级为根、环上的一条边被断开。那是**给渲染用的临时修正**，
+    照着它写回磁盘，等于在人还没来得及修好数据之前，先把「这一步本来挂在 014 上」
+    这个事实永久删掉了——而删掉之后连「本来挂在哪」都问不出来了。
+
+    残缺输入产出部分结果（读侧）和残缺输入不被悄悄改写（写侧）是同一条原则的两面。
+    """
+    meta, _body, _w = parse_note(text)
+    raw_parent = (meta.get("parent") or "").strip()
+    step.parent = None if raw_parent.lower() in _ROOT_WORDS else raw_parent
+    return step
 
 
 # ---------------------------------------------------------------- 创建
@@ -666,6 +1097,8 @@ def create_step(
     key: str = "",
     tags: list[str] | None = None,
     paths: Any = None,
+    inputs: Any = None,
+    code: Any = None,
     lang: str = "",
 ) -> tuple[Step, bool]:
     """新建一步。返回 (step, created)；created=False 表示命中幂等键返回了既有步骤。
@@ -720,6 +1153,10 @@ def create_step(
             # 对后来的读者说「这是原文」而说不出是哪种语言的原文。
             lang=norm_lang(lang) if _clean_line(lang) else "",
         )
+        # 数据依赖和代码位置：core 里还没有这两个字段时也要能落盘，所以直接挂在
+        # 实例上（dataclass 没有 __slots__）。render_note 用 getattr 取它们。
+        step.inputs = norm_inputs(inputs)      # type: ignore[attr-defined]
+        step.code = norm_code(code)            # type: ignore[attr-defined]
 
         text = _utf8_bytes(render_note(step), "正文")
         d = steps_dir / step.dirname
@@ -736,7 +1173,8 @@ def create_step(
 # ---------------------------------------------------------------- 修改
 
 MUTABLE = ("status", "title", "body", "date", "commit", "author", "tags",
-           "paths", "add_paths", "add_repro", "lang")
+           "paths", "add_paths", "add_repro", "lang",
+           "inputs", "add_inputs", "code", "add_code")
 
 
 def norm_repro(raw: Any) -> list[dict[str, str]]:
@@ -766,10 +1204,12 @@ def norm_repro(raw: Any) -> list[dict[str, str]]:
 
 
 def update_step(steps_dir: Path, sid: str, patch: dict[str, Any], *, expect: str = "") -> Step:
-    """只允许改 status / title / body / date / commit / author / tags。
+    """只允许改 status / title / body / date / commit / author / tags / paths / inputs / code。
 
-    id 和 parent 是只追加系统的地基——任何引用（笔记里写的"见 003b"、论文里的脚注）
-    永远有效，靠的就是它们不变。改它们的请求一律 409。
+    id 在这里仍然是硬地基——任何引用（笔记里写的"见 003b"、论文里的脚注）永远有效，
+    靠的就是它不变，所以改 id 一律 409。
+    parent 也不从这条路走，但理由变了：它**可以**改，只是必须留下审计记录，
+    所以请求会被 409 到 move_step 那条路上去（见那个函数的说明）。
 
     `expect` 是乐观并发控制：传当前 note.md 的摘要指纹（digest_of），
     对不上就抛 Conflict 而不是照写。不传就是「不检查」，保持老行为。
@@ -803,7 +1243,9 @@ def _update_step_locked(steps_dir: Path, sid: str, patch: dict[str, Any], expect
             "改成新号（目录名和 note.md 里的 id: 都要改），再来改这一步。")
 
     note_path = steps_dir / step.dirname / NOTE_NAME
-    read_text_strict(note_path, "这一步的 note.md")   # 非 UTF-8 就别动它，见函数说明
+    # 非 UTF-8 就别动它（见 read_text_strict 的说明）；读到的原文顺手交给 _hydrate，
+    # 把 core 还没建模的行和 validate 改写过的 parent 都读回来，免得整组重写时丢掉。
+    _hydrate(step, read_text_strict(note_path, "这一步的 note.md"))
 
     if expect:
         current = digest_of(note_path)
@@ -813,9 +1255,20 @@ def _update_step_locked(steps_dir: Path, sid: str, patch: dict[str, Any], expect
                 "别直接重试——先重新读一遍，把你的改动合到最新内容上再存，"
                 "否则会把这期间别人（很可能是你自己的 agent）写进去的整段内容抹掉。")
 
-    for locked in ("id", "parent"):
-        if locked in patch and _clean_line(patch[locked]) != _clean_line(getattr(step, locked)):
-            raise Conflict(f"{locked} 不可修改（只追加原则）")
+    if "id" in patch and _clean_line(patch["id"]) != _clean_line(step.id):
+        raise Conflict(
+            "id 不可修改（只追加原则）。笔记里写的 [[003b]] 和论文脚注里的引用"
+            "永远有效，靠的就是 id 写下之后不再动。")
+    if "parent" in patch and _clean_line(patch["parent"]) != _clean_line(step.parent):
+        # 语义变了：parent 不再是「写下不可改」，而是「可改，但必须留下审计记录」。
+        # 一整条支挂错了父节点是真会发生的事；没有移动能力，人会去对调两个节点的
+        # 正文，那才是真的毁记录（创建日期和内容脱节，还一条审计都没有）。
+        # 但也不能在这条路上放行：update_step 收不到原因，而没有原因的移动，
+        # 半年后看到一棵和创建顺序对不上的树就再也解释不了了。
+        raise Conflict(
+            "parent 不能从这条路改。移动一步请用 move_step（REST 是 "
+            'PATCH …/steps/{id} 带 {"parent": …, "reason": …}）并写清原因：'
+            "移动会留下一条 moved: 审计，原因是那条审计里唯一无法自动生成的部分。")
 
     unknown = set(patch) - set(MUTABLE) - {"id", "parent"}
     if unknown:
@@ -846,6 +1299,18 @@ def _update_step_locked(steps_dir: Path, sid: str, patch: dict[str, Any], expect
     if "add_paths" in patch:                                # 追加，位置去重
         seen = {p["location"] for p in step.paths}
         step.paths = step.paths + [p for p in norm_paths(patch["add_paths"]) if p["location"] not in seen]
+    if "inputs" in patch:
+        step.inputs = norm_inputs(patch["inputs"])          # type: ignore[attr-defined]
+    if "add_inputs" in patch:                               # 追加，按 (步骤, 说明) 去重
+        seen = {(i["step"], i["note"]) for i in step.inputs}    # type: ignore[attr-defined]
+        step.inputs = step.inputs + [                       # type: ignore[attr-defined]
+            i for i in norm_inputs(patch["add_inputs"]) if (i["step"], i["note"]) not in seen]
+    if "code" in patch:
+        step.code = norm_code(patch["code"])                # type: ignore[attr-defined]
+    if "add_code" in patch:                                 # 追加，按位置去重
+        seen_loc = {c["location"] for c in step.code}       # type: ignore[attr-defined]
+        step.code = step.code + [                           # type: ignore[attr-defined]
+            c for c in norm_code(patch["add_code"]) if c["location"] not in seen_loc]
     if "add_repro" in patch:                                # 只追加：复现历史不覆盖
         step.repro = step.repro + norm_repro(patch["add_repro"])
     if "lang" in patch:
@@ -860,6 +1325,202 @@ def _update_step_locked(steps_dir: Path, sid: str, patch: dict[str, Any], expect
     return step
 
 
+def _ancestors(by_id: dict[str, Step], sid: str) -> list[str]:
+    """从 sid 沿 parent 链一路向上，返回经过的祖先（不含自己）。
+
+    数据可能是残缺的：parent 指向不存在的 id（人手删了一步）、甚至已经成环
+    （两个人分别手改了 note.md）。两种情况都不能让这个函数转不出来，
+    所以既查 by_id 里在不在，也用 seen 兜住环——「构建器必须能在残缺输入上
+    产出部分结果」这条对写入侧的校验同样适用。
+    """
+    out: list[str] = []
+    seen = {sid}
+    cur = by_id[sid].parent if sid in by_id else None
+    while cur and cur in by_id and cur not in seen:
+        out.append(cur)
+        seen.add(cur)
+        cur = by_id[cur].parent
+    return out
+
+
+def move_step(steps_dir: Path, sid: str, new_parent: str | None, reason: str,
+              by: str = "", date: str = "", expect: str = "") -> dict[str, Any]:
+    """把一步（连同它的整棵子树）改挂到另一个父节点下，并留下审计记录。
+
+    这是 P2 在这一版里的重新定义：**只追加的地基是「不丢历史」，不是「不能改结构」
+    ——记下来就不丢。** id 仍然永不可改（引用要一直有效），parent 变成「可改，
+    但必须写原因」。
+
+    没有这个函数的时候，人是怎么解决「一整条支挂错了父节点」的：把两个节点的
+    **正文对调**。结果是 013b 的创建日期和它现在装的内容对不上号，而那次修改
+    一条记录都没留下。能移动 + 强制写原因，历史反而完整。
+
+    落盘的是 front-matter 里追加的一行（可重复，一个节点可以被移动多次）：
+
+        moved: 2026-08-09 | 014 | 013b | human | 补原子的产物从未进过下游计算
+
+    为什么放 front-matter 而不是正文里的「## 已移动」：正文是人的判断区，
+    一次编辑就可能整段误删；front-matter 是机器记录区，render_note 全量重写它，
+    这一行只会被追加，不会被人顺手改没。
+
+    校验（每一条都能举出它挡住的真实错误）：
+      * reason 必填 —— 半年后看到一棵和创建顺序对不上的树，唯一能解释它的就是这句话；
+      * 目标必须存在且在**同一个项目**里（steps_dir 天然限定了项目，跨项目的 id
+        在这里就是「不存在」）；
+      * 不能挂到自己身上，也不能挂到自己的后代下面（那会造出一个脱离森林的环，
+        整棵子树从树上消失）；
+      * 和现在的 parent 相同直接报错，而不是留一条毫无信息量的审计。
+
+    `expect` 和 update_step 一视同仁：对不上就 409，一个字节都不写。
+    """
+    reason = _clean_line(reason)
+    if not reason:
+        raise WriteError(
+            "移动必须写原因。移动之后这棵树就和创建顺序对不上了——"
+            "「为什么 016 挂在 013b 下面，而它的号比 013b 大」只有这句话答得了。"
+            "写清楚是哪条数据依赖决定了新的父子关系，而不是「修正结构」。")
+    expect = str(expect or "").strip()
+    new_parent = (new_parent or "").strip() or None
+    if new_parent and new_parent.lower() in _ROOT_WORDS:
+        new_parent = None
+
+    with project_lock(steps_dir.parent):
+        by_id = load(steps_dir)
+        if sid not in by_id:
+            raise NotFound(f"步骤 {sid} 不存在")
+        step = by_id[sid]
+        if "~" in step.id:
+            # 和 update_step 同一条理由：`001~dup2` 是「两个目录用了同一个 id」时
+            # 贴的临时显示标签，把它写进 note.md 就是把派生信息变成存储信息。
+            raise Conflict(
+                f"{sid} 不是这一步真正的 id，只是「有两个目录用了同一个 id」时的临时标签。"
+                "请先在文件系统里把两个同号目录之一改成新号，再来移动它。")
+
+        note_path = steps_dir / step.dirname / NOTE_NAME
+        _hydrate(step, read_text_strict(note_path, "这一步的 note.md"))
+        if expect:
+            current = digest_of(note_path)
+            if current != expect:
+                raise Conflict(
+                    f"这一步在你读到它之后被改过（你拿的是 {expect}，磁盘上现在是 {current}）。"
+                    "别直接重试——先重新读一遍再决定要不要移动。")
+
+        old_parent = step.parent or None
+        subtree = _descendants(by_id, sid)
+        if new_parent == old_parent:
+            raise WriteError(
+                f"{sid} 的 parent 已经是 {new_parent or '（根）'} 了。"
+                "这是一次空操作，不该在历史里留下一条什么都没改的移动记录。")
+        if new_parent == sid:
+            raise WriteError(f"不能把 {sid} 挂到它自己下面。")
+        if new_parent is not None:
+            if new_parent not in by_id:
+                raise NotFound(
+                    f"目标父节点 {new_parent} 在这个项目里不存在。"
+                    "父子关系只在同一个项目内成立——跨项目请用正文里的 [[引用]]。")
+            # 两条判据是同一件事的两个方向（自己在目标的祖先链上 ⟺ 目标在自己的
+            # 子树里）。都留着是因为残缺数据里它们可能不一致：parent 链在悬空的
+            # 那一环断掉，而 children 索引照样把断点之后的节点算进子树。
+            # 移动的代价是整棵子树，宁可多挡一次。
+            if sid in _ancestors(by_id, new_parent) or new_parent in subtree:
+                raise Conflict(
+                    f"{new_parent} 在 {sid} 的子树里，挂过去会成环，"
+                    f"整棵子树会从森林上掉下来。要把 {new_parent} 那一支拿出来，"
+                    f"请先把它移到别处，再移 {sid}。")
+
+        day = _clean_line(date) or today()
+        if not _DATE_RE.match(day):
+            raise WriteError(f"移动日期要写成 YYYY-MM-DD，收到 {day!r}")
+        entry = {"date": day, "from": old_parent or "", "to": new_parent or "",
+                 "by": _clean_line(by), "reason": reason}
+        # 只追加：一个节点可以被移动多次，那是一段历史，不是一个当前值。
+        step.moved = list(getattr(step, "moved", None) or []) + [entry]   # type: ignore[attr-defined]
+        step.parent = new_parent
+        write_atomic(note_path, _utf8_bytes(render_note(step), "正文"))
+
+    return {"id": sid, "old_parent": old_parent, "new_parent": new_parent,
+            "reason": reason, "by": entry["by"], "date": entry["date"],
+            "moved": "moved: " + format_moved(entry),
+            # 移动带走的是整棵子树。调用方要能当场把这件事说给人听——
+            # 「你移的是一步」和「你移的是一步和它下面的 9 步」是两个决定。
+            "subtree": sorted(subtree, key=id_key),
+            "digest": digest_of(note_path)}
+
+
+def _descendants(by_id: dict[str, Step], sid: str) -> set[str]:
+    """sid 的整棵子树（不含自己）。广度优先 + seen，残缺数据里的环也转得出来。"""
+    kids: dict[str, list[str]] = {}
+    for k, s in by_id.items():
+        if s.parent:
+            kids.setdefault(s.parent, []).append(k)
+    out: set[str] = set()
+    stack = list(kids.get(sid, []))
+    while stack:
+        cur = stack.pop()
+        if cur in out or cur == sid:
+            continue
+        out.add(cur)
+        stack.extend(kids.get(cur, []))
+    return out
+
+
+def record_path_check(steps_dir: Path, sid: str, loc: str, *, exists: bool,
+                      date: str = "", size: int | None = None,
+                      n: int | None = None) -> dict[str, Any]:
+    """记一次「这条路径还在不在」的核对结果。**只动机器字段**。
+
+    用户这次逐条核对 164 条外部路径时发现有三个目录已经被删了（其中一个 57 GB），
+    这本该由机器自己发现。所以有了这个入口：服务端或 agent 定期 stat 一遍，
+    把结果写回属性——
+
+        path: /blue/lab/cif_files | input | 原始 CIF | size=61203283968 missing=2026-08-09
+
+    三条硬约定：
+      * **不删记录。** 路径没了是溯源结论（「这份数据当年在这儿，现在没了」），
+        和 dead 一样有价值。删掉它等于抹掉线索。
+      * **不动 role 和说明**，那两样是人写的判断，机器没有资格改。
+      * checked 和 missing 互斥：确认存在就清掉 missing，反之亦然。最后一次核对
+        是哪种结果，这条路径现在就是哪种状态。size / n 即使在 missing 时也保留——
+        「没了的那个有 57 GB」正是要留下来的信息。
+    """
+    loc = _clean_line(loc)
+    if not loc:
+        raise WriteError("要核对哪条路径？loc 不能为空。")
+    day = _clean_line(date) or today()
+    if not _DATE_RE.match(day):
+        raise WriteError(f"核对日期要写成 YYYY-MM-DD，收到 {day!r}")
+
+    with project_lock(steps_dir.parent):
+        by_id = load(steps_dir)
+        if sid not in by_id:
+            raise NotFound(f"步骤 {sid} 不存在")
+        step = by_id[sid]
+        note_path = steps_dir / step.dirname / NOTE_NAME
+        _hydrate(step, read_text_strict(note_path, "这一步的 note.md"))
+
+        idx = next((i for i, p in enumerate(step.paths) if p["location"] == loc), None)
+        if idx is None:
+            raise NotFound(
+                f"步骤 {sid} 上没有记着 {loc} 这条路径。核对结果只写在已经记下来的路径上——"
+                "凭空多出一条会让「这一步产出了什么」变成机器说了算。")
+        hit = step.paths[idx]
+        attrs = dict(hit.get("attrs") or {})
+        # checked 和 missing 互斥：留着上一次的相反结论，读侧就得靠比日期猜现在的状态。
+        attrs.pop("missing" if exists else "checked", None)
+        attrs["checked" if exists else "missing"] = day
+        if size is not None:
+            attrs["size"] = str(int(size))
+        if n is not None:
+            attrs["n"] = str(int(n))
+        row = _path_row(hit["location"], hit.get("note", ""), hit.get("role", ""), attrs)
+        step.paths[idx] = row
+        write_atomic(note_path, _utf8_bytes(render_note(step), "正文"))
+
+    return {"id": sid, "location": loc, "exists": bool(exists), "date": day,
+            "path": row, "line": "path: " + format_path(row),
+            "digest": digest_of(note_path)}
+
+
 def delete_step(steps_dir: Path, sid: str, reason: str, by: str = "", date: str = "") -> dict[str, Any]:
     """真删：整个目录连同附件一起移除。
 
@@ -867,15 +1528,21 @@ def delete_step(steps_dir: Path, sid: str, reason: str, by: str = "", date: str 
     ——误建、测试数据、不小心粘进去的令牌。它和 `dead` 是两件事：
     `dead` 是研究结论（此路不通），往里塞垃圾会毁掉这套系统最有价值的信号。
 
-    两个已知代价，是明确接受的：
+    三个已知代价，是明确接受的：
 
     1. **id 会被重用。** 分配用的是"现存 id 的最大值 + 1"，删掉最大号之后
        下一步就会拿到同一个号。于是半年前笔记里的「见 002」可能指向另一个东西。
        要避免就得有个"用过哪些号"的中心文件，而那正是 P1 禁止的。
     2. **子步骤会变成孤儿。** 它们的 parent 指向一个不存在的 id，
        validate() 会把它们降级为根并给出警告——构建不会崩，但那条线断了。
+    3. **别的步骤的 `input:` 会指空。** 数据依赖是这一版新加的边，和 `[[002]]`
+       那种正文引用一样会被删除打断，但后果更重：`[[002]]` 是给人读的一句话，
+       而 `input: 002 | train.jsonl` 是「这些字节从哪来」的**声明**，可溯源性
+       正沿着它上溯。再叠上第 1 条（id 会被重用），下一个拿到 002 的步骤会
+       **静悄悄地**接手这些边——那时它指向的是一个完全不相干的实验，而没有
+       任何一处会报错。所以它必须和孤儿一样，删的时候当场报出来。
 
-    所以返回值里明确告诉调用方这两件事各自发生了多少，让人能当场看见后果。
+    所以返回值里明确告诉调用方这三件事各自发生了多少，让人能当场看见后果。
     """
     reason = _clean_line(reason)
     if not reason:
@@ -892,6 +1559,9 @@ def delete_step(steps_dir: Path, sid: str, reason: str, by: str = "", date: str 
         children = sorted((k for k, s in by_id.items() if s.parent == sid), key=id_key)
         refs = sorted(k for k, s in by_id.items()
                       if k != sid and re.search(rf"\[\[\s*{re.escape(sid)}\s*\]\]", s.body))
+        # 谁声明过「我读了这一步的产物」。这条边一样会被删除打断，见上面第 3 条。
+        eaters = sorted((k for k, s in by_id.items()
+                         if k != sid and any(i["step"] == sid for i in s.inputs)), key=id_key)
 
         d = steps_dir / target.dirname
         # rglob 数的是目录里所有文件，所以 note.md、每一份 note.<lang>.md 和全部
@@ -920,7 +1590,8 @@ def delete_step(steps_dir: Path, sid: str, reason: str, by: str = "", date: str 
                 f"关掉占用的程序后重试，或手工删掉残留的 {d.name}/。") from None
 
     return {"id": sid, "title": target.title, "reason": reason,
-            "files_removed": files, "orphaned": children, "dangling_refs": refs}
+            "files_removed": files, "orphaned": children, "dangling_refs": refs,
+            "dangling_inputs": eaters}
 
 
 def _on_rm_error(func, path, _exc) -> None:

@@ -45,8 +45,23 @@ _ID_RE = re.compile(r"^(\d+)([a-z]*)$")
 _DIRNAME_RE = re.compile(r"^(\d+[a-z]*)_(.*)$")
 _WIKILINK_RE = re.compile(r"\[\[\s*([0-9]+[a-z]*)\s*\]\]")
 
-# front-matter 里可以重复出现的键（其余键重复时后写的覆盖先写的）
-MULTI_KEYS = ("path", "repro")
+# front-matter 里可以重复出现的键（其余键重复时后写的覆盖先写的）。
+#
+# 后三个是「一件事发生了很多次」的记录：数据依赖可以有好几条、代码可以既有 git 又有
+# 快照、移动过的步骤会被移动第二次。它们和 path/repro 一样**只追加**，所以必须能重复；
+# 换成「后写覆盖先写」等于每记一条就抹掉上一条，那正是只追加要防的事。
+MULTI_KEYS = ("path", "repro", "input", "code", "moved")
+
+# path 的 role 词表。**机器字段，不翻译**——它要能被 `grep -r "| output |"` 捞出来，
+# 一旦跟着界面语言走，同一个概念在磁盘上就有了两种写法（G4 下 grep 只能捞到一半）。
+PATH_ROLES = ("input", "script", "output", "evidence")
+
+# path 属性里认得出来的校验和键。顺序即优先级（派生 checksum 字段取第一个命中的）。
+CHECKSUM_KEYS = ("md5", "sha256")
+
+# code 记录的三种形态。git 之外的两种是给「代码不在 git 里」准备的：
+# 快照目录 + 逐文件校验和、容器镜像 + digest，在可溯源性上不比 commit 差。
+CODE_KINDS = ("git", "snapshot", "container")
 
 # 复现记录的取值。这是**事实**，算不出来，必须存。
 # 与之相对，可溯源性等级是**派生**的（从记了什么算出来），绝不存储。
@@ -84,6 +99,18 @@ INSIGHT_NAMES = {
 }
 INSIGHT_KEY_BY_NAME = {n: k for k, names in INSIGHT_NAMES.items() for n in names.values()}
 DELETED_NAME = {"zh": "已删除", "en": "Deleted"}
+# 「这一条取代了那一条」的连接词，同样是封闭词表（理由同 SECTION_NAMES）：
+# 一条洞察被取代是**写在取代者身上**的一句话，被取代的那一条什么都不改——
+# 「p1 已被取代」是派生的，写第二份就又是双真相源。
+SUPERSEDE_NAMES = {"zh": "取代", "en": "supersedes"}
+# 同一个对象的第二个名字，不是第二份数据：写入侧按 SUPERSEDES_WORD 从 core 导入这张表。
+# 一张封闭词表在两个模块里各写一份迟早会对不上，所以宁可多一个别名，也不让它被抄走。
+SUPERSEDES_WORD = SUPERSEDE_NAMES
+# 洞察 id 的形状。读侧（本模块）和写侧（trace_write._INSIGHT_LINE_RE）必须是同一条，
+# 否则会出现「写得进去、读不回来」的洞察。字母开头，于是 `## 已删除` 里的
+# `` `009` `` 不会被当成洞察 id。
+INSIGHT_ID_RE = r"[A-Za-z][A-Za-z0-9_-]{0,15}"
+INSIGHT_ID_PREFIX = "p"
 
 # ---------------------------------------------------------------- 翻译文件
 #
@@ -96,7 +123,7 @@ PROJECT_TR_ONLY_KEYS = ("name",)     # 项目的翻译文件里唯一允许的�
 
 # 结构键：只有 note.md / project.md 说了算。翻译文件里写了也一律忽略（见 parse_translation）。
 TR_STRUCT_KEYS = ("id", "parent", "status", "date", "commit", "author",
-                  "tags", "path", "repro", "key")
+                  "tags", "path", "repro", "key", "input", "code", "moved")
 
 _HPC_RE = re.compile(r"^(/blue/|/orange/|/red/|/scratch/|/gpfs/|/lustre/|/work/)", re.I)
 _WIN_RE = re.compile(r"^[a-z]:[\\/]", re.I)
@@ -154,24 +181,44 @@ def parse_repro(raw: str) -> list[dict[str, str]]:
 
 # 这两个模式在 sections()/_filled() 里对每一行正文都要试一次，是全流程调用次数
 # 最多的正则。预编译掉 re 模块的缓存查找（实测占 compile_forest 的一成以上）。
-_HEADING_RE = re.compile(r"^\s*#{1,6}\s+(.*?)\s*$")
+_HEADING_RE = re.compile(r"^\s*(#{1,6})\s+(.*?)\s*$")
 _PLACEHOLDER_RE = re.compile(r"^[（(].*?[）)]\s*$", re.S)
 
 
+def _headings(body: str) -> tuple[list[str], list[tuple[int, str, int]]]:
+    """正文的行 + 每个标题的 (层级, 标题文字, 内容起始行号)。sections/lint 共用。"""
+    lines = (body or "").split("\n")
+    heads = [(len(m.group(1)), m.group(2).strip(), i + 1)
+             for i, m in ((i, _HEADING_RE.match(l)) for i, l in enumerate(lines)) if m]
+    return lines, heads
+
+
 def sections(body: str) -> dict[str, str]:
-    """按 `## 小节名` 切正文。用于判断「为什么」这类小节是不是真的写了东西。"""
+    """按标题切正文。**一节的内容包含它下面所有更深的标题及其内容。**
+
+    只有层级**不深于**本节的标题才结束本节，这是 markdown 的常识语义。以前是见到
+    任何标题就切一节，于是这样一份写得很全的记录会被判成「什么都没写」→ L0：
+
+        ## 做了什么
+        ### 1 · 统计口袋蛋白含量
+        用 …… 统计了每个口袋里的残基组成
+
+    `## 做了什么` 在 `### 1 · …` 那一行就被截断，内容是空的。作者只能靠猜发现问题，
+    然后补一句废话引言把评级骗上去——评级一旦逼着人写废话，它就开始撒谎了。
+
+    键仍然是**每一个**标题（包括更深的那些），只是内容变长了：这样 `# 一级标题`
+    开头的笔记里，`## 为什么` 照样是自己的一个键，不会被吞进那个一级标题。
+    同名标题仍然是后写覆盖先写。
+    """
+    lines, heads = _headings(body)
     out: dict[str, str] = {}
-    name, buf = None, []
-    for line in (body or "").split("\n"):
-        m = _HEADING_RE.match(line)
-        if m:
-            if name is not None:
-                out[name] = "\n".join(buf).strip()
-            name, buf = m.group(1).strip(), []
-        elif name is not None:
-            buf.append(line)
-    if name is not None:
-        out[name] = "\n".join(buf).strip()
+    for k, (lv, name, start) in enumerate(heads):
+        end = len(lines)
+        for lv2, _n2, s2 in heads[k + 1:]:
+            if lv2 <= lv:                # 同级或更浅的标题才结束本节
+                end = s2 - 1
+                break
+        out[name] = "\n".join(lines[start:end]).strip()
     return out
 
 
@@ -202,19 +249,342 @@ def section_text(body: str, key: str) -> str:
     return _pick(sections(body), key)
 
 
-def parse_paths(raw: str) -> list[dict[str, str]]:
-    """每行一条 `<位置> | <说明>`。说明是自由文本，校验和、大小、"哪台机器"都往里写。"""
+# 一个「属性段」里的 token：`size=61203283968`、`md5=7d4e1a9c`、`missing=2026-08-09`。
+# 键必须以 ASCII 字母开头——这样「位置=这里」这种中文键不会被当成机器字段。
+# 值不含空白（token 本来就是按空白切出来的），允许为空（`missing=` 也解析得出来）。
+_ATTR_TOKEN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.\-]*=\S*$")
+
+
+def _attrs_of(segment: str) -> dict[str, str] | None:
+    """一段是不是「属性段」：所有空白分隔的 token **全部**形如 k=v。不是就返回 None。
+
+    判据故意选得这么严：`lr=3e-4 的那次运行` 里只有一个 token 是 k=v，于是整段落进
+    说明——顺手在说明里写个等号不会被误当成机器字段。反过来，一段全是 k=v 就几乎
+    不可能是人写给人看的说明。宁可漏认（掉回说明，字一个不少），不可错认（说明被
+    吃成属性，人写的那句话就从界面上消失了）。
+    """
+    toks = segment.split()
+    if not toks:                                   # 空段是空说明，不是「零个属性」
+        return None
+    if not all(_ATTR_TOKEN_RE.match(t) for t in toks):
+        return None
+    out: dict[str, str] = {}
+    for t in toks:
+        k, _, v = t.partition("=")
+        out[k] = v
+    return out
+
+
+def _int_or_none(v: str) -> int | None:
+    """属性值转整数；转不了就当没写（原值仍在 attrs 里，不丢）。"""
+    v = (v or "").strip()
+    return int(v) if v.isdigit() else None
+
+
+def _path_state(checked: str, missing: str) -> str:
+    """这条路径当前是不是还在。
+
+    `checked=` / `missing=` 都是**存储的事实**（像 repro：某人某天真去看过一眼），
+    「现在还在不在」才是派生的。两个都写着时**看日期，晚的说了算**——一条路径先
+    被确认存在、后被确认消失是最常见的时间线，反过来（清掉了又被重建）也一样成立。
+    同一天两个都写着时判 missing：这一整条需求的来历就是「三个目录已被删除、
+    57 GB 那个，本该自动发现」——漏报一次丢失比多报一次警报贵得多。
+    """
+    if missing and checked:
+        return "missing" if missing >= checked else "present"
+    if missing:
+        return "missing"
+    if checked:
+        return "present"
+    return ""
+
+
+def parse_paths(raw: str) -> list[dict[str, Any]]:
+    """每行一条 `<位置> | <角色> | <说明> | <k=v …>`，除位置外全部可选、顺序随意。
+
+    按 `|` 切开之后逐段判定：
+
+      * 整段**恰好**是 PATH_ROLES 里的一个词  → 它是 role
+      * 整段的空白 token **全部**形如 k=v      → 它们是属性
+      * 其余                                   → 拼进说明（多段用 " | " 接回去）
+
+    **向后兼容是硬要求**：现存的 `位置 | 说明` 一个字都不用改——中文说明既不是
+    role 也不是纯 k=v，自然落进说明，note 拿到的和以前逐字一样。
+
+    返回的字典在原来的 {location, note, kind} 上**只增不改**：网页和 CLI 都在读那三个键。
+    """
+    out: list[dict[str, Any]] = []
+    for line in (raw or "").split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        segs = line.split("|")
+        loc = segs[0].strip()
+        if not loc:
+            continue
+        role = ""
+        attrs: dict[str, str] = {}
+        desc: list[str] = []
+        for seg in segs[1:]:
+            s = seg.strip()
+            if s in PATH_ROLES:
+                role = s
+                continue
+            a = _attrs_of(s)
+            if a is not None:
+                attrs.update(a)                    # 同名属性后写覆盖先写
+                continue
+            desc.append(s)
+        checksum = next((f"{k}:{attrs[k]}" for k in CHECKSUM_KEYS if attrs.get(k)), "")
+        out.append({
+            "location": loc,
+            "note": " | ".join(desc),              # 说明里原来就允许有竖线，接回去保持逐字不变
+            "kind": path_kind(loc),
+            "role": role,
+            # 未知属性照样留着。半年后有人写了 `nodes=…`，系统不该把它吃掉——
+            # 认不认得出来是程序的事，写下来的东西是人的事。
+            "attrs": dict(attrs),
+            # size 存的是**字节数**（整数），格式化成「592 MB」是显示层的事。
+            "size": _int_or_none(attrs.get("size", "")),
+            "n": _int_or_none(attrs.get("n", "")),
+            "checksum": checksum,
+            "checked": attrs.get("checked", ""),
+            "missing": attrs.get("missing", ""),
+            "state": _path_state(attrs.get("checked", ""), attrs.get("missing", "")),
+        })
+    return out
+
+
+def format_path(p: dict[str, Any]) -> str:
+    """把一条结构化 path 还原成 note.md 里的一行（不含 `path: ` 前缀）。
+
+    写入侧回写 front-matter 时必须走这里：只拼 `location | note` 的话，role 和
+    size/md5/checked 会在**任何一次无关的编辑**里被静默抹掉——用户在网页上改一下
+    标题，刚核对完的 164 条校验和就没了。
+
+    段序归一为 `位置 | role | 说明 | 属性`。再解析一次得到同样的字典（幂等）。
+    """
+    segs = [str(p.get("location", "")).strip()]
+    role = str(p.get("role", "") or "").strip()
+    if role in PATH_ROLES:
+        segs.append(role)
+    note = str(p.get("note", "") or "").strip()
+    if note:
+        segs.append(note)
+    attrs = p.get("attrs") or {}
+    if attrs:
+        segs.append(" ".join(f"{k}={v}" for k, v in attrs.items()))
+    return " | ".join(segs)
+
+
+def fmt_size(n: Any) -> str:
+    """字节数 → 人读的大小。**只给显示用**，存进文件的永远是字节数。"""
+    try:
+        v = float(n)
+    except (TypeError, ValueError):
+        return ""
+    if v < 0:
+        return ""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if v < 1024 or unit == "TB":
+            return (f"{int(v)} {unit}" if unit == "B" or v >= 100 or v == int(v)
+                    else f"{v:.1f} {unit}")
+        v /= 1024
+    return ""
+
+
+def locations_haystack(step: dict[str, Any]) -> str:
+    """一步里所有「东西在哪」的文本，拼成一串供搜索用。**只读，不存。**
+
+    收的是 `path:` 和 `code:` 的位置与说明。为什么这也得能搜：
+    「/orange/…/run042/best.pt 是哪一步产出的」「谁用了 20260809 那个快照」
+    正是这两个键存在的主要用途，而 `grep -rn best.pt projects/` 一秒就答得出。
+    G4 的底线是「删掉全部程序，grep 还答得了」——工具比 grep 弱的地方，
+    恰好就是 agent 唯一够得到的地方：它拿到「没搜到」，会读成「没记过」。
+
+    `input:` 的说明（消费的是哪份产物文件名）一并收进来，同一个理由。
+    校验和与日期这类属性**不收**：搜一串 md5 是核对，不是找东西，
+    而把它们拼进干草堆只会让「12」这种短查询命中一堆无关的步骤。
+
+    入参是 Step.to_dict() 或 forest 里的 step（两边形状一样），
+    所以服务端和 MCP 两处搜索共用这一份，不会再各写各的。
+    """
+    bits: list[str] = []
+    for p in step.get("paths") or []:
+        bits.append(str(p.get("location") or ""))
+        bits.append(str(p.get("note") or ""))
+    for c in step.get("code") or []:
+        bits.append(str(c.get("location") or ""))
+        bits.append(str(c.get("note") or ""))
+    for i in step.get("inputs") or []:
+        bits.append(str(i.get("note") or ""))
+    return " ".join(b for b in bits if b)
+
+
+def parse_inputs(raw: str) -> list[dict[str, str]]:
+    """每行一条 `<步骤 id> | <消费的是哪份产物>`。
+
+    **记录派生关系（parent）和数据依赖（input）是两件事。** 森林是单父树，数据流是
+    DAG：016 的输入同时来自 013 的 pocket_composition.csv 和 014 的 rmscore_pairs.csv，
+    树上只能表达其中一个。以前只能在正文里写一句「本步的输入其实来自 X」，读的人
+    得自己拼；现在它是机器读得到的边（并且照样 grep 得到）。
+    """
     out: list[dict[str, str]] = []
     for line in (raw or "").split("\n"):
         line = line.strip()
         if not line:
             continue
-        loc, _, note = line.partition("|")
-        loc = loc.strip()
-        if not loc:
+        sid, _, note = line.partition("|")
+        sid = sid.strip()
+        if not sid:
             continue
-        out.append({"location": loc, "note": note.strip(), "kind": path_kind(loc)})
+        out.append({"step": sid, "note": note.strip()})
     return out
+
+
+def format_input(i: dict[str, str]) -> str:
+    note = str(i.get("note", "") or "").strip()
+    return f"{i.get('step', '')}" + (f" | {note}" if note else "")
+
+
+def parse_code(raw: str) -> list[dict[str, Any]]:
+    """每行一条 `<kind> | <位置> | <k=v …>`，kind ∈ CODE_KINDS。
+
+    为什么不止 `commit:`：代码不在 git 里的时候（超算上直接改脚本、跑完打个快照目录
+    留一份逐文件校验和）「代码在这里、逐文件校验和在这里」在可溯源性上不比 commit 差。
+    只认 commit 等于逼着这类记录永远停在 L1，而它们其实是找得回来的。
+
+    未知 kind 不丢也不报错：十年后多出一种形态（`nix`、`ipfs`）是完全可能的，
+    系统的本分是把人写下的东西原样留着，而不是把它判成不存在。
+    """
+    out: list[dict[str, Any]] = []
+    for line in (raw or "").split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        segs = [s.strip() for s in line.split("|")]
+        kind = segs[0].lower()
+        if not kind:
+            continue
+        loc = segs[1] if len(segs) > 1 else ""
+        attrs: dict[str, str] = {}
+        note: list[str] = []
+        for seg in segs[2:]:
+            a = _attrs_of(seg)
+            if a is not None:
+                attrs.update(a)
+            elif seg:
+                note.append(seg)
+        out.append({"kind": kind, "location": loc, "attrs": dict(attrs),
+                    "note": " | ".join(note), "from": "code"})
+    return out
+
+
+def format_code(c: dict[str, Any]) -> str:
+    """还原成 note.md 里的一行（不含 `code: ` 前缀）。
+
+    `from == "commit"` 的那条是**派生**的（由 `commit:` 折算出来），写入侧要跳过它，
+    否则同一个事实在文件里存两份——这正是上一代系统的死因。
+    """
+    segs = [str(c.get("kind", "") or "").strip(), str(c.get("location", "") or "").strip()]
+    note = str(c.get("note", "") or "").strip()
+    if note:
+        segs.append(note)
+    attrs = c.get("attrs") or {}
+    if attrs:
+        segs.append(" ".join(f"{k}={v}" for k, v in attrs.items()))
+    while len(segs) > 1 and not segs[-1]:
+        segs.pop()
+    return " | ".join(segs)
+
+
+def parse_moved(raw: str) -> list[dict[str, str]]:
+    """每行一次搬家：`日期 | 原 parent | 新 parent | 谁 | 为什么`。
+
+    P2 的地基是「不丢历史」，不是「不能改结构」——**记下来就不丢**。于是 parent 从
+    「写下不可改」变成「可改，但必须留下审计记录」，而 id 仍然不可改（笔记里的
+    `[[003b]]`、论文脚注里的引用要永远有效）。
+
+    这一行放在 front-matter 而不是正文的「## 已移动」：正文是人的判断区，一次编辑
+    就可能把它误删；front-matter 是机器记录区，回写时整段重建，不会被顺手删掉。
+    **顺序即历史，只追加。**
+    """
+    out: list[dict[str, str]] = []
+    for line in (raw or "").split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        parts = [x.strip() for x in line.split("|")]
+        if not parts[0]:
+            continue
+        out.append({
+            "date": parts[0],
+            "from": parts[1] if len(parts) > 1 else "",
+            "to": parts[2] if len(parts) > 2 else "",
+            "by": parts[3] if len(parts) > 3 else "",
+            # 原因里再有竖线也没关系，并进原因（和 repro 的说明同一个规矩）
+            "reason": " | ".join(parts[4:]) if len(parts) > 4 else "",
+        })
+    return out
+
+
+def format_moved(m: dict[str, str]) -> str:
+    return " | ".join([m.get("date", ""), m.get("from", ""), m.get("to", ""),
+                       m.get("by", ""), m.get("reason", "")]).rstrip(" |")
+
+
+def _copy_row(d: dict[str, Any]) -> dict[str, Any]:
+    """浅拷一条记录，顺带把嵌套的 attrs 也拷一份。
+
+    产物是只读的派生数据，但共享一个可变 dict 迟早会有人往里塞东西，而那一塞
+    改的是解析结果本身（下一个读者拿到的就是被改过的「文件内容」）。一层拷贝很便宜。
+    """
+    out = dict(d)
+    a = out.get("attrs")
+    if isinstance(a, dict):
+        out["attrs"] = dict(a)
+    return out
+
+
+def code_records(step: "Step") -> list[dict[str, Any]]:
+    """这一步记下的代码位置，**含 `commit:` 折算出来的那一条**。
+
+    `commit: c1d2e3f` 等价于 `code: git | | commit=c1d2e3f`，但它是**派生**的：
+    文件里仍然只有 `commit:` 一份，绝不再写一行 `code: git`。带 `from` 字段就是为了
+    让写入侧一眼分得出哪些是文件里真有的（`code`）、哪些是算出来的（`commit`）。
+    """
+    # getattr 兜底：写入侧会拿手工造的 Step 调 to_dict（测试、纯演算），
+    # 少一个字段就抛 AttributeError，而这里的本分是「读得下来」。
+    out = [_copy_row(c) for c in (getattr(step, "code", None) or [])]
+    commit = (getattr(step, "commit", "") or "").strip()
+    if commit and not any(c.get("kind") == "git" and (c.get("attrs") or {}).get("commit") == commit
+                          for c in out):
+        out.append({"kind": "git", "location": "", "attrs": {"commit": commit},
+                    "note": "", "from": "commit"})
+    return out
+
+
+def _code_locates(rec: dict[str, Any]) -> bool:
+    """这一条 code 记录到底有没有回答「代码在哪」。
+
+    * git       —— 有 commit / rev / tag，或者记了仓库位置
+    * snapshot  —— 有目录位置（`manifest=` / 校验和让它更强，但**不额外分级**，理由见 traceability）
+    * container —— 有镜像位置或 digest
+    * 其它 kind —— 只要记了位置就算。认不出的形态不代表它没定位到东西
+    """
+    kind = str(rec.get("kind", "")).lower()
+    attrs = rec.get("attrs") or {}
+    loc = str(rec.get("location", "") or "").strip()
+    if kind == "git":
+        return bool(loc or attrs.get("commit") or attrs.get("rev") or attrs.get("tag"))
+    if kind == "container":
+        return bool(loc or attrs.get("digest"))
+    return bool(loc)
+
+
+def code_located(step: "Step") -> bool:
+    """L2 的「代码找得回来」判据：任何一条 code 记录定位得到就算数。"""
+    return any(_code_locates(r) for r in code_records(step))
 
 # ---------------------------------------------------------------- id 工具
 
@@ -258,8 +628,16 @@ class Step:
     author: str = ""
     key: str = ""
     tags: list[str] = field(default_factory=list)
-    paths: list[dict[str, str]] = field(default_factory=list)
+    paths: list[dict[str, Any]] = field(default_factory=list)
     repro: list[dict[str, str]] = field(default_factory=list)
+    # 数据依赖（`input:`）。和 parent 是两件事：parent 是**记录的派生关系**（单父树），
+    # inputs 是**数据流**（DAG）。一步的输入可以同时来自 013 和 014，树上只能挂一个。
+    inputs: list[dict[str, str]] = field(default_factory=list)
+    # 代码在哪（`code:`）。**只装文件里真有的那几行**——`commit:` 折算出来的那条是
+    # 派生的，由 code_records() 现算，绝不写进这里，更不写进文件（双真相源）。
+    code: list[dict[str, Any]] = field(default_factory=list)
+    # parent 的移动审计（`moved:`）。顺序即历史，只追加。
+    moved: list[dict[str, str]] = field(default_factory=list)
     body: str = ""
     dirname: str = ""
     # note.md 自己声明的语言（front-matter 的 `lang:`）。**没声明就是空串**，
@@ -286,8 +664,13 @@ class Step:
             "author": self.author,
             "key": self.key,
             "tags": list(self.tags),
-            "paths": [dict(p) for p in self.paths],
+            "paths": [_copy_row(p) for p in self.paths],
             "repro": [dict(r) for r in self.repro],
+            "inputs": [dict(i) for i in self.inputs],
+            # **派生**：含 `commit:` 折算出来的那条（带 from: "commit"）。写回文件时
+            # 只许写 from == "code" 的那些，否则同一个事实在磁盘上有两份。
+            "code": [_copy_row(c) for c in code_records(self)],
+            "moved": [dict(m) for m in self.moved],
             "body": self.body,
             "dirname": self.dirname,
             "digest": self.digest,
@@ -297,8 +680,25 @@ class Step:
         }
 
 
-def warn(level: str, code: str, message: str, where: str = "") -> dict[str, str]:
-    return {"level": level, "code": code, "message": message, "where": where}
+def warn(level: str, code: str, message: str, where: str = "",
+         vars: dict[str, str] | None = None) -> dict[str, Any]:
+    """一条警告。`message` 永远是中文原句，`vars` 是同一句话里那几个**变量**。
+
+    为什么要多带一份 vars：界面要说使用者的语言，可 message 是拼好的中文。
+    没有 vars 的时候，web/app.js 只能拿正则去那句中文里把 {id} / {chain} 抠回来
+    ——那条正则脆得离谱：这里改一个字，英文界面上就原样漏出一句中文。
+    所以凡是句子里嵌了值的警告，都把值**结构化地**给出来一份；
+    抠正则退化成认不出 vars 时的退路，而不是唯一的路。
+
+    只有真带变量的警告才会有这个键：给每条都塞一个空 dict 会让静态导出里
+    几十条警告各多出四个字节，而它们一个变量都没有。
+    """
+    out: dict[str, Any] = {"level": level, "code": code, "message": message, "where": where}
+    if vars:
+        # 值一律转成字符串：JSON 里出现 int 会让前端的 "" + v 和 t() 的占位符替换
+        # 走两条不同的路（一个补零一个不补），而这里没有任何数值需要参与计算。
+        out["vars"] = {k: str(v) for k, v in vars.items()}
+    return out
 
 
 @dataclass
@@ -314,6 +714,136 @@ class Project:
         return {"slug": self.slug, "name": self.name or self.slug, "body": self.body,
                 "created": self.created, "lang": self.lang,
                 "tr": {k: dict(self.tr[k]) for k in sorted(self.tr)}}
+
+
+# ---------------------------------------------------------------- 项目洞察
+#
+# 洞察在磁盘上就是 project.md 里的一行 `- …`，本节的函数只是**读**它。
+# 洞察不单独存成结构（P1：文件即数据库），也不额外存一份「谁被谁取代了」。
+
+_INSIGHT_BULLET_RE = re.compile(r"^\s*[-*]\s+(.*\S)\s*$")
+# 行首反引号里的 id，和 `## 已删除` 里 `` `002` `` 的写法一致（那一节是系统自己写的，
+# 人已经在读它了，洞察沿用同一个形状就不用再学一遍）。形状用共享的 INSIGHT_ID_RE，
+# 和写侧同一条——读写各写一个正则，就会有「写得进去、读不回来」的洞察。
+#
+# 已知代价：`` - `fp16` 会 NaN `` 这种以行内代码开头的行，id 会被认成 fp16。
+# 可以接受，因为**一个字都没丢**：raw 里是原样的整行，界面把 id 当徽章显示出来
+# 也仍然读得通；而收窄形状会让写侧发出去的 id 有一部分读不回来，那是真的坏。
+_INSIGHT_ID_RE = re.compile(r"^`(%s)`\s*(.*)$" % INSIGHT_ID_RE, re.S)
+# `· 取代 p1` / `· supersedes p1`。只写在**取代者**身上——「p1 已被取代」是派生的。
+_SUPERSEDE_RE = re.compile(
+    r"\s*·\s*(?:%s)\s+([A-Za-z][A-Za-z0-9_,\s-]*)$" % "|".join(
+        re.escape(v) for v in SUPERSEDES_WORD.values()))
+
+
+def _parse_insight_line(text: str) -> dict[str, Any]:
+    sup: list[str] = []
+    m = _SUPERSEDE_RE.search(text)
+    if m:
+        sup = [x for x in re.split(r"[,\s]+", m.group(1).strip()) if x]
+        text = text[: m.start()].rstrip()
+    iid = ""
+    m2 = _INSIGHT_ID_RE.match(text)
+    if m2:
+        iid, text = m2.group(1), m2.group(2).strip()
+    return {"id": iid, "text": text, "supersedes": sup, "superseded_by": []}
+
+
+def parse_insights(body: str) -> dict[str, list[dict[str, Any]]]:
+    """把项目笔记的四个洞察小节读成结构。中英两套小节名都认（封闭词表）。
+
+    每条洞察是 `- ` 开头的一行：
+
+        - `p3` PDBFixer 误杀 944 个带修饰残基，见 [[013b]] · 取代 p1
+        - `p1` PDBFixer 误杀 1,099 个
+
+    返回 {kind: [{id, text, supersedes, superseded_by, line, raw}]}，`line` 是它在
+    body 里的行号（写入侧按 id 就地改一行要用）。`superseded_by` 是**派生**的：
+    磁盘上只有取代者身上那半句话，被取代的那一条一个字都不改——写第二份就又是
+    双真相源，而且它一定会先漂移（人只会去改自己正在写的那一行）。
+
+    id 在整个 project.md 内唯一（不分小节）：洞察会从「坑」变成「无效」，
+    id 跟着小节走就等于换一个 id，而笔记里 `见 p3` 这样的引用要一直有效。
+    没有 id 的旧行（现存数据全是）照常工作，id 为空串。
+    """
+    out: dict[str, list[dict[str, Any]]] = {k: [] for k in INSIGHT_NAMES}
+    lines = (body or "").split("\n")
+    kind: str | None = None
+    level = 0
+    for i, line in enumerate(lines):
+        m = _HEADING_RE.match(line)
+        if m:
+            lv, name = len(m.group(1)), m.group(2).strip()
+            k = INSIGHT_KEY_BY_NAME.get(name)
+            if k is not None:
+                kind, level = k, lv
+            elif kind is not None and lv <= level:
+                kind = None            # 更深的子标题不结束本节（和 sections() 同一套语义）
+            continue
+        if kind is None:
+            continue
+        b = _INSIGHT_BULLET_RE.match(line)
+        if b:
+            item = _parse_insight_line(b.group(1))
+            item["line"] = i
+            item["raw"] = b.group(1)
+            out[kind].append(item)
+    by_id: dict[str, dict[str, Any]] = {}
+    for items in out.values():
+        for it in items:
+            if it["id"]:
+                by_id.setdefault(it["id"], it)
+    for items in out.values():
+        for it in items:
+            for target in it["supersedes"]:
+                t = by_id.get(target)
+                if t is not None and t is not it:
+                    t["superseded_by"].append(it["id"] or it["text"][:20])
+    return out
+
+
+def find_insight(body: str, iid: str) -> dict[str, Any] | None:
+    """按 id 找一条洞察，返回它自己加上 `kind`。找不到返回 None。"""
+    for kind, items in parse_insights(body).items():
+        for it in items:
+            if it["id"] and it["id"] == iid:
+                return {**it, "kind": kind}
+    return None
+
+
+def next_insight_id(body: str, prefix: str = INSIGHT_ID_PREFIX) -> str:
+    """下一个可用的洞察 id。**只增不重用**——`p1` 被取代之后它的号也不许再发出去，
+    否则笔记里那句「见 p1」半年后指向的是另一条结论。"""
+    used = 0
+    pat = re.compile(rf"^{re.escape(prefix)}(\d+)$")
+    for items in parse_insights(body).values():
+        for it in items:
+            m = pat.match(it["id"] or "")
+            if m:
+                used = max(used, int(m.group(1)))
+    return f"{prefix}{used + 1}"
+
+
+def format_insight(text: str, iid: str = "", supersedes: Any = (),
+                   lang: str = "zh") -> str:
+    """拼出一条洞察的行内容（**不含**行首的 `- `，写入侧自己加）。
+
+    词表之外的语言退回英文的 `supersedes`：宁可用一个读得懂的词，也不要造一个
+    解析器认不回来的写法——认不回来就等于这条取代关系不存在。
+
+    `supersedes` 收列表也收 `"p1, p2"` 这样的字符串：写入侧校验完之后手里是一个
+    字符串，读侧解析出来的是一个列表，两边都会原样递到这里。只收列表的话，
+    传字符串会被逐字符迭代成 `p, 1, ,, …` —— 静默产出一行谁也解析不回来的垃圾。
+    """
+    body = " ".join(str(text or "").split())
+    head = f"`{iid}` " if iid else ""
+    if isinstance(supersedes, str):
+        supersedes = [x for x in re.split(r"[,，\s]+", supersedes) if x]
+    ids = [str(x).strip() for x in (supersedes or ()) if str(x).strip()]
+    tail = ""
+    if ids:
+        tail = " · " + SUPERSEDES_WORD.get(lang, SUPERSEDES_WORD["en"]) + " " + ", ".join(ids)
+    return head + body + tail
 
 
 # ---------------------------------------------------------------- 项目
@@ -520,6 +1050,9 @@ def build_step(dirname: str, meta: dict[str, str], body: str) -> tuple[Step, lis
         tags=_parse_tags(meta.get("tags", "")),
         paths=parse_paths(meta.get("path", "")),
         repro=parse_repro(meta.get("repro", "")),
+        inputs=parse_inputs(meta.get("input", "")),
+        code=parse_code(meta.get("code", "")),
+        moved=parse_moved(meta.get("moved", "")),
         body=body,
         dirname=dirname,
         # 没写就是空串。**不做任何猜测**：字符集探测能把一段引用了中文论文标题的
@@ -769,6 +1302,95 @@ def validate(steps: Iterable[Step]) -> tuple[dict[str, Step], list[dict[str, str
 
     # I4 · 单父由数据模型保证（parent 是标量字段），无需检查。
     return by_id, warnings
+
+
+def dep_edges(by_id: dict[str, Step], sid: str) -> list[str]:
+    """这一步依赖谁：**记录派生**（parent）在前，**数据依赖**（inputs）在后，去重。
+
+    顺序是产物的一部分（平局时靠前的赢，见 _worst_of），所以固定成「parent 优先」：
+    树是这套系统的主干，同级别的两个最弱环里，指树上那个更容易让人找到位置。
+    """
+    s = by_id.get(sid)
+    if s is None:
+        return []
+    out: list[str] = []
+    for cand in ([s.parent] if s.parent else []) + [i["step"] for i in s.inputs]:
+        if cand and cand != sid and cand in by_id and cand not in out:
+            out.append(cand)
+    return out
+
+
+def compute_consumers(by_id: dict[str, Step]) -> dict[str, list[str]]:
+    """谁消费了本步的产物。**派生的反向边**，和 backlinks 一个套路，绝不存储。
+
+    正向的 `input: 013 | pocket_composition.csv` 写在消费者身上（写的人当时就知道
+    自己在用谁的东西）；「013 的产物被谁用了」是扫出来的——写第二份就是双真相源。
+    """
+    out: dict[str, list[str]] = {sid: [] for sid in by_id}
+    for sid in sorted(by_id, key=id_key):
+        for target in dict.fromkeys(i["step"] for i in by_id[sid].inputs):
+            if target in out and target != sid:
+                out[target].append(sid)
+    return out
+
+
+def validate_inputs(by_id: dict[str, Step]) -> list[dict[str, str]]:
+    """数据依赖的三条检查。**全部只报警，绝不中断构建**——十年后的日志一定是残缺的。
+
+    和 dangling_parent 同一个处理方式：说出来，然后继续画图。指向不存在的 id 的
+    `input:` 那一行仍然留在 inputs 里（文本一个字不改），只是不参与图。
+    """
+    warnings: list[dict[str, str]] = []
+    for sid in sorted(by_id, key=id_key):
+        s = by_id[sid]
+        for i in s.inputs:
+            t = i["step"]
+            if t == sid:
+                warnings.append(warn("warn", "self_input",
+                                     f"input 指向自己（{sid}）", s.dirname, {"id": sid}))
+            elif t not in by_id:
+                warnings.append(warn("warn", "dangling_input",
+                                     f"input 指向不存在的步骤 {t}", s.dirname, {"id": t}))
+
+    # 环。parent 的环已经被 validate() 断掉了，所以这里报出来的环必然有 input 边参与。
+    # 数据流成环是没意义的（A 的输入来自 B、B 的输入来自 A），但它同样不该让构建停下。
+    color: dict[str, int] = {}
+    for start in sorted(by_id, key=id_key):
+        if color.get(start):
+            continue
+        stack: list[tuple[str, int]] = [(start, 0)]
+        path: list[str] = []
+        while stack:
+            sid, k = stack.pop()
+            if k == 0:
+                if color.get(sid) == 2:
+                    continue
+                if color.get(sid) == 1:
+                    cycle = path[path.index(sid):] if sid in path else [sid]
+                    chain = " → ".join(cycle + [cycle[0]])
+                    warnings.append(warn(
+                        "warn", "input_cycle",
+                        "数据依赖成环: " + chain
+                        + "——A 的输入来自 B、B 的输入又来自 A，两边都说不清谁先算出来的",
+                        by_id[sid].dirname, {"chain": chain}))
+                    continue
+                color[sid] = 1
+                path.append(sid)
+                stack.append((sid, 1))
+                for d in reversed(dep_edges(by_id, sid)):
+                    stack.append((d, 0))
+            else:
+                color[sid] = 2
+                path.pop()
+    # 同一个环会被每个入口各报一次，去重后仍然确定（sorted 遍历 + 固定的边序）。
+    seen: set[tuple[str, str]] = set()
+    out: list[dict[str, str]] = []
+    for w in warnings:
+        k = (w["code"], w["message"])
+        if k not in seen:
+            seen.add(k)
+            out.append(w)
+    return out
 
 
 def build_children(by_id: dict[str, Step]) -> dict[str, list[str]]:
@@ -1033,6 +1655,128 @@ def _lint_figures(step: Step) -> list[dict[str, str]]:
     return out
 
 
+_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+_IMG_ONLY_RE = re.compile(r"^\s*!\[[^\]]*\]\([^)]*\)\s*$")
+
+
+def _prose_map(lines: list[str]) -> tuple[list[bool], list[bool], list[bool]]:
+    """逐行判定：这一行是散文吗 / 是表格行吗 / 是围栏代码块吗。
+
+    「散文」= 人写给人看的句子，列表项和引用都算（`- 输入改为 [CLS] …` 就是说明）。
+    标题、表格行、代码块、**没有图注**的图片都不算——它们正是需要被说明的东西。
+
+    带图注的图片**算**说明：图注本来就是一句解释性文字，而且是这一节里质量最高的
+    那一句（FORMAT.md 要求它写结论）。不算的话，「一张指标表 + 一张带图注的曲线」
+    这个 FORMAT.md 自己推荐的写法会被报成「没有说明」——在推荐写法上误报，
+    是让人从此忽略警告最快的办法。
+    """
+    prose = [False] * len(lines)
+    table = [False] * len(lines)
+    fence = [False] * len(lines)
+    in_fence = False
+    for i, line in enumerate(lines):
+        if _FENCE_RE.match(line):
+            fence[i] = True
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            fence[i] = True
+            continue
+        s = line.strip()
+        if not s or _HEADING_RE.match(line):
+            continue
+        if _IMG_ONLY_RE.match(line):
+            if any(alt.strip() or title.strip() for alt, _a, _b, title in _IMG_IN_BODY.findall(line)):
+                prose[i] = True
+            continue
+        if s.startswith("|"):
+            table[i] = True
+            continue
+        prose[i] = True
+    return prose, table, fence
+
+
+def _section_groups(lines: list[str], heads: list[tuple[int, str, int]]) -> list[int]:
+    """每一行属于哪个「已知小节」（SECTION_NAMES 里的那五个），不在任何一个里就是 -1。
+
+    分组按**最近的已知小节**而不是最近的标题：`## 结果` 下面先写一句话、再分几个
+    `###` 各摆一张表，是完全正常的写法，按标题分组会对每张表各报一次「没有说明」。
+    宁可少报。
+    """
+    group = [-1] * len(lines)
+    cur, level = -1, 0
+    for idx, (lv, name, start) in enumerate(heads):
+        if name in SECTION_KEY_BY_NAME:
+            cur, level = idx, lv
+        elif cur >= 0 and lv <= level:
+            cur = -1
+        end = heads[idx + 1][2] - 1 if idx + 1 < len(heads) else len(lines)
+        for i in range(start, end):
+            group[i] = cur
+    return group
+
+
+def _lint_prose(step: "Step") -> list[dict[str, str]]:
+    """三条**只提示、不降级**的写法诊断。
+
+    为什么不降级：L0–L4 是「这个结果追不追得到」，而这三条问的是「读起来顺不顺」。
+    把风格问题塞进等级会让等级变成风格分，人就开始为了分数写废话——这一整轮的
+    起因就是有人被迫在小节下补一句引言来骗过评级。
+
+      1. `## 做了什么` 下面只有子标题、一个字散文都没有。现在不再判 L0（那是 bug，
+         已在 sections() 里修掉），但作者多半是漏写了，所以直说。
+      2. 表格前后没有任何说明文字。
+      3. 代码块前后没有任何说明文字。
+
+    后两条对齐图注那条规矩的**动机**（这张表/这段命令说明了什么），但**只到提示为止**：
+    图注是「图对文本读者的唯一信息来源」（不写就是零信息），而表格和代码块本身
+    LLM 读得到，缺的只是一句结论。
+    """
+    out: list[dict[str, str]] = []
+    for fname, body in note_bodies(step):
+        where = step.dirname if fname == NOTE_NAME else f"{step.dirname}/{fname}"
+        lines, heads = _headings(body)
+        prose, table, fence = _prose_map(lines)
+
+        for idx, (lv, name, start) in enumerate(heads):
+            if name not in SECTION_KEY_BY_NAME:
+                continue
+            end = len(lines)
+            for lv2, _n2, s2 in heads[idx + 1:]:
+                if lv2 <= lv:
+                    end = s2 - 1
+                    break
+            inner = list(range(start, end))
+            has_sub = any(_HEADING_RE.match(lines[i]) for i in inner)
+            has_text = any(lines[i].strip() and not _HEADING_RE.match(lines[i]) for i in inner)
+            if has_sub and not has_text:
+                out.append(warn(
+                    "warn", "section_without_prose",
+                    f"{fname} 的「{'#' * lv} {name}」下面没有正文，只有子标题——"
+                    f"子标题里的内容算这一节的内容（不再判 L0），但这一节大概率是漏写了",
+                    where, {"section": name}))
+
+        group = _section_groups(lines, heads)
+        explained = {group[i] for i in range(len(lines)) if prose[i]}
+        seen: set[tuple[int, str]] = set()
+        for i in range(len(lines)):
+            kind = "table" if table[i] else ("code" if fence[i] else "")
+            if not kind or group[i] in explained:
+                continue
+            g = group[i]
+            if (g, kind) in seen:
+                continue
+            seen.add((g, kind))
+            what = "表格" if kind == "table" else "代码块"
+            hint = "这张表说明了什么" if kind == "table" else "这段命令在干什么"
+            out.append(warn(
+                "warn", f"{kind}_without_explanation",
+                f"{fname} 里有{what}，但同一节里没有任何说明文字——"
+                f"一句「{hint}」就够（只是提示，不影响 L0–L4）",
+                where))
+    return out
+
+
 # 内容层缺陷：小节的**语义键** → (警告 code, 为什么这条缺了要紧)。
 # 存语义键而不是中文标题，这样同一条检查对中文版和英文版同时成立（见 SECTION_NAMES）。
 # 只对 done / dead 生效——wip 是"还在写"，对着一个刚建出来的空模板报警只会训练
@@ -1074,7 +1818,7 @@ def lint_body(step: Step) -> list[dict[str, str]]:
     级别用 warn 不用 error：这不是结构错误（树照样能建、图照样能画），
     是记录质量问题。error 留给「构建被迫改动数据」的情形（重复 id、环）。
     """
-    out = _lint_figures(step)
+    out = _lint_figures(step) + _lint_prose(step)
     if step.status in ("done", "dead"):
         secs = _all_sections(step)
         for key, code, why in _CONTENT_CHECKS:
@@ -1116,7 +1860,15 @@ def traceability(step: Step) -> dict[str, Any]:
         # 这是有意的——对读英文版的人来说，那张图确实什么都没说。补一句图注的成本
         # 是一行，而缺了就是整张图的信息对一半读者不存在。
         "captions": not _lint_figures(step),
-        "commit": bool(step.commit.strip()),
+        # 「代码找得回来」而不是「记了 commit」。代码不在 git 里的时候（超算上直接改
+        # 脚本、跑完打一个快照目录 + 逐文件校验和）「代码在这里、校验和在这里」在
+        # 可溯源性上不比 commit 差，卡着不给 L2 只会让这类记录永远显示成追不到底。
+        #
+        # **有没有 manifest / 校验和不再分一级**：L2 的语义是「可定位」——东西在哪
+        # 记下来了。快照目录的路径本身就回答了这个问题；逐文件校验和回答的是另一个
+        # 问题（拿到的还是不是当时那一份），那属于「有人真去看过、跑过」的 L3/L4。
+        # 硬塞进 L2 会造出一个机械判不清的半级，而阶梯一旦开始撒谎就没人看了。
+        "code": code_located(step),
         "paths": bool(step.paths),
     }
     missing = []
@@ -1128,8 +1880,10 @@ def traceability(step: Step) -> dict[str, Any]:
         missing.append("没写「结论」——假设到底成不成立")
     if not checks["captions"]:
         missing.append("有图没写图注——图里的信息对文本读者是黑洞")
-    if not checks["commit"]:
-        missing.append("没记 commit——找不回当时的代码")
+    if not checks["code"]:
+        # 文案里留着 "commit" 这个词是有原因的：网页按一段稳定的判别子串把这些中文
+        # 句子认回 i18n 的 key（web/i18n.js 的 MISSING_MATCH），认不出就原样显示中文。
+        missing.append("没记 commit / 代码快照——找不回当时的代码")
     if not checks["paths"]:
         missing.append("没记产物位置——数据和权重在哪不知道")
 
@@ -1137,7 +1891,7 @@ def traceability(step: Step) -> dict[str, Any]:
         level = "L0"
     elif not (checks["conclusion"] and checks["captions"]):
         level = "L0"
-    elif checks["commit"] and checks["paths"]:
+    elif checks["code"] and checks["paths"]:
         level = "L2"
     else:
         level = "L1"
@@ -1153,20 +1907,86 @@ def traceability(step: Step) -> dict[str, Any]:
 
 
 def _trace_dict(self_t: dict[str, Any], worst_id: str, worst_level: str,
-                lineage_entries: list[dict[str, str]]) -> dict[str, Any]:
-    """组装 trace 字段。键的顺序是产物的一部分（静态导出要逐字节一致），别动。"""
+                lineage_entries: list[dict[str, str]], via: str = "self") -> dict[str, Any]:
+    """组装 trace 字段。键的顺序是产物的一部分（静态导出要逐字节一致），别动。
+
+    新键只许**追加在末尾**，同样是因为逐字节确定这条。
+    """
     return {
         "self": self_t["level"],
         "chain": worst_level,
         "weakest": worst_id,
         "missing": self_t["missing"],
         "repro": self_t["repro"],
+        # lineage 是**记录派生**那条路（根 → 自己），也就是面包屑那一串。
+        # 它刻意不包含数据依赖上的祖先：那是一张 DAG，摊不成一条链，硬摊出来
+        # 面包屑就不再是面包屑了。链级可能低于 lineage 里的任何一环，此时
+        # weakest 指的是数据依赖上的某一步，via 会说是从哪条边过去的。
         "lineage": lineage_entries,
+        # 最弱一环是从哪条边找到的：self / parent（记录派生）/ input（数据依赖）。
+        "via": via,
     }
 
 
+def _worst_via(by_id: dict[str, Step], sid: str, worst_id: str) -> str:
+    if worst_id == sid:
+        return "self"
+    return "parent" if worst_id in lineage(by_id, sid) else "input"
+
+
+def _weakest(per: dict[str, dict[str, Any]], by_id: dict[str, Step],
+             starts: Iterable[str]) -> dict[str, str]:
+    """每个节点在它的**依赖闭包**（parent ∪ inputs）里最弱的那一环。
+
+    为什么数据依赖要参与：「这一步的输入来自哪一步」正是溯源在问的那件事。
+    016 的口袋组成来自 013，013 那一步连产物在哪都没记，那么 016 这个结论就是
+    追不到底的——哪怕树上 016 挂在写得很全的 013b 底下。最弱一环沿着**数据**走，
+    才是「这个数字是怎么来的」这条问题的答案。
+
+    递推关系和原来一样，只是「父」换成了「所有依赖」：
+
+        worst(n) = 各依赖的 worst 与 n 自己之中等级最低的那个
+
+    平局规则也一字不改：**依赖赢过自己**（原来 min() 的第二关键字 chain.index 就是
+    这个意思，祖先在链里下标更小），依赖之间靠前的赢（dep_edges 定死了 parent 在前）。
+    在没有任何 input 的项目里，这两条合起来和旧实现逐字等价。
+
+    inputs 可能有环（validate_inputs 会报），所以这里是三色迭代 DFS：踩到正在栈上的
+    节点就跳过它的贡献——不能因为一条脏边就让整棵树算不出等级。
+    """
+    worst: dict[str, str] = {}
+    state: dict[str, int] = {}
+    for start in starts:
+        if state.get(start):
+            continue
+        stack: list[tuple[str, int]] = [(start, 0)]
+        while stack:
+            sid, phase = stack.pop()
+            if phase == 0:
+                if state.get(sid):
+                    continue
+                state[sid] = 1
+                stack.append((sid, 1))
+                for d in reversed(dep_edges(by_id, sid)):
+                    if not state.get(d):
+                        stack.append((d, 0))
+                continue
+            best: str | None = None
+            for d in dep_edges(by_id, sid):
+                w = worst.get(d)             # 环上的节点还没算完，跳过它的贡献
+                if w is None:
+                    continue
+                if best is None or LEVELS.index(per[w]["level"]) < LEVELS.index(per[best]["level"]):
+                    best = w
+            if best is None or LEVELS.index(per[sid]["level"]) < LEVELS.index(per[best]["level"]):
+                best = sid
+            worst[sid] = best
+            state[sid] = 2
+    return worst
+
+
 def chain_traceability(by_id: dict[str, Step], sid: str) -> dict[str, Any]:
-    """整条链的可溯源性 = 链上最弱的一环。
+    """整条链的可溯源性 = 依赖闭包里最弱的一环。
 
     这是这套评级真正有用的地方：001 没记数据在哪，004 就算自己写得再全，
     「004 这个结论是怎么来的」依然追不到底。
@@ -1174,10 +1994,19 @@ def chain_traceability(by_id: dict[str, Step], sid: str) -> dict[str, Any]:
     只问一个节点用这个；要问整棵树用 compute_traces()，别在循环里调本函数。
     """
     chain = lineage(by_id, sid)
-    per = {i: traceability(by_id[i]) for i in chain}
-    worst_id = min(chain, key=lambda i: (LEVELS.index(per[i]["level"]), chain.index(i)))
+    closure: list[str] = []
+    stack = [sid]
+    while stack:                       # 闭包 = parent ∪ inputs 一路上溯（去重，防环）
+        cur = stack.pop()
+        if cur in closure:
+            continue
+        closure.append(cur)
+        stack.extend(dep_edges(by_id, cur))
+    per = {i: traceability(by_id[i]) for i in closure}
+    worst_id = _weakest(per, by_id, [sid])[sid]
     return _trace_dict(per[sid], worst_id, per[worst_id]["level"],
-                       [{"id": i, "level": per[i]["level"]} for i in chain])
+                       [{"id": i, "level": per[i]["level"]} for i in chain],
+                       _worst_via(by_id, sid, worst_id))
 
 
 def compute_traces(by_id: dict[str, Step], order: list[str]) -> dict[str, dict[str, Any]]:
@@ -1185,12 +2014,8 @@ def compute_traces(by_id: dict[str, Step], order: list[str]) -> dict[str, dict[s
 
     为什么要有批量版本：chain_traceability 每次都把整条祖先链的 traceability
     重算一遍，深链上就是 n²/2 次正文解析（1000 步实测 17 秒，其中 500500 次
-    traceability 调用占了绝大部分）。而「链上最弱一环」是可递推的：
-
-        worst(n) = worst(parent(n)) 与 n 自己之中等级更低者，平局取更靠近根的那个
-
-    平局取祖先，正是原来 min() 的第二关键字 chain.index —— 祖先在链里下标更小。
-    order 是前序（父一定排在子前面），所以自顶向下扫一遍就够，每步 O(1)。
+    traceability 调用占了绝大部分）。最弱一环是可递推的（见 _weakest），
+    一遍 DFS 就够，每条边只走一次。
 
     lineage 列表用「父的列表 + 自己」增量拼出来，且各条链共享同一批条目对象：
     产物是只读的派生数据，共享不改变任何一次比较或序列化的结果，却把深链上的
@@ -1198,20 +2023,19 @@ def compute_traces(by_id: dict[str, Step], order: list[str]) -> dict[str, dict[s
     """
     per = {sid: traceability(by_id[sid]) for sid in order}
     entry = {sid: {"id": sid, "level": per[sid]["level"]} for sid in order}
+    worst = _weakest(per, by_id, order)
 
-    worst: dict[str, str] = {}
     lines: dict[str, list[dict[str, str]]] = {}
     out: dict[str, dict[str, Any]] = {}
     for sid in order:
         p = by_id[sid].parent
         if p is None or p not in lines:   # 根；p 不在 lines 里说明链断了，按根处理
-            worst[sid] = sid
             lines[sid] = [entry[sid]]
         else:
-            wp = worst[p]
-            worst[sid] = wp if LEVELS.index(per[wp]["level"]) <= LEVELS.index(per[sid]["level"]) else sid
             lines[sid] = lines[p] + [entry[sid]]
-        out[sid] = _trace_dict(per[sid], worst[sid], per[worst[sid]]["level"], lines[sid])
+        w = worst[sid]
+        via = "self" if w == sid else ("parent" if any(e["id"] == w for e in lines[sid]) else "input")
+        out[sid] = _trace_dict(per[sid], w, per[w]["level"], lines[sid], via)
     return out
 
 
@@ -1239,6 +2063,8 @@ def compile_forest(steps_dir: Path, with_files: bool = True) -> dict[str, Any]:
     order = compute_order(by_id, children)
     lane, end = compute_lanes(by_id, children, order)
     back = compute_backlinks(by_id)
+    consumers = compute_consumers(by_id)              # 派生，不存储
+    w_inputs = validate_inputs(by_id)
 
     traces = compute_traces(by_id, order)             # 派生，不存储
 
@@ -1250,6 +2076,8 @@ def compile_forest(steps_dir: Path, with_files: bool = True) -> dict[str, Any]:
         d = step.to_dict()
         d["children"] = children.get(sid, [])
         d["backlinks"] = back.get(sid, [])
+        # 「谁用了本步的产物」——inputs 的反向边，和 backlinks 一样现算。
+        d["consumers"] = consumers.get(sid, [])
         # 用目录名取附件，不用 id：两个目录写了同一个 id 时，validate 只改得动
         # 后一个的 id（→ 001~dup2），而附件是按目录扫出来的，用 id 做键会把
         # 001 的清单换成 001~dup2 那个目录的文件（点开 404，自己的附件消失）。
@@ -1265,7 +2093,7 @@ def compile_forest(steps_dir: Path, with_files: bool = True) -> dict[str, Any]:
         "lanes": {sid: lane[sid] for sid in order},
         "lane_count": (max(lane.values()) + 1) if lane else 0,
         "tree": compute_tree(by_id, children, order),
-        "warnings": w_scan + w_val + w_lint,
+        "warnings": w_scan + w_val + w_inputs + w_lint,
         "row_h": ROW_H,
         "lane_w": LANE_W,
     }

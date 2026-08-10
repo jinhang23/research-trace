@@ -67,8 +67,14 @@ def test_other_repeated_keys_still_last_wins():
     assert meta["title"] == "后"
 
 
+def legacy(p: dict) -> dict:
+    """只看老三样。结构化字段是**新增**的，老断言不该因为多了几个键就得改写——
+    网页和 CLI 读的也正是这三个键。"""
+    return {k: p[k] for k in ("location", "note", "kind")}
+
+
 def test_path_without_a_note_is_fine():
-    assert core.parse_paths("/blue/g/u/data") == [
+    assert [legacy(p) for p in core.parse_paths("/blue/g/u/data")] == [
         {"location": "/blue/g/u/data", "note": "", "kind": "hpc"}
     ]
 
@@ -80,7 +86,7 @@ def test_windows_paths_survive_the_pipe_split():
 
 
 def test_blank_lines_are_skipped():
-    assert core.parse_paths("\n  \n/blue/a\n\n") == [
+    assert [legacy(p) for p in core.parse_paths("\n  \n/blue/a\n\n")] == [
         {"location": "/blue/a", "note": "", "kind": "hpc"}
     ]
 
@@ -107,6 +113,109 @@ def test_paths_are_greppable_in_the_raw_file(tmp_path: Path):
     s, _ = W.create_step(d, title="x", paths=["/blue/g/u/data | 12 GB"])
     lines = (d / s.dirname / core.NOTE_NAME).read_text(encoding="utf-8").splitlines()
     assert [l for l in lines if l.startswith("path:")] == ["path: /blue/g/u/data | 12 GB"]
+
+
+# ------------------------------------------------------------ 结构化的 path
+#
+# 需求来历：用户这一次核对 164 条路径时发现三个目录已经被删掉了（其中一个 57 GB），
+# 而这本该被自动发现。于是位置行要能带上 role / size / n / 校验和 / 最后一次确认，
+# 且**现存的 164 条 `位置 | 说明` 一个字都不用改**。
+
+
+def one(line: str) -> dict:
+    got = core.parse_paths(line)
+    assert len(got) == 1
+    return got[0]
+
+
+def test_an_existing_location_and_note_line_parses_exactly_as_before():
+    """向后兼容是硬要求：现存记录里的中文说明既不是 role 也不是纯 k=v，
+    它必须原样落进 note，一个字不多一个字不少。"""
+    p = one("/blue/g/u/data | 去重后的训练集，12 GB")
+    assert legacy(p) == {"location": "/blue/g/u/data", "note": "去重后的训练集，12 GB",
+                         "kind": "hpc"}
+    assert p["role"] == "" and p["attrs"] == {} and p["size"] is None and p["state"] == ""
+
+
+def test_a_segment_that_is_exactly_a_role_word_becomes_the_role():
+    p = one("/orange/lab/pockets | output | 纯 RNA 口袋 | n=4554 size=620756992 md5=7d4e1a9c")
+    assert p["role"] == "output"
+    assert p["note"] == "纯 RNA 口袋", "role 和属性都不许混进说明"
+    assert p["n"] == 4554
+    assert p["size"] == 620756992
+    assert p["checksum"] == "md5:7d4e1a9c"
+
+
+def test_a_description_that_merely_contains_an_equals_sign_stays_a_description():
+    """判据是「**全部** token 都形如 k=v」，刻意选的：顺手在说明里写个等号
+    （`lr=3e-4 的那次运行`）不该被当成机器字段吃掉。"""
+    p = one("/blue/a | lr=3e-4 的那次运行")
+    assert p["note"] == "lr=3e-4 的那次运行" and p["attrs"] == {}
+
+
+def test_a_chinese_key_with_an_equals_sign_is_not_a_machine_field():
+    p = one("/blue/a | 位置=这里")
+    assert p["note"] == "位置=这里" and p["attrs"] == {}
+
+
+def test_unknown_attributes_are_kept_not_eaten():
+    """半年后有人写了 `nodes=…`，系统不该把它吃掉——认不认得出来是程序的事，
+    写下来的东西是人的事。"""
+    p = one("/blue/a | nodes=48 walltime=36h")
+    assert p["attrs"] == {"nodes": "48", "walltime": "36h"}
+    assert p["note"] == ""
+
+
+def test_size_is_stored_in_bytes_and_only_formatted_for_display():
+    p = one("/blue/a | size=620756992")
+    assert p["size"] == 620756992, "存的必须是字节数，格式化是显示层的事"
+    assert core.fmt_size(p["size"]) == "592 MB"
+    assert core.fmt_size(one("/blue/a | size=abc")["attrs"]["size"]) == "", "非整数不当数字用"
+    assert one("/blue/a | size=abc")["size"] is None
+    assert one("/blue/a | size=abc")["attrs"] == {"size": "abc"}, "看不懂也要留着"
+
+
+def test_a_missing_path_is_a_stored_fact_and_the_later_date_wins():
+    """`checked=` / `missing=` 是**存储的事实**（某人某天真去看过一眼），
+    「现在还在不在」才是派生的。"""
+    assert one("/blue/a | checked=2026-08-09")["state"] == "present"
+    assert one("/blue/cif | missing=2026-08-09")["state"] == "missing"
+    assert one("/blue/a | checked=2026-08-01 missing=2026-08-09")["state"] == "missing"
+    assert one("/blue/a | checked=2026-08-09 missing=2026-08-01")["state"] == "present"
+    assert one("/blue/a | checked=2026-08-09 missing=2026-08-09")["state"] == "missing", \
+        "同一天判 missing：漏报一次丢失（57 GB 那个目录）比多报一次警报贵得多"
+
+
+def test_pipes_inside_a_description_are_rejoined_verbatim():
+    """说明里本来就允许有竖线（老格式是 partition 一刀切，右边整段都是说明）。"""
+    assert one("/blue/a | 说明一 | 说明二")["note"] == "说明一 | 说明二"
+
+
+def test_format_path_round_trips_so_an_unrelated_edit_cannot_drop_the_attributes():
+    """**这条钉的是数据丢失**：写入侧回写 front-matter 时如果只拼 `位置 | 说明`，
+    用户在网页上改一下标题，刚核对完的 164 条校验和就没了。"""
+    line = "/orange/lab/pockets | output | 纯 RNA 口袋 | n=4554 size=620756992 md5=7d4e1a9c"
+    p = one(line)
+    again = core.format_path(p)
+    assert core.parse_paths(again) == [p], "解析 → 还原 → 再解析必须是同一个东西"
+    for token in ("output", "纯 RNA 口袋", "n=4554", "size=620756992", "md5=7d4e1a9c"):
+        assert token in again
+    plain = "/blue/g/u/data | 去重后的训练集，12 GB"
+    assert core.format_path(one(plain)) == plain, "老格式还原之后要逐字不变"
+
+
+def test_structured_paths_are_still_one_grep_able_line(tmp_path: Path):
+    """G4：删掉全部程序之后，`grep -rn '^path:'` 仍然要能列出所有产物在哪、还在不在。"""
+    d = tmp_path / "steps" / "001_x"
+    d.mkdir(parents=True)
+    (d / "note.md").write_text(
+        "---\nid: 001\ntitle: t\n"
+        "path: /blue/lab/cif_files | input | 原始 CIF | size=61203283968 missing=2026-08-09\n"
+        "---\n", encoding="utf-8")
+    s = core.compile_forest(tmp_path / "steps")["steps"][0]
+    assert s["paths"][0]["state"] == "missing"
+    raw = (d / "note.md").read_text(encoding="utf-8")
+    assert "missing=2026-08-09" in [l for l in raw.splitlines() if l.startswith("path:")][0]
 
 
 # ------------------------------------------------------------ 写入接口
@@ -181,10 +290,16 @@ def test_mcp_add_paths_appends(be):
 
 
 def test_paths_survive_the_http_json_shape(be):
-    """服务端返回的 dict 里 paths 必须是结构化的，不是一坨字符串。"""
+    """服务端返回的 dict 里 paths 必须是结构化的，不是一坨字符串。
+
+    结构化那一轮把 role / attrs / size / checksum / checked / missing / state 加了进来。
+    断言写成「老三样一个都不许少」而不是「恰好这几个键」：新增字段是加成，
+    改名或删键才是破坏——网页和 CLI 读的就是 location / note / kind。
+    """
     M.dispatch(be, "trace_new_step", {"project": "alpha", "title": "x", "paths": ["/blue/a | 说明"]})
     p = be.step("alpha", "001")["paths"][0]
-    assert set(p) == {"location", "note", "kind"}
+    assert {"location", "note", "kind"} <= set(p)
+    assert p["note"] == "说明" and p["kind"] == "hpc"
 
 
 # ------------------------------------------------------------ 可溯源性评级

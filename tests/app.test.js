@@ -175,10 +175,241 @@ test("四种 repro 状态两种语言都有标签，failed 也必须有 —— �
   });
 });
 
+/* ------------------------------------------------ ③ 结构化路径的回写 */
+
+test("回写 path 时 role 和属性一个都不许掉 —— 改个标题就抹掉刚核对完的校验和是最贵的一种 bug", () => {
+  const p = { location: "/orange/lab/pockets", role: "output", note: "纯 RNA 口袋",
+              attrs: { n: "4554", size: "620756992", md5: "7d4e1a9c" } };
+  assert.equal(U.formatPath(p),
+    "/orange/lab/pockets | output | 纯 RNA 口袋 | n=4554 size=620756992 md5=7d4e1a9c");
+});
+
+test("老写法「位置 | 说明」回写之后逐字不变 —— 向后兼容是硬要求", () => {
+  assert.equal(U.formatPath({ location: "/blue/x", note: "去重后的训练集，12 GB", role: "", attrs: {} }),
+               "/blue/x | 去重后的训练集，12 GB");
+  assert.equal(U.formatPath({ location: "/blue/x", note: "", role: "", attrs: {} }), "/blue/x");
+});
+
+test("词表之外的 role 落回说明位 —— 写入侧只认四个词，硬塞进 role 位会被拒", () => {
+  assert.equal(U.formatPath({ location: "/x", role: "sideways", note: "", attrs: {} }), "/x");
+});
+
+test("format_code 跳过空位置的尾段 —— `git | | commit=…` 那种行写不进去", () => {
+  assert.equal(U.formatCode({ kind: "snapshot", location: "/orange/snap", note: "",
+                              attrs: { manifest: "MANIFEST.md5", n: "43" } }),
+               "snapshot | /orange/snap | manifest=MANIFEST.md5 n=43");
+  assert.equal(U.formatCode({ kind: "git", location: "", note: "", attrs: {} }), "git");
+});
+
+test("format_input 没写说明时不留一个孤零零的竖线", () => {
+  assert.equal(U.formatInput({ step: "013", note: "pocket_composition.csv" }), "013 | pocket_composition.csv");
+  assert.equal(U.formatInput({ step: "013", note: "" }), "013");
+});
+
+test("字节数分到 GB / TB —— 57 GB 的目录只到 MB 会显示成 58366 MB，那个数没人读得出来", () => {
+  assert.equal(U.sizeUnit(61203283968).key, "unit.gb");
+  assert.equal(U.sizeUnit(61203283968).n, "57.0");
+  assert.equal(U.sizeUnit(620756992).key, "unit.mb");
+  assert.equal(U.sizeUnit(3 * 1099511627776).key, "unit.tb");
+  assert.equal(U.sizeUnit(900).key, "unit.b");
+  assert.equal(U.sizeUnit(null), null, "没写 size 的路径不该显示成 0 B");
+});
+
+/* ------------------------------------------------ ④ 洞察的 id 与取代 */
+
+test("洞察行读得出 id、正文和「取代了谁」，三样分得干净", () => {
+  const got = U.parseInsightLine("`p3` PDBFixer 误杀 944 个带修饰残基，见 [[013b]] · 取代 p1");
+  assert.equal(got.id, "p3");
+  assert.equal(got.text, "PDBFixer 误杀 944 个带修饰残基，见 [[013b]]");
+  assert.deepEqual(got.supersedes, ["p1"]);
+});
+
+test("英文那一侧用 supersedes，认的是同一张封闭词表", () => {
+  assert.deepEqual(U.parseInsightLine("`p3` PDBFixer over-deletes · supersedes p1").supersedes, ["p1"]);
+});
+
+test("「p1 已被取代」是派生的 —— 只有取代者身上写着那半句，被取代的那条一个字都没改", () => {
+  const body = ["## 坑",
+                "- `p3` PDBFixer 误杀 944 个 · 取代 p1",
+                "- `p1` PDBFixer 误杀 1,099 个"].join("\n");
+  const got = U.parseInsights(body).pitfall;
+  assert.equal(got.length, 2);
+  assert.deepEqual(got[1].superseded_by, ["p3"]);
+  assert.deepEqual(got[0].superseded_by, [], "取代者自己没有被取代");
+  assert.equal(got[1].raw, "`p1` PDBFixer 误杀 1,099 个", "被取代那一行的原文一个字都不许动");
+});
+
+test("没有 id 的旧洞察照常读得出来 —— 现存数据全是这样的", () => {
+  const got = U.parseInsights("## 无效\n- 回译一直没用\n").fails;
+  assert.equal(got.length, 1);
+  assert.equal(got[0].id, "");
+  assert.equal(got[0].text, "回译一直没用");
+});
+
+test("洞察小节的子标题不结束本节，别的同级标题才结束 —— 和 trace_core.sections() 同一套层级语义", () => {
+  const body = ["## 坑", "### 数据", "- `p1` a", "## 已删除", "- `002` 误建"].join("\n");
+  const got = U.parseInsights(body);
+  assert.equal(got.pitfall.length, 1, "子标题下面那条也算「坑」");
+  assert.ok(!JSON.stringify(got).includes("误建"), "「已删除」里的行绝不能被当成洞察");
+});
+
+test("英文小节名同样认得 —— 界面切成英文之后洞察不该退化成一段死文本", () => {
+  assert.equal(U.parseInsights("## Doesn't work\n- `p1` back-translation never helped\n").fails.length, 1);
+});
+
+/* ------------------------------------------------ ① 移动的当场校验 */
+
+const MOVE_TREE = {
+  "001": { id: "001", parent: "" },
+  "002": { id: "002", parent: "001" },
+  "003": { id: "003", parent: "002" },
+  "010": { id: "010", parent: "" },
+};
+
+test("挂到自己的后代下面当场拒 —— 这不是笔误，是想法本身有问题，不能等服务端 400", () => {
+  assert.equal(U.moveError(MOVE_TREE, "001", "003"), "descendant");
+  assert.equal(U.moveError(MOVE_TREE, "001", "001"), "self");
+});
+
+test("挂到不相干的另一棵树上是允许的 —— 移动的全部意义就是「当时归错了地方」", () => {
+  assert.equal(U.moveError(MOVE_TREE, "003", "010"), "");
+  assert.equal(U.moveError(MOVE_TREE, "003", ""), "", "提为根也算一次移动");
+});
+
+test("原地不动不是一次移动 —— 那会往文件里追加一条什么都没说的审计", () => {
+  assert.equal(U.moveError(MOVE_TREE, "002", "001"), "noop");
+  assert.equal(U.moveError(MOVE_TREE, "001", ""), "noop");
+});
+
+test("目标不存在时说得出来，而不是让人点了确定才知道", () => {
+  assert.equal(U.moveError(MOVE_TREE, "002", "999"), "missing");
+});
+
+/* ------------------------------------------------ ⑥ 提示级不和真警告混在一起 */
+
+test("三条新诊断是提示级 —— 它们不影响 L0–L4，混进警告栏人就不再看警告栏了", () => {
+  ["section_without_prose", "table_without_explanation", "code_without_explanation"].forEach((c) => {
+    assert.equal(U.warnLevel({ level: "warn", code: c }), "hint", c);
+  });
+  assert.equal(U.warnLevel({ level: "warn", code: "dangling_input" }), "warn");
+  assert.equal(U.warnLevel({ level: "error", code: "bad_frontmatter" }), "error");
+});
+
+/* ------------------------------------------------ ② 数据流布局 */
+
+/* 016 的输入同时来自 013 和 014 —— 树上只能表达一个，这正是要画第二张图的理由。 */
+const FLOW_STEPS = [
+  { id: "013", parent: "", inputs: [] },
+  { id: "014", parent: "013", inputs: [] },
+  { id: "013b", parent: "013", inputs: [] },
+  { id: "016", parent: "013b", inputs: [{ step: "013" }, { step: "014" }] },
+];
+
+test("层号沿依赖走：一步的层永远深于它的每一个依赖，于是每条边都朝下", () => {
+  const L = U.flowLayout(FLOW_STEPS);
+  L.edges.forEach((e) => {
+    assert.ok(L.nodes[e.to].layer > L.nodes[e.from].layer,
+              `${e.from} → ${e.to} 这条边没朝下走`);
+  });
+  assert.equal(L.nodes["016"].layer, 2, "016 要落在 014 之下，而不是只按 parent 算");
+});
+
+test("parent 和 input 同时指向同一步时是一条 both 边 —— 它占绝大多数边，混进 data 会让人以为树边画丢了", () => {
+  const L = U.flowLayout([{ id: "001", parent: "", inputs: [] },
+                          { id: "002", parent: "001", inputs: [{ step: "001" }] }]);
+  assert.equal(L.edges.length, 1);
+  assert.equal(L.edges[0].kind, "both");
+});
+
+test("只有 parent 的边是 tree，只有 input 的边是 data", () => {
+  const L = U.flowLayout(FLOW_STEPS);
+  const kind = {};
+  L.edges.forEach((e) => { kind[e.from + ">" + e.to] = e.kind; });
+  assert.equal(kind["013b>016"], "tree");
+  assert.equal(kind["014>016"], "data");
+  assert.equal(kind["013>016"], "data", "013 既是数据源又是祖先，但树上它不是 016 的父");
+});
+
+test("布局是纯函数：同一份数据永远得到同一张图 —— 形状本身是信息，这就是不做力导向的理由", () => {
+  assert.deepEqual(U.flowLayout(FLOW_STEPS), U.flowLayout(FLOW_STEPS));
+});
+
+test("悬空和自指的 input 不进图，也不让布局死掉 —— 删掉一步之后引用变悬空是已接受的代价", () => {
+  const L = U.flowLayout([{ id: "001", parent: "", inputs: [{ step: "404" }, { step: "001" }] }]);
+  assert.equal(L.edges.length, 0);
+  assert.equal(L.nodes["001"].layer, 0);
+});
+
+test("数据依赖成环时不死循环 —— 环由服务端报警告，图还得画得出来", () => {
+  const L = U.flowLayout([{ id: "001", parent: "", inputs: [{ step: "002" }] },
+                          { id: "002", parent: "", inputs: [{ step: "001" }] }]);
+  assert.equal(Object.keys(L.nodes).length, 2);
+  assert.equal(L.edges.length, 2);
+});
+
+test("空项目不产出负数尺寸的画布", () => {
+  const L = U.flowLayout([]);
+  assert.equal(L.w, 0);
+  assert.equal(L.h, 0);
+});
+
+test("上游闭包沿 parent ∪ inputs 走 —— 在一张 DAG 上「祖先」只有沿依赖走才有意义", () => {
+  const byId = {};
+  FLOW_STEPS.forEach((s) => { byId[s.id] = s; });
+  const got = U.depClosure(byId, "016");
+  assert.deepEqual(Object.keys(got).sort(), ["013", "013b", "014", "016"]);
+  assert.deepEqual(Object.keys(U.depClosure(byId, "014")).sort(), ["013", "014"]);
+});
+
 /* ------------------------------------------------ 载入行为 */
 
 test("在没有 document 的环境里 require app.js 不会启动界面", () => {
   // 上面所有 require 都已经跑过一遍了；能走到这里就说明界面那个 IIFE 提前返回了。
   assert.equal(typeof U.splitInsightBody, "function");
   assert.equal(typeof globalThis.document, "undefined");
+});
+
+/* ------------------------------------------------ 继承路径：抄位置，不抄结论 */
+
+test("从父步骤继承路径时，核对结论和度量一个都不跟着抄", () => {
+  const p = {
+    location: "/blue/lab/cif", role: "input", note: "原始 CIF",
+    attrs: { n: "4554", size: "61203283968", md5: "7d4e1a9c",
+             checked: "2026-08-09", nodes: "12" },
+  };
+  const got = U.inheritPath(p);
+  assert.equal(U.formatPath(got), "/blue/lab/cif | input | 原始 CIF | nodes=12");
+  assert.deepEqual(got.attrs, { nodes: "12" },
+    "size/n/md5/checked 是「有人真去看过一眼」的度量和结论，" +
+    "抄进一个还没跑过的步骤就是伪造证据；认不出的 nodes= 留着，替人删字更糟");
+});
+
+test("一个今天才建出来的步骤，不许一出生就声称那份数据没了", () => {
+  const got = U.inheritPath({
+    location: "/orange/ckpt", role: "output", note: "权重",
+    attrs: { missing: "2026-08-09", size: "277872640" },
+  });
+  assert.equal(U.formatPath(got), "/orange/ckpt | output | 权重");
+});
+
+test("位置、角色、说明恰恰应该继承 —— 同一条线上数据在哪多半没变", () => {
+  const got = U.inheritPath({ location: "/x", role: "script", note: "跑这一步的脚本", attrs: {} });
+  assert.equal(U.formatPath(got), "/x | script | 跑这一步的脚本");
+});
+
+/* ------------------------------------------------ 搜索：位置也得搜得到 */
+
+test("产物和代码的位置进搜索干草堆，校验和与日期不进", () => {
+  const step = {
+    id: "001", title: "训练", body: "## 为什么\n因为\n", tags: [],
+    paths: [{ location: "/orange/lab/ckpt/run042/best.pt", note: "权重",
+              attrs: { md5: "7d4e1a9c", checked: "2026-08-09" } }],
+    code: [{ kind: "snapshot", location: "/orange/snap/20260809", note: "" }],
+    inputs: [{ step: "001", note: "pocket_composition.csv" }],
+  };
+  assert.ok(U.matches(step, "best.pt"), "grep -rn best.pt 一秒答得出，站内搜索不该更弱");
+  assert.ok(U.matches(step, "20260809"));
+  assert.ok(U.matches(step, "pocket_composition"));
+  assert.ok(!U.matches(step, "7d4e1a9c"),
+    "搜一串 md5 是核对不是找东西，把它拼进干草堆只会制造噪声命中");
 });

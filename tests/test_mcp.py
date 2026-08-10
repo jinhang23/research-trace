@@ -855,6 +855,184 @@ def test_the_local_backend_fills_the_date_server_side(be):
     assert f"date={datetime.datetime.now():%Y-%m-%d}" in out
 
 
+# ------------------------------------------------------------ 移动
+
+
+def test_move_step_records_the_reason_and_keeps_the_id(be):
+    call(be, "trace_new_step", project="alpha", title="013b")
+    call(be, "trace_new_step", project="alpha", title="014")
+    call(be, "trace_new_step", project="alpha", parent="002", title="016")
+    out = call(be, "trace_move_step", project="alpha", step="003", parent="001",
+               reason="016 的输入全部来自 001 的口袋组成，002 的产物从未进过下游计算")
+    assert "002" in out and "001" in out
+    step = be.step("alpha", "003")
+    assert step["parent"] == "001"
+    assert step["moved"][0]["reason"].startswith("016 的输入")
+    assert step["id"] == "003", "id 不跟着变"
+
+
+def test_move_step_needs_a_reason(be):
+    call(be, "trace_new_step", project="alpha", title="a")
+    call(be, "trace_new_step", project="alpha", title="b")
+    with pytest.raises(M.ToolError, match="原因"):
+        call(be, "trace_move_step", project="alpha", step="002", parent="001", reason="  ")
+
+
+def test_move_step_says_the_whole_subtree_is_coming_along(be):
+    call(be, "trace_new_step", project="alpha", title="a")
+    call(be, "trace_new_step", project="alpha", title="b")
+    call(be, "trace_new_step", project="alpha", parent="002", title="c")
+    out = call(be, "trace_move_step", project="alpha", step="002", parent="001", reason="挂错了支")
+    assert "003" in out and "后代" in out
+
+
+def test_the_move_tool_description_separates_it_from_inputs(be):
+    """agent 最容易把「数据来自那一步」当成「应该挂在那一步下面」，
+    而混了之后画出来的图会骗人——所以这条区别必须写在工具描述里。"""
+    d = next(t for t in M.TOOLS if t["name"] == "trace_move_step")["description"]
+    assert "inputs" in d and "id" in d
+    assert "reason" in d and "必填" in d
+    assert "reason" in next(t for t in M.TOOLS
+                            if t["name"] == "trace_move_step")["inputSchema"]["required"]
+
+
+def test_update_step_points_at_the_move_tool_instead_of_just_refusing(be):
+    """光说「不能改」的后果是人跑去**对调两个节点的正文**——那才是真的毁记录。"""
+    call(be, "trace_new_step", project="alpha", title="a")
+    call(be, "trace_new_step", project="alpha", title="b")
+    with pytest.raises(M.ToolError, match="trace_move_step"):
+        call(be, "trace_update_step", project="alpha", step="002", parent="001")
+    with pytest.raises(M.ToolError, match="id"):
+        call(be, "trace_update_step", project="alpha", step="002", id="999")
+
+
+# ------------------------------------------------------------ 数据依赖
+
+
+def test_a_step_reads_back_both_directions_of_the_data_flow(be):
+    """agent 看不到网页，trace_read 是它唯一能读到数据流的地方。
+    缺了下游那一半，就答不了「我要改 001 的产物，谁会跟着错」。"""
+    call(be, "trace_new_step", project="alpha", title="口袋组成")
+    call(be, "trace_new_step", project="alpha", title="配对分数")
+    call(be, "trace_new_step", project="alpha", title="配对",
+         inputs=["001 | pocket_composition.csv", "002 | rmscore_pairs.csv"])
+    out = call(be, "trace_read", project="alpha", step="003")
+    assert "pocket_composition.csv" in out and "rmscore_pairs.csv" in out
+    assert "003" in call(be, "trace_read", project="alpha", step="001")
+
+
+def test_flow_walks_the_data_dependencies_not_the_tree(be):
+    """树是单父的（我当时接着哪一步想），数据流是 DAG（这些字节从哪来）。
+    001 → 002 → 003 全在一棵扁平的树上（都没有 parent），照样要连得起来。"""
+    call(be, "trace_new_step", project="alpha", title="原始 CIF")
+    call(be, "trace_new_step", project="alpha", title="口袋", inputs=["001 | cif"])
+    call(be, "trace_new_step", project="alpha", title="配对", inputs=["002 | pockets"])
+    up = call(be, "trace_flow", project="alpha", step="003", direction="up")
+    assert "002" in up and "001" in up, "上游要求传递闭包，不是只看直接的一层"
+    down = call(be, "trace_flow", project="alpha", step="001", direction="down")
+    assert "002" in down and "003" in down
+    assert "parent" in call(be, "trace_flow", project="alpha", step="002")
+
+
+def test_flow_survives_a_cycle_in_the_records(be):
+    """两个人分别手改了 note.md 就会有环。查询不能因此转不出来。"""
+    call(be, "trace_new_step", project="alpha", title="a")
+    call(be, "trace_new_step", project="alpha", title="b", inputs=["001 | x"])
+    call(be, "trace_update_step", project="alpha", step="001", inputs=["002 | y"])
+    assert "002" in call(be, "trace_flow", project="alpha", step="001", direction="up")
+
+
+# ------------------------------------------------------------ 代码位置
+
+
+def test_a_snapshot_counts_as_code_so_nobody_stuffs_it_into_commit(be):
+    """用户之前是把快照目录塞进 commit: 的。工具描述要让 agent 不再那么干，
+    而写入这条路必须真的走得通，否则那句话就是空头支票。"""
+    call(be, "trace_new_step", project="alpha", title="a",
+         code=["snapshot | /orange/lab/snap/20260809 | manifest=MANIFEST.md5 n=43"])
+    out = call(be, "trace_read", project="alpha", step="001")
+    assert "代码快照" in out and "/orange/lab/snap/20260809" in out and "manifest=MANIFEST.md5" in out
+    d = next(t for t in M.TOOLS if t["name"] == "trace_new_step")["inputSchema"]
+    assert "snapshot" in d["properties"]["code"]["description"]
+    assert "L2" in d["properties"]["code"]["description"]
+
+
+# ------------------------------------------------------------ 路径核对
+
+
+def test_probe_never_touches_the_network(tmp_path: Path):
+    """远端位置一律不探测：任何能写记录的人都能往 path: 里塞一个内网地址，
+    去发请求就等于把「从这台机器发起请求」的权力交给了他。"""
+    for loc in ("https://zenodo.org/record/1234567", "s3://bucket/k",
+                "//host/share/x", "relative/path"):
+        assert M.probe_path(loc) == (M.PROBE_UNREACHABLE, None), loc
+
+
+def test_probe_tells_unreachable_apart_from_missing(tmp_path: Path):
+    """**够不着 ≠ 不存在。** 判据是「上级目录看得见」：/blue 根本没挂时什么都不说，
+    上级在而这一条没了才是真的被删了。"""
+    assert M.probe_path("/blue/这台机器上没有的挂载点/data")[0] == M.PROBE_UNREACHABLE
+    assert M.probe_path(str(tmp_path / "从来没建过"))[0] == M.PROBE_MISSING
+    f = tmp_path / "在.bin"
+    f.write_bytes(b"0123456789")
+    assert M.probe_path(str(f)) == (M.PROBE_PRESENT, 10)
+    # 目录不报大小：st_size 是元数据块大小，写进 size= 会把 57 GB 记成 4 KB。
+    assert M.probe_path(str(tmp_path)) == (M.PROBE_PRESENT, None)
+
+
+def test_check_paths_writes_back_what_it_saw(be, tmp_path: Path):
+    live = tmp_path / "还在.pt"
+    live.write_bytes(b"x" * 7)
+    gone = tmp_path / "没了"
+    call(be, "trace_new_step", project="alpha", title="a",
+         paths=[f"{live} | output | 权重", f"{gone} | output | 被删掉的那个",
+                "s3://bucket/k | output | 远端"])
+    out = call(be, "trace_check_paths", project="alpha", step="001")
+    assert "还在" in out and "已确认不存在" in out and "够不着" in out
+    rows = {p["location"]: p for p in be.step("alpha", "001")["paths"]}
+    assert rows[str(live)]["state"] == "present" and rows[str(live)]["size"] == 7
+    assert rows[str(gone)]["state"] == "missing"
+    assert rows["s3://bucket/k"]["state"] == "", "够不着的那条一个字都不许写"
+    assert rows[str(gone)]["note"] == "被删掉的那个", "说明是人写的判断，机器不许碰"
+
+
+def test_check_paths_keeps_the_row_of_something_that_vanished(be, tmp_path: Path):
+    """路径没了是溯源结论（P4），不是要顺手清掉的笔误。"""
+    gone = tmp_path / "57GB的那个"
+    call(be, "trace_new_step", project="alpha", title="a",
+         paths=[f"{gone} | input | 原始 CIF | size=61203283968"])
+    call(be, "trace_check_paths", project="alpha", step="001")
+    row = be.step("alpha", "001")["paths"][0]
+    assert row["state"] == "missing" and row["size"] == 61203283968, "没了的那个有多大要留着"
+
+
+def test_check_paths_refuses_a_location_it_was_never_told_about(be):
+    call(be, "trace_new_step", project="alpha", title="a")
+    with pytest.raises(M.ToolError):
+        call(be, "trace_check_paths", project="alpha", step="001", path="/凭空来的")
+
+
+def test_the_check_tool_description_says_where_it_has_to_run(be):
+    """跑在笔记本上只会得到一屏「够不着」。这一点不说清，人会以为工具坏了。"""
+    d = next(t for t in M.TOOLS if t["name"] == "trace_check_paths")["description"]
+    assert "够不着" in d and "不存在" in d
+    assert "机器" in d
+
+
+# ------------------------------------------------------------ 格式标准送到 agent 手里
+
+
+def test_the_instructions_carry_the_new_keys(be):
+    """initialize 的 instructions 是唯一无论怎么装都一定送达的通道——
+    pip 装的机器上根本没有 FORMAT.md。"""
+    text = M.INSTRUCTIONS
+    assert "trace_move_step" in text and "inputs" in text
+    assert "checked=" in text and "missing=" in text, "path 的属性写法要送到"
+    assert "snapshot" in text and "container" in text
+    for key in ("input", "code", "moved"):
+        assert f"/ {key} " in text or f"`{key}`" in text or f" {key} " in text
+
+
 def test_the_http_backend_gets_the_same_date_from_the_server(tmp_path: Path, monkeypatch):
     """远端那条路上填日期的是服务端。两条后端必须给出同一个结果，否则记录会分裂成两种。"""
     import datetime

@@ -141,7 +141,19 @@
 
   /* 搜索的干草堆里**必须**包含所有译文：整个双语功能的意义就是「英文那一侧
      也能回答同一个问题」。只搜原文的话，界面切成英文之后搜 "contrastive"
-     一条都搜不到，而那正是人打开搜索框的原因。 */
+     一条都搜不到，而那正是人打开搜索框的原因。
+
+     `path:` / `code:` 的位置和说明同样在里面，理由是同一条：「best.pt 是哪一步
+     产出的」是这两个键存在的主要用途，`grep -rn best.pt projects/` 一秒答得出，
+     站内搜索答不出就等于比 grep 弱。判据和服务端的 search_hits、MCP 的
+     trace_search 是同一份（core.locations_haystack），三处必须搜到同一批东西。 */
+  function locationsHay(step) {
+    var bits = [];
+    (step.paths || []).forEach(function (p) { bits.push(p.location || "", p.note || ""); });
+    (step.code || []).forEach(function (c) { bits.push(c.location || "", c.note || ""); });
+    (step.inputs || []).forEach(function (i) { bits.push(i.note || ""); });
+    return bits.filter(Boolean).join(" ");
+  }
   function hay(step) {
     var tr = (step && step.tr) || {}, extra = "";
     Object.keys(tr).sort().forEach(function (l) {
@@ -149,7 +161,7 @@
       extra += " " + (e.title || "") + " " + (e.name || "") + " " + (e.body || "");
     });
     return (step.id + " " + (step.title || "") + " " + (step.body || "") + " "
-            + (step.tags || []).join(" ") + extra).toLowerCase();
+            + (step.tags || []).join(" ") + " " + locationsHay(step) + extra).toLowerCase();
   }
   function matches(step, q) {
     q = String(q || "").trim().toLowerCase();
@@ -169,12 +181,321 @@
     return (a > 0 ? "…" : "") + s.slice(a, b) + (b < s.length ? "…" : "");
   }
 
+  /* ------------------------------------------------------------ 字节数分档
+   *
+   * 只算「用哪一档、数字是多少」，不出文案——单位名在 i18n（unit.b/kb/mb/gb/tb）。
+   * 分到 GB / TB 这两档是有具体来历的：用户那条 57 GB 的 CIF 目录，只到 MB 会
+   * 显示成「58366 MB」，而这个数正是要一眼看出「这是个大家伙」的那一个。
+   */
+  function sizeUnit(bytes) {
+    // 没写 size 的路径必须返回 null 而不是「0 B」：Number(null) 是 0，
+    // 而「这个目录 0 字节」和「没人量过这个目录」是完全不同的两句话。
+    if (bytes === null || bytes === undefined || bytes === "") return null;
+    var n = Number(bytes);
+    if (!isFinite(n) || n < 0) return null;
+    if (n < 1024) return { key: "unit.b", n: String(Math.round(n)) };
+    if (n < 1048576) return { key: "unit.kb", n: (n / 1024).toFixed(1) };
+    if (n < 1073741824) return { key: "unit.mb", n: (n / 1048576).toFixed(1) };
+    if (n < 1099511627776) return { key: "unit.gb", n: (n / 1073741824).toFixed(1) };
+    return { key: "unit.tb", n: (n / 1099511627776).toFixed(2) };
+  }
+
+  /* ------------------------------------------------------ 回写用的三个序列化
+   *
+   * 编辑器里的 path / input / code 三个框，存进去和读出来必须是同一套写法，
+   * 否则「改一下标题」就会静默抹掉刚核对完的 role 和校验和——这三个函数逐字
+   * 对着 trace_core.format_path / format_input / format_code，
+   * tests/test_web.py 拿 Python 那一侧的真实实现逐条对过（不是各写各的）。
+   */
+  var PATH_ROLES = ["input", "script", "output", "evidence"];
+  function attrText(attrs) {
+    var out = [];
+    Object.keys(attrs || {}).forEach(function (k) { out.push(k + "=" + attrs[k]); });
+    return out.join(" ");
+  }
+  function formatPath(p) {
+    var segs = [String((p && p.location) || "").trim()];
+    var role = String((p && p.role) || "").trim();
+    if (PATH_ROLES.indexOf(role) >= 0) segs.push(role);
+    var note = String((p && p.note) || "").trim();
+    if (note) segs.push(note);
+    var a = attrText(p && p.attrs);
+    if (a) segs.push(a);
+    return segs.join(" | ");
+  }
+  function formatInput(i) {
+    var note = String((i && i.note) || "").trim();
+    return String((i && i.step) || "") + (note ? " | " + note : "");
+  }
+
+  /* 建子步骤时从父步骤**抄一份路径**，但这几个属性一个都不能跟着抄。
+     它们全是「某人在某一刻真的去看过一眼」的结论：checked / missing 是那一次
+     核对的判决和日期，md5 / sha256 / size / n 是那一刻那些字节的度量。
+     照抄进一个刚刚建出来、还什么都没跑的步骤，就凭空造出一条**看起来像证据**的
+     假记录——比没有记录有害得多，而这一整条 ③ 需求的来历正是「假结论比没结论贵」。
+     最荒唐的一种是 missing=：一个今天才建出来的步骤，一出生就声称那份数据没了。
+
+     位置、role、说明是人写的判断，那三样恰恰**应该**继承（同一条线上数据在哪
+     多半没变，改比重打省事）。认不出来的属性也留着：我们不知道 `nodes=…` 是
+     度量还是描述，替人删掉别人写的字比多留一个字更糟。 */
+  var MEASURED_ATTRS = ["size", "n", "md5", "sha256", "checked", "missing"];
+  function inheritPath(p) {
+    var attrs = {};
+    Object.keys((p && p.attrs) || {}).forEach(function (k) {
+      if (MEASURED_ATTRS.indexOf(k) < 0) attrs[k] = p.attrs[k];
+    });
+    return { location: (p && p.location) || "", role: (p && p.role) || "",
+             note: (p && p.note) || "", attrs: attrs };
+  }
+  function formatCode(c) {
+    var segs = [String((c && c.kind) || "").trim(), String((c && c.location) || "").trim()];
+    var note = String((c && c.note) || "").trim();
+    if (note) segs.push(note);
+    var a = attrText(c && c.attrs);
+    if (a) segs.push(a);
+    while (segs.length > 1 && !segs[segs.length - 1]) segs.pop();
+    return segs.join(" | ");
+  }
+
+  /* -------------------------------------------------------------- 洞察解析
+   *
+   * 和 trace_core.parse_insights 同构。浏览器手里只有 project.md 的原文，
+   * 而「哪条被哪条取代了」要按条渲染才做得出折叠——所以这里必须读得懂同一套写法。
+   * 两处封闭词表（小节名、「取代」那个词）在 tests/test_web.py 里对着 trace_core
+   * 逐字核过，防的就是「Python 认得、网页不认得」这种半边失效。
+   *
+   * superseded_by 是**派生**的：磁盘上只有取代者身上那半句话。 */
+  var INSIGHT_KIND_BY_HEADING = {
+    "核心想法": "idea", "Ideas": "idea",
+    "有效": "works", "Works": "works",
+    "无效": "fails", "Doesn't work": "fails",
+    "坑": "pitfall", "Pitfalls": "pitfall",
+  };
+  var SUPERSEDE_WORDS = ["取代", "supersedes"];
+  var INSIGHT_ID_RE = /^`([A-Za-z][A-Za-z0-9_-]{0,15})`\s*([\s\S]*)$/;
+  var BULLET_RE = /^\s*[-*]\s+(.*\S)\s*$/;
+  var SUPERSEDE_RE = new RegExp(
+    "\\s*·\\s*(?:" + SUPERSEDE_WORDS.join("|") + ")\\s+([A-Za-z][A-Za-z0-9_,\\s-]*)$");
+
+  function parseInsightLine(text) {
+    var sup = [];
+    var m = SUPERSEDE_RE.exec(text);
+    if (m) {
+      sup = m[1].trim().split(/[,\s]+/).filter(Boolean);
+      text = text.slice(0, m.index).replace(/\s+$/, "");
+    }
+    var iid = "";
+    var m2 = INSIGHT_ID_RE.exec(text);
+    if (m2) { iid = m2[1]; text = m2[2].trim(); }
+    return { id: iid, text: text, supersedes: sup, superseded_by: [] };
+  }
+
+  function parseInsights(body) {
+    var out = { idea: [], works: [], fails: [], pitfall: [] };
+    var lines = String(body == null ? "" : body).split("\n");
+    var kind = null, level = 0;
+    lines.forEach(function (line, i) {
+      var h = HEADING_RE.exec(line);
+      if (h) {
+        var lv = (/^\s*(#{1,6})/.exec(line))[1].length;
+        var k = INSIGHT_KIND_BY_HEADING[h[1].trim()];
+        if (k) { kind = k; level = lv; }
+        // 更深的子标题不结束本节——和 trace_core.sections() 同一套层级语义
+        else if (kind !== null && lv <= level) kind = null;
+        return;
+      }
+      if (kind === null) return;
+      var b = BULLET_RE.exec(line);
+      if (!b) return;
+      var item = parseInsightLine(b[1]);
+      item.line = i;
+      item.raw = b[1];
+      out[kind].push(item);
+    });
+    var byId = Object.create(null);
+    Object.keys(out).forEach(function (k) {
+      out[k].forEach(function (it) { if (it.id && !byId[it.id]) byId[it.id] = it; });
+    });
+    Object.keys(out).forEach(function (k) {
+      out[k].forEach(function (it) {
+        it.supersedes.forEach(function (t) {
+          var target = byId[t];
+          if (target && target !== it) target.superseded_by.push(it.id || it.text.slice(0, 20));
+        });
+      });
+    });
+    return out;
+  }
+
+  /* ------------------------------------------------------------ ① 移动校验
+   *
+   * 服务端一定会再判一次（它才是唯一权威），但成环和「挂到自己的后代下面」
+   * 必须**当场**说出来：这两条不是笔误，是想法本身有问题，等一个 4xx 回来再说
+   * 已经晚了——人那时已经点过确定，注意力也已经离开了。
+   * 返回空串表示可以移。 */
+  function moveError(byId, id, parent) {
+    if (!byId[id]) return "missing";
+    parent = String(parent || "");
+    if (!parent) return (byId[id].parent || "") ? "" : "noop";
+    if (parent === id) return "self";
+    if (!byId[parent]) return "missing";
+    if ((byId[id].parent || "") === parent) return "noop";
+    var cur = parent, seen = Object.create(null);
+    while (cur && byId[cur] && !seen[cur]) {
+      seen[cur] = 1;
+      if (cur === id) return "descendant";       // 新父在自己的子树里
+      cur = byId[cur].parent;
+    }
+    return "";
+  }
+
+  /* -------------------------------------------------------------- ⑥ 提示级
+   *
+   * 这三条诊断服务端发的是 warn 级，但它们**不影响 L0–L4**。混在真警告里显示，
+   * 人很快就不再看警告栏了——而警告栏里那些真的会降级的条目才是要人动手的。 */
+  var HINT_CODES = ["section_without_prose", "table_without_explanation", "code_without_explanation"];
+  function warnLevel(w) {
+    if (w && HINT_CODES.indexOf(w.code) >= 0) return "hint";
+    return (w && w.level === "error") ? "error" : "warn";
+  }
+
+  /* ------------------------------------------------------------ ② 数据流布局
+   *
+   * 森林是单父树，数据流是 DAG——Reingold–Tilford 那一套（父居中于子）在 DAG 上
+   * 根本没有定义。这里用最朴素也最稳的做法：**分层 + 直连边**。
+   *
+   *   层号 = 依赖里最深的那一个 + 1（最长路径）。于是每条边都朝下走，
+   *          「谁先算出来的」在纵轴上是可读的。
+   *   层内序 = 依赖的平均列号（重心法）排一遍，平局按森林序。
+   *
+   * 刻意**不做力导向**：它每次刷新形状都不一样，而形状本身是信息——
+   * 「这张图和我上次看到的是同一张」是读图的前提。这里的输出是纯函数，
+   * 同一份数据永远得到同一张图。
+   *
+   * 环（服务端会报 input_cycle）不会让它死循环：回边不参与层号计算，只照常画出来。
+   */
+  function flowLayout(steps, opts) {
+    opts = opts || {};
+    var NW = opts.nw || 148, NH = opts.nh || 44;
+    var GX = opts.gx || 22, GY = opts.gy || 52, PAD = opts.pad || 14;
+    var list = steps || [];
+    var byId = Object.create(null);
+    list.forEach(function (s) { byId[s.id] = s; });
+    var order = list.map(function (s) { return s.id; });
+    var ordIdx = Object.create(null);
+    order.forEach(function (id, i) { ordIdx[id] = i; });
+
+    /* 依赖边：parent ∪ inputs，去重、跳过悬空与自指——和 trace_core.dep_edges
+       同一条规矩。kind 记的是「这条边同时是树边还是只是数据边」，图例分三档
+       正是因为「parent 和 input 是同一步」占了绝大多数边，不单独给它一档，
+       读者会以为数据流图画错了。 */
+    var deps = Object.create(null), edges = [], kindOf = Object.create(null);
+    order.forEach(function (id) {
+      var s = byId[id], seen = Object.create(null), row = [];
+      var add = function (t, kind) {
+        if (!t || t === id || !byId[t]) return;
+        if (seen[t]) { if (kindOf[t + ">" + id] !== kind) kindOf[t + ">" + id] = "both"; return; }
+        seen[t] = 1;
+        row.push(t);
+        kindOf[t + ">" + id] = kind;
+        edges.push({ from: t, to: id, kind: kind });
+      };
+      add(s.parent, "tree");
+      (s.inputs || []).forEach(function (i) { add(i.step, "data"); });
+      deps[id] = row;
+    });
+    edges.forEach(function (e) { e.kind = kindOf[e.from + ">" + e.to]; });
+
+    var layer = Object.create(null), onStack = Object.create(null);
+    order.forEach(function (start) {
+      if (layer[start] !== undefined) return;
+      var stack = [[start, 0]];
+      while (stack.length) {
+        var top = stack[stack.length - 1], id = top[0];
+        if (layer[id] !== undefined) { stack.pop(); onStack[id] = 0; continue; }
+        if (top[1] === 0) {
+          top[1] = 1;
+          onStack[id] = 1;
+          deps[id].forEach(function (d) {
+            if (layer[d] === undefined && !onStack[d]) stack.push([d, 0]);
+          });
+          continue;
+        }
+        var m = -1;
+        deps[id].forEach(function (d) { if (layer[d] !== undefined && layer[d] > m) m = layer[d]; });
+        layer[id] = m + 1;
+        onStack[id] = 0;
+        stack.pop();
+      }
+    });
+
+    var rows = [];
+    order.forEach(function (id) {
+      var l = layer[id] || 0;
+      while (rows.length <= l) rows.push([]);
+      rows[l].push(id);
+    });
+    var col = Object.create(null);
+    rows.forEach(function (ids, l) {
+      if (l > 0) {
+        ids.sort(function (a, b) {
+          var ba = bary(a), bb = bary(b);
+          if (ba !== bb) return ba - bb;
+          return ordIdx[a] - ordIdx[b];
+        });
+      }
+      ids.forEach(function (id, i) { col[id] = i; });
+      function bary(id) {
+        var got = deps[id].filter(function (d) { return col[d] !== undefined; });
+        if (!got.length) return ordIdx[id];
+        var sum = 0;
+        got.forEach(function (d) { sum += col[d]; });
+        return sum / got.length;
+      }
+    });
+
+    var nodes = Object.create(null), wide = 0;
+    order.forEach(function (id) {
+      var l = layer[id] || 0, c = col[id] || 0;
+      if (c + 1 > wide) wide = c + 1;
+      nodes[id] = { x: PAD + c * (NW + GX), y: PAD + l * (NH + GY), layer: l, col: c };
+    });
+    return {
+      nodes: nodes, edges: edges, layers: rows.length, nw: NW, nh: NH,
+      w: list.length ? PAD * 2 + wide * (NW + GX) - GX : 0,
+      h: list.length ? PAD * 2 + rows.length * (NH + GY) - GY : 0,
+    };
+  }
+
+  /* 上游闭包：本步的数据和记录到底是从哪些步骤流过来的（含自己）。
+     数据流视图里的「淡出」用的是它而不是 parent 那条链——在一张 DAG 上
+     「祖先」这个词只有沿着依赖走才有意义。 */
+  function depClosure(byId, id) {
+    var out = Object.create(null), stack = id ? [id] : [];
+    while (stack.length) {
+      var cur = stack.pop();
+      if (!cur || out[cur] || !byId[cur]) continue;
+      out[cur] = 1;
+      var s = byId[cur];
+      if (s.parent) stack.push(s.parent);
+      (s.inputs || []).forEach(function (i) { stack.push(i.step); });
+    }
+    return out;
+  }
+
   var U = {
     LEVELS: LEVELS, REPRO_STATES: REPRO_STATES, INSIGHT_HEADINGS: INSIGHT_HEADINGS,
+    INSIGHT_KIND_BY_HEADING: INSIGHT_KIND_BY_HEADING, SUPERSEDE_WORDS: SUPERSEDE_WORDS,
+    PATH_ROLES: PATH_ROLES, HINT_CODES: HINT_CODES,
     levelIndex: levelIndex, splitSections: splitSections,
     splitInsightBody: splitInsightBody, foreignHeadings: foreignHeadings,
-    draftKey: draftKey, matches: matches, snippet: snippet,
+    draftKey: draftKey, matches: matches, snippet: snippet, locationsHay: locationsHay,
     pickLang: pickLang, headingsIn: headingsIn, langByHeadings: langByHeadings,
+    sizeUnit: sizeUnit, formatPath: formatPath, formatInput: formatInput, formatCode: formatCode,
+    MEASURED_ATTRS: MEASURED_ATTRS, inheritPath: inheritPath,
+    parseInsights: parseInsights, parseInsightLine: parseInsightLine,
+    moveError: moveError, warnLevel: warnLevel,
+    flowLayout: flowLayout, depClosure: depClosure,
   };
   global.traceUtil = U;
   if (typeof module !== "undefined" && module.exports) module.exports = U;
@@ -232,8 +553,8 @@
      只在**没有存过偏好**时这样选：用户明确切过就永远听用户的。 */
   var savedView = localStorage.getItem("trace.view");
   var NARROW = 760;
-  var view = savedView === "list" ? "list"
-    : savedView === "graph" ? "graph"
+  var VIEWS = ["graph", "list", "flow"];
+  var view = VIEWS.indexOf(savedView) >= 0 ? savedView
     : (window.innerWidth && window.innerWidth < NARROW ? "list" : "graph");
   var zoom = 1;
 
@@ -345,10 +666,11 @@
     var d = new Date(), p = function (n) { return (n < 10 ? "0" : "") + n; };
     return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
   }
+  /* 分档在纯函数层（U.sizeUnit），这里只负责把它说成话。GB / TB 两档是为
+     path 上的 size= 加的：57 GB 那个目录只到 MB 会显示成「58366 MB」。 */
   function human(n) {
-    if (n < 1024) return i18n.t("unit.b", { n: n });
-    if (n < 1048576) return i18n.t("unit.kb", { n: (n / 1024).toFixed(1) });
-    return i18n.t("unit.mb", { n: (n / 1048576).toFixed(1) });
+    var u = U.sizeUnit(n);
+    return u ? i18n.t(u.key, { n: u.n }) : "";
   }
   function fileURL(s, rel) {
     var p = rel.split("/").map(encodeURIComponent).join("/");
@@ -491,7 +813,9 @@
     renderRails();
     renderRows();
     renderDiagram();
+    renderFlow();
     renderWarnings();
+    renderMissingPaths();
     applyView();
     onHash();
   }
@@ -552,7 +876,7 @@
       var other = (s.files || []).length - pics;
       var marks = (pics ? '<span class="cmk" title="' + esc(i18n.t("count.images", { n: pics })) + '">🖼' + (pics > 1 ? pics : "") + "</span>" : "")
         + (other ? '<span class="cmk" title="' + esc(i18n.t("count.files", { n: other })) + '">📎' + (other > 1 ? other : "") + "</span>" : "")
-        + traceMarks(s);
+        + nodeMarks(s);
       return '<div class="card s-' + s.status + '" data-id="' + esc(s.id) + '" tabindex="0"'
         + ' style="left:' + n.x + "px;top:" + n.y + "px;width:" + NW + "px;height:" + NH + 'px">'
         + '<div class="chead"><span class="cid">' + esc(s.id) + "</span>"
@@ -577,6 +901,68 @@
   function fitZoom() {
     var w = F.tree && F.tree.w;
     setZoom(w ? Math.min(1, ($("#scroller").clientWidth - 10) / w) : 1);
+  }
+
+  /* -------------------------------------------------------------- 数据流视图
+   *
+   * 第三个视图，画的是**另一张图**：森林是单父树，数据流是 DAG。016 的输入同时
+   * 来自 013 和 014，树上只能表达一个——以前只能在正文里写一句「本步的输入其实
+   * 来自 X」，读的人得自己拼。
+   *
+   * 布局在纯函数层（U.flowLayout）：分层 + 直连边，不做力导向。力导向每次刷新
+   * 形状都不一样，而形状本身是信息。
+   *
+   * 边的样子只承载一件事——这条边是树边、数据边、还是两者同时。节点的 status
+   * 仍然走线型（和另外两个视图一致），两个通道不打架。
+   */
+  var FLOW = { nodes: {}, edges: [], w: 0, h: 0, nw: 148, nh: 44 };
+
+  function renderFlow() {
+    FLOW = U.flowLayout(F.steps || []);
+    var svg = $("#fedges"), holder = $("#fnodes");
+    if (!svg || !holder) return;
+    var NW = FLOW.nw, NH = FLOW.nh;
+    $("#flow").style.width = FLOW.w + "px";
+    $("#flow").style.height = FLOW.h + "px";
+    svg.setAttribute("width", FLOW.w);
+    svg.setAttribute("height", FLOW.h);
+    svg.setAttribute("viewBox", "0 0 " + FLOW.w + " " + FLOW.h);
+
+    var out = [];
+    FLOW.edges.forEach(function (e) {
+      var a = FLOW.nodes[e.from], b = FLOW.nodes[e.to];
+      if (!a || !b) return;
+      var x1 = a.x + NW / 2, y1 = a.y + NH, x2 = b.x + NW / 2, y2 = b.y - 7;
+      var dy = Math.max(16, (y2 - y1) / 2);
+      var d = "M" + x1 + " " + y1 + "C" + x1 + " " + (y1 + dy) + " " + x2 + " " + (y2 - dy) + " " + x2 + " " + y2;
+      var tag = ' data-from="' + esc(e.from) + '" data-to="' + esc(e.to) + '"';
+      // 「同时是父子边和数据边」画成一条粗的托底 + 一条细的在上面：它占了绝大多数边，
+      // 不让它自成一档的话，读者会以为这张图把树边画丢了。
+      if (e.kind === "both") out.push('<path class="fedge under"' + tag + ' d="' + d + '"/>');
+      out.push('<path class="fedge k-' + e.kind + '"' + tag + ' d="' + d + '"/>');
+      out.push('<path class="farrow k-' + e.kind + '"' + tag + ' d="M' + (x2 - 4) + " " + y2
+        + "L" + (x2 + 4) + " " + y2 + "L" + x2 + " " + (y2 + 6.5) + 'Z"/>');
+    });
+    svg.innerHTML = out.join("");
+
+    holder.innerHTML = (F.steps || []).map(function (s) {
+      var n = FLOW.nodes[s.id];
+      if (!n) return "";
+      var off = (s.inputs || []).filter(function (i) { return i.step !== s.parent; }).length;
+      return '<div class="fcard s-' + s.status + '" data-id="' + esc(s.id) + '" tabindex="0"'
+        + ' style="left:' + n.x + "px;top:" + n.y + "px;width:" + NW + "px;height:" + NH + 'px">'
+        + '<div class="chead"><span class="cid">' + esc(s.id) + "</span>"
+        + (off ? '<span class="cmk dep" title="'
+            + esc(i18n.t("count.inputs", { n: off })) + '">⇢' + off + "</span>" : "")
+        + '<span class="cdate">' + esc(s.date || "") + "</span></div>"
+        + '<div class="ctitle">' + esc(stepTitle(s) || i18n.t("common.untitled")) + "</div>"
+        + "</div>";
+    }).join("");
+
+    // 一条 input 都没有时如实说明：那种情况下这张图和树逐字一样，
+    // 不说的话人会以为是功能坏了。
+    var any = (F.steps || []).some(function (s) { return (s.inputs || []).length; });
+    $("#flowempty").hidden = any || !(F.steps || []).length;
   }
 
   /* -------------------------------------------------------------- 列表视图 */
@@ -627,7 +1013,7 @@
       return '<div class="row s-' + s.status + '" data-id="' + esc(s.id) + '">'
         + '<span class="id s-' + s.status + '">' + esc(s.id) + "</span>"
         + '<span class="t">' + esc(stepTitle(s) || i18n.t("common.untitled")) + "</span>"
-        + traceMarks(s)
+        + nodeMarks(s)
         + (pics ? '<span class="who" title="' + esc(i18n.t("count.files", { n: pics })) + '">📎</span>' : "")
         + (isAgent(s) ? '<span class="who" title="' + esc(s.author) + '">🤖</span>' : "")
         + '<span class="d">' + esc(s.date || "") + "</span>"
@@ -666,13 +1052,106 @@
     return out;
   }
 
+  /* 图/列表上的其余三个字形标记。和 traceMarks 用的是同一个通道（字形），
+   * 所以线型仍然只归 status、不透明度仍然只归祖先链/搜索命中。
+   *
+   *   ⇢n  这一步还有 n 个数据来源不在树上 —— 不给这个标记，数据流视图就是一个
+   *       没人知道该去点的按钮，而 ② 的全部意义就在于「让人一眼分得清 parent
+   *       和 inputs 是两回事」
+   *   ⇄   被移动过 —— 用户吃过的亏是「创建日期和内容对不上号」，一棵移动过的树
+   *       本来就会和创建顺序对不上，得让人知道那不是 bug
+   *   ⊘n  有 n 个记下来的位置已经确认不存在了（那三个被删掉的目录，57 GB 的那个）
+   */
+  function nodeMarks(s) {
+    var out = traceMarks(s);
+    var off = (s.inputs || []).filter(function (i) { return i.step !== s.parent; }).length;
+    if (off) {
+      out += '<span class="cmk dep" title="'
+        + esc(i18n.t("count.inputs", { n: off }) + " · " + i18n.t("input.parent.tip"))
+        + '">⇢' + off + "</span>";
+    }
+    if ((s.moved || []).length) {
+      out += '<span class="cmk moved" title="'
+        + esc(i18n.t("move.badge.title", { n: s.moved.length })) + '">⇄</span>';
+    }
+    var gone = (s.paths || []).filter(function (p) { return p.state === "missing"; }).length;
+    if (gone) {
+      out += '<span class="cmk gone" title="' + esc(i18n.t("path.summary.missing", { n: gone }))
+        + '">⊘' + (gone > 1 ? gone : "") + "</span>";
+    }
+    return out;
+  }
+
+  /* 服务端的 warning 是中文的（Python 侧不在翻译范围），而 ⑥ 之后警告栏里会混进
+   * 一批**不影响等级**的提示。两件事都得在这里处理：
+   *
+   *  - 按 code 换成本语言的说法。占位符**优先取 w.vars**（core.warn 把句子里的
+   *    那几个值结构化地一起发过来了）；只有拿不到 vars 时才退回从中文句子里抠。
+   *    抠正则留着是为了老服务端 / 静态导出出来的旧数据，不是主路径——它脆得离谱，
+   *    那几句中文改一个字就会让英文界面上原样漏出中文。抠不出来就显示原句，绝不吞。
+   *  - 按级别分档。提示级和真警告混在一起显示，人很快就不再看警告栏了，
+   *    而那里面真正会降级的条目才是要人动手的。
+   */
+  var WARN_MAP = {
+    section_without_prose: { key: "lint.subheads", pick: /「[#\s]*([^」]+)」/, as: "section" },
+    table_without_explanation: { key: "lint.table.nodesc" },
+    code_without_explanation: { key: "lint.pre.nodesc" },
+    dangling_input: { key: "input.warn.missing", pick: /(\S+)\s*$/, as: "id" },
+    self_input: { key: "input.warn.self", pick: /[（(]([^）)]+)[）)]/, as: "id" },
+    input_cycle: { key: "input.warn.cycle", pick: /:\s*([^—]+)/, as: "chain" },
+  };
+  /* 出的是 HTML：这些文案里有 `行内代码` 和 **粗体**，走 t() 的话反引号会原样
+     显示给用户看。认不出来时退回服务端那句中文，那一条要 esc——它是别处来的字节。 */
+  function warnText(w) {
+    var m = WARN_MAP[w.code];
+    if (!m || !i18n.has(m.key)) return esc(w.message);
+    if (!m.pick) return i18n.tHtml(m.key);
+    var vars = {};
+    if (w.vars && typeof w.vars[m.as] === "string" && w.vars[m.as] !== "") {
+      vars[m.as] = w.vars[m.as];
+    } else {
+      var got = m.pick.exec(w.message || "");
+      if (!got) return esc(w.message);
+      vars[m.as] = got[1].trim();
+    }
+    return i18n.tHtml(m.key, vars);
+  }
+
   function renderWarnings() {
     var bar = $("#warnbar"), ws = F.warnings || [];
     bar.hidden = !ws.length;
     if (!ws.length) return;
-    bar.innerHTML = ws.map(function (w) {
-      return (w.level === "error" ? "✕ " : "⚠ ") + "<b>" + esc(w.where || w.code) + "</b> — " + esc(w.message);
-    }).join("<br>");
+    var by = { error: [], warn: [], hint: [] };
+    ws.forEach(function (w) { by[U.warnLevel(w)].push(w); });
+    var block = function (lv) {
+      if (!by[lv].length) return "";
+      var mark = lv === "error" ? "✕ " : (lv === "hint" ? "· " : "⚠ ");
+      return '<div class="wgroup w-' + lv + '"><b class="wlv">'
+        + esc(i18n.t("lint.level." + lv)) + "</b>"
+        + (lv === "hint" ? '<span class="wnote">' + esc(i18n.t("lint.note")) + "</span>" : "")
+        + by[lv].map(function (w) {
+            return '<div class="wrow">' + mark + "<b>" + esc(w.where || w.code) + "</b> — "
+              + warnText(w) + "</div>";
+          }).join("") + "</div>";
+    };
+    bar.innerHTML = block("error") + block("warn") + block("hint");
+  }
+
+  /* 「整个项目里有几处位置已经不存在了」——用户这次是**手工核对**才发现三个目录
+     没了（57 GB 的那个）。所以它不能只藏在某一步的详情里：一条横幅摆在顶上，
+     点得进去。记录一条都不删，只是标出来（P4：那是一条发现，不是一个笔误）。 */
+  function renderMissingPaths() {
+    var bar = $("#missbar");
+    if (!bar) return;
+    var hits = [];
+    (F.steps || []).forEach(function (s) {
+      (s.paths || []).forEach(function (p) { if (p.state === "missing") hits.push(s.id); });
+    });
+    bar.hidden = !hits.length;
+    if (!hits.length) return;
+    var ids = hits.filter(function (id, i) { return hits.indexOf(id) === i; });
+    bar.innerHTML = '<b>⊘ ' + esc(i18n.t("path.summary.missing", { n: hits.length })) + "</b>"
+      + ids.map(function (id) { return " " + stepLink(id); }).join(" ·");
   }
 
   function applyView() {
@@ -682,8 +1161,13 @@
     }
     $("#dwrap").hidden = view !== "graph";
     $("#track").hidden = view !== "list";
+    $("#fwrap").hidden = view !== "flow";
     $("#empty").hidden = F.steps.length > 0;
     $("#zoombar").hidden = view !== "graph";
+    // 图例跟着视图换：数据流那三条说的是边的意思，和 status 那三条不是一回事，
+    // 同时摆出来只会让人以为「实线 = 树边」。
+    $("#treelegend").hidden = view === "flow";
+    $("#flowlegend").hidden = view !== "flow";
     document.querySelectorAll("#viewtoggle button").forEach(function (b) {
       b.classList.toggle("on", b.getAttribute("data-view") === view);
     });
@@ -694,18 +1178,28 @@
 
   function renderSelection() {
     var sel = selected(), chain = chainOf(sel);
+    /* 数据流视图里「祖先」这个词只有沿着依赖走才有意义：那张图上淡出的判据是
+       「这一步在不在选中那一步的上游闭包里」，也就是「这个数字是从哪些步骤
+       流过来的」。通道没变，仍然是不透明度。 */
+    var dchain = sel ? U.depClosure(IDX, sel) : {};
     var q = query.trim().toLowerCase(), hits = 0;
 
-    document.querySelectorAll("#rows .row, #dnodes .card").forEach(function (el) {
+    document.querySelectorAll("#rows .row, #dnodes .card, #fnodes .fcard").forEach(function (el) {
       var id = el.getAttribute("data-id"), s = IDX[id];
       if (!s) return;
       // 判定走 U.matches：以前这里自己又拼了一遍干草堆，于是加上译文之后
       // 侧栏和跨项目搜索会对同一个词给出两种答案。
       var hit = U.matches(s, q);
       if (q && hit && el.classList.contains("row")) hits++;
+      var inChain = el.classList.contains("fcard") ? dchain[id] : chain[id];
       el.classList.toggle("miss", !!q && !hit);
-      el.classList.toggle("faded", !!sel && !chain[id]);
+      el.classList.toggle("faded", !!sel && !inChain);
       el.classList.toggle("sel", id === sel);
+    });
+    document.querySelectorAll("#fedges [data-to]").forEach(function (el) {
+      var from = el.getAttribute("data-from"), to = el.getAttribute("data-to");
+      el.classList.toggle("faded", !!sel && !(dchain[from] && dchain[to]));
+      el.classList.toggle("sel", sel === to || sel === from);
     });
     $("#hits").textContent = q ? hits + " / " + F.steps.length
       : (F.steps.length ? i18n.t("count.steps", { n: F.steps.length }) : "");
@@ -720,7 +1214,8 @@
   function scrollToSelected() {
     var sel = selected();
     if (!sel) return;
-    var el = document.querySelector((view === "graph" ? "#dnodes .card" : "#rows .row") + '[data-id="' + sel + '"]');
+    var sels = { graph: "#dnodes .card", flow: "#fnodes .fcard", list: "#rows .row" };
+    var el = document.querySelector((sels[view] || sels.list) + '[data-id="' + sel + '"]');
     if (el) el.scrollIntoView({ block: "nearest", inline: "nearest" });
   }
 
@@ -811,23 +1306,195 @@
     return i18n.has(key) ? i18n.t(key) : String(kind || "");
   }
 
+  /* 角色的显示名。和 kindLabel 同一个套路：词表之外的值原样显示，
+     不认识不等于不存在（服务端将来加第五种 role 时界面不该显示成空白）。 */
+  function roleLabel(role) {
+    var key = "path.role." + role;
+    return i18n.has(key) ? i18n.t(key) : String(role || "");
+  }
+
+  /* 一条路径上那些机器记下来的事实：大小、条目数、校验和、最后一次核对。
+     各占一格而不是挤成一句话——这一整条需求的来历是「三个目录已被删除、
+     57 GB 那个，本该自动发现」，而挤成一句话时人正是扫不到那一格。 */
+  function pathFacts(p) {
+    var out = [];
+    if (p.size !== null && p.size !== undefined && p.size !== "") {
+      out.push('<span class="pfact mono">' + esc(human(p.size)) + "</span>");
+    }
+    if (p.n !== null && p.n !== undefined && p.n !== "") {
+      out.push('<span class="pfact mono">' + esc(i18n.t("path.n", { n: p.n })) + "</span>");
+    }
+    if (p.checksum) {
+      var algo = String(p.checksum).split(":")[0];
+      var val = String(p.checksum).slice(algo.length + 1);
+      out.push('<span class="pfact mono" title="' + esc(i18n.t("path.checksum.title", { algo: algo })) + '">'
+        + esc(i18n.t("path.checksum", { algo: algo, value: val })) + "</span>");
+    }
+    // 未知属性照样摆出来。半年后有人写了 nodes=…，界面把它吃掉就等于替他删了记录。
+    var known = { size: 1, n: 1, md5: 1, sha256: 1, checked: 1, missing: 1 };
+    Object.keys(p.attrs || {}).forEach(function (k) {
+      if (known[k]) return;
+      out.push('<span class="pfact mono unk" title="'
+        + esc(i18n.t("path.attr.unknown.title", { k: k, v: p.attrs[k] })) + '">'
+        + esc(k + "=" + p.attrs[k]) + "</span>");
+    });
+    if (p.state === "missing") {
+      out.push('<span class="pfact gone" title="' + esc(i18n.t("path.missing.title", { date: p.missing })) + '">'
+        + esc(i18n.t("path.missing", { date: p.missing })) + "</span>");
+    } else if (p.state === "present") {
+      out.push('<span class="pfact ok" title="' + esc(i18n.t("path.checked.title", { date: p.checked })) + '">'
+        + esc(i18n.t("path.checked", { date: p.checked })) + "</span>");
+    } else {
+      out.push('<span class="pfact none" title="' + esc(i18n.t("path.unchecked.title")) + '">'
+        + esc(i18n.t("path.unchecked")) + "</span>");
+    }
+    return '<div class="pfacts">' + out.join("") + "</div>";
+  }
+
+  function pathRow(p) {
+    var loc = esc(p.location);
+    var isLink = /^https?:\/\//i.test(p.location);
+    return '<div class="pathrow' + (p.state === "missing" ? " gone" : "") + '">'
+      + '<span class="pkind k-' + esc(p.kind) + '">' + esc(kindLabel(p.kind)) + "</span>"
+      + (isLink
+          ? '<a class="ploc" href="' + loc + '" target="_blank" rel="noopener noreferrer">' + loc + "</a>"
+          : '<code class="ploc">' + loc + "</code>")
+      + (p.state === "missing"
+          ? '<span class="pgone" title="' + esc(i18n.t("path.missing.title", { date: p.missing })) + '">'
+            + esc(i18n.t("path.missing.badge")) + "</span>" : "")
+      + '<button class="pcopy" type="button" data-copy="' + loc + '" title="' + esc(i18n.t("common.copy")) + '">⧉</button>'
+      + (p.note ? '<span class="pnote">' + esc(p.note) + "</span>" : "")
+      + pathFacts(p)
+      + "</div>";
+  }
+
   /* 外部产物的位置。checkpoint、数据集这些 GB 级的东西不进仓库，
-     只在这里记"它在哪"——溯源时最常问的就是这个。 */
+     只在这里记"它在哪"——溯源时最常问的就是这个。
+     按 role 分组：「别人能看到这一步做了什么」本质上就是分清读进来的、跑的、
+     写出去的、留作凭据的这四类。没标 role 的旧记录（现存的全部）排在最后，
+     一个字不改也照样显示——向后兼容是硬要求。 */
   function renderPaths(s) {
     var ps = s.paths || [];
     if (!ps.length) return "";
-    return '<div class="pathbox">' + ps.map(function (p) {
-      var loc = esc(p.location);
-      var isLink = /^https?:\/\//i.test(p.location);
-      return '<div class="pathrow">'
-        + '<span class="pkind k-' + esc(p.kind) + '">' + esc(kindLabel(p.kind)) + "</span>"
-        + (isLink
-            ? '<a class="ploc" href="' + loc + '" target="_blank" rel="noopener noreferrer">' + loc + "</a>"
-            : '<code class="ploc">' + loc + "</code>")
-        + '<button class="pcopy" type="button" data-copy="' + loc + '" title="' + esc(i18n.t("common.copy")) + '">⧉</button>'
-        + (p.note ? '<span class="pnote">' + esc(p.note) + "</span>" : "")
-        + "</div>";
+    var groups = U.PATH_ROLES.concat([""]).map(function (role) {
+      return { role: role, rows: ps.filter(function (p) {
+        return role ? p.role === role : U.PATH_ROLES.indexOf(p.role) < 0;
+      }) };
+    }).filter(function (g) { return g.rows.length; });
+    var gone = ps.filter(function (p) { return p.state === "missing"; }).length;
+    var head = gone
+      ? '<p class="pathsum">' + esc(i18n.t("path.summary.missing", { n: gone })) + "</p>" : "";
+    // 一个组也分不出来（全是没标 role 的老记录）时不加分组标题：那只是噪声
+    var single = groups.length === 1 && !groups[0].role;
+    return '<div class="pathbox">' + head + groups.map(function (g) {
+      var title = g.role
+        ? '<h4 class="prole" title="' + esc(i18n.t("path.role." + g.role + ".title")) + '">'
+          + esc(roleLabel(g.role)) + "</h4>"
+        : (single ? "" : '<h4 class="prole quiet">' + esc(i18n.t("path.role.none")) + "</h4>");
+      return title + g.rows.map(pathRow).join("");
     }).join("") + "</div>";
+  }
+
+  /* ⑤ 代码在哪。`commit:` 只是其中一种写法——代码不在 git 里的时候
+     （超算上直接改脚本，跑完打一个快照目录 + 逐文件校验和）同样答得了
+     「代码在哪」，凭什么永远停在 L1。 */
+  function renderCode(s) {
+    var cs = s.code || [];
+    if (!cs.length) return "";
+    return '<div class="sec codebox"><h3>' + esc(i18n.t("code.head", { n: cs.length })) + "</h3>"
+      + cs.map(function (c) {
+          var kindKey = "code.kind." + c.kind;
+          var label = i18n.has(kindKey) ? i18n.t(kindKey) : String(c.kind || "");
+          var tip = i18n.has(kindKey + ".title") ? i18n.t(kindKey + ".title") : "";
+          var attrs = c.attrs || {};
+          var facts = [];
+          if (attrs.manifest) {
+            facts.push('<span class="pfact mono" title="' + esc(i18n.t("code.manifest.title")) + '">'
+              + esc(i18n.t("code.manifest", { name: attrs.manifest })) + "</span>");
+          }
+          if (attrs.n) facts.push('<span class="pfact mono">' + esc(i18n.t("code.files", { n: attrs.n })) + "</span>");
+          Object.keys(attrs).forEach(function (k) {
+            if (k === "manifest" || k === "n") return;
+            facts.push('<span class="pfact mono">' + esc(k + "=" + attrs[k]) + "</span>");
+          });
+          var loc = String(c.location || "");
+          var isLink = /^https?:\/\//i.test(loc);
+          return '<div class="coderow">'
+            + '<span class="ckind" title="' + esc(tip) + '">' + esc(label) + "</span>"
+            + (loc
+                ? (isLink
+                    ? '<a class="ploc" href="' + esc(loc) + '" target="_blank" rel="noopener noreferrer">' + esc(loc) + "</a>"
+                    : '<code class="ploc">' + esc(loc) + "</code>")
+                : "")
+            // 派生出来的那条要标出来：文件里只有一行 `commit:`，没有第二份。
+            + (c.from === "commit"
+                ? '<span class="cderived" title="' + esc(i18n.t("code.from.commit.title")) + '">'
+                  + esc(i18n.t("code.from.commit")) + "</span>" : "")
+            + (c.note ? '<span class="pnote">' + esc(c.note) + "</span>" : "")
+            + (facts.length ? '<div class="pfacts">' + facts.join("") + "</div>" : "")
+            + "</div>";
+        }).join("") + "</div>";
+  }
+
+  function stepLink(id) {
+    return '<a href="#' + esc(id) + '" data-goto="' + esc(id) + '">' + esc(id) + "</a>";
+  }
+
+  /* ② 数据依赖，两个方向都要有。
+   *
+   * 上游（本步消费了谁的产物）是文件里写着的 `input:`；下游（谁消费了本步的）
+   * 是扫全项目现算出来的反向边，绝不存储——存了就是第二份真相。
+   *
+   * 顶上那句 input.lead 是这个区块存在的全部意义：`parent` 是我当时接着哪一步想，
+   * `input` 是这些字节从哪来。少了它，读者只会把 input 当成「第二个 parent」。
+   */
+  function renderDeps(s) {
+    var ins = s.inputs || [], outs = s.consumers || [];
+    if (!ins.length && !outs.length) return "";
+    var up = ins.length
+      ? '<ul class="deplist">' + ins.map(function (i) {
+          var known = !!IDX[i.step];
+          var link = known ? stepLink(i.step) : '<code>' + esc(i.step) + "</code>";
+          var line = i.note
+            ? i18n.tHtml("input.entry", { link: { html: link }, what: i.note })
+            : i18n.tHtml("input.entry.bare", { link: { html: link } });
+          return '<li' + (known ? "" : ' class="dangling"') + ">" + line
+            + (known ? '<span class="deptitle">' + esc(titleOf(i.step)) + "</span>"
+                     : '<span class="depwarn">' + esc(i18n.t("input.warn.missing", { id: i.step })) + "</span>")
+            + "</li>";
+        }).join("") + "</ul>"
+      : '<p class="dropnote">' + esc(i18n.t("input.empty")) + "</p>";
+    var down = outs.length
+      ? '<ul class="deplist">' + outs.map(function (id) {
+          return "<li>" + stepLink(id) + '<span class="deptitle">' + esc(titleOf(id)) + "</span></li>";
+        }).join("") + "</ul>"
+      : '<p class="dropnote">' + esc(i18n.t("input.consumers.empty")) + "</p>";
+    return '<div class="sec depbox"><h3>' + esc(i18n.t("input.head", { n: ins.length })) + "</h3>"
+      + '<p class="dropnote deplead">' + i18n.tHtml("input.lead") + "</p>"
+      + up
+      + '<h4 class="rhead">' + esc(i18n.t("input.consumers.head", { n: outs.length })) + "</h4>"
+      + down + "</div>";
+  }
+
+  /* ① 移动审计。顺序即历史，只追加。
+   *
+   * 为什么要显示它：用户吃过的亏正是「创建日期和内容对不上号」，而一棵移动过的树
+   * 本来就会和创建顺序对不上——不把这几行摆出来，那种对不上就会被当成 bug。 */
+  function renderMoved(s) {
+    var ms = s.moved || [];
+    if (!ms.length) return "";
+    return '<div class="sec movedbox"><h3>' + esc(i18n.t("move.head", { n: ms.length })) + "</h3>"
+      + ms.map(function (m) {
+          var vars = {
+            date: m.date || "",
+            from: m.from ? m.from : i18n.t("move.from.root"),
+            to: m.to ? m.to : i18n.t("move.to.root"),
+            reason: m.reason || "",
+            by: m.by === "human" ? i18n.t("move.by.human") : (m.by || ""),
+          };
+          return '<div class="moverow">'
+            + esc(i18n.t(m.by ? "move.entry" : "move.entry.nobody", vars)) + "</div>";
+        }).join("") + "</div>";
   }
 
   /* ---------------------------------------------------------- 可溯源性 */
@@ -872,6 +1539,13 @@
     } else if (t.weakest === s.id && t.chain !== "L4") {
       head += '<span class="lvsep">—</span><span class="lvcap">' + esc(i18n.t("trace.weakest.self")) + "</span>";
     }
+    /* via 说的是最弱一环是**从哪条边**找过去的。没有它，「整链等级比面包屑里
+       任何一环都低」看着就像算错了——其实是最弱的那一环挂在数据依赖上，
+       而 lineage 只画得出 parent 那条路（DAG 摊不成面包屑）。 */
+    if (weak && t.via === "input") {
+      head += '<span class="viatag" title="' + esc(i18n.t("input.parent.tip")) + '">'
+        + esc(i18n.t("flow.legend.data")) + "</span>";
+    }
     head += "</div>";
 
     // missing 的每一条都是服务端算出来的中文（Python 侧不在翻译范围），
@@ -903,15 +1577,31 @@
         }).join("") + "</div>"
       : '<p class="dropnote">' + i18n.tHtml("trace.repro.empty") + "</p>";
 
+    /* L2 的判据放宽之后要在这里说一句：快照目录 + 逐文件校验和不比 commit 差。
+       只在这一步真的靠非 git 的方式定位到代码时才说——对一个普通的 git 记录
+       讲这段话是噪声。 */
+    var l2 = (s.code || []).some(function (c) { return c.kind && c.kind !== "git"; })
+      ? '<p class="dropnote l2note">' + i18n.tHtml("code.l2.note") + "</p>" : "";
+
     return '<div class="sec tracebox"><h3>' + esc(i18n.t("trace.title")) + "</h3>"
-      + head + todo + chain
+      + head + todo + l2 + chain
       + '<h4 class="rhead">' + esc(i18n.t("trace.repro.head", { n: repro.length })) + "</h4>" + rp + "</div>";
   }
 
+  /* 编辑框里的三块结构化文本。**必须**走 U.format*（逐字对着 trace_core 的
+     format_path / format_input / format_code），否则一次无关的编辑——改个标题、
+     改个状态——就会把 role、校验和、最后核对日期整组抹掉。 */
   function pathsToText(s) {
-    return (s.paths || []).map(function (p) {
-      return p.location + (p.note ? " | " + p.note : "");
-    }).join("\n");
+    return (s.paths || []).map(U.formatPath).join("\n");
+  }
+  function inputsToText(s) {
+    return (s.inputs || []).map(U.formatInput).join("\n");
+  }
+  function codeToText(s) {
+    // from == "commit" 的那条是**派生**的（由 `commit:` 折算出来）。摆进框里
+    // 就等于让人把同一个事实写第二遍，而且它没有位置，原样发回去写入侧会拒。
+    return (s.code || []).filter(function (c) { return c.from !== "commit"; })
+      .map(U.formatCode).join("\n");
   }
   function textToPaths(text) {
     return String(text || "").split("\n").map(function (l) { return l.trim(); }).filter(Boolean);
@@ -935,6 +1625,92 @@
     return '<span class="mono">' + k + "</span> " + esc(i18n.t(label));
   }
 
+  /* ---------------------------------------------------------- ④ 洞察逐条渲染
+   *
+   * 一条洞察在磁盘上就是 project.md 里的一行 `- `。这里把它按条摆出来，
+   * 为的是三件事：
+   *   · id 是个把手——「见 p3」这样的引用要一直有效，所以 id 得看得见；
+   *   · 「取代了 p1」只写在取代者身上，「p1 已被取代」是**派生**的，
+   *     所以那半句话由这里算出来显示，磁盘上一个字都不多写；
+   *   · 被取代的那条默认折叠但**绝不删除**——你当初信的那件事是你走到今天的
+   *     一部分，删了它，后来的更正看着就像凭空冒出来的。
+   */
+  function insightBody() {
+    var p = currentProject() || { body: "" };
+    return String(p.body || "");
+  }
+  function findInsight(iid) {
+    var items = U.parseInsights(insightBody());
+    var found = null;
+    Object.keys(items).forEach(function (k) {
+      items[k].forEach(function (it) { if (!found && it.id === iid) found = { kind: k, item: it }; });
+    });
+    return found;
+  }
+
+  function insightRow(it, kind, byId, editable) {
+    var bits = '<span class="insid" title="' + esc(i18n.t("insight.id.title")) + '">'
+      + esc(i18n.t("insight.id", { id: it.id })) + "</span>";
+    var text = '<div class="instext">' + window.md.render(it.text, { resolve: function (h) { return h; } }) + "</div>";
+    var tags = "";
+    it.supersedes.forEach(function (t) {
+      tags += byId[t]
+        ? '<span class="instag">' + esc(i18n.t("insight.supersedes", { id: t })) + "</span>"
+        : '<span class="instag warn">' + esc(i18n.t("insight.warn.missing", { id: t })) + "</span>";
+    });
+    it.superseded_by.forEach(function (t) {
+      tags += '<span class="instag old" title="' + esc(i18n.t("insight.superseded.title")) + '">'
+        + esc(i18n.t("insight.superseded", { id: t })) + "</span>";
+    });
+    var acts = (editable && it.id)
+      ? '<span class="insacts">'
+        + '<button data-ins-edit="' + esc(it.id) + '">' + esc(i18n.t("insight.item.edit")) + "</button>"
+        + '<button data-ins-sup="' + esc(it.id) + '" title="' + esc(i18n.t("insight.supersede.hint")) + '">'
+        + esc(i18n.t("insight.supersede.act")) + "</button></span>"
+      : "";
+    return '<li class="insrow' + (it.superseded_by.length ? " isold" : "") + '">'
+      + (it.id ? bits : "") + text + tags + acts + "</li>";
+  }
+
+  function renderInsightBody(body, editable) {
+    var secs = U.splitSections(body);
+    var items = U.parseInsights(body);
+    var byId = Object.create(null);
+    Object.keys(items).forEach(function (k) {
+      items[k].forEach(function (it) { if (it.id && !byId[it.id]) byId[it.id] = it; });
+    });
+    var done = Object.create(null), out = "";
+    secs.forEach(function (sec) {
+      var text = sec.lines.join("\n").replace(/^\n+|\n+$/g, "");
+      if (!text.trim()) return;
+      var kind = sec.heading === null ? null : U.INSIGHT_KIND_BY_HEADING[sec.heading];
+      // 洞察之外的小节（尤其「## 已删除」）原样渲染：那几行是步骤被真删之后
+      // 唯一还 grep 得到的证据，一个字都不能少。
+      if (!kind || done[kind]) {
+        out += '<div class="prose">' + window.md.render(text, { resolve: function (h) { return h; } }) + "</div>";
+        return;
+      }
+      done[kind] = 1;
+      var live = items[kind].filter(function (it) { return !it.superseded_by.length; });
+      var old = items[kind].filter(function (it) { return it.superseded_by.length; });
+      out += '<div class="inssec"><h2>' + esc(sec.heading) + "</h2>"
+        + (live.length
+            ? '<ul class="inslist">' + live.map(function (it) {
+                return insightRow(it, kind, byId, editable);
+              }).join("") + "</ul>"
+            : "")
+        + (old.length
+            ? '<button class="insfold" data-ins-fold="' + esc(kind) + '">'
+              + esc(i18n.t("insight.superseded.show", { n: old.length })) + "</button>"
+              + '<ul class="inslist insold" data-old="' + esc(kind) + '" hidden>'
+              + old.map(function (it) { return insightRow(it, kind, byId, editable); }).join("")
+              + "</ul>"
+            : "")
+        + "</div>";
+    });
+    return out;
+  }
+
   function renderInsights(el) {
     var p = currentProject() || { name: PROJECT, body: "" };
     // 洞察正文同样跟语言走：project.en.md 里的四个小节是同一批判断的英文那一份。
@@ -951,9 +1727,11 @@
       : "";
     var content = body
       ? trNotice(p, "tr.fallback.project")
-        + '<div class="prose">' + window.md.render(body, {
-            resolve: function (h) { return h; },
-          }) + "</div>"
+        // 逐条渲染而不是整段 md.render：④ 要的「被取代的折叠起来、取代者标出
+        // 取代了谁」是**每一条**上的事，整段渲染时它们只是四行看不出关系的 bullet。
+        // 能不能改由「此刻显示的是不是原文」决定：写入只会落到 project.md，
+        // 对着译文点「编辑这一条」会改到另一个文件上去。
+        + renderInsightBody(body, canWrite() && !pick.tr)
       : '<p class="dropnote">' + i18n.tHtml("insight.empty") + "</p>";
 
     el.innerHTML = '<div class="insights">'
@@ -974,7 +1752,11 @@
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
-    }).then(function () { return refreshProjects(); }).then(function () { onHash(); });
+    }).then(function (r) {
+      // 响应要一路带回调用处：新写的那条洞察分到的 id 只有服务端知道，
+      // 而不知道它叫 p3，人就说不出下一句「· 取代 p3」。
+      return refreshProjects().then(function () { onHash(); return r || {}; });
+    });
   }
 
   /* 「编辑洞察」只提交它真正编辑的那部分。
@@ -1056,11 +1838,30 @@
     if (s.trace) meta.push(lvChip(s.trace.chain, "mini"));
     if (s.date) meta.push(esc(s.date));
     if (s.commit) meta.push(esc(i18n.t("detail.meta.commit", { commit: s.commit })));
+    // 非 git 的代码位置也上 meta：⑤ 之后「代码在哪」不只有 commit 一种答案
+    (s.code || []).forEach(function (c) {
+      if (c.from === "commit" || !c.location) return;
+      meta.push(esc(i18n.t("detail.meta.code", { kind: c.kind, loc: c.location })));
+    });
     if (s.author) meta.push(esc(s.author));
     if (s.parent) {
-      meta.push(i18n.tHtml("detail.meta.parent", {
-        id: { html: '<a href="#' + esc(s.parent) + '" data-goto="' + esc(s.parent) + '">' + esc(s.parent) + "</a>" },
-      }));
+      meta.push('<span title="' + esc(i18n.t("input.parent.tip")) + '">'
+        + i18n.tHtml("detail.meta.parent", {
+            id: { html: '<a href="#' + esc(s.parent) + '" data-goto="' + esc(s.parent) + '">' + esc(s.parent) + "</a>" },
+          }) + "</span>");
+    }
+    // 数据依赖只在它**和 parent 说的不是同一件事**时上 meta：树上那一条已经
+    // 写在旁边了，重复一遍只会让人以为 input 就是第二个 parent。
+    var offTree = (s.inputs || []).filter(function (i) { return i.step !== s.parent; });
+    if (offTree.length) {
+      meta.push('<span class="depchip" title="' + esc(i18n.t("input.parent.tip")) + '">'
+        + esc(i18n.t("detail.meta.inputs", { ids: offTree.map(function (i) { return i.step; }).join(" · ") }))
+        + "</span>");
+    }
+    if ((s.moved || []).length) {
+      meta.push('<span class="movechip" title="'
+        + esc(i18n.t("move.badge.title", { n: s.moved.length })) + '">'
+        + esc(i18n.t("move.badge")) + "</span>");
     }
     if ((s.children || []).length) meta.push(esc(i18n.t("count.children", { n: s.children.length })));
     (s.tags || []).forEach(function (tag) { meta.push('<span class="tag">' + esc(tag) + "</span>"); });
@@ -1072,6 +1873,10 @@
         + ["wip", "done", "dead"].map(function (st) {
             return '<button data-status="' + st + '"' + (s.status === st ? ' class="on"' : "") + ">" + st + "</button>";
           }).join("")
+        // 「移动」不是主操作，但它必须在场：没有它，人只能回去用「把正文对调」
+        // 那种老办法，而那种办法是不留痕迹的。
+        + '<button data-act="move" title="' + esc(i18n.t("move.act.title")) + '">'
+        + esc(i18n.t("move.act")) + "</button>"
         + '<span class="sp"></span>'
         + '<button data-act="delete" class="danger" title="' + esc(i18n.t("detail.act.delete.title")) + '">'
         + esc(i18n.t("detail.act.delete")) + "</button>"
@@ -1112,9 +1917,10 @@
 
     el.innerHTML = crumbs(s)
       + '<h1 class="title">' + esc(stepTitle(s) || i18n.t("common.untitled")) + "</h1>"
-      + '<div class="meta">' + meta.join("") + "</div>" + acts + paths
+      + '<div class="meta">' + meta.join("") + "</div>" + acts + paths + renderCode(s)
       + trNotice(s)
-      + '<div class="prose">' + body + "</div>" + back + renderTrace(s) + files;
+      + '<div class="prose">' + body + "</div>" + renderDeps(s) + back
+      + renderMoved(s) + renderTrace(s) + files;
     enhanceProse(el);
     el.scrollTop = 0;
   }
@@ -1151,20 +1957,29 @@
     var b = $("#ed-body");
     if (!b) return null;
     return { title: ($("#ed-title") || {}).value || "", body: b.value,
-             paths: ($("#ed-paths") || {}).value || "", lang: edLang };
+             paths: ($("#ed-paths") || {}).value || "",
+             inputs: ($("#ed-inputs") || {}).value || "",
+             code: ($("#ed-code") || {}).value || "", lang: edLang };
   }
-  /* 编辑器此刻对着的那一份磁盘内容。译文只有标题和正文——path 是结构信息，
-     翻译文件里一行都不许有（写两份就是双真相源）。 */
+  /* 编辑器此刻对着的那一份磁盘内容。译文只有标题和正文——path / input / code
+     都是结构信息，翻译文件里一行都不许有（写两份就是双真相源，而且 core 会
+     把它们读都不读地丢掉并报一条 translation_structural_key）。 */
   function editTarget(s, l) {
-    if (!s) return { title: "", body: "", paths: "" };
-    if (!l) return { title: s.title || "", body: s.body || "", paths: pathsToText(s) };
+    if (!s) return { title: "", body: "", paths: "", inputs: "", code: "" };
+    if (!l) {
+      return { title: s.title || "", body: s.body || "", paths: pathsToText(s),
+               inputs: inputsToText(s), code: codeToText(s) };
+    }
     var e = (s.tr || {})[l] || {};
-    return { title: e.title || "", body: e.body || "", paths: "" };
+    return { title: e.title || "", body: e.body || "", paths: "", inputs: "", code: "" };
   }
   function sameAsStep(s, st) {
     if (!s || !st) return false;
     var base = editTarget(s, st.lang || "");
-    return st.title === base.title && st.body === base.body && st.paths === base.paths;
+    // 老草稿里没有 inputs / code 两个键：undefined 当成空串比，
+    // 否则升级之后每一份旧草稿都会被判成「有未保存改动」，每次进出都弹框。
+    return st.title === base.title && st.body === base.body && st.paths === base.paths
+      && (st.inputs || "") === base.inputs && (st.code || "") === base.code;
   }
   function isDirty() {
     if (!editing) return false;
@@ -1302,6 +2117,7 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             title: c.mine.title, body: c.mine.body, paths: textToPaths(c.mine.paths),
+            inputs: textToPaths(c.mine.inputs), code: textToPaths(c.mine.code),
             expect: c.server.digest || "",
           }),
         });
@@ -1434,11 +2250,21 @@
       + draftBanner(s)
       + '<input class="title-input" id="ed-title" value="' + esc(base.title) + '" maxlength="200" placeholder="'
       + esc(i18n.t("editor.title.placeholder")) + '">'
-      // 译文里没有外部路径：路径是结构信息，只写在 note.md 里，写两份就是双真相源
+      // 译文里没有这三块：它们是结构信息，只写在 note.md 里，写两份就是双真相源
       + (edLang ? ""
           : '<label class="edpaths">' + i18n.tHtml("editor.paths.label")
             + '<textarea id="ed-paths" rows="2" spellcheck="false" placeholder="'
-            + esc(i18n.t("editor.paths.placeholder")) + '">' + esc(base.paths) + "</textarea></label>")
+            + esc(i18n.t("editor.paths.placeholder")) + '">' + esc(base.paths) + "</textarea>"
+            // 多出来的那几段竖线是新的，人第一次看到时唯一能自学的地方就是这里
+            + '<span class="edtip">' + i18n.tHtml("editor.paths.hint") + "</span></label>"
+            + '<label class="edpaths">' + i18n.tHtml("editor.inputs.label")
+            + '<textarea id="ed-inputs" rows="2" spellcheck="false" placeholder="'
+            + esc(i18n.t("editor.inputs.placeholder")) + '">' + esc(base.inputs) + "</textarea>"
+            + '<span class="edtip">' + esc(i18n.t("editor.inputs.hint")) + "</span></label>"
+            + '<label class="edpaths">' + i18n.tHtml("editor.code.label")
+            + '<textarea id="ed-code" rows="2" spellcheck="false" placeholder="'
+            + esc(i18n.t("editor.code.placeholder")) + '">' + esc(base.code) + "</textarea>"
+            + '<span class="edtip">' + i18n.tHtml("editor.code.hint") + "</span></label>")
       + '<div class="edtools">' + TOOLS.map(function (x) {
           return '<button type="button" data-md="' + x.k + '" title="'
             + esc(i18n.t("editor.tool." + x.k)) + '">' + x.html + "</button>";
@@ -1575,8 +2401,8 @@
 
   function bindEditor(ta, s) {
     ta.addEventListener("input", function () { schedulePreview(s); scheduleDraft(); });
-    // 标题和外部路径同样是人敲进去的，一起进草稿
-    ["#ed-title", "#ed-paths"].forEach(function (sel) {
+    // 标题、外部路径、数据依赖、代码位置同样是人敲进去的，一起进草稿
+    ["#ed-title", "#ed-paths", "#ed-inputs", "#ed-code"].forEach(function (sel) {
       var el = $(sel);
       if (el) el.addEventListener("input", scheduleDraft);
     });
@@ -1659,6 +2485,11 @@
           title: st.title,
           body: st.body,
           paths: textToPaths(st.paths),
+          // 三块结构化文本一起回写。整组替换是对的：框里显示的就是磁盘上的
+          // 全部内容（`commit:` 派生出来的那条除外，见 codeToText），
+          // 删掉一行的意思就该是删掉那一行。
+          inputs: textToPaths(st.inputs),
+          code: textToPaths(st.code),
           // 乐观并发控制：expect 是我打开这一步时读到的摘要。这期间别人改过就 409，
           // 由人来判怎么合，而不是谁最后按保存谁赢。
           expect: s.digest || "",
@@ -1672,6 +2503,80 @@
         if (e && e.status === 409) return handleConflict(s, st, e);
         fail(e);
       });
+  }
+
+  /* -------------------------------------------------------------- ① 移动 */
+
+  /* P2 的地基是「不丢历史」，不是「不能改结构」——记下来就不丢。于是 parent 可以
+   * 改，但每一次改都要留下一条 `moved:` 审计，而**原因是唯一无法自动生成的部分**。
+   *
+   * 所以这个框有两条硬规矩：
+   *   1) 原因输入框不是可选的。一个可选的框会让人先点了确定才发现要写，
+   *      转头就回去用「把两步的正文对调」那种不留痕迹的老办法。
+   *   2) 成环 / 挂到自己的后代下面**当场**说，不等服务端 4xx——那两条不是笔误，
+   *      是想法本身有问题，等一个 400 回来时人已经点过确定了。
+   */
+  function openMove(sid) {
+    var s = IDX[sid];
+    if (!s) return;
+    $("#mv-title").textContent = i18n.t("move.dialog.title", { id: s.id });
+    var cur = s.parent || "";
+    var opts = ['<option value="">' + esc(i18n.t("move.parent.none")) + "</option>"];
+    F.steps.forEach(function (o) {
+      if (o.id === s.id) return;
+      var bad = U.moveError(IDX, s.id, o.id);
+      opts.push('<option value="' + esc(o.id) + '"' + (o.id === cur ? " selected" : "") + ">"
+        + esc(o.id + "  " + (stepTitle(o) || i18n.t("common.untitled")).slice(0, 40)
+              + (o.id === cur ? "  · " + i18n.t("move.parent.current", { id: cur }) : "")
+              + (bad === "descendant" ? "  ⚠" : ""))
+        + "</option>");
+    });
+    $("#mv-parent").innerHTML = opts.join("");
+    $("#mv-parent").value = cur;
+    $("#mv-reason").value = "";
+    $("#dlg-move").dataset.sid = s.id;
+    paintMoveErr();
+    $("#dlg-move").showModal();
+    setTimeout(function () { $("#mv-reason").focus(); }, 30);
+  }
+
+  /* 选中的目标当场判一次。返回的是「能不能提交」，顺带把话说在按钮旁边。 */
+  function paintMoveErr() {
+    var sid = $("#dlg-move").dataset.sid, box = $("#mv-err");
+    var parent = $("#mv-parent").value;
+    var code = U.moveError(IDX, sid, parent);
+    var msg = "";
+    if (code === "self") msg = i18n.t("move.err.self", { id: sid });
+    else if (code === "descendant") msg = i18n.t("move.err.descendant", { id: sid, parent: parent });
+    else if (code === "noop") msg = i18n.t("move.err.noop", { id: sid, parent: parent || "" });
+    else if (code === "missing") msg = i18n.t("move.err.missing", { parent: parent });
+    box.textContent = msg;
+    box.hidden = !msg;
+    $("#mv-ok").disabled = !!msg;
+    return !msg;
+  }
+
+  function submitMove() {
+    var sid = $("#dlg-move").dataset.sid, s = IDX[sid];
+    if (!s || !paintMoveErr()) return;
+    var parent = $("#mv-parent").value;
+    var reason = $("#mv-reason").value.trim();
+    if (!reason) { toast(i18n.t("move.err.reason"), true); $("#mv-reason").focus(); return; }
+    $("#dlg-move").close();
+    /* 走的是同一条 PATCH：payload 里带 parent + reason，服务端把它转给
+       W.move_step（它才是唯一写审计的地方）。缺原因时服务端也会拒，这里那道
+       校验是为了让人在**还看着这个框**的时候就知道。 */
+    papi("/steps/" + encodeURIComponent(sid), {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ parent: parent || null, reason: reason, author: "human",
+                             date: todayISO(), expect: s.digest || "" }),
+    }).then(function () {
+      return refresh().then(function () {
+        toast(parent ? i18n.t("toast.moved", { id: sid, parent: parent })
+                     : i18n.t("toast.moved.root", { id: sid }));
+      });
+    }).catch(fail);
   }
 
   /* -------------------------------------------------------------- 写入 */
@@ -1694,6 +2599,7 @@
     var b = $("#nf-body");
     if (!b || !$("#dlg-new").open) return;
     var d = { title: $("#nf-title").value, body: b.value, paths: $("#nf-paths").value,
+              inputs: $("#nf-inputs").value, code: $("#nf-code").value,
               commit: $("#nf-commit").value, status: $("#nf-status").value,
               lang: $("#nf-lang").value,
               parent: $("#nf-parent").dataset.pid || "", at: Date.now() };
@@ -1717,8 +2623,14 @@
     $("#nf-date").value = todayISO();
     $("#nf-status").value = "wip";
     $("#nf-commit").value = "";
-    // 从父步骤继承路径：同一条线上的数据/代码位置多半没变，改比重打省事
-    $("#nf-paths").value = p ? pathsToText(p) : "";
+    // 从父步骤继承路径和代码位置：同一条线上多半没变，改比重打省事。
+    // 但**核对结果和度量不跟着走**（U.inheritPath 抹掉 checked/missing/md5/size/n）：
+    // 那些是「有人真去看过一眼」的结论，抄给一个还没跑过的步骤就是伪造证据。
+    // **数据依赖不继承**：它说的是「这一次消费了哪份产物」，照抄一遍就是替人
+    // 编造一条他没做过的声明。空着的意思正是「数据就是从 parent 下来的」。
+    $("#nf-paths").value = p ? (p.paths || []).map(U.inheritPath).map(U.formatPath).join("\n") : "";
+    $("#nf-code").value = p ? codeToText(p) : "";
+    $("#nf-inputs").value = "";
 
     var d = newDraft();
     $("#nf-draft").hidden = !d;
@@ -1736,6 +2648,8 @@
     $("#nf-title").value = d.title || "";
     $("#nf-body").value = d.body || templateBody($("#nf-lang").value);
     $("#nf-paths").value = d.paths || "";
+    $("#nf-inputs").value = d.inputs || "";
+    $("#nf-code").value = d.code || "";
     $("#nf-commit").value = d.commit || "";
     if (d.status) $("#nf-status").value = d.status;
     if (d.lang && i18n.STRINGS[d.lang]) $("#nf-lang").value = d.lang;
@@ -1750,6 +2664,8 @@
   function submitNew() {
     var title = $("#nf-title").value.trim();
     if (!title) { toast(i18n.t("toast.title.required"), true); return; }
+    var wantInputs = textToPaths($("#nf-inputs").value);
+    var wantCode = textToPaths($("#nf-code").value);
     papi("/steps", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1762,6 +2678,8 @@
         author: "human",
         body: $("#nf-body").value,
         paths: textToPaths($("#nf-paths").value),
+        inputs: wantInputs,
+        code: wantCode,
         // 把下拉框里选的内容语言**写进 note.md**。不写的话这次选择只影响插入的
         // 模板，转头就丢了：读的一侧再打开这一步，只能从小节名倒推，而对没翻译
         // 的记录界面就只能说「这是原文」——说不出是哪种语言的原文。
@@ -1770,7 +2688,20 @@
       }),
     }).then(function (step) {
       dropDraft(NEW_DRAFT_ID);
-      return refresh().then(function () {
+      /* 建步骤那条路由**当前**还没有把 inputs / code 透传给写入层（见报告里的
+         接缝清单）。少写两个字段是静默丢数据，所以这里补一次 PATCH——那条路
+         已经收这两个键了。服务端补上之后这次 PATCH 自然不会发生（返回值里
+         已经有了），不需要回来改这段。 */
+      var lack = (wantInputs.length && !(step.inputs || []).length)
+        || (wantCode.length && !(step.code || []).filter(function (c) { return c.from !== "commit"; }).length);
+      var go = lack
+        ? papi("/steps/" + encodeURIComponent(step.id), {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ inputs: wantInputs, code: wantCode }),
+          }).catch(fail)
+        : Promise.resolve();
+      return go.then(refresh).then(function () {
         forceSelect(step.id);
         scrollToSelected();
         refreshProjects();
@@ -1832,6 +2763,8 @@
         $("#ed-title").value = dd.title || "";
         $("#ed-body").value = dd.body || "";
         if ($("#ed-paths")) $("#ed-paths").value = dd.paths || "";
+        if ($("#ed-inputs")) $("#ed-inputs").value = dd.inputs || "";
+        if ($("#ed-code")) $("#ed-code").value = dd.code || "";
         updatePreview(ds);
         toast(i18n.t("toast.draft.restored"));
       } else {
@@ -1861,7 +2794,7 @@
     var goto = e.target.closest("[data-goto]");
     if (goto) { e.preventDefault(); select(goto.getAttribute("data-goto")); scrollToSelected(); return; }
 
-    var hit = e.target.closest("#rows .row, #dnodes .card");
+    var hit = e.target.closest("#rows .row, #dnodes .card, #fnodes .fcard");
     if (hit) { select(hit.getAttribute("data-id")); return; }
 
     // 点图上的空白处 = 取消选中 = 所有节点回到全亮。
@@ -1901,11 +2834,68 @@
       return;
     }
 
+    /* ④ 折叠开关。被取代的那几条默认收起——它们不是当前结论；但它们必须
+       一直在页面上够得着，因为「我当初信的是什么」正是这段记录的价值所在。 */
+    var fold = e.target.closest("[data-ins-fold]");
+    if (fold) {
+      e.preventDefault();
+      // 变量名不叫 kind：同一个事件处理函数里「＋ 洞察」那一支已经有一个 kind，
+      // var 是函数作用域的，撞名之后出错的地方离现场很远。
+      var foldKind = fold.getAttribute("data-ins-fold");
+      var box = document.querySelector('[data-old="' + foldKind + '"]');
+      if (!box) return;
+      box.hidden = !box.hidden;
+      fold.textContent = box.hidden
+        ? i18n.t("insight.superseded.show", { n: box.children.length })
+        : i18n.t("insight.superseded.hide");
+      return;
+    }
+
+    /* 「改这一条」和「取代这一条」是两件不同的事，i18n 的 insight.supersede.hint
+       写清了怎么选：说错了话就改，想错了事就取代。改是就地重写那一行（id 不变，
+       指向它的引用继续有效）；取代是新写一条，旧的一个字都不动。 */
+    var ied = e.target.closest("[data-ins-edit]");
+    if (ied) {
+      e.preventDefault();
+      var eid = ied.getAttribute("data-ins-edit");
+      var got = findInsight(eid);
+      if (!got) return;
+      var newText = prompt(i18n.t("insight.item.edit.prompt", { id: eid }), got.item.text);
+      if (!newText || !newText.trim() || newText.trim() === got.item.text) return;
+      patchProject({ add_insight: { kind: got.kind, text: newText.trim(), id: eid } })
+        .then(function () { toast(i18n.t("toast.insight.updated", { id: eid })); }).catch(fail);
+      return;
+    }
+    var isu = e.target.closest("[data-ins-sup]");
+    if (isu) {
+      e.preventDefault();
+      var oid = isu.getAttribute("data-ins-sup");
+      var old = findInsight(oid);
+      if (!old) return;
+      var txt = prompt(i18n.t("insight.supersede.prompt", { id: oid }));
+      if (!txt || !txt.trim()) return;
+      patchProject({ add_insight: { kind: old.kind, text: txt.trim(), supersedes: oid } })
+        .then(function (r) {
+          // id 优先用服务端回的那一个（它才是分配者）；老服务端不回传时从刚刷新的
+          // 正文里反查「谁取代了 oid」——那是派生的，本来就不该有第二个来源。
+          var neu = (r && r.insight && r.insight.id) || "";
+          if (!neu) {
+            var items = U.parseInsights(insightBody());
+            Object.keys(items).forEach(function (k) {
+              items[k].forEach(function (it) { if (it.supersedes.indexOf(oid) >= 0) neu = it.id; });
+            });
+          }
+          toast(i18n.t("toast.insight.superseded", { id: neu, old: oid }));
+        }).catch(fail);
+      return;
+    }
+
     var act = e.target.closest("[data-act]");
     if (!act) return;
     var name = act.getAttribute("data-act");
     if (name === "edit-insights") { openInsightEditor(); return; }
     if (name === "save-insights") { saveInsights(); return; }
+    if (name === "move") { openMove(selected()); return; }
     if (name === "edit") { startEditing(); }
     else if (name === "cancel") { guardLeave(function () { editing = false; renderDetail(); }); }
     else if (name === "child") { openNew(selected()); }
@@ -1913,11 +2903,18 @@
       var d = IDX[selected()];
       if (!d) return;
       var kids = (d.children || []).length;
+      // 删除会打断三种边，不是一种。子步骤（parent）以前就说了；`input:` 那条边是
+      // 这一版新加的，而且后果更重——可溯源性沿着它上溯，再叠上「id 会被重用」，
+      // 那些边会无声地改指到别的步骤上。所以三条一起在**动手之前**摆出来。
+      var eaters = (d.consumers || []).length, refs = (d.backlinks || []).length;
       var why = prompt([
         i18n.t("confirm.delete.title", { id: d.id, title: stepTitle(d) }),
         "",
         i18n.t("confirm.delete.what"),
         kids ? i18n.t("confirm.delete.children", { n: kids }) : "",
+        eaters ? i18n.t("confirm.delete.consumers", { n: eaters, id: d.id }) : "",
+        refs ? i18n.t("confirm.delete.refs", { n: refs, id: d.id }) : "",
+        (eaters || refs) ? i18n.t("confirm.delete.reuse") : "",
         i18n.t("confirm.delete.dead"),
         "",
         i18n.t("confirm.delete.why"),
@@ -1933,9 +2930,13 @@
         Object.keys(d.tr || {}).forEach(function (l) { dropDraft(d.id, l); });
         forceSelect("");
         return refresh().then(refreshProjects).then(function () {
-          toast(info.orphaned.length
-            ? i18n.t("toast.deleted.orphaned", { id: info.id, ids: info.orphaned.join(" · ") })
-            : i18n.t("toast.deleted", { id: info.id }));
+          // 指空的 input 排在孤儿前面：孤儿会被降级为根、在图上仍然看得见，
+          // 而一条指空的 input 在界面上只是一行小字，最容易就这么留在那里。
+          toast(info.dangling_inputs && info.dangling_inputs.length
+            ? i18n.t("toast.deleted.inputs", { id: info.id, ids: info.dangling_inputs.join(" · ") })
+            : (info.orphaned.length
+              ? i18n.t("toast.deleted.orphaned", { id: info.id, ids: info.orphaned.join(" · ") })
+              : i18n.t("toast.deleted", { id: info.id })));
         });
       }).catch(fail);
     }
@@ -1974,7 +2975,11 @@
     saveNewDraft();
   });
   $("#nf-ok").addEventListener("click", function (e) { e.preventDefault(); $("#dlg-new").close(); submitNew(); });
-  ["#nf-title", "#nf-body", "#nf-paths", "#nf-commit"].forEach(function (sel) {
+  /* 移动对话框。选到一个不能挂的目标时**当场**说，而不是等服务端的 4xx：
+     那时人已经点过确定，注意力也已经从「我到底想把它挂到哪」上移开了。 */
+  $("#mv-parent").addEventListener("change", paintMoveErr);
+  $("#mv-ok").addEventListener("click", function (e) { e.preventDefault(); submitMove(); });
+  ["#nf-title", "#nf-body", "#nf-paths", "#nf-inputs", "#nf-commit", "#nf-code"].forEach(function (sel) {
     var el = $(sel);
     if (el) el.addEventListener("input", saveNewDraft);
   });
@@ -2028,7 +3033,8 @@
         if (e.key === "Escape") { e.preventDefault(); onHash(); }
         return;
       }
-      if (e.target.id === "ed-body" || e.target.id === "ed-title" || e.target.id === "ed-paths") {
+      if (e.target.id === "ed-body" || e.target.id === "ed-title" || e.target.id === "ed-paths"
+          || e.target.id === "ed-inputs" || e.target.id === "ed-code") {
         if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); saveEditor(); return; }
         if ((e.metaKey || e.ctrlKey) && (e.key === "b" || e.key === "B")) {
           e.preventDefault(); wrapSel($("#ed-body"), "**", "**", i18n.t("editor.ph.bold"));
@@ -2057,7 +3063,9 @@
     } else if (e.key === "ArrowUp" || e.key === "k") {
       e.preventDefault(); select(F.steps[Math.max(0, i <= 0 ? 0 : i - 1)].id); scrollToSelected();
     } else if (e.key === "g") {
-      view = view === "graph" ? "list" : "graph";
+      // 三个视图轮着来。数据流也进这个循环——它不是一个附属面板，而是同一份
+      // 文件的第三种读法，和图/列表平级。
+      view = VIEWS[(VIEWS.indexOf(view) + 1) % VIEWS.length];
       localStorage.setItem("trace.view", view);
       applyView(); renderSelection(); scrollToSelected();
     } else if (e.key === "n" && canWrite()) { e.preventDefault(); openNew(selected()); }
@@ -2381,6 +3389,9 @@
     if (!PROJECT) { renderHome(); return; }
     renderRows();
     renderDiagram();
+    renderFlow();
+    renderWarnings();        // 警告栏和缺失横幅现在都是本语言的说法，切换要跟上
+    renderMissingPaths();
     applyView();
     if (keepEditor) { renderSelection(); return; }
     onHash();

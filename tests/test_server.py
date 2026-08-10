@@ -81,6 +81,9 @@ WRITES = [
     ("DELETE", "/api/p/课题/steps/001/tr/en", {}),
     ("PUT", "/api/p/课题/tr/en", {"name": "Anyone can rename this"}),
     ("DELETE", "/api/p/课题/tr/en", {}),
+    # 路径核对写的是 note.md 里的 checked= / missing=。不设防的话，任何人都能给
+    # 每一条外部产物盖上「已确认不存在」——那是要被后来人当成溯源结论读的。
+    ("POST", "/api/p/课题/steps/001/paths/check", {"loc": "/x", "exists": False}),
 ]
 
 
@@ -772,3 +775,282 @@ def test_untranslated_rejects_a_junk_language_code(client):
 
 def test_untranslated_on_a_missing_project_is_a_404(client):
     assert client.get("/api/p/没有这个/untranslated").status_code == 404
+
+
+# ------------------------------------------------------- 移动（PATCH parent）
+#
+# P2 在这一版里被重新定义了：只追加的地基是「不丢历史」，不是「不能改结构」。
+# 于是 parent 从「写下不可改」变成「可改，但必须留下审计」，而 id 仍然不可改。
+# 用户要的就是 PATCH …/steps/{id} {"parent": …, "reason": …} 这个形状。
+
+
+def test_patching_the_parent_moves_the_step_and_records_why(client):
+    a = mkstep(client, title="013b")
+    b = mkstep(client, title="014")
+    c = mkstep(client, parent=b.id, title="016")
+
+    r = client.patch(f"/api/p/课题/steps/{c.id}",
+                     json={"parent": a.id, "reason": "016 的输入全部来自 013b 的口袋组成"},
+                     headers=AUTH)
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert (d["old_parent"], d["new_parent"]) == (b.id, a.id)
+    text = note_of(client, c.id).read_text(encoding="utf-8")
+    assert "moved:" in text and "口袋组成" in text, "原因必须落进 front-matter，不能只在响应里"
+    assert f"id: {c.id}" in text, "id 不跟着变——笔记里的 [[016]] 要一直指得到"
+
+
+def test_moving_without_a_reason_is_refused(client):
+    """报错要说清**为什么**必填，不是干巴巴一句「缺少参数」：半年后看到一棵和创建
+    顺序对不上的树，唯一能解释它的就是那句话。"""
+    a = mkstep(client, title="根")
+    b = mkstep(client, title="另一棵")
+    r = client.patch(f"/api/p/课题/steps/{b.id}", json={"parent": a.id}, headers=AUTH)
+    assert r.status_code == 400 and "原因" in r.json()["error"]
+    assert "moved:" not in note_of(client, b.id).read_text(encoding="utf-8"), "一个字节都不该写"
+
+
+def test_moving_under_your_own_descendant_is_refused_with_the_way_out(client):
+    a = mkstep(client, title="a")
+    b = mkstep(client, parent=a.id, title="b")
+    r = client.patch(f"/api/p/课题/steps/{a.id}",
+                     json={"parent": b.id, "reason": "试试成环"}, headers=AUTH)
+    assert r.status_code == 409
+    msg = r.json()["error"]
+    assert b.id in msg and "子树" in msg, "要指名道姓说清是谁在谁的子树里，并给出出路"
+
+
+def test_moving_to_a_parent_outside_this_project_is_a_404_that_says_why(client):
+    """父子关系只在同一个项目内成立。报错要说出这一点，否则调用方会以为是打错了号。"""
+    W.create_project(client.root, "另一个课题")
+    W.create_step(core.steps_dir_of(client.root, "另一个课题"), title="别的项目的第一步")
+    mkstep(client, title="这个项目的")
+    r = client.patch("/api/p/课题/steps/001", json={"parent": "099", "reason": "挪过去"},
+                     headers=AUTH)
+    assert r.status_code == 404 and "同一个项目" in r.json()["error"]
+
+
+def test_patching_an_unchanged_parent_is_not_a_move(client):
+    """网页保存正文时会把整份步骤原样 PATCH 回来，里面必然带着一个没变的 parent。
+    那不是一次移动：不该因为没写 reason 就 400，更不该在历史里留下一条空审计。"""
+    a = mkstep(client, title="a")
+    b = mkstep(client, parent=a.id, title="b")
+    r = client.patch(f"/api/p/课题/steps/{b.id}",
+                     json={"parent": a.id, "status": "done"}, headers=AUTH)
+    assert r.status_code == 200 and r.json()["status"] == "done"
+    assert "moved:" not in note_of(client, b.id).read_text(encoding="utf-8")
+
+
+def test_a_real_move_refuses_to_be_bundled_with_other_edits(client):
+    """移动有它自己的审计行。和改正文混在一次请求里，要么得写两次盘
+    （第二次的 expect 已经过期），要么得悄悄丢掉一半——都比多发一个请求糟。"""
+    a = mkstep(client, title="a")
+    b = mkstep(client, title="b")
+    r = client.patch(f"/api/p/课题/steps/{b.id}",
+                     json={"parent": a.id, "reason": "挪过去", "status": "done"}, headers=AUTH)
+    assert r.status_code == 400 and "status" in r.json()["error"]
+    assert "moved:" not in note_of(client, b.id).read_text(encoding="utf-8")
+
+
+def test_the_id_is_still_untouchable(client):
+    """parent 松了，id 没松：笔记里的 [[003b]] 和论文脚注靠的就是它不动。"""
+    mkstep(client, title="a")
+    assert client.patch("/api/p/课题/steps/001", json={"id": "999"},
+                        headers=AUTH).status_code == 409
+
+
+def test_a_move_reports_the_subtree_that_came_along(client):
+    """「你移的是一步」和「你移的是一步和它下面的两步」是两个决定。"""
+    a = mkstep(client, title="a")
+    b = mkstep(client, title="b")
+    c = mkstep(client, parent=b.id, title="c")
+    d = mkstep(client, parent=c.id, title="d")
+    r = client.patch(f"/api/p/课题/steps/{b.id}",
+                     json={"parent": a.id, "reason": "整支挂错了"}, headers=AUTH)
+    assert set(r.json()["subtree"]) == {c.id, d.id}
+
+
+# ------------------------------------------------------- 数据依赖与代码位置
+
+
+def test_inputs_and_code_go_through_the_plain_patch(client):
+    """写入层早就支持了，服务端是原样透传——这条钉的是「透传没被中途拦掉」。"""
+    mkstep(client, title="a")
+    mkstep(client, title="b")
+    r = client.patch("/api/p/课题/steps/002", json={
+        "inputs": ["001 | pocket_composition.csv"],
+        "code": ["snapshot | /orange/lab/snap/20260809 | manifest=MANIFEST.md5 n=43"],
+    }, headers=AUTH)
+    assert r.status_code == 200, r.text
+    assert r.json()["inputs"] == [{"step": "001", "note": "pocket_composition.csv"}]
+    text = note_of(client, "002").read_text(encoding="utf-8")
+    assert "input: 001 | pocket_composition.csv" in text
+    assert "code: snapshot | /orange/lab/snap/20260809" in text
+
+
+def test_a_new_step_can_declare_its_inputs_and_code_up_front(client):
+    """一步的输入是「开跑之前」就知道的事。逼调用方建完再 PATCH 一次，
+    等于给「先建 wip 再开跑」这条规矩加了一道摩擦。"""
+    mkstep(client, title="上游")
+    r = client.post("/api/p/课题/steps", json={
+        "title": "配对", "inputs": ["001 | pocket_composition.csv"],
+        "code": ["snapshot | /orange/lab/snap/20260809 | manifest=MANIFEST.md5"],
+    }, headers=AUTH)
+    assert r.status_code == 201, r.text
+    text = note_of(client, r.json()["id"]).read_text(encoding="utf-8")
+    assert "input: 001 | pocket_composition.csv" in text and "code: snapshot |" in text
+
+
+def test_the_forest_says_who_consumes_a_step(client):
+    """下游是派生的（扫全项目算出来的），绝不存储——但它必须到得了客户端手里，
+    否则「我要改 001 的产物，谁会跟着错」只能靠人自己 grep。"""
+    mkstep(client, title="a")
+    mkstep(client, title="b")
+    client.patch("/api/p/课题/steps/002", json={"inputs": ["001 | x.csv"]}, headers=AUTH)
+    by = {s["id"]: s for s in client.get("/api/p/课题/forest").json()["steps"]}
+    assert by["001"]["consumers"] == ["002"]
+
+
+# ------------------------------------------------------- 路径核对
+
+
+def test_recording_a_path_check_writes_the_machine_fields_only(client):
+    mkstep(client, title="a", paths=["/orange/lab/pockets | output | 纯 RNA 口袋"])
+    r = client.post("/api/p/课题/steps/001/paths/check",
+                    json={"loc": "/orange/lab/pockets", "exists": True,
+                          "date": "2026-08-09", "size": 620756992}, headers=AUTH)
+    assert r.status_code == 200, r.text
+    text = note_of(client, "001").read_text(encoding="utf-8")
+    assert "checked=2026-08-09" in text and "size=620756992" in text
+    assert "output" in text and "纯 RNA 口袋" in text, "role 和说明是人写的判断，机器不许碰"
+
+
+def test_a_path_that_is_gone_keeps_its_row_and_its_size(client):
+    """路径没了是**结论**，不是错误（P4）。删掉那一行等于抹掉线索；
+    而「没了的那个有 57 GB」正是最该留下来的信息。"""
+    mkstep(client, title="a", paths=["/blue/lab/cif | input | 原始 CIF | size=61203283968"])
+    client.post("/api/p/课题/steps/001/paths/check",
+                json={"loc": "/blue/lab/cif", "exists": False, "date": "2026-08-09"},
+                headers=AUTH)
+    text = note_of(client, "001").read_text(encoding="utf-8")
+    assert "missing=2026-08-09" in text
+    assert "size=61203283968" in text and "原始 CIF" in text and "/blue/lab/cif" in text
+
+
+def test_a_path_check_without_an_explicit_verdict_is_refused(client):
+    """默认成 false 的话，一个漏填字段的客户端就能把「我没查」写成「已确认不存在」。"""
+    mkstep(client, title="a", paths=["/blue/lab/cif | 原始 CIF"])
+    r = client.post("/api/p/课题/steps/001/paths/check",
+                    json={"loc": "/blue/lab/cif"}, headers=AUTH)
+    assert r.status_code == 400 and "exists" in r.json()["error"]
+    assert "missing=" not in note_of(client, "001").read_text(encoding="utf-8")
+
+
+def test_a_path_check_never_invents_a_row(client):
+    mkstep(client, title="a")
+    assert client.post("/api/p/课题/steps/001/paths/check",
+                       json={"loc": "/没记过的", "exists": True},
+                       headers=AUTH).status_code == 404
+
+
+def test_a_size_that_is_not_a_number_is_refused(client):
+    mkstep(client, title="a", paths=["/blue/x | 说明"])
+    assert client.post("/api/p/课题/steps/001/paths/check",
+                       json={"loc": "/blue/x", "exists": True, "size": "12 GB"},
+                       headers=AUTH).status_code == 400
+
+
+# ------------------------------------------------------- 服务端定期核对
+
+
+def test_the_sweep_marks_what_really_disappeared(client, tmp_path: Path):
+    """服务端每天自己 stat 一遍。用户上一次是**手工**核对 164 条才发现三个目录没了。"""
+    live = tmp_path / "还在"
+    live.mkdir()
+    (live / "a.txt").write_text("x", encoding="utf-8")
+    gone = tmp_path / "没了"
+    mkstep(client, title="a", paths=[f"{live / 'a.txt'} | output | 权重",
+                                     f"{gone} | output | 被删掉的那个"])
+    report = S.sweep_path_checks(client.root, today="2026-08-09")
+    assert (report["gone"], report["written"]) == (1, 2)
+    text = note_of(client, "001").read_text(encoding="utf-8")
+    assert "checked=2026-08-09" in text and "missing=2026-08-09" in text
+    assert "size=1" in text
+
+
+def test_the_sweep_never_calls_an_unreachable_path_missing(client):
+    """**够不着 ≠ 不存在。** 服务器跑在一台机器上，用户的 /blue/… 挂在另一台超算上；
+    把「这里看不见」写成「已确认不存在」，是给一份好好的记录盖上错误的结论。
+    远端位置更是一个字节都不碰——去探测它们等于把内网请求权交给任何能写记录的人。"""
+    mkstep(client, title="a", paths=[
+        "/blue/这台机器上根本没有的挂载点/data | input | 超算上的",
+        "s3://bucket/exports/run042.parquet | output | 导出的预测",
+        "https://zenodo.org/record/1234567 | evidence | 公开版本",
+    ])
+    report = S.sweep_path_checks(client.root, today="2026-08-09")
+    assert (report["written"], report["unreachable"]) == (0, 3)
+    text = note_of(client, "001").read_text(encoding="utf-8")
+    assert "missing=" not in text and "checked=" not in text
+
+
+def test_the_sweep_does_not_rewrite_what_it_checked_yesterday(client, tmp_path: Path):
+    """每天把 164 条 checked= 全刷一遍，等于每天给数据仓造一次 164 个文件的提交，
+    而里面一个事实都没变。但过了 stale_days 就该再看一眼——
+    「半年前还在」不是「现在还在」。"""
+    live = tmp_path / "在"
+    live.mkdir()
+    mkstep(client, title="a", paths=[f"{live} | output | 目录"])
+    S.sweep_path_checks(client.root, today="2026-08-09")
+    before = note_of(client, "001").read_bytes()
+    assert S.sweep_path_checks(client.root, today="2026-08-10")["written"] == 0
+    assert note_of(client, "001").read_bytes() == before
+    assert S.sweep_path_checks(client.root, today="2026-12-09")["written"] == 1
+
+
+def test_the_sweep_stays_within_its_budget(client, tmp_path: Path):
+    """扫描跑在服务进程里。没有预算的话，一个记了几千条路径的项目会让它一直在 stat。"""
+    d = tmp_path / "d"
+    d.mkdir()
+    mkstep(client, title="a", paths=[f"{d}/{i} | output | 第{i}个" for i in range(5)])
+    report = S.sweep_path_checks(client.root, budget=2, today="2026-08-09")
+    assert (report["probed"], report["skipped"]) == (2, 3)
+
+
+# ------------------------------------------------------- 洞察的 id
+
+
+def test_adding_an_insight_reports_the_id_it_got(client):
+    """不回传 id，agent 就说不出下一句「· 取代 p1」——而那半句只写在取代者身上。"""
+    r = client.patch("/api/projects/课题",
+                     json={"add_insight": {"kind": "pitfall", "text": "PDBFixer 误杀了带修饰残基"}},
+                     headers=AUTH)
+    assert r.status_code == 200, r.text
+    assert r.json()["insight"]["id"] == "p1"
+
+
+def test_superseding_folds_the_old_insight_but_keeps_it_on_disk(client):
+    client.patch("/api/projects/课题",
+                 json={"add_insight": {"kind": "pitfall", "text": "误杀 1,099 个"}}, headers=AUTH)
+    r = client.patch("/api/projects/课题",
+                     json={"add_insight": {"kind": "pitfall", "text": "查清了，是 944 个",
+                                           "supersedes": "p1"}}, headers=AUTH)
+    assert r.json()["insight"]["id"] == "p2"
+    body = (core.project_dir(client.root, "课题") / core.PROJECT_NOTE).read_text(encoding="utf-8")
+    assert "误杀 1,099 个" in body, "被取代的那条不删除，只折叠"
+    items = {i["id"]: i for i in core.parse_insights(body)["pitfall"]}
+    assert items["p1"]["superseded_by"] == ["p2"]
+
+
+def test_editing_an_insight_in_place_keeps_its_id(client):
+    """重新锚定是「改那一行」，不是「再记一条」——id 不变，别处的「· 取代 p1」还指得对。"""
+    client.patch("/api/projects/课题",
+                 json={"add_insight": {"kind": "fails", "text": "回译没用，见 [[013]]"}},
+                 headers=AUTH)
+    r = client.patch("/api/projects/课题",
+                     json={"add_insight": {"id": "p1", "text": "回译没用，见 [[013b]]"}},
+                     headers=AUTH)
+    assert r.status_code == 200 and r.json()["insight"]["id"] == "p1"
+    body = (core.project_dir(client.root, "课题") / core.PROJECT_NOTE).read_text(encoding="utf-8")
+    items = core.parse_insights(body)["fails"]
+    assert len(items) == 1 and items[0]["id"] == "p1"
+    assert "[[013b]]" in items[0]["text"]

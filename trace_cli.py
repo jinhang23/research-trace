@@ -4,6 +4,8 @@
     python trace_cli.py projects                         列出项目
     python trace_cli.py new-project --name "SMARTAffinity"
     python trace_cli.py new -P <项目> --title "..."       新建一步
+    python trace_cli.py mv <id> --parent 013b --reason "…" 改挂到别的父节点下（原因必填）
+    python trace_cli.py paths --check                    逐条核对外部路径还在不在
     python trace_cli.py check [-P <项目>]                 校验不变量
     python trace_cli.py tr [-P <项目>] [--lang en]        还缺哪些语言版本 / 补一份译文
     python trace_cli.py build [--out dist]               静态导出，file:// 可直接打开
@@ -38,6 +40,11 @@ DEFAULT_DATA_DIR = "../trace-data"
 
 LEVELS = ("L0", "L1", "L2", "L3", "L4")
 LEVEL_LABEL = {"L0": "不可溯源", "L1": "可读", "L2": "可定位", "L3": "可重跑", "L4": "已复现"}
+
+# 纯写法提示：内核发的是 warn 级，但它们**一条都不影响 L0–L4**，也不该让 --strict 失败。
+# 单独列出来而不是靠 level 字段区分，是因为 level 说的是「有多确定」，
+# 这里要分的是「有什么后果」——两者不是一回事，混用会让真正的警告被一起忽略。
+HINT_CODES = ("section_without_prose", "table_without_explanation", "code_without_explanation")
 
 
 def data_root(cfg: dict) -> Path:
@@ -248,6 +255,8 @@ def cmd_new(args) -> int:
         author=args.author or "human",
         tags=[t.strip() for t in (args.tags or "").split(",") if t.strip()],
         paths=args.path or None,
+        inputs=args.input or None,
+        code=args.code or None,
     )
     print(("已创建 " if created else "已存在 ") + f"{slug}/{step.id}")
     print(sd / step.dirname / core.NOTE_NAME)
@@ -272,6 +281,11 @@ def cmd_rm(args) -> int:
         print("⚠ 变成孤儿（会被降级为根）：" + "、".join(info["orphaned"]))
     if info["dangling_refs"]:
         print("⚠ 这些步骤的正文里还写着 [[" + info["id"] + "]]：" + "、".join(info["dangling_refs"]))
+    if info.get("dangling_inputs"):
+        # 单独一行，措辞比上面那条重：正文引用是给人读的，`input:` 是数据依赖的声明，
+        # 可溯源性沿着它上溯；再加上 id 会被重用，这些边会无声地改指到别的步骤上。
+        print("⚠ 这些步骤声明了 input: " + info["id"] + "（数据依赖，可溯源链会断在这里）："
+              + "、".join(info["dangling_inputs"]))
     print(f"⚠ id {info['id']} 可能被下一个新建的步骤重用。")
     return 0
 
@@ -283,26 +297,125 @@ KIND_LABEL = {
 }
 
 
+ROLE_LABEL = {"input": "输入", "script": "脚本", "output": "产物", "evidence": "证据"}
+
+
+def _path_status(p: dict) -> str:
+    """一条路径最后一次核对的结论，写成人话。
+
+    「已确认不存在」按 P4 写成**结论**而不是错误：一个曾经装着 57 GB、现在空了的
+    位置是一条发现，不是要顺手清掉的笔误。所以这里不用「错误」「失败」这类词，
+    这一行也永远不会被 --check 删掉。
+    """
+    if p.get("state") == "missing":
+        return f"✕ {p.get('missing')} 起已确认不存在"
+    if p.get("state") == "present":
+        return f"✓ {p.get('checked')} 确认还在"
+    return "· 从未核对过"
+
+
+def _check_one_project(root: Path, slug: str, rows, count: bool) -> tuple[int, int, int]:
+    """对一批 (step, path) 逐条 stat 并写回。返回（还在, 已不存在, 够不着）。"""
+    sd = core.steps_dir_of(root, slug)
+    ok = gone = far = 0
+    for s, p in rows:
+        loc = p["location"]
+        state, size = mcp.probe_path(loc)
+        if state == mcp.PROBE_UNREACHABLE:
+            # **一个字都不写。** 这台机器够不着，不代表那份数据没了。
+            far += 1
+            print(f"  ? {s['id']:<5} {loc}   够不着（远端位置，或这台机器上没挂那个盘）")
+            continue
+        n = None
+        if count and state == mcp.PROBE_PRESENT and Path(loc).is_dir():
+            n = mcp.count_entries(Path(loc))
+        W.record_path_check(sd, s["id"], loc, exists=state == mcp.PROBE_PRESENT, size=size, n=n)
+        if state == mcp.PROBE_PRESENT:
+            ok += 1
+        else:
+            gone += 1
+            print(f"  ✕ {s['id']:<5} {loc}   已确认不存在（记录保留，只是记上了日期）")
+    return ok, gone, far
+
+
 def cmd_paths(args) -> int:
-    """把一个项目里所有外部产物的位置列出来 —— 溯源时最常问的"东西在哪"。"""
+    """把一个项目里所有外部产物的位置列出来 —— 溯源时最常问的"东西在哪"。
+
+    `--check` 会逐条 stat 一遍并把结论写回记录。它**只在能看到那些路径的机器上
+    才有意义**：`/blue/…` 多半挂在超算上，笔记本上跑一遍只会得到一屏「够不着」。
+    而「够不着」和「不存在」绝不混为一谈——前者什么都不写。
+    """
     cfg = load_config()
     root = data_root(cfg)
     slugs = [pick_project(root, args.project)] if args.project else [p.slug for p in core.scan_projects(root)]
-    total = 0
+
+    if args.check:
+        for slug in slugs:
+            f = core.compile_forest(core.steps_dir_of(root, slug), with_files=False)
+            rows = [(s, p) for s in f["steps"] for p in s["paths"]
+                    if not args.kind or p["kind"] == args.kind]
+            if not rows:
+                continue
+            print(f"[{slug}] 核对 {len(rows)} 条…")
+            ok, gone, far = _check_one_project(root, slug, rows, args.count)
+            print(f"  → 还在 {ok} · 已不存在 {gone} · 够不着 {far}\n")
+
+    total = missing = 0
     for slug in slugs:
         f = core.compile_forest(core.steps_dir_of(root, slug), with_files=False)
         rows = [(s, p) for s in f["steps"] for p in s["paths"]
-                if not args.kind or p["kind"] == args.kind]
+                if (not args.kind or p["kind"] == args.kind)
+                and (not args.missing or p.get("state") == "missing")]
         if not rows:
             continue
         print(f"[{slug}]")
         for s, p in rows:
             total += 1
-            print(f"  {s['id']:<5} {KIND_LABEL.get(p['kind'], p['kind']):<6} {p['location']}"
-                  + (f"\n{'':>14}{p['note']}" if p["note"] else ""))
+            if p.get("state") == "missing":
+                missing += 1
+            # checksum 是 core 拼好的 "md5:7d4e1a9c" 一串（算法在冒号左边）。
+            # 它以前一处出口都没有：`paths` 不打、`check` 不打，于是「拿到的还是不是
+            # 当时那份」这个问题只能靠人去 grep note.md。核对的时候它比大小有用得多。
+            bits = [b for b in (
+                core.fmt_size(p["size"]) if p.get("size") is not None else "",
+                f"{p['n']} 条" if p.get("n") is not None else "",
+                str(p["checksum"]).replace(":", "=", 1) if p.get("checksum") else "",
+                _path_status(p),
+            ) if b]
+            print(f"  {s['id']:<5} {KIND_LABEL.get(p['kind'], p['kind']):<6} "
+                  f"{ROLE_LABEL.get(p.get('role', ''), '—'):<4} {p['location']}")
+            print(f"{'':>20}{' · '.join(bits)}" + (f"   {p['note']}" if p["note"] else ""))
         print()
     if not total:
-        print("还没有记录任何外部路径。用 trace_cli.py new --path \"…\" 或在网页里加。")
+        if args.missing:
+            print("没有任何一条路径被确认为已不存在。")
+        else:
+            print("还没有记录任何外部路径。用 trace_cli.py new --path \"…\" 或在网页里加。")
+    elif missing and not args.missing:
+        print(f"⚠ {missing} 处位置已确认不存在（记录保留——那是溯源结论，不是笔误）。"
+              f"只看它们：paths --missing")
+    return 0
+
+
+def cmd_mv(args) -> int:
+    """把一步连同它的整棵子树改挂到别的父节点下。
+
+    这个子命令的意义不是「能移」——在数据仓那台机器上，改一行 `parent:` 本来就能
+    达到同样的效果。它的意义是**逼你把原因留下来**：移动之后这棵树就和创建顺序对不上了，
+    「为什么 016 挂在 013b 下面，而它的号比 013b 大」只有那句话答得了。
+    """
+    cfg = load_config()
+    root = data_root(cfg)
+    slug = pick_project(root, args.project)
+    sd = core.steps_dir_of(root, slug)
+    info = W.move_step(sd, args.id, args.parent, args.reason,
+                       by=args.by or "human", date=args.date or "")
+    print(f"已把 {slug}/{info['id']} 从 {info['old_parent'] or '（根）'} 移到 "
+          f"{info['new_parent'] or '（根）'}")
+    print("  " + info["moved"])
+    if info["subtree"]:
+        print(f"⚠ 跟着一起走的还有 {len(info['subtree'])} 个后代：" + "、".join(info["subtree"]))
+    print("id 没变，inputs 也没动 —— 数据依赖是另一件事。")
     return 0
 
 
@@ -420,7 +533,9 @@ def cmd_check(args) -> int:
         ws = f["warnings"]
         errs = [w for w in ws if w["level"] == "error"]
         errors += len(errs)
-        warns += len(ws) - len(errs)
+        # 提示不进 warns：--strict 是给 CI 用的闸门，而「这张表没配一句说明」
+        # 不是缺陷，用它拦住一次合并只会让人加 --no-verify。
+        warns += len([w for w in ws if w["level"] != "error" and w["code"] not in HINT_CODES])
         steps = f["steps"]
         print(f"[{slug}] {len(steps)} 步 · {f['lane_count']} 轨道 · "
               f"树 {f['tree']['w']}×{f['tree']['h']}px · 警告 {len(ws)}（错误 {len(errs)}）")
@@ -448,8 +563,33 @@ def cmd_check(args) -> int:
             for m in t.get("missing", []):
                 print(f"      · {m}")
 
+        # 三档，按**后果**分，不按 level 字段分：新加的三条诊断都是 warn 级，
+        # 但它们一个都不影响 L0–L4。混在一起打，人会以为「表格没写说明」和
+        # 「dead 没写结论」一样严重，然后开始整体忽略这一段——而那正是警告失效的方式。
         for w in ws:
+            if w["code"] in HINT_CODES:
+                continue
             print(("  ✕ " if w["level"] == "error" else "  ⚠ ") + f"[{w['where'] or w['code']}] {w['message']}")
+        hints = [w for w in ws if w["code"] in HINT_CODES]
+        if hints:
+            print(f"  ⓘ {len(hints)} 条写法提示（**不影响 L0–L4，也不影响退出码**）：")
+            for w in hints:
+                print(f"      [{w['where'] or w['code']}] {w['message']}")
+
+        # 已确认不存在的外部位置。**不是警告，也不进退出码**：路径没了是溯源
+        # 结论（P4），不是这份记录写错了。但 check 是三个出口里唯一一个人会
+        # 天天跑的，而它以前对此一个字都不说——网页顶上有横幅、`paths` 有汇总、
+        # 只有这里静默，于是「57 GB 没了」这件事在 CI 里永远看不见。
+        gone = [(s["id"], p) for s in steps for p in (s.get("paths") or [])
+                if p.get("state") == "missing"]
+        if gone:
+            print(f"  ⊘ {len(gone)} 处记下来的位置已确认不存在"
+                  f"（记录保留——那是溯源结论，不是笔误；不计入退出码）：")
+            for sid, p in gone:
+                size = f"{core.fmt_size(p['size'])} · " if p.get("size") else ""
+                print(f"      {sid}  {p['location']}  （{size}{p['missing']} 起）")
+            print("      逐条看：paths --missing ／ 重新核对：paths --check"
+                  "（只在看得见那些路径的机器上跑）")
 
     if errors:
         return 1
@@ -586,8 +726,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--commit", default="")
     p.add_argument("--author", default="human")
     p.add_argument("--tags", default="")
-    p.add_argument("--path", action="append", metavar="位置|说明",
-                   help='外部产物的位置，可重复。如 --path "/blue/组/用户/data | 训练集，12 GB"')
+    p.add_argument("--path", action="append", metavar="位置|角色|说明|k=v",
+                   help='外部产物的位置，可重复。如 --path "/blue/组/用户/data | input | 训练集 | size=12884901888"。'
+                        '角色是 input/script/output/evidence 之一，属性是 size/n/md5/sha256/checked/missing；'
+                        '老写法 "位置 | 说明" 照样有效')
+    p.add_argument("--input", action="append", metavar="步骤id|消费的产物",
+                   help='**数据依赖**，可重复。如 --input "013 | pocket_composition.csv"。'
+                        '它和 --parent 是两件事：parent 是「我当时接着哪一步想」（树，单父），'
+                        'input 是「这些字节从哪来」（DAG，可以有好几个）')
+    p.add_argument("--code", action="append", metavar="kind|位置|k=v",
+                   help='代码在哪，可重复。kind ∈ git/snapshot/container。'
+                        '如 --code "snapshot | /orange/lab/snap/20260809 | manifest=MANIFEST.md5 n=43"。'
+                        '代码不在 git 里时用 snapshot，它一样能上 L2 —— 别再把快照路径塞进 --commit')
     p.set_defaults(fn=cmd_new)
 
     p = sub.add_parser("rm", help="真删一步（只用于误建/测试数据；失败的实验请标 dead）")
@@ -598,9 +748,32 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--date", default="")
     p.set_defaults(fn=cmd_rm)
 
-    p = sub.add_parser("paths", help="列出所有外部产物的位置")
+    p = sub.add_parser("mv", help="把一步（连同整棵子树）改挂到别的父节点下。原因必填")
+    p.add_argument("id")
+    p.add_argument("--parent", default=None, metavar="新父id",
+                   help="新的父节点 id；不给（或给 root）就是提为根，自己开一棵树")
+    p.add_argument("--reason", required=True,
+                   help="为什么移。必填 —— 移完这棵树就和创建顺序对不上了，"
+                        "「为什么 016 挂在 013b 下面」只有这句话答得了。"
+                        "写清是哪条数据依赖决定了新的父子关系，别写「修正结构」")
+    p.add_argument("-P", "--project", default=None)
+    p.add_argument("--by", default="human")
+    p.add_argument("--date", default="")
+    p.set_defaults(fn=cmd_mv)
+
+    p = sub.add_parser("paths", help="列出所有外部产物的位置，或逐条核对它们还在不在")
     p.add_argument("-P", "--project", default=None)
     p.add_argument("--kind", default=None, help="只看某一类：hpc / github / dropbox / object / url …")
+    p.add_argument("--missing", action="store_true",
+                   help="只列已确认不存在的那些（记录不会被删——那是溯源结论，不是笔误）")
+    p.add_argument("--check", action="store_true",
+                   help="逐条 stat 一遍，把结论写回 checked= / missing=。"
+                        "**只在看得到那些路径的机器上跑才有意义**：/blue/… 多半挂在超算上，"
+                        "在笔记本上跑只会得到一屏「够不着」。够不着≠不存在，那种情况一个字都不写；"
+                        "s3:// / https:// 一律不探测（那等于让工具替你去访问网络）")
+    p.add_argument("--count", action="store_true",
+                   help="配合 --check：目录还要数一层条目数写进 n=。默认不数，"
+                        "因为数一个几十万文件的目录要遍历整棵树，在网络盘上能卡很久")
     p.set_defaults(fn=cmd_paths)
 
     p = sub.add_parser("tr", help="列出还缺哪些语言版本，或从一份写好的译文补一版进去")

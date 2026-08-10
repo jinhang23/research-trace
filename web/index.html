@@ -37,8 +37,10 @@
     <button id="btn-scope" type="button"></button>
     <span id="hits" class="mono"></span>
   </div>
+  <!-- 三个视图。数据流是第三个而不是一个附属面板：森林是单父树、数据流是 DAG，
+       同一份文件的两种读法平级，谁也不是谁的注脚。 -->
   <div class="seg" id="viewtoggle">
-    <button data-view="graph" data-i18n="app.view.graph" data-i18n-title="app.view.graph.title"></button><button data-view="list" data-i18n="app.view.list" data-i18n-title="app.view.list.title"></button>
+    <button data-view="graph" data-i18n="app.view.graph" data-i18n-title="app.view.graph.title"></button><button data-view="list" data-i18n="app.view.list" data-i18n-title="app.view.list.title"></button><button data-view="flow" data-i18n="app.view.flow" data-i18n-title="app.view.flow.title"></button>
   </div>
   <button id="btn-new" data-i18n="app.new" data-i18n-title="app.new.title"></button>
   <!-- 新建项目必须在顶栏：只剩一个项目时项目索引页会 302 弹回项目页，
@@ -64,6 +66,11 @@
 
 <div id="warnbar" hidden></div>
 
+<!-- 「记下来的位置已经不在了」的整块汇总。它不能只藏在某一步的详情里：用户这次
+     是手工核对 164 条路径才发现三个目录没了（57 GB 的那个）。记录一条都不删，
+     只是标出来——一个曾经装着 57 GB、现在空了的位置是一条发现，不是笔误。 -->
+<div id="missbar" hidden></div>
+
 <!-- 项目索引：没有选中项目时显示 -->
 <section id="home" hidden>
   <div class="home-head">
@@ -88,16 +95,39 @@
         <svg id="rails" xmlns="http://www.w3.org/2000/svg" width="0" height="0" aria-hidden="true"></svg>
         <div id="rows"></div>
       </div>
+      <!-- 数据流视图：分层 DAG。边是**声明出来的 input**，树一个字没改——
+           这是同一批文件的第二种读法，不是第二份数据。 -->
+      <div id="fwrap" hidden>
+        <h2 id="flowtitle" class="viewtitle" data-i18n="flow.title"></h2>
+        <p id="flowlead" class="viewlead" data-i18n-html="flow.lead"></p>
+        <p id="flowempty" class="viewlead quiet" hidden data-i18n="flow.empty"></p>
+        <div id="flow">
+          <svg id="fedges" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"></svg>
+          <div id="fnodes"></div>
+        </div>
+      </div>
       <p id="empty" hidden data-i18n-html="list.empty"></p>
     </div>
     <footer id="legend">
-      <span><i class="lg done"></i><span data-i18n="list.legend.done"></span></span>
-      <span><i class="lg wip"></i><span data-i18n="list.legend.wip"></span></span>
-      <span><i class="lg dead"></i><span data-i18n="list.legend.dead"></span></span>
-      <!-- 字形标记是第四个通道：不抢线型（status）也不抢不透明度（祖先链/搜索）。
-           ↺✕ 和 L0 两种字形在两种语言里都不翻——它们是记号，不是词 -->
-      <span class="lgm"><i class="cmk lv0">L0</i><span data-i18n="list.legend.l0"></span></span>
-      <span class="lgm"><i class="cmk rfail">↺✕</i><span data-i18n="list.legend.reprofail"></span></span>
+      <span id="treelegend">
+        <span><i class="lg done"></i><span data-i18n="list.legend.done"></span></span>
+        <span><i class="lg wip"></i><span data-i18n="list.legend.wip"></span></span>
+        <span><i class="lg dead"></i><span data-i18n="list.legend.dead"></span></span>
+        <!-- 字形标记是第四个通道：不抢线型（status）也不抢不透明度（祖先链/搜索）。
+             ↺✕ L0 ⇢ ⇄ ⊘ 这些字形在两种语言里都不翻——它们是记号，不是词 -->
+        <span class="lgm"><i class="cmk lv0">L0</i><span data-i18n="list.legend.l0"></span></span>
+        <span class="lgm"><i class="cmk rfail">↺✕</i><span data-i18n="list.legend.reprofail"></span></span>
+        <span class="lgm"><i class="cmk dep">⇢</i><span data-i18n="flow.legend.data"></span></span>
+        <span class="lgm"><i class="cmk moved">⇄</i><span data-i18n="move.badge"></span></span>
+        <span class="lgm"><i class="cmk gone">⊘</i><span data-i18n="path.missing.badge"></span></span>
+      </span>
+      <!-- 数据流的图例分三条是刻意的：「parent 和 input 是同一步」占了绝大多数边，
+           不给它单独一档，读者会以为这张图把树边画丢了。 -->
+      <span id="flowlegend" hidden>
+        <span><i class="fl tree"></i><span data-i18n="flow.legend.tree"></span></span>
+        <span><i class="fl data"></i><span data-i18n="flow.legend.data"></span></span>
+        <span><i class="fl both"></i><span data-i18n="flow.legend.both"></span></span>
+      </span>
       <span class="sp"></span>
       <span id="zoombar">
         <button data-zoom="out" data-i18n-title="list.zoom.out">−</button>
@@ -139,6 +169,14 @@
     <label><span data-i18n-html="editor.paths.label"></span>
       <textarea id="nf-paths" rows="2" spellcheck="false" data-i18n-ph="newstep.paths.placeholder"></textarea>
     </label>
+    <!-- 数据依赖和代码位置。inputs 不从父步骤继承（照抄一遍等于替人编造一条
+         他没做过的声明），code 继承——同一条线上代码在哪多半没变。 -->
+    <label><span data-i18n="newstep.field.inputs"></span>
+      <textarea id="nf-inputs" rows="2" spellcheck="false" data-i18n-ph="editor.inputs.placeholder"></textarea>
+    </label>
+    <label><span data-i18n="newstep.field.code"></span>
+      <textarea id="nf-code" rows="2" spellcheck="false" data-i18n-ph="editor.code.placeholder"></textarea>
+    </label>
     <!-- 正文语言 ≠ 界面语言。界面是英文的人完全可能用中文记笔记，而这几个小节
          标题是要写进 note.md 的**内容**，写错了 trace_core 就找不到「为什么」，
          评级和 check 一起失灵。所以这里给一个显式的选择，默认值由
@@ -156,6 +194,26 @@
     <menu>
       <button value="cancel" data-i18n="newstep.cancel"></button>
       <button id="nf-ok" value="ok" class="primary" data-i18n="newstep.create"></button>
+    </menu>
+  </form>
+</dialog>
+
+<!-- ① 换一个父节点。P2 的地基是「不丢历史」，不是「不能改结构」——记下来就不丢。
+     原因**不是可选项**：一个可选的输入框会让人先点了确定才发现要写，转头就回去
+     用「把两步的正文对调」那种不留痕迹的老办法。 -->
+<dialog id="dlg-move">
+  <form method="dialog">
+    <h2 id="mv-title"></h2>
+    <p class="hint" data-i18n-html="move.dialog.hint"></p>
+    <label><span data-i18n="move.field.parent"></span><select id="mv-parent" class="mono"></select></label>
+    <label><span data-i18n="move.field.reason"></span>
+      <input id="mv-reason" maxlength="300" required data-i18n-ph="move.reason.placeholder">
+    </label>
+    <p class="hint req" data-i18n="move.reason.required"></p>
+    <p class="hint mverr" id="mv-err" hidden></p>
+    <menu>
+      <button value="cancel" data-i18n="move.cancel"></button>
+      <button id="mv-ok" value="ok" class="primary" data-i18n="move.submit"></button>
     </menu>
   </form>
 </dialog>

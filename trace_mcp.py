@@ -40,12 +40,46 @@ KIND_LABEL = {
     "local": "本机", "path": "路径",
 }
 PATHS_DESC = (
-    "外部产物的位置，每条写成 \"位置 | 说明\"。GB 级的东西（数据集、checkpoint）不要传进来，"
-    "只记它在哪 —— 这是溯源的一半。例："
-    "\"/blue/<组>/<用户>/exp/agnews-clean | 去重后的训练集，12 GB\"、"
-    "\"https://github.com/你/仓库/tree/9b7d112 | 跑这一步的代码\"、"
-    "\"s3://bucket/ckpt/run042.pt | sha256:ab12cd34, 4.2 GB\"。"
+    "外部产物的位置，一条一行，按 `|` 分段：**第一段永远是位置**，之后每一段按内容认领——\n"
+    "  · 整段恰好是 input / script / output / evidence 之一 → 它是**角色**\n"
+    "  · 整段的空白分隔 token **全部**形如 k=v → 它们是**机器属性**\n"
+    "  · 其余 → 都拼进**说明**（中文、逗号、\"lr=3e-4 的那次运行\" 都落这里，不会被误当机器字段）\n"
+    "已知属性：size=字节数（写整数，别写 12GB）、n=条目数、md5= / sha256=、"
+    "checked=YYYY-MM-DD（最后一次确认还在）、missing=YYYY-MM-DD（最后一次确认已经没了）。"
+    "不认识的属性照样保留，不会被吃掉。\n"
+    "GB 级的东西（数据集、checkpoint）不要传进来，只记它在哪 —— 这是溯源的一半。例：\n"
+    "  \"/blue/<组>/<用户>/exp/agnews-clean | input | 去重后的训练集 | n=120000 size=12884901888\"\n"
+    "  \"/orange/<组>/<用户>/ckpt/run042.pt | output | 最好的那一版 | sha256=ab12cd34\"\n"
+    "  \"https://github.com/你/仓库/tree/9b7d112 | script | 跑这一步的代码\""
 )
+INPUTS_DESC = (
+    "**数据依赖**：这一步消费了哪几步的产物。一条一行，写成 \"步骤id | 消费的是哪份产物\"。\n"
+    "**它和 parent 是两件不同的事，最容易混，混了画出来的图会骗人**：\n"
+    "  · `parent` ＝ **记录的派生关系**：我当时是接着哪一步的想法往下做的。树只有一个父。\n"
+    "  · `input`  ＝ **数据依赖**：这些字节是从哪来的。可以有好几个，是一张 DAG。\n"
+    "一步的输入常常同时来自两支（口袋组成来自 013、配对分数来自 014），"
+    "而树上只能表达其中一个 —— 另一个就得写在这里，否则「这个数字怎么来的」永远缺一半。\n"
+    "例：\"013 | pocket_composition.csv\"、\"014 | rmscore_pairs.csv\"。\n"
+    "目标步骤不存在时**不会拒绝**（建立顺序不定），只会在读的一侧给一条警告。"
+)
+CODE_DESC = (
+    "跑这一步的代码在哪，一条一行，写成 \"kind | 位置 | k=v …\"。kind 三选一：\n"
+    "  git       —— 位置是仓库/树的 URL 或本地仓库路径（`commit:` 字段等价于这一种，"
+    "已经写了 commit 就不用再写一条）\n"
+    "  snapshot  —— **代码不在 git 里**时用它：一个快照目录 + 逐文件校验和清单。"
+    "例 \"snapshot | /orange/lab/run_snapshots/20260809 | manifest=MANIFEST.md5 n=43\"\n"
+    "  container —— 容器镜像，位置是镜像引用，例 \"container | ghcr.io/lab/rna:2026-08 | "
+    "digest=sha256:7d4e…\"\n"
+    "**snapshot 和 container 一样能上 L2**（可定位）。以前没有这个字段时，"
+    "人会把快照目录塞进 commit:，于是那一格里躺着一个不是 commit 的东西，"
+    "「解不解析得出来」这条查证就永远给不出答案 —— 现在不要再那么干。"
+)
+# 路径核对的三种结论。**unreachable 不是 missing**：服务器（或 agent 这台机器）
+# 看不到 /blue/… 只说明这条链路够不着，不说明那份数据没了。把两者混为一谈，
+# 就会在别人的超算目录还好好的时候，在记录上写下「2026-08-09 起不存在」。
+PROBE_PRESENT = "present"
+PROBE_MISSING = "missing"
+PROBE_UNREACHABLE = "unreachable"
 DEFAULT_AUTHOR = os.environ.get("TRACE_AUTHOR", "agent")
 
 BODY_TEMPLATE = (
@@ -59,7 +93,7 @@ BODY_TEMPLATE = (
 # 单独拷过去的（只有 TRACE_URL，没有 trace_core）。tests/test_mcp.py 拿 core 的
 # TR_STRUCT_KEYS 逐字核对这一份，漂移会当场被测出来。
 TR_STRUCT_KEYS = ("id", "parent", "status", "date", "commit", "author",
-                  "tags", "path", "repro", "key")
+                  "tags", "path", "repro", "key", "input", "code", "moved")
 
 # 小节名的中英对照。agent 手上**没有别的地方**能知道这张表：FORMAT.md 在 pip 装的
 # 机器上根本不存在，而小节名是精确匹配的——写成 `## Why not`，评级和 check 就都
@@ -163,6 +197,60 @@ def check_data_root(raw: str | Path) -> tuple[Path, str, str]:
     return root, DATA_ROOT_ABSENT, _hint(f"{root} 还不存在，我会现建一个全新的空仓。")
 
 
+# ---------------------------------------------------------------- 路径核对
+#
+# 这一份实现被三个门面共用（MCP 工具、trace_cli paths --check、服务端的定期扫描）。
+# 放在 trace_mcp 里而不是 core，是因为 core 除 scan/signature 外不碰 IO；
+# 放在这里而不是各写一份，是因为「什么叫看不见」的判据一旦分家，就会有一个门面
+# 在别人的超算目录还好好的时候，往记录上写下「已确认不存在」。
+
+_URL_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
+
+
+def probe_path(loc: str) -> tuple[str, int | None]:
+    """在**本机**上看一眼这条路径还在不在。返回 (present/missing/unreachable, 字节数或 None)。
+
+    三条规则，每一条挡的都是一种会写进记录的谎话：
+
+    **① 远端位置一律不探测**（`s3://` / `https://` / `//host/share`）。
+    这不是省事，是安全边界：任何能写记录的人都能往 path: 里塞一个内网地址，
+    如果这里去发请求，服务器就变成了替他扫内网的代理（SSRF），而它跑在能看到
+    数据仓的那台机器上。远端产物还在不在，只能由**人**去核对后写回结论。
+
+    **② 够不着 ≠ 不存在。** 服务端跑在一台机器上，用户的 `/blue/…` 多半挂在另一台
+    超算上。那台机器上根本没有 /blue 时，`exists()` 返回 False —— 把它当成
+    「数据没了」，就会给一份好好的记录盖上「2026-08-09 起不存在」的结论，
+    而 P4 说了 missing 是**结论**不是错误，结论写错比不写贵得多。
+    判据取「**上级目录看得见**」：`/blue/lab/cif_files` 没了但 `/blue/lab` 在，
+    那是真的被删了；连 `/blue/lab` 都看不见，就是这台机器够不着这条链路，
+    什么都不写。宁可漏报，不可误报。
+
+    **③ 只报文件的大小。** 目录的 st_size 是元数据块大小（Linux 上常是 4096），
+    写进 size= 会把「57 GB 的那个目录」记成 4 KB。目录有多大要遍历，见
+    sweep 那边关于「数条目数」的说明——不在这里做。
+    """
+    loc = (loc or "").strip()
+    if not loc or _URL_SCHEME_RE.match(loc) or loc.startswith("\\\\") or loc.startswith("//"):
+        return PROBE_UNREACHABLE, None
+    p = Path(loc)
+    if not p.is_absolute():
+        # 相对路径相对于**谁**的工作目录？没有答案，就不该给结论。
+        # 这一条在 Windows 上顺带挡住了 `/blue/lab/…`：那种写法在 Windows 上是
+        # **盘符相对**的（跟着当前驱动器走），拿它去 stat 等于换了个盘查一遍。
+        return PROBE_UNREACHABLE, None
+    try:
+        parent = p.parent
+        if parent == p or not parent.is_dir():
+            return PROBE_UNREACHABLE, None
+        st = p.stat() if p.exists() else None
+    except OSError:
+        # 权限不足、NFS 掉线、路径过长——都是「这次没看清」，不是「它没了」。
+        return PROBE_UNREACHABLE, None
+    if st is None:
+        return PROBE_MISSING, None
+    return PROBE_PRESENT, (int(st.st_size) if p.is_file() else None)
+
+
 # ---------------------------------------------------------------- 后端
 
 
@@ -224,6 +312,15 @@ class HttpBackend:
 
     def update(self, project, sid, patch):
         return self._call("PATCH", f"/api/p/{urllib.parse.quote(project)}/steps/{urllib.parse.quote(sid)}", patch)
+
+    def move(self, project, sid, payload):
+        # 和 update 打的是同一条路由：`parent` 出现在 PATCH 里就是一次移动。
+        # 服务端在那里分流到 move_step（reason 必填），返回的是移动审计而不是步骤。
+        return self._call("PATCH", f"/api/p/{urllib.parse.quote(project)}/steps/{urllib.parse.quote(sid)}", payload)
+
+    def check_path(self, project, sid, payload):
+        return self._call("POST", f"/api/p/{urllib.parse.quote(project)}/steps/"
+                                  f"{urllib.parse.quote(sid)}/paths/check", payload)
 
     def delete(self, project, sid, payload):
         return self._call("DELETE", f"/api/p/{urllib.parse.quote(project)}/steps/{urllib.parse.quote(sid)}", payload)
@@ -310,13 +407,34 @@ class LocalBackend:
         return self._guard(self.W.create_project, self.root, name).to_dict()
 
     def update_project(self, project, payload):
-        add = None
-        if payload.get("add_insight"):
-            a = payload["add_insight"]
-            add = (a.get("kind"), a.get("text", ""))
-        return self._guard(self.W.update_project, self.root, project,
-                           name=payload.get("name"), insights=payload.get("insights"),
-                           add=add).to_dict()
+        """改项目名 / 整段洞察 / 追加一条洞察 / 就地改一条既有洞察。
+
+        洞察那一条走 W.add_insight / W.update_insight 而不是 update_project，
+        是为了把**分配到的 id** 带回去（update_project 只把它挂在返回对象的属性上，
+        进不了 to_dict）。不知道刚写的那条叫 p3，agent 就说不出下一句「· 取代 p3」。
+        """
+        info: dict[str, Any] = {}
+        a = payload.get("add_insight")
+        if a:
+            lang = a.get("lang", "")
+            if a.get("id"):
+                info = self._guard(self.W.update_insight, self.root, project, a["id"],
+                                   text=a.get("text"), supersedes=a.get("supersedes"), lang=lang)
+            else:
+                info = self._guard(self.W.add_insight, self.root, project, a.get("kind"),
+                                   a.get("text", ""), supersedes=a.get("supersedes") or "", lang=lang)
+        if payload.get("name") is not None or payload.get("insights") is not None:
+            p = self._guard(self.W.update_project, self.root, project,
+                            name=payload.get("name"), insights=payload.get("insights"))
+            out = p.to_dict()
+        else:
+            hit = next((x for x in self.core.scan_projects(self.root) if x.slug == project), None)
+            if hit is None:
+                raise ToolError(f"项目 {project} 不存在")
+            out = hit.to_dict()
+        if info:
+            out["insight"] = info
+        return out
 
     def create(self, project, payload):
         step, created = self._guard(
@@ -326,6 +444,7 @@ class LocalBackend:
             date=payload.get("date", ""), commit=payload.get("commit", ""),
             author=payload.get("author", ""), key=payload.get("key", ""),
             tags=payload.get("tags"), paths=payload.get("paths"),
+            inputs=payload.get("inputs"), code=payload.get("code"),
             lang=payload.get("lang", ""),
         )
         d = step.to_dict()
@@ -334,6 +453,18 @@ class LocalBackend:
 
     def update(self, project, sid, patch):
         return self._guard(self.W.update_step, self._sd(project), sid, patch).to_dict()
+
+    def move(self, project, sid, payload):
+        return self._guard(self.W.move_step, self._sd(project), sid,
+                           payload.get("parent"), payload.get("reason", ""),
+                           by=payload.get("author", ""), date=payload.get("date", ""),
+                           expect=payload.get("expect", ""))
+
+    def check_path(self, project, sid, payload):
+        return self._guard(self.W.record_path_check, self._sd(project), sid,
+                           payload.get("loc", ""), exists=bool(payload.get("exists")),
+                           date=payload.get("date", ""), size=payload.get("size"),
+                           n=payload.get("n"))
 
     def delete(self, project, sid, payload):
         return self._guard(self.W.delete_step, self._sd(project), sid,
@@ -505,6 +636,88 @@ def untranslated_report(forest: dict[str, Any], project: dict[str, Any] | None,
 
 # ---------------------------------------------------------------- 渲染
 
+ROLE_LABEL = {"input": "输入", "script": "脚本", "output": "产物", "evidence": "证据"}
+CODE_KIND_LABEL = {"git": "git", "snapshot": "代码快照", "container": "容器镜像"}
+
+
+def _fmt_bytes(n: Any) -> str:
+    """字节数的显示形式。走 core.fmt_size，让人和网页看到的是同一串数字。"""
+    try:
+        import trace_core as _core  # noqa: PLC0415
+        return _core.fmt_size(n)
+    except Exception:
+        return f"{n} 字节"
+
+
+def _locations_haystack(s: dict) -> str:
+    """一步里所有「东西在哪」的文本，拼成一串供 trace_search 用。
+
+    权威实现在 core.locations_haystack；这里只是那条「trace_mcp.py 被单独拷到
+    一台只有 TRACE_URL 的机器上」的老路上的退路，和 _why_is_blank / TR_STRUCT_KEYS
+    是同一个处理方式。tests/test_seams_flex.py 拿同一批数据核对两份的输出逐字相同，
+    漂移会当场被测出来。
+    """
+    try:
+        import trace_core as _core  # noqa: PLC0415
+        return _core.locations_haystack(s)
+    except Exception:
+        bits = []
+        for p in s.get("paths") or []:
+            bits += [str(p.get("location") or ""), str(p.get("note") or "")]
+        for c in s.get("code") or []:
+            bits += [str(c.get("location") or ""), str(c.get("note") or "")]
+        for i in s.get("inputs") or []:
+            bits.append(str(i.get("note") or ""))
+        return " ".join(b for b in bits if b)
+
+
+def _matched_locations(s: dict, q: str) -> list[str]:
+    """命中落在「东西在哪」上时，把是哪一行说出来。用 note.md 里的原写法。"""
+    out = []
+    for p in s.get("paths") or []:
+        if q in (str(p.get("location") or "") + " " + str(p.get("note") or "")).lower():
+            out.append("path: " + str(p.get("location") or "")
+                       + (f"  — {p['note']}" if p.get("note") else ""))
+    for c in s.get("code") or []:
+        if q in (str(c.get("location") or "") + " " + str(c.get("note") or "")).lower():
+            out.append(f"code: {c.get('kind', '')} | " + str(c.get("location") or ""))
+    for i in s.get("inputs") or []:
+        if q in str(i.get("note") or "").lower():
+            out.append(f"input: {i.get('step', '')} | {i.get('note', '')}")
+    return out
+
+
+def _fmt_attrs(p: dict) -> str:
+    """一条 path 上机器记下来的那部分：条目数、大小、校验和、最后一次核对的结论。
+
+    **「已确认不存在」要说成结论，不说成错误**（P4）：这一行不删，
+    一个曾经装着 57 GB、现在空了的位置本身就是一条发现。
+    未知属性照样列出来——半年后有人写了 `nodes=…`，工具不该把它吃掉。
+    """
+    bits = []
+    if p.get("n") is not None:
+        bits.append(f"{p['n']} 条")
+    if p.get("size") is not None:
+        bits.append(_fmt_bytes(p["size"]))
+    # core.parse_paths 给的 checksum 是**一个字符串** "md5:7d4e1a9c"（算法在冒号左边），
+    # 不是 {算法: 值} 的字典。以前这里当字典用，于是任何一条真写了 md5= 的记录
+    # 都会让 trace_read 直接抛 AttributeError —— 而那恰恰是 ③ 存在的理由，
+    # 也就是说这条渲染路径在最该管用的时候是坏的。attrs 里同时留着原始的 md5=/sha256=，
+    # 所以下面的未知属性过滤仍然要把它们排除掉，否则会打印两遍。
+    if p.get("checksum"):
+        algo, _, val = str(p["checksum"]).partition(":")
+        bits.append(f"{algo}={val}" if val else str(p["checksum"]))
+    known = {"n", "size", "checked", "missing", "md5", "sha256"}
+    for k, v in (p.get("attrs") or {}).items():
+        if k not in known:
+            bits.append(f"{k}={v}")
+    if p.get("state") == "missing":
+        bits.append(f"⚠ {p.get('missing')} 起已确认不存在（记录保留，这是结论不是笔误）")
+    elif p.get("state") == "present":
+        bits.append(f"{p.get('checked')} 确认还在")
+    return "（" + "，".join(bits) + "）" if bits else ""
+
+
 def _fmt_tree(forest: dict, header: str) -> str:
     """把森林渲染成缩进树。比返回 JSON 省 token，也更好读。"""
     steps = forest["steps"]
@@ -520,7 +733,10 @@ def _fmt_tree(forest: dict, header: str) -> str:
         if t.get("self"):
             extra.append(t["self"] if t.get("chain") == t["self"] else f"{t['self']}→链{t['chain']}")
         if s.get("paths"):
-            extra.append(f"{len(s['paths'])} 路径")
+            # 「已确认不存在」的那几条要在树上就看得见。这一整条需求的来历就是
+            # 三个目录被删了半年没人发现——只在单步详情里说，等于还是要人一步步点开。
+            gone = sum(1 for p in s["paths"] if p.get("state") == "missing")
+            extra.append(f"{len(s['paths'])} 路径" + (f"（{gone} 条已不存在）" if gone else ""))
         if s["files"]:
             extra.append(f"{len(s['files'])} 附件")
         if s["tags"]:
@@ -570,11 +786,40 @@ def _fmt_step(project: str, s: dict) -> str:
         head.append("  子步骤: " + ", ".join(s["children"]))
     if s.get("backlinks"):
         head.append("  被引用: " + ", ".join(s["backlinks"]))
+    # 数据依赖：**两个方向都要说**。树上只看得到 parent（记录的派生关系），
+    # 而「这个数字是拿谁的产物算出来的」在 input 上。agent 看不到网页，
+    # 这几行是它唯一能读到数据流的地方；缺了下游那一半，就答不了
+    # 「我要改 013 的产物，谁会跟着错」。
+    if s.get("inputs"):
+        head.append("  消费了这些步骤的产物（数据依赖，和 parent 是两回事）:")
+        for i in s["inputs"]:
+            head.append(f"    ← {i['step']}" + (f"  {i['note']}" if i.get("note") else ""))
+    if s.get("consumers"):
+        head.append("  本步的产物被这些步骤消费: " + ", ".join(s["consumers"])
+                    + "（派生，扫全项目算出来的）")
+    if s.get("code"):
+        head.append("  代码位置:")
+        for c in s["code"]:
+            attrs = " ".join(f"{k}={v}" for k, v in (c.get("attrs") or {}).items())
+            head.append(f"    [{CODE_KIND_LABEL.get(c['kind'], c['kind'])}] {c['location']}"
+                        + (f"  {attrs}" if attrs else "")
+                        + (f"  — {c['note']}" if c.get("note") else "")
+                        + ("  （由 commit: 折算而来，磁盘上没有第二份）" if c.get("from") == "commit" else ""))
+    if s.get("moved"):
+        head.append("  移动记录（只追加，顺序即历史）:")
+        for m in s["moved"]:
+            head.append(f"    {m['date']}  {m['from'] or '（根）'} → {m['to'] or '（根）'}"
+                        + (f"  by {m['by']}" if m.get("by") else "")
+                        + f"  —— {m['reason']}")
     if s.get("paths"):
         head.append("  外部产物（不在仓库里，只记了位置）:")
         for p in s["paths"]:
-            head.append(f"    [{KIND_LABEL.get(p['kind'], p['kind'])}] {p['location']}"
-                        + (f"  — {p['note']}" if p.get("note") else ""))
+            attrs = _fmt_attrs(p)
+            head.append(f"    [{KIND_LABEL.get(p['kind'], p['kind'])}]"
+                        + (f"[{ROLE_LABEL[p['role']]}]" if p.get("role") in ROLE_LABEL else "")
+                        + f" {p['location']}"
+                        + (f"  — {p['note']}" if p.get("note") else "")
+                        + (f"  {attrs}" if attrs else ""))
     if s.get("files"):
         head.append("  文件: " + ", ".join(f"{f['path']} ({f['size']}B)" for f in s["files"]))
         if any(Path(f["path"]).suffix.lower() in IMG_EXT for f in s["files"]):
@@ -613,7 +858,13 @@ TOOLS: list[dict[str, Any]] = [
             "什么时候写：一条线走完得出总体结论时、发现一个会反复咬人的坑时、"
             "冒出一个还没验证但值得记下来的想法时。\n"
             "写完一步之后顺手想一想：这一步有没有产生「项目级」的教训？有就记一条。\n"
-            "带上 step 让它指回证据来源，正文里会渲染成可跳转的链接。"
+            "带上 step 让它指回证据来源，正文里会渲染成可跳转的链接。\n"
+            "**每条洞察都会拿到一个 id**（`p1`、`p2`…，写在行首的反引号里），返回值里会告诉你。"
+            "后来发现当时的判断不准时，别再手写一条重复的，有两条路：\n"
+            "  · 同一件事说得更准了（数字更正、指回的步骤换了）→ 给 id，就地改那一行；\n"
+            "  · 结论被**新的结论取代**了 → 新记一条并给 supersedes。被取代的那条"
+            "**不删除，只折叠**——「当时是这么以为的」本身是信息，删掉它，"
+            "半年后的人会以为一开始就查清楚了，然后重走一遍那条弯路。"
         ),
         "inputSchema": {
             "type": "object",
@@ -623,12 +874,22 @@ TOOLS: list[dict[str, Any]] = [
                     "type": "string", "enum": ["idea", "works", "fails", "pitfall"],
                     "description": ("idea＝核心想法（还没验证的方向）；works＝有效（确认管用的）；"
                                     "fails＝无效（确认不管用的，和 works 一样重要）；"
-                                    "pitfall＝坑（会反复咬人的问题，比如数据里的陷阱、环境的雷）"),
+                                    "pitfall＝坑（会反复咬人的问题，比如数据里的陷阱、环境的雷）。"
+                                    "给了 id（改既有那条）时可以不填"),
                 },
                 "text": {"type": "string", "description": "一句话说清楚。有数字就带上数字"},
                 "step": {"type": "string", "description": "证据来自哪一步，如 002c。会渲染成可跳转链接"},
+                "id": {"type": "string",
+                       "description": "给了就是**就地改写**这一条既有洞察（重新锚定、更正措辞），不新增。"
+                                      "id 是行首反引号里那个，如 p1"},
+                "supersedes": {"type": "string",
+                               "description": "这条取代了哪几条（逗号分隔，如 \"p1, p2\"）。"
+                                              "被取代的那条**不会被删**，只在界面上折叠起来。"
+                                              "「取代了谁」只写在取代者身上，反向关系是算出来的"},
+                "lang": {"type": "string",
+                         "description": "写进 project.<lang>.md 那一份（洞察的译文）。不给就是原文"},
             },
-            "required": ["project", "kind", "text"],
+            "required": ["project"],
         },
     },
     {
@@ -681,9 +942,11 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "trace_search",
-        "description": ("在标题、正文、标签、以及各语言的译文里搜关键词。"
-                        "用来回答「之前是不是试过 X」「为什么放弃了 Y」。"
-                        "英文词搜得到英文译文，命中落在译文里时结果行上会标出是哪个语言。"),
+        "description": ("在标题、正文、标签、**产物与代码的位置**、以及各语言的译文里搜关键词。"
+                        "用来回答「之前是不是试过 X」「为什么放弃了 Y」"
+                        "「/orange/…/best.pt 是哪一步产出的」「谁用了 20260809 那个快照」。"
+                        "英文词搜得到英文译文，命中落在译文里时结果行上会标出是哪个语言；"
+                        "命中只落在位置上时会把 `path:` / `code:` / `input:` 那一行摆出来。"),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -716,6 +979,8 @@ TOOLS: list[dict[str, Any]] = [
                 "key": {"type": "string", "description": "幂等键，防止重试造出重复步骤"},
                 "tags": {"type": "array", "items": {"type": "string"}},
                 "paths": {"type": "array", "items": {"type": "string"}, "description": PATHS_DESC},
+                "inputs": {"type": "array", "items": {"type": "string"}, "description": INPUTS_DESC},
+                "code": {"type": "array", "items": {"type": "string"}, "description": CODE_DESC},
                 "lang": {"type": "string", "description": "这份记录用什么语言写的（en / zh / ja …）。**声明**出来，别让读的一侧去猜——没有它，界面对没翻译的记录只能说「这是原文」，说不出是哪种语言的原文。"},
             },
             "required": ["project", "title"],
@@ -724,8 +989,9 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "trace_update_step",
         "description": (
-            "改一个已有步骤。只能改 status / title / body / date / commit / tags——"
-            "id 和 parent 是只追加系统的地基，改不了（会返回 409）。\n"
+            "改一个已有步骤：status / title / body / date / commit / tags / paths / inputs / code。\n"
+            "**id 改不了**（会返回 409）——笔记里的 `[[003b]]` 和论文脚注里的引用永远有效，"
+            "靠的就是它不动。**parent 不从这条路改**：它可以改，但必须写原因，请用 trace_move_step。\n"
             "跑完之后典型用法：status 改成 done 或 dead，同时用 append 把「结果」和「结论」追加进去。\n"
             "**失败也要记：标 dead 并写清为什么放弃**——死胡同是这个系统最有价值的部分。"
         ),
@@ -745,6 +1011,14 @@ TOOLS: list[dict[str, Any]] = [
                 "lang": {"type": "string", "description": "这份记录用什么语言写的（en / zh / ja …）。补一句声明，界面就不必对读者说「这是原文」而说不出是哪种语言；空串是撤回声明。"},
                 "add_paths": {"type": "array", "items": {"type": "string"},
                               "description": "追加（按位置去重），比整组替换安全。" + PATHS_DESC},
+                "inputs": {"type": "array", "items": {"type": "string"},
+                           "description": "整组替换。" + INPUTS_DESC},
+                "add_inputs": {"type": "array", "items": {"type": "string"},
+                               "description": "追加（按「步骤+说明」去重），比整组替换安全。" + INPUTS_DESC},
+                "code": {"type": "array", "items": {"type": "string"},
+                         "description": "整组替换。" + CODE_DESC},
+                "add_code": {"type": "array", "items": {"type": "string"},
+                             "description": "追加，比整组替换安全。" + CODE_DESC},
                 "repro": {
                     "type": "string",
                     "description": (
@@ -758,6 +1032,92 @@ TOOLS: list[dict[str, Any]] = [
                         "0.9468±0.0011，原记录 0.947`"
                     ),
                 },
+            },
+            "required": ["project", "step"],
+        },
+    },
+    {
+        "name": "trace_move_step",
+        "description": (
+            "把一步（**连同它下面的整棵子树**）改挂到另一个父节点下，并留下一条永久的移动审计。\n"
+            "**这不是「改错了就改」的口子，是「树形本来就画错了」的口子。** 典型场景：016 当时"
+            "顺手挂在 014 下面，后来发现 014 那一支的产物从没进过 016 的计算，016 真正接着的是 013b。\n"
+            "没有这个工具的时候，人会去**对调两个节点的正文**——那才是真的毁记录：创建日期和"
+            "内容从此对不上号，而且一条审计都没有。能移动 + 强制写原因，历史反而完整。\n"
+            "  · reason **必填**，它会永久留在 front-matter 的 `moved:` 那一行里（只追加，可以移动多次）。"
+            "半年后看到一棵和创建顺序对不上的树，唯一能解释它的就是这句话——写清楚是**哪条数据依赖**"
+            "决定了新的父子关系，不要写「修正结构」。\n"
+            "  · **id 仍然不可改**，移动的只是它挂在哪。笔记里的 `[[016]]` 照样指得到。\n"
+            "  · 移动**不改变 inputs**。数据依赖是另一件事，它本来就允许有多个来源"
+            "（见 trace_update_step 的 inputs）——树形改对了，数据流该怎么写还是怎么写。\n"
+            "  · 不能挂到自己或自己的后代下面（那会让整棵子树从森林上掉下来）。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string"},
+                "step": {"type": "string", "description": "要移动哪一步，如 016"},
+                "parent": {"type": "string",
+                           "description": "新的父节点 id；空串 / \"root\" 表示提为根（自己开一棵树）"},
+                "reason": {"type": "string",
+                           "description": "**为什么移**。必填，会永久写进 note.md 的 moved: 那一行。"
+                                          "写「016 的输入全部来自 013b 的口袋组成，014 的补原子产物"
+                                          "从未进过下游计算」，不要写「修正结构」"},
+                "date": {"type": "string", "description": "YYYY-MM-DD，不给就是今天"},
+            },
+            "required": ["project", "step", "reason"],
+        },
+    },
+    {
+        "name": "trace_flow",
+        "description": (
+            "顺着**数据依赖**看一步的上下游：它的数字是从哪些步骤的产物算出来的，"
+            "以及谁又拿它的产物往下算。\n"
+            "和 trace_read 看到的树是两张不同的图，别混：树画的是「我当时接着哪一步想」"
+            "（parent，单父），这里画的是「这些字节从哪来」（input，DAG，可以有多个来源）。\n"
+            "什么时候用：要改某一步的产物、想知道**谁会跟着错**（下游）；"
+            "或者拿到一个数字，要一路问到底**它到底是怎么来的**（上游）。\n"
+            "结果是**传递闭包**（上游的上游也算进来），按 id 序排，环会被自动截断。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string"},
+                "step": {"type": "string"},
+                "direction": {"type": "string", "enum": ["up", "down", "both"], "default": "both",
+                              "description": "up＝这一步消费了谁的产物；down＝谁消费了这一步的产物"},
+            },
+            "required": ["project", "step"],
+        },
+    },
+    {
+        "name": "trace_check_paths",
+        "description": (
+            "**在你这台机器上**逐条 stat 一遍某一步记的外部路径，把结果写回 `checked=` / `missing=`。\n"
+            "为什么需要它：外部产物不在仓库里，只记了位置——而位置会失效。"
+            "用户上一次手工核对 164 条路径时发现三个目录已经被删了（其中一个 57 GB），"
+            "本该由机器自己发现。\n"
+            "三条硬规矩：\n"
+            "  · **记录不删**。路径没了是溯源结论（「这份数据当年在这儿，现在没了」），"
+            "和 dead 一样有价值；size 也会保留——「没了的那个有 57 GB」正是要留下的信息。\n"
+            "  · **够不着 ≠ 不存在**。`s3://` / `https://` 一律不探测（那等于让工具替人去访问网络），"
+            "本机看不见的挂载点（比如这台机器上根本没有 /blue）也只报「够不着」、什么都不写。"
+            "只有「上级目录看得见、这一条没了」才写 missing。\n"
+            "  · 只动机器字段，**不碰 role 和说明**——那两样是人写的判断。\n"
+            "**在能看到那些路径的机器上跑才有意义**：agent 在超算上跑就核对得了 /blue/…，"
+            "跑在你笔记本上就全是「够不着」。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string"},
+                "step": {"type": "string"},
+                "path": {"type": "string",
+                         "description": "只核对这一条（写位置本身，和记录里逐字一致）。不给就核对这一步的全部路径"},
+                "count": {"type": "boolean", "default": False,
+                          "description": "目录还要不要数条目数（写进 n=）。默认不数：数一个"
+                                         "几十万文件的目录要遍历整棵树，在网络盘上能卡很久"},
+                "date": {"type": "string", "description": "YYYY-MM-DD，不给就是今天"},
             },
             "required": ["project", "step"],
         },
@@ -874,13 +1234,18 @@ def t_read(be, args) -> str:
 
 
 def t_search(be, args) -> str:
-    """id / 标题 / 正文 / 标签 / **各语言的译文**里搜。
+    """id / 标题 / 正文 / 标签 / **产物与代码的位置** / **各语言的译文**里搜。
 
     译文也搜，理由和 REST 那侧的 search_hits 一字不差：这套系统的底线是
     「删掉全部程序，grep -r 还能回答『为什么放弃了 X』」，双语之后英文的 grep
     也要能回答同一个问题。`grep -r abandoned` 命中 note.en.md 而 trace_search
     命中不了的话，agent 会得到「没搜到」，而它会把这四个字读成「没试过」，
     然后重跑一条已经走死的路。命中落在译文里时结果行上会标出是哪个语言。
+
+    `path:` / `code:` 里的位置和说明同样进搜索范围，理由是同一条：
+    「/orange/…/run042/best.pt 是哪一步产出的」「谁用了 20260809 那个快照」
+    是这两个键存在的**主要**用途，而 `grep -rn best.pt projects/` 一秒就答得出。
+    工具比 grep 弱的那部分，恰好就是 agent 唯一够得到的那部分。
     """
     q = args["query"].strip().lower()
     if not q:
@@ -890,7 +1255,8 @@ def t_search(be, args) -> str:
     for slug in slugs:
         for s in be.forest(slug)["steps"]:
             tr = s.get("tr") or {}
-            hay = " ".join([s["id"], s["title"], s["body"], " ".join(s["tags"])]).lower()
+            hay = " ".join([s["id"], s["title"], s["body"], " ".join(s["tags"]),
+                            _locations_haystack(s)]).lower()
             langs = [c for c in sorted(tr)
                      if q in ((tr[c].get("title") or "") + "\n" + (tr[c].get("body") or "")).lower()]
             if q not in hay and not langs:
@@ -904,6 +1270,13 @@ def t_search(be, args) -> str:
             if where >= 0:
                 a = max(0, where - 60)
                 snippet = ("…" if a else "") + src[a:where + 140].replace("\n", " ") + "…"
+            else:
+                # 命中只落在位置上（正文里一个字都没提这个路径），这时必须把命中的
+                # 那一行摆出来：光给一个 id 和标题，agent 没法判断这是不是误命中，
+                # 而「说不清为什么命中」的搜索结果会被当成噪音整体忽略。
+                for line in _matched_locations(s, q):
+                    snippet = line
+                    break
             hits.append(f"{slug}/{s['id']}  [{s['status']}]  {s['title']}"
                         + (f"   （命中 {'/'.join(langs)} 译文）" if langs else "")
                         + (f"\n    {snippet}" if snippet else ""))
@@ -936,13 +1309,40 @@ def _why_is_blank(body: str) -> bool:
     return not text or text.startswith(("（", "("))   # 空的，或者还是模板里的占位括号
 
 
+INSIGHT_LABEL = {"idea": "核心想法", "works": "有效", "fails": "无效", "pitfall": "坑"}
+
+
 def t_insight(be, args) -> str:
-    text = args["text"].strip()
+    """记一条项目级洞察，或就地改写一条既有的。
+
+    `kind` / `text` 的必填判断放在这里而不是 schema 的 required 里：给了 id 就是
+    「改那一条」，这时 kind 是多余的（小节由 id 所在的位置决定），text 不给就是
+    「只补一句『取代了谁』、正文不动」。写死在 required 里会逼调用方把原文抄一遍，
+    而抄错一个字就成了另一条洞察。
+    """
+    iid = (args.get("id") or "").strip()
+    text = (args.get("text") or "").strip()
+    if not iid and not (args.get("kind") and text):
+        raise ToolError("新记一条洞察要同时给 kind 和 text；要改既有的那条请给 id。")
     if args.get("step"):
         text = f"{text} —— [[{args['step'].strip()}]]"
-    p = be.update_project(args["project"], {"add_insight": {"kind": args["kind"], "text": text}})
-    label = {"idea": "核心想法", "works": "有效", "fails": "无效", "pitfall": "坑"}[args["kind"]]
-    return f"已记入 {p['slug']} 的「{label}」：{text}"
+    payload = {"kind": args.get("kind"), "text": text,
+               "id": iid, "supersedes": args.get("supersedes") or "",
+               "lang": args.get("lang") or ""}
+    p = be.update_project(args["project"], {"add_insight": payload})
+    info = p.get("insight") or {}
+    where = f"{p['slug']}" + (f" 的 {info['lang']} 译文" if info.get("lang") else "")
+    if iid:
+        return (f"已改写 {where} 里的洞察 `{iid}`：{info.get('line', text)}\n"
+                "被它取代的那条（如果有）一个字都没删——「当时是这么以为的」本身是信息。")
+    label = INSIGHT_LABEL.get(args.get("kind"), args.get("kind"))
+    out = f"已记入 {where} 的「{label}」，id 是 `{info.get('id', '?')}`：{text}"
+    if args.get("supersedes"):
+        out += (f"\n它取代了 {args['supersedes']}——那几条仍然留在 project.md 里，"
+                "只是在界面上折叠起来。")
+    else:
+        out += "\n以后要更正这条判断，用 id 改写它，或者新记一条并写 supersedes，别再手写一条重复的。"
+    return out
 
 
 def t_delete_step(be, args) -> str:
@@ -956,6 +1356,14 @@ def t_delete_step(be, args) -> str:
     if info["dangling_refs"]:
         out.append("⚠ " + "、".join(info["dangling_refs"])
                    + f" 的正文里写了 [[{info['id']}]]，现在指不到东西了。")
+    if info.get("dangling_inputs"):
+        # 这条比上面那条重：`[[006]]` 是给人读的一句话，`input: 006 | x.csv` 是
+        # 「这些字节从哪来」的声明，可溯源性正沿着它上溯。而 id 会被重用——
+        # 下一个拿到这个号的步骤会**静悄悄地**接手这些边。
+        out.append("⚠ " + "、".join(info["dangling_inputs"])
+                   + f" 声明了 `input: {info['id']}`（数据依赖），现在指不到东西了。"
+                     "这些步骤的可溯源链会断在这里；等 id 被重用之后，它们会无声地"
+                     "指向一个不相干的步骤。请去把那几行 input 改掉或删掉。")
     out.append(f"⚠ id {info['id']} 可能被下一个新建的步骤重用——旧笔记里对它的引用会指向别的东西。")
     return "\n".join(out)
 
@@ -977,7 +1385,8 @@ def t_new_step(be, args) -> str:
         # 已经有项目时不这么做——那种情况下项目名对不上多半是笔误。
         be.create_project(project)
 
-    payload = {k: args[k] for k in ("parent", "title", "status", "body", "date", "commit", "key", "tags", "paths", "lang")
+    payload = {k: args[k] for k in ("parent", "title", "status", "body", "date", "commit", "key",
+                                    "tags", "paths", "inputs", "code", "lang")
                if k in args and args[k] not in (None, "")}
     payload.setdefault("status", "wip")
     payload["author"] = args.get("author") or DEFAULT_AUTHOR
@@ -994,14 +1403,20 @@ def t_new_step(be, args) -> str:
 
 def t_update_step(be, args) -> str:
     project, sid = args["project"], args["step"]
-    # 静默忽略比报错更糟：agent 会以为改成功了。这里和服务端的 409 保持一致。
-    for locked in ("parent", "id"):
-        if locked in args:
-            raise ToolError(
-                f"{locked} 不可修改。只追加是这套系统的地基——笔记里写的「见 003b」、"
-                f"论文脚注里的引用能一直有效，靠的就是 id 和 parent 不变。"
-            )
-    patch = {k: args[k] for k in ("status", "title", "date", "commit", "tags", "paths", "add_paths", "lang")
+    # 静默忽略比报错更糟：agent 会以为改成功了。这里和服务端保持一致。
+    if "id" in args:
+        raise ToolError(
+            "id 不可修改。只追加是这套系统的地基——笔记里写的「见 003b」、"
+            "论文脚注里的引用能一直有效，靠的就是 id 写下之后不再动。")
+    if "parent" in args:
+        # 语义变了：parent 可以改，但必须留下审计。这条路收不到原因，所以指过去，
+        # 而不是像以前那样一口回绝——回绝的后果是人跑去对调两个节点的正文。
+        raise ToolError(
+            "parent 不从这条路改。它**可以**改，但必须写清为什么——请用 trace_move_step"
+            "（reason 必填，会永久留在 note.md 的 moved: 那一行里）。"
+            "顺带一提：如果你真正想说的是「这一步的数据来自那一步」，那是 inputs，不是 parent。")
+    patch = {k: args[k] for k in ("status", "title", "date", "commit", "tags", "paths", "add_paths",
+                                  "inputs", "add_inputs", "code", "add_code", "lang")
              if k in args and args[k] is not None}
     if args.get("repro"):
         patch["add_repro"] = [args["repro"]]
@@ -1016,6 +1431,141 @@ def t_update_step(be, args) -> str:
         raise ToolError("没有要改的字段")
     s = be.update(project, sid, patch)
     return f"已更新 {project}/{s['id']}  [{s['status']}]  {s['title']}"
+
+
+def t_move_step(be, args) -> str:
+    project, sid = args["project"], args["step"]
+    info = be.move(project, sid, {
+        "parent": args.get("parent", ""), "reason": args.get("reason", ""),
+        "author": DEFAULT_AUTHOR, "date": args.get("date", "")})
+    out = [f"已把 {project}/{info['id']} 从 {info['old_parent'] or '（根）'} 移到 "
+           f"{info['new_parent'] or '（根）'}。",
+           f"审计已写进 note.md：{info['moved']}"]
+    if info.get("subtree"):
+        # 「你移的是一步」和「你移的是一步和它下面的 9 步」是两个决定，
+        # 事后才发现的话，已经没有第二次机会说「我不是这个意思」了。
+        out.append(f"⚠ 跟着一起走的还有 {len(info['subtree'])} 个后代："
+                   + "、".join(info["subtree"]))
+    out.append("id 没变，inputs 也没动——数据依赖是另一件事，要改用 trace_update_step 的 inputs。")
+    return "\n".join(out)
+
+
+def _flow_closure(steps: list[dict], sid: str, direction: str) -> list[str]:
+    """沿数据依赖求传递闭包。返回值按 forest 的既有顺序排，不另发明一套排序。
+
+    环是残缺数据里真实存在的（两个人分别手改了 note.md），seen 兜住它：
+    「构建器必须能在残缺输入上产出部分结果」这条对查询同样适用。
+    """
+    by_id = {s["id"]: s for s in steps}
+    if sid not in by_id:
+        raise ToolError(f"步骤 {sid} 不存在")
+    seen, stack = {sid}, [sid]
+    while stack:
+        cur = by_id.get(stack.pop())
+        if cur is None:
+            continue
+        nxts = ([i["step"] for i in (cur.get("inputs") or [])] if direction == "up"
+                else list(cur.get("consumers") or []))
+        for n in nxts:
+            if n in by_id and n not in seen:
+                seen.add(n)
+                stack.append(n)
+    return [s["id"] for s in steps if s["id"] in seen and s["id"] != sid]
+
+
+def t_flow(be, args) -> str:
+    project, sid = args["project"], args["step"]
+    steps = be.forest(project)["steps"]
+    by_id = {s["id"]: s for s in steps}
+    if sid not in by_id:
+        raise ToolError(f"步骤 {sid} 不存在")
+    want = (args.get("direction") or "both").lower()
+    me = by_id[sid]
+    out = [f"{project}/{sid}  {me['title']}",
+           "（数据依赖 input，不是树上的 parent —— 前者是「这些字节从哪来」，"
+           "后者是「我当时接着哪一步想」）"]
+
+    def block(head: str, ids: list[str], direct: list[str], empty: str) -> None:
+        out.append("")
+        out.append(f"{head}（{len(ids)} 步）:" if ids else f"{head}: {empty}")
+        for i in ids:
+            s = by_id[i]
+            out.append(f"  {'●' if i in direct else '·'} {i:<6} [{s['status']}] {s['title']}")
+        if ids:
+            out.append("  （● 是直接相邻的一层，· 是再往外的传递依赖）")
+
+    if want in ("up", "both"):
+        block("上游 · 这一步消费了谁的产物",
+              _flow_closure(steps, sid, "up"),
+              [i["step"] for i in (me.get("inputs") or [])],
+              "没写 input —— 如果这一步真的读了别人的产物，补上，"
+              "否则「这个数字怎么来的」只能靠猜")
+        for i in (me.get("inputs") or []):
+            if i.get("note"):
+                out.append(f"    ← {i['step']}  {i['note']}")
+    if want in ("down", "both"):
+        block("下游 · 谁消费了这一步的产物",
+              _flow_closure(steps, sid, "down"),
+              list(me.get("consumers") or []),
+              "还没有别的步骤声明用了它（这是派生结果，扫全项目算出来的）")
+    return "\n".join(out)
+
+
+def count_entries(p: Path) -> int | None:
+    """目录里有多少个直接条目。**只数一层**。
+
+    递归数是这件事里唯一会慢到不可接受的部分：那个 57 GB 的目录底下几十万个 inode，
+    在网络盘上遍历一遍能跑几分钟，而 stat 本身是毫秒级的。所以 n= 记的是
+    「这一层有多少条」，要更细的数字请人自己去数了再写。
+    """
+    try:
+        return sum(1 for _ in p.iterdir())
+    except OSError:
+        return None
+
+
+def t_check_paths(be, args) -> str:
+    project, sid = args["project"], args["step"]
+    s = be.step(project, sid)
+    rows = list(s.get("paths") or [])
+    only = (args.get("path") or "").strip()
+    if only:
+        rows = [p for p in rows if p["location"] == only]
+        if not rows:
+            raise ToolError(f"{sid} 上没有记着 {only} 这条路径。核对结果只写在已经记下来的路径上。")
+    if not rows:
+        return f"{project}/{sid} 没有记任何外部路径，没什么可核对的。"
+
+    date = args.get("date", "")
+    done, gone, skipped = [], [], []
+    for p in rows:
+        loc = p["location"]
+        state, size = probe_path(loc)
+        if state == PROBE_UNREACHABLE:
+            # **一个字都不写。** 这台机器够不着，不代表那份数据没了。
+            skipped.append(loc)
+            continue
+        n = None
+        if args.get("count") and state == PROBE_PRESENT and Path(loc).is_dir():
+            n = count_entries(Path(loc))
+        be.check_path(project, sid, {"loc": loc, "exists": state == PROBE_PRESENT,
+                                     "date": date, "size": size, "n": n})
+        (done if state == PROBE_PRESENT else gone).append(
+            loc + (f"（{_fmt_bytes(size)}）" if size is not None else "")
+            + (f"（{n} 条）" if n is not None else ""))
+
+    out = [f"{project}/{sid} 的 {len(rows)} 条路径，在这台机器上核对完了："]
+    if done:
+        out.append(f"  ✓ 还在（{len(done)}）: " + "、".join(done))
+    if gone:
+        out.append(f"  ✕ 已确认不存在（{len(gone)}）: " + "、".join(gone))
+        out.append("    记录**没有删**——一个曾经装着东西、现在空了的位置是一条溯源结论，"
+                   "不是要顺手清掉的笔误。要说清它是怎么没的，请在正文里补一句。")
+    if skipped:
+        out.append(f"  ? 这台机器够不着，什么都没写（{len(skipped)}）: " + "、".join(skipped))
+        out.append("    远端位置（s3:// / https://）一律不探测；本机看不见的挂载点也只报够不着。"
+                   "**够不着 ≠ 不存在** —— 要核对它们，请到看得见那些路径的机器上再跑一次。")
+    return "\n".join(out)
 
 
 def _md_ref(path: str, caption: str, is_img: bool) -> str:
@@ -1151,6 +1701,9 @@ HANDLERS = {
     "trace_search": t_search,
     "trace_new_step": t_new_step,
     "trace_update_step": t_update_step,
+    "trace_move_step": t_move_step,
+    "trace_flow": t_flow,
+    "trace_check_paths": t_check_paths,
     "trace_attach": t_attach,
     "trace_translate": t_translate,
     "trace_untranslated": t_untranslated,
@@ -1177,7 +1730,7 @@ def dispatch(backend, name: str, args: dict[str, Any]) -> str:
 # 的客户端连上来跑一遍互操作。
 
 SERVER_NAME = "trace"
-SERVER_VERSION = "1.3.0"
+SERVER_VERSION = "1.4.0"
 
 # 收到客户端要的版本就原样回它（前提是我们认识），否则回我们最新的。
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
@@ -1212,10 +1765,25 @@ FORMAT_ESSENTIALS = (
     "图注写这张图**说明了什么**，不是「这是一张 loss 曲线」；没图注的图 check 会报"
     "figure_without_caption，评级卡在 L0。"
     "④ 正文里 `[[003b]]` 是交叉引用，会渲染成跳转链接并在对方页面显示反向链接。"
-    "⑤ 外部产物用 paths 记成 `位置 | 说明`，说明里带上校验和与大小；"
+    "⑤ 外部产物用 paths 记成 `位置 | 角色 | 说明 | k=v …`：第一段永远是位置；"
+    "之后每一段按内容认领——整段**恰好**是 input/script/output/evidence 之一就是角色，"
+    "整段的空白分隔 token **全部**形如 k=v 就是机器属性，其余都拼进说明"
+    "（所以老写法 `位置 | 说明` 一个字都不用改，而「lr=3e-4 的那次运行」也照样落进说明）。"
+    "已知属性：size=字节数（写整数）、n=条目数、md5=/sha256=、checked=YYYY-MM-DD（最后一次确认还在）、"
+    "missing=YYYY-MM-DD（最后一次确认已经没了；两个都在时看日期，同一天算 missing）。"
+    "不认识的属性照样保留。**路径没了不要删那一行**——「这份数据当年在这儿、现在没了」是溯源结论。"
     "GB 级的东西不要传进来，只记它在哪 —— 这是溯源的一半。"
+    "⑤b 记录的派生关系（`parent`）和数据依赖（`input`）是两件事：前者是「我当时接着哪一步想」，"
+    "树上只能有一个；后者是「这些字节从哪来」，可以有好几个（`input: 013 | pocket_composition.csv`）。"
+    "一步的输入同时来自 013 和 014 时，树上只表达得了一个，另一个必须写进 input。"
+    "`parent` **可以改**，但要走 trace_move_step 并写清原因，那次移动会追加一行 "
+    "`moved: 日期 | 原 parent | 新 parent | 谁 | 原因`；`id` 仍然永不可改。"
+    "代码位置用 `code: <kind> | <位置> | <k=v …>`，kind ∈ git / snapshot / container；"
+    "`commit:` 等价于一条 code: git，两者只写一份。"
     "⑥ 可溯源性等级：L0 不可溯源（缺「为什么」/「做了什么」，或有图没图注，或 done/dead 没结论）；"
-    "L1 可读；L2 可定位（L1 + 记了 commit + 记了产物位置）；L3 可重跑（repro: runnable）；"
+    "L1 可读；L2 可定位（L1 + 代码找得回来 + 记了产物位置）——代码找得回来指**任何一条** code 记录"
+    "（commit / 有位置的 snapshot / container），快照目录加逐文件校验和一样算数，"
+    "不必为了上 L2 把不是 commit 的东西塞进 commit 字段；L3 可重跑（repro: runnable）；"
     "L4 已复现（repro: verified）。**等级受祖先制约**——祖先没记数据在哪，后代再全，"
     "整条链也追不到底，所以补记录要从**最弱的那一环**补起，不是从最新那一步补起。"
     "⑦ repro 三种状态：runnable＝查过、命令环境种子齐全；verified＝真跑过、数字在容差内对上；"
@@ -1241,8 +1809,8 @@ FORMAT_ESSENTIALS = (
     "`note.en.md`，项目笔记的是 `project.en.md`（`note.<短语言码>.md`，ja / zh-Hant 同理）。"
     "写它只有 trace_translate 一条路，它碰不到原文；还欠哪些用 trace_untranslated 查。"
     "译文的 front-matter **只准有 `title:`**（项目笔记是 `name:`），其余结构一律不重复——"
-    "id / parent / status / date / commit / author / tags / path / repro / key 写进去会被"
-    "忽略并报一条警告，因为那些在原文里已经有了，写两份就是双真相源。"
+    "id / parent / status / date / commit / author / tags / path / repro / key / input / code / moved "
+    "写进去会被忽略并报一条警告，因为那些在原文里已经有了，写两份就是双真相源。"
     "译文正文的小节名用目标语言那一套，和原文一一对应：为什么=Why、做了什么=What、"
     "结果=Result、结论=Conclusion、下一步=Next；项目洞察 核心想法=Ideas、有效=Works、"
     "无效=Doesn't work、坑=Pitfalls。"
@@ -1257,8 +1825,10 @@ INSTRUCTIONS = (
     "③ 正文必须写「为什么」，这是唯一无法自动生成的字段；"
     "④ 失败也要记，标 dead 并写清放弃理由，死胡同是这里最有价值的部分；"
     "⑤ 图必须给 caption，你看不到图，图注是它唯一的信息来源；"
-    "⑥ 产物落在哪（超算路径、GitHub、对象存储）用 paths 记下来；"
-    "⑦ id 和 parent 写下就不可改；"
+    "⑥ 产物落在哪（超算路径、GitHub、对象存储）用 paths 记下来，位置会失效，"
+    "定期用 trace_check_paths 在**看得见那些路径的机器上**核对一遍；"
+    "⑦ id 写下就不可改；parent 可以改，但只能走 trace_move_step 并写清原因（会留下审计）；"
+    "别把 parent 当数据依赖用 —— 「这些字节从哪来」是 inputs，能有好几个，用 trace_flow 看；"
     "⑧ 要双语就用 trace_translate 单独补一份译文（`note.en.md`），它碰不到原文——"
     "建完步骤马上调就是立刻翻译，过几天再调就是延迟翻译，同一条路径；"
     "隔了几天先用 trace_untranslated 看还欠哪些。\n\n"

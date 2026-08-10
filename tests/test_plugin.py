@@ -231,14 +231,19 @@ SKILL_DIR = ROOT / "skills"
 # 正文让它调 trace_read 它却根本看不见这个工具。所以这里集中定义一次，由测试钉住。
 MCP_PREFIX = "mcp__plugin_research-trace_trace__"
 
-# trace_mcp.py 实际注册的 11 个工具，按「读」「写」分开——
+# trace_mcp.py 实际注册的全部工具，按「读」「写」分开——
 # auditor 只读这条线是需求，不是风格偏好。
 # trace_untranslated 归读（它只回答「还欠哪些语言版本」，一个字节都不写）；
 # trace_translate 归写：它落一个 note.<lang>.md 到磁盘上。译文虽然碰不到原文，
 # 但 auditor 的约束是「只查证、不改动仓库」，写译文一样违反它。
-READ_TOOLS = {"trace_projects", "trace_read", "trace_search", "trace_untranslated"}
+# trace_flow 归读：它只是沿 inputs 求一遍传递闭包，派生结果，不存。
+# trace_check_paths 归**写**，尽管它读起来像查证：它把 checked= / missing= 写进 note.md。
+# 这一条值得单说——「路径还在不在」正是 auditor 该干的活，但按现在的工具集它够不着，
+# 只能报告给人再由人写回（见报告里的接缝）。
+READ_TOOLS = {"trace_projects", "trace_read", "trace_search", "trace_untranslated", "trace_flow"}
 WRITE_TOOLS = {"trace_new_project", "trace_insight", "trace_delete_step",
-               "trace_new_step", "trace_update_step", "trace_attach", "trace_translate"}
+               "trace_new_step", "trace_update_step", "trace_move_step",
+               "trace_check_paths", "trace_attach", "trace_translate"}
 
 
 def _split_tools(value) -> list:

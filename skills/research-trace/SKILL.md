@@ -6,17 +6,20 @@ description: "记录与查询科研步骤树（trace 系统，支持多项目）
 # trace — 科研步骤树
 
 **如果 `trace_*` 这组 MCP 工具可用，优先用它们**——参数有 schema、不用自己拼请求、
-中文不会撞终端编码。十一个工具：
+中文不会撞终端编码。十四个工具：
 
 | 工具 | 什么时候用 |
 |---|---|
 | `trace_projects` | 不确定该记到哪个项目时，先调它 |
 | `trace_read` | **动手之前**先读。给 `step` 就读那一步全文 + 溯源链 + L0–L4 |
-| `trace_search` | 「之前是不是试过 X」「为什么放弃了 Y」。不给 `project` 就搜全部项目 |
+| `trace_search` | 「之前是不是试过 X」「为什么放弃了 Y」「`best.pt` 是哪一步产出的」。搜标题/正文/标签/`path:` 与 `code:` 的位置/各语言译文；不给 `project` 就搜全部项目 |
+| `trace_flow` | 顺**数据依赖**看上下游：这个数字是从哪几步算出来的、改了它谁会跟着错 |
 | `trace_new_project` | 建项目。同一个课题的不同尝试是**分叉的步骤**，不是新项目 |
-| `trace_insight` | 项目级的沉淀：核心想法 / 有效 / 无效 / 坑 |
+| `trace_insight` | 项目级的沉淀：核心想法 / 有效 / 无效 / 坑。返回分配到的 id |
 | `trace_new_step` | 建步骤。**开跑之前就建**（`status=wip`） |
-| `trace_update_step` | 改状态 / 追加正文 / 追加产物路径 / 追加一条 `repro` |
+| `trace_update_step` | 改状态 / 追加正文 / 追加产物路径 / 追加数据依赖或代码位置 / 追加一条 `repro` |
+| `trace_move_step` | 这一步挂错了父节点。**`reason` 必填**，见「树形挂错了怎么办」 |
+| `trace_check_paths` | 在**当前这台机器上**逐条核对外部路径还在不在，结果写回 |
 | `trace_delete_step` | 真删。只用于误建、测试数据、粘进去的令牌 |
 | `trace_attach` | 传附件。**图片必须给 `caption`** |
 | `trace_translate` | 补一份译文。**唯一碰翻译的写入口，它永远不动原文** |
@@ -48,20 +51,24 @@ description: "记录与查询科研步骤树（trace 系统，支持多项目）
 
 | 字段 | 说明 |
 |---|---|
-| `id` | 服务端分配，永不变更。`003` 派生出 `004` / `004b` / `004c` |
-| `parent` | 单父，**同项目内**。写下之后不可改，改了返回 409 |
+| `id` | 服务端分配，**永不变更、不重发**。`003` 派生出 `004` / `004b` / `004c`。改它返回 409 |
+| `parent` | 单父，**同项目内**。**可以改，但要走 `trace_move_step` 并写清原因**。REST 上就是 `PATCH {parent, reason}`：不写原因 400，和别的字段混发也 400 |
 | `status` | 只有三个：`wip` / `done` / `dead` |
 | `title` `date` `commit` `author` `tags` | 展示用。`date` 不给的话服务端填当天 |
 | `key` | 幂等键。见规矩 5 |
 | `body` | 自由正文，按 `FORMAT.md` 的五个小节写 |
-| `paths` | 外部产物的位置，`位置 \| 说明`。整组替换；`add_paths` 是追加 |
+| `paths` | 外部产物的位置，`位置 \| 角色 \| 说明 \| k=v`。整组替换；`add_paths` 是追加。见「产物路径」一节 |
+| `inputs` | **数据依赖**：`步骤 id \| 消费的是哪份产物`。整组替换；`add_inputs` 是追加。见「`parent` 和 `inputs`」一节 |
+| `code` | 代码在哪：`kind \| 位置 \| k=v`，kind ∈ `git` / `snapshot` / `container`。整组替换；`add_code` 是追加 |
 | `repro` | 复现记录，**只能追加**。见「复现记录」一节 |
+| `moved` | 只读。这一步被挪过位置的审计，顺序即历史。只有 `trace_move_step` 写得了它 |
 | `digest` | `sha256(note.md 原始字节)[:12]`。用来做冲突检测，见「别覆盖掉别人的写入」 |
-| `lang` | 只读。`note.md` **自己**是什么语言（`zh` / `en` …）。不写就是没声明，系统不猜；写入接口没有这个参数，要声明就手写进 `note.md` |
+| `lang` | `note.md` **自己**是什么语言（`zh` / `en` …）。不写就是没声明，系统不猜。可以在建步骤或 PATCH 时给 |
 | `tr` | 这一步的全部译文，按语言码：`{"en": {"title": …, "body": …}}`。只读，改它走 `trace_translate` |
 
-派生字段（`children` `backlinks` `files` `lineage` `lane` `row` `tree` `trace` `tr`）由服务端算出，
-**不要试图写它们**。
+派生字段（`children` `consumers` `backlinks` `files` `lineage` `lane` `row` `tree` `trace` `tr`）
+由服务端算出，**不要试图写它们**。`consumers`（谁消费了本步的产物）是 `inputs` 的反向边，
+扫描现算——**别在被消费的那一步上再记一份**，那就是双真相源。
 
 ## 规矩
 
@@ -80,6 +87,8 @@ description: "记录与查询科研步骤树（trace 系统，支持多项目）
    留在仓库外，正文里记路径 + 校验和 + 大小。附件名**别带空格和括号**（理由见 FORMAT.md 第 5 节）。
 7. **不确定该记到哪个项目就问**，不要随便挑一个，更不要新建项目。
 8. **写完一步想一句**：这一步有没有产生**项目级**的教训？有就 `trace_insight` 记一条。
+9. **输入不是只来自 parent 那一步就写 `inputs`**。读了 013 和 014 的文件，就写两条——
+   树上只挂得下一个 parent，而「这个数字是从哪来的」要靠它才追得到。
 
 ## 别覆盖掉别人的写入
 
@@ -100,8 +109,105 @@ call("PATCH", p("/steps/004"), {
   用新的 `digest` 再存一次。原样重试等于把这期间人写的东西抹掉。
 - MCP 的 `trace_update_step` 用 `append` 参数就够了（它先读再拼，不整组替换）。
 
-优先用追加：`append`（正文）、`add_paths`（产物路径）、`repro`（复现记录）。
-整组替换只在真的要重写整段时用。
+优先用追加：`append`（正文）、`add_paths`（产物路径）、`add_inputs`（数据依赖）、
+`add_code`（代码位置）、`repro`（复现记录）。整组替换只在真的要重写整段时用。
+
+## `parent` 和 `inputs` 是两件事（**最容易搞混的一对**）
+
+> **`parent` 是「我当时接着哪一步想」，`inputs` 是「这些字节从哪来」。**
+
+树是**单父**的，数据流是 **DAG**。一步的输入完全可能同时来自两步，而树上只挂得下一个：
+
+```python
+call("POST", p("/steps"), {
+    "parent": "013b",                            # 我接着 013b 的判定往下想
+    "title": "口袋-配体配对", "status": "wip",
+    "inputs": ["013 | pocket_composition.csv",   # 但实际读的是这两份文件
+               "014 | rmscore_pairs.csv"],
+    "body": "## 为什么\n013b 给出了纯 RNA 口袋的判定阈值，接着要把口袋和配体配起来。\n",
+})
+```
+
+建完之后再补也一样：`{"add_inputs": ["014 | rmscore_pairs.csv"]}`。
+
+判断该写哪个，问自己一句：**我这一步真的读了那一步产出的文件吗？**
+
+- 读了 → `inputs`（把文件名写在竖线右边，半年后就是它救场）
+- 只是"接着那个结论往下想"、或者只是想指一下 → `parent` / 正文里的 `[[013b]]`
+
+**别把 `inputs` 当成第二个 parent。**写 `inputs` 不改变树，也不改变面包屑。
+
+三件跟着来的事：
+
+1. **可溯源性沿数据依赖上溯。**013 什么都没记，你这一步的整链等级就被 013 压住，
+   哪怕 013 根本不在你的 `lineage` 里。`trace_read` 返回的最弱一环会告诉你它是从
+   哪条边找到的——补记录要从**那一步**补起。
+2. **反向边是算出来的。**「013 的产物被谁用了」用 `trace_flow` 现查，
+   不要去 013 上再记一份。
+3. 目标步骤还不存在也允许写（建立顺序不定），只会得到一条 `dangling_input` 警告。
+
+## 产物路径写细一点（`paths`）
+
+最简写法 `位置 | 说明` 一直有效。要让机器读得到就再分段：
+
+```python
+call("PATCH", p("/steps/016"), {"add_paths": [
+    "/orange/组/pockets | output | 纯 RNA 口袋 | n=4554 size=620756992 md5=7d4e1a9c",
+]})
+```
+
+- 第 0 段永远是位置；整段**恰好**是 `input` / `script` / `output` / `evidence`
+  之一 → 它是**角色**；整段的空白 token **全部**形如 `k=v` → 它们是**属性**；
+  其余一律拼进**说明**
+- 已知属性：`size`（**字节数**，不要写「12 GB」）· `n`（条目数）· `md5` / `sha256` ·
+  `checked` / `missing`（`YYYY-MM-DD`）。认不出的属性照样保留
+- `checked=` 是「最后一次确认它**存在**」，`missing=` 是「最后一次确认它**不存在**」。
+  两个都在时看日期，晚的说了算
+
+**这两个日期别手写。**去核对是 `trace_check_paths` 的事（它在**当前这台机器上**
+逐条 stat）。跑在超算上就核对得了 `/blue/…`，跑在别处就全是「够不着」。
+**够不着 ≠ 不存在**——把「我这儿看不见」写成「没了」，得到的是一条看起来像证据的
+假结论，比没有结论有害得多。路径确认没了也**不删那一行**：「这份数据当年在这儿，
+现在没了」是溯源结论。
+
+## 代码不在 git 里的时候（`code`）
+
+L2「可定位」要的是**代码找得回来**，不是非得有 commit。三条路任选：
+
+```python
+call("PATCH", p("/steps/016"), {"add_code":
+     "snapshot | /orange/组/run_snapshots/20260809 | manifest=MANIFEST.md5 n=43"})
+```
+
+| kind | 什么时候 |
+|---|---|
+| `git` | 代码在 git 仓库里（也可以继续只写 `commit`，两者等价） |
+| `snapshot` | 超算上直接改的脚本，跑完打一个快照目录 + 逐文件校验和。**必须记目录位置** |
+| `container` | 跑在容器里，记镜像地址或 `digest=` |
+
+`commit` 会被自动折算成一条 `code: git`，**别再手写一条重复的**——同一个事实存两处
+正是这套系统最忌讳的。有没有 `manifest` / 校验和不额外分级（那是 L3/L4 的事）。
+
+## 树形挂错了怎么办（`trace_move_step`）
+
+「只追加」的地基是**不丢历史**，不是不能改结构。所以：
+
+- **`id` 永远不改。**`[[003b]]` 和论文脚注里的引用要一直有效。
+- **`parent` 可以改**，但每改一次都会在 `note.md` 里永久留下一行
+  `moved: 日期 | 原 parent | 新 parent | 谁 | 原因`。
+
+```
+trace_move_step(project="我的课题", step="016", parent="013b",
+                reason="补原子的产物从未进过下游计算，016 真正接着的是 013b 的判定")
+```
+
+- **`reason` 必填**，空的直接拒绝。写清楚是**哪条数据依赖**决定了新的父子关系，
+  别写「修正结构」——半年后看到一棵和创建顺序对不上的树，唯一能解释它的就是这句话
+- 移动会带走**整棵子树**；不能挂到自己或自己的后代下面；目标必须在同一个项目里
+- 移动**不改变 `inputs`**。树形改对了，数据依赖该怎么写还是怎么写
+
+**绝对不要用「对调两个节点的正文」来修树形。**那会让创建日期和内容对不上号、
+`[[013b]]` 悄悄指向另一个东西，而且一条记录都不留——移动加一句原因，历史反而完整。
 
 ## 复现记录（`repro`）
 
@@ -131,11 +237,12 @@ MCP 那边是 `trace_update_step(project=…, step="004", repro="verified | … 
 |---|---|
 | L0 | 「为什么」或「做了什么」空着，或有图没图注，或 `done`/`dead` 却没结论 |
 | L1 | 上面这些都齐了 |
-| L2 | L1 + 记了 `commit` + 记了产物 `path` |
+| L2 | L1 + **代码找得回来**（`commit` 或任意一条 `code`）+ 记了产物 `path` |
 | L3 | 已经到 L2，且有一条 `repro: runnable` |
 | L4 | 有一条 `repro: verified`（最后那条说了算） |
 
-**等级受祖先制约**：001 没记数据在哪，004 写得再全，整条链也追不到底。
+**等级受依赖制约，而依赖 = `parent` ∪ `inputs`**：001 没记数据在哪，004 写得再全，
+整条链也追不到底；数据依赖同样算数，最弱的那一环可能根本不在 `lineage` 里。
 所以被问到"要不要补记录"时，**从 `weakest` 指的那一步补起**，不是从最新那一步补起。
 
 ## 正文模板
@@ -207,6 +314,28 @@ call("PATCH", "/api/projects/" + PROJ,
 
 一条一行，`- ` 开头，要能被 `grep` 一行捞出来。带上出处：正文里写 `[[004]]`。
 
+### 每条洞察都有 id，别写重复的
+
+`trace_insight` 会分配一个 id（`p1`、`p2`…，写在行首的反引号里）并在返回值里
+告诉你。后来发现当时那条不准了，**不要再手写一条相似的**，两条路二选一：
+
+| 情况 | 怎么做 |
+|---|---|
+| 同一件事说得更准了（数字更正、指回的步骤换了） | 给 `id`，就地改那一行 |
+| 结论被**新的结论取代**了 | 新记一条，带上 `supersedes` |
+
+```python
+call("PATCH", "/api/projects/" + PROJ, {"add_insight": {
+    "kind": "pitfall", "text": "PDBFixer 误杀 944 个带修饰残基", "supersedes": "p1"}})
+```
+
+落到文件里是 `` - `p2` PDBFixer 误杀 944 个带修饰残基 · 取代 p1 ``。
+
+- **被取代的那条不删。**「当时以为是 1,099 个」本身是信息——删掉它，半年后的人
+  会以为一开始就查清楚了，然后重走一遍那条弯路。界面上它折叠显示
+- **「p1 已被取代」是派生的**，只写在取代者身上。别去 p1 那一行上再补一句
+- id 在整个 `project.md` 内唯一（跨小节、跨译文），所以「见 p1」永远指得到同一条
+
 `project.md` 里还有一个 `## 已删除` 小节，由系统在删除步骤时自己写。
 **永远不要动它**——目录已经没了，那一行是「为什么删的」仅存的证据。
 
@@ -251,9 +380,9 @@ trace_translate(project="我的课题", lang="en",          # 省略 step = 翻�
 
 ### 绝不要往翻译文件里写结构字段
 
-`id` · `parent` · `status` · `date` · `commit` · `author` · `tags` · `path` · `repro` · `key`
+`id` · `parent` · `status` · `date` · `commit` · `author` · `tags` · `path` · `repro` · `key` · `input` · `code` · `moved`
 
-这十个键写进译文会被**一律忽略**，并产出一条警告。
+这十三个键写进译文会被**一律忽略**，并产出一条警告。
 
 **理由不是洁癖。**上一代系统就是死在双真相源上：同一个事实存在两个地方，
 写一处漏一处，页面上永远有一半是错的。要改状态、改 commit、加 `repro`，
@@ -305,9 +434,11 @@ Base = `TRACE_URL`（形如 `https://你的域名/t/<space>`）。
 | GET | `/api/status` — 版本、项目数、步骤数、git 同步状态、`write_protected` | — |
 | GET | `/api/git` — 自动 git 同步的状态（`ok` / `summary` / `hint`） | — |
 | POST | `/api/projects` — `{name}` | Bearer |
-| PATCH | `/api/projects/{项目}` — `{name}` / `{insights}` / `{add_insight:{kind,text}}` | Bearer |
-| POST | `/api/p/{项目}/steps` — `{parent, title, status, body, date, commit, author, key, tags, paths}` | Bearer |
-| PATCH | `/api/p/{项目}/steps/{id}` — `status` `title` `body` `date` `commit` `author` `tags` `paths` `add_paths` `add_repro`；可带 `expect` | Bearer |
+| PATCH | `/api/projects/{项目}` — `{name}` / `{insights}` / `{add_insight:{kind,text,supersedes?}}` 追加并回 id / `{add_insight:{id,text?}}` 就地改 | Bearer |
+| POST | `/api/p/{项目}/steps` — `{parent, title, status, body, date, commit, author, key, tags, paths, inputs, code, lang}` | Bearer |
+| PATCH | `/api/p/{项目}/steps/{id}` — `status` `title` `body` `date` `commit` `author` `tags` `lang` `paths` `inputs` `code` `add_paths` `add_repro` `add_inputs` `add_code`；可带 `expect` | Bearer |
+| PATCH | `/api/p/{项目}/steps/{id}` — **移动**：`{parent, reason}`，`reason` 必填且这一次请求里不能夹带别的字段 | Bearer |
+| POST | `/api/p/{项目}/steps/{id}/paths/check` — `{loc, exists, date?, size?, n?}`，`exists` 必须显式 true/false | Bearer |
 | DELETE | `/api/p/{项目}/steps/{id}` — `{reason}` 必填 | Bearer |
 | PUT | `/api/p/{项目}/steps/{id}/tr/{lang}` — 这一步的译文 `{title, body}`；可带 `expect`（对的是**译文自己**的 digest） | Bearer |
 | DELETE | `/api/p/{项目}/steps/{id}/tr/{lang}` — 撤掉一个语言版本，原文不受影响 | Bearer |
@@ -356,7 +487,9 @@ call("PATCH", p(f"/steps/{step['id']}"), {"status": "done", "expect": step["dige
 |---|---|
 | **401** | 令牌不对或没填。**不是**磁盘故障——文件系统的错误不会返回 401 |
 | **409** + `expect`/`digest` | 冲突检测拦下了。重新读、合并、带新 `digest` 再存。**别原样重试** |
-| **409** 其它 | 改了 `id`/`parent`，或者幂等键/目录撞车。读错误正文，别硬来 |
+| **409** 其它 | 改了 `id`，把一步挂到了自己的后代下面，或者幂等键/目录撞车。读错误正文，别硬来 |
+| **400** 移动相关 | 没写 `reason`、新旧 parent 一样（空操作）、或者这次请求里把移动和别的字段混在一起发了。按错误正文单独发一次移动请求 |
+| **400** `exists 必须显式给` | 路径核对没给 `exists`。**「没给」不等于「不存在」**——够不着就别发这个请求 |
 | **400** `kind: name_too_long` | 文件名太长（Windows 整条路径 260、Linux 单个文件名 255 **字节**，一个中文 3 字节）。换个短名字 |
 | **409** `kind: locked` / **403** `permission` | 文件被占用 / 权限不足。可以过一会儿重试 |
 | **507** `disk_full` / **503** `unavailable` | 磁盘满 / 网络盘掉线。**告诉用户**，别静默重试 |
@@ -369,7 +502,14 @@ call("PATCH", p(f"/steps/{step['id']}"), {"status": "done", "expect": step["dige
 
 - 不要直接改服务器上的文件绕过 API（本地 clone 里手写 note.md 再 push 是可以的，
   但必须是 UTF-8，且照 `FORMAT.md` 的 front-matter 写）
-- 不要试图改 `id` 或 `parent`——只追加是这套系统的地基
+- 不要试图改 `id`——它永不变更，`[[003b]]` 和论文脚注靠它一直有效
+- 改 `parent` 不要偷偷来：走 `trace_move_step`（REST 是 `{parent, reason}`）并写清原因。
+  **更不要用「对调两个节点的正文」来修树形**——那会让创建日期和内容对不上号，
+  而且一条记录都不留
+- 不要把 `inputs` 当成第二个 `parent`。它不改变树，只说明「这些字节从哪来」
+- 不要手写 `path` 的 `checked=` / `missing=`：那两个日期的意思是「**真去看过**」。
+  去核对用 `trace_check_paths`，够不着的时候什么都别写
+- 不要因为一条洞察说得不准就再写一条相似的：给 id 就地改，或者带 `supersedes` 取代它
 - **不要用 `trace_delete_step` 处理失败的实验。** 试过、走不通，那是 `status=dead`，
   是研究结论，也是这套系统里最有价值的东西。删除只用于"这条记录本身就不该存在"
   （误建、测试数据、粘进去的令牌）。删了会有三个代价：id 可能被重用、

@@ -41,8 +41,11 @@ def test_each_kind_lands_in_its_own_section(root: Path):
     b = body_of(root)
     for heading in ("核心想法", "有效", "无效", "坑"):
         assert f"## {heading}" in b
-    # 每条都落在自己的小节下，不会串
-    assert b.split("## 无效")[1].split("##")[0].strip() == "- 不管用"
+    # 每条都落在自己的小节下，不会串。断言走 parse_insights 而不是逐字比对整行：
+    # 洞察现在带 id（`p3`），把 id 的形状写进断言，等于以后改一次 id 格式就要改一遍测试。
+    fails = core.parse_insights(b)["fails"]
+    assert [i["text"] for i in fails] == ["不管用"]
+    assert fails[0]["id"], "每条洞察都要分到一个 id，否则说不出「· 取代 p1」"
 
 
 def test_unknown_kind_is_refused(root: Path):
@@ -57,7 +60,8 @@ def test_empty_text_is_refused(root: Path):
 
 def test_newlines_are_flattened_so_bullets_stay_bullets(root: Path):
     W.update_project(root, "课题", add=("idea", "第一行\n第二行"))
-    assert "- 第一行 第二行" in body_of(root)
+    assert core.parse_insights(body_of(root))["idea"][0]["text"] == "第一行 第二行"
+    assert "- `p1` 第一行 第二行" in body_of(root), "落盘仍然是一行，id 在行首的反引号里"
 
 
 def test_renaming_keeps_the_insights(root: Path):
@@ -76,9 +80,15 @@ def test_replacing_the_whole_body_works(root: Path):
 
 
 def test_insights_are_greppable_in_project_md(root: Path):
+    """G4：删掉全部程序之后，`grep -rn 近重复 projects/` 仍然要能捞到这条判断。
+
+    id（`p1`）挤在行首，但 grep 的是内容，不是行首——这一条钉的正是「加了 id
+    之后那句人话仍然在同一行上，没有被拆到别处去」。
+    """
     W.update_project(root, "课题", add=("pitfall", "测试集有近重复"))
     text = (core.project_dir(root, "课题") / core.PROJECT_NOTE).read_text(encoding="utf-8")
-    assert "- 测试集有近重复" in text
+    assert "- `p1` 测试集有近重复" in text
+    assert [ln for ln in text.split("\n") if "近重复" in ln] == ["- `p1` 测试集有近重复"]
     assert text.startswith("---\nname: 课题\n---")
 
 
@@ -106,6 +116,56 @@ def test_mcp_insight_rejects_a_bad_kind(root: Path):
     be = M.LocalBackend(root)
     with pytest.raises(M.ToolError):
         M.dispatch(be, "trace_insight", {"project": "课题", "kind": "随便", "text": "x"})
+
+
+def test_mcp_insight_tells_the_caller_which_id_it_got(root: Path):
+    """不回传 id，agent 就永远说不出下一句「· 取代 p1」——而「取代了谁」只写在取代者身上，
+    没有第二个地方能补。"""
+    be = M.LocalBackend(root)
+    out = M.dispatch(be, "trace_insight", {
+        "project": "课题", "kind": "pitfall", "text": "PDBFixer 误杀 1,099 个带修饰残基"})
+    assert "`p1`" in out
+    assert core.parse_insights(body_of(root))["pitfall"][0]["id"] == "p1"
+
+
+def test_mcp_insight_supersedes_folds_the_old_one_but_never_deletes_it(root: Path):
+    """被取代的那条**留在磁盘上**。删掉它，半年后的人会以为一开始就查清楚了，
+    然后重走一遍那条弯路——「当时是这么以为的」本身是信息。"""
+    be = M.LocalBackend(root)
+    M.dispatch(be, "trace_insight", {"project": "课题", "kind": "pitfall", "text": "误杀 1,099 个"})
+    out = M.dispatch(be, "trace_insight", {
+        "project": "课题", "kind": "pitfall", "text": "查清了，是 944 个", "supersedes": "p1"})
+    assert "`p2`" in out and "p1" in out
+    items = {i["id"]: i for i in core.parse_insights(body_of(root))["pitfall"]}
+    assert "误杀 1,099 个" in items["p1"]["text"], "旧的那条一个字都不能少"
+    assert items["p2"]["supersedes"] == ["p1"]
+    assert items["p1"]["superseded_by"] == ["p2"], "反向关系是派生的，磁盘上只写在取代者身上"
+
+
+def test_mcp_insight_can_reanchor_an_existing_line_in_place(root: Path):
+    """重新锚定走的是「改那一行」，不是「再记一条」——id 不变，别处的「· 取代 p1」还指得对。"""
+    be = M.LocalBackend(root)
+    M.dispatch(be, "trace_insight", {"project": "课题", "kind": "fails", "text": "回译没用",
+                                     "step": "013"})
+    M.dispatch(be, "trace_insight", {"project": "课题", "id": "p1", "text": "回译没用",
+                                     "step": "013b"})
+    items = core.parse_insights(body_of(root))["fails"]
+    assert len(items) == 1, "改写不该多出一条"
+    assert "[[013b]]" in items[0]["text"] and "[[013]]" not in items[0]["text"].replace("[[013b]]", "")
+
+
+def test_mcp_insight_needs_kind_and_text_unless_it_is_an_edit(root: Path):
+    be = M.LocalBackend(root)
+    with pytest.raises(M.ToolError, match="kind"):
+        M.dispatch(be, "trace_insight", {"project": "课题", "text": "只给了文本"})
+
+
+def test_mcp_insight_refuses_to_point_at_an_insight_that_does_not_exist(root: Path):
+    """「· 取代 p9」指向一条不存在的记录，比不写更糟：它是给读的人看的指路牌。"""
+    be = M.LocalBackend(root)
+    with pytest.raises(M.ToolError):
+        M.dispatch(be, "trace_insight", {"project": "课题", "kind": "works", "text": "x",
+                                         "supersedes": "p9"})
 
 
 def test_insight_kinds_match_between_schema_and_writer():

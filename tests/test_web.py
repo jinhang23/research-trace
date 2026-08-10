@@ -416,9 +416,14 @@ def test_the_export_does_not_offer_server_only_controls():
 def test_narrow_screens_default_to_the_list_view():
     """图视图的画布是绝对像素宽，375px 上等于一屏一个节点全靠横向拖。"""
     assert "NARROW" in APP
-    m = re.search(r"var view = savedView[\s\S]*?;", APP)
+    # 加了第三个视图（数据流）之后判定从「是不是那两个字面量之一」改成查 VIEWS 表，
+    # 所以这里跟着改成对新写法断言——要防的那件事没变：**存过偏好就听用户的**，
+    # 只有什么都没存过时才按屏宽给默认值。
+    m = re.search(r"var view = VIEWS\.indexOf\(savedView\)[\s\S]*?;", APP)
     assert m and "innerWidth" in m.group(0)
-    assert 'savedView === "graph"' in m.group(0), "存过偏好就必须听用户的"
+    assert ">= 0 ? savedView" in m.group(0), "存过偏好就必须听用户的"
+    vs = re.search(r"var VIEWS = (\[[^\]]*\]);", APP)
+    assert vs and set(json.loads(vs.group(1))) == {"graph", "list", "flow"}
 
 
 def test_the_header_and_dialogs_survive_a_phone_width():
@@ -523,15 +528,47 @@ def test_no_ui_text_is_hardcoded_in_the_page():
     assert leftover <= {"中"}, f"index.html 里还有写死的中文：{leftover}"
 
 
+def closed_vocab_literals() -> set[str]:
+    """app.js 里允许出现中文的那几处**封闭词表**（不是界面文案）。
+
+    它们是 project.md 里真实写着的字：小节名、以及「取代」这个连接词。
+    切换界面语言绝不能让它们变——变了就解析不回来，用户在框里删不掉自己看见的
+    东西，或者一条「· 取代 p1」写得进去、读不回来。
+    每一张表都在下面那条测试里对着 trace_core 逐字核过，所以放行它们并没有
+    在这条断言上开口子：多写一个字仍然会被那一条抓住。
+    """
+    out = set(re.search(r"var INSIGHT_HEADINGS = \[([^\]]*)\];", APP).group(1).replace('"', "").split(", "))
+    out |= set(re.search(r"var SUPERSEDE_WORDS = \[([^\]]*)\];", APP).group(1).replace('"', "").split(", "))
+    body = re.search(r"var INSIGHT_KIND_BY_HEADING = \{([\s\S]*?)\};", APP).group(1)
+    out |= set(re.findall(r'"([^"]+)":', body))
+    return {x.strip() for x in out}
+
+
+def test_the_insight_vocabulary_in_app_js_matches_the_core_side():
+    """洞察那两张封闭词表必须和 trace_core 逐字一致。
+
+    网页要按条渲染洞察（id、取代了谁、被取代的折叠起来），就得读得懂
+    trace_core.parse_insights 认的那套写法。少认一个小节名 = 那一节在界面上
+    退化成一段没有关系的 bullet；「取代」少一个字 = 取代关系整条消失，
+    而磁盘上它明明写着。
+    """
+    import trace_core as core  # noqa: PLC0415
+
+    body = re.search(r"var INSIGHT_KIND_BY_HEADING = \{([\s\S]*?)\};", APP).group(1)
+    got = dict(re.findall(r'"([^"]+)":\s*"(\w+)"', body))
+    assert got == core.INSIGHT_KEY_BY_NAME, "小节名词表和 core 对不上"
+    words = re.search(r"var SUPERSEDE_WORDS = \[([^\]]*)\];", APP).group(1)
+    assert set(x.strip().strip('"') for x in words.split(",")) == set(core.SUPERSEDE_NAMES.values())
+
+
 @needs_node
 def test_no_ui_text_is_hardcoded_in_app_js():
     """app.js 的字符串字面量里不许再有界面文案。
 
-    唯一的例外是 INSIGHT_HEADINGS：那四个字符串不是界面文案，是 project.md 里
-    真实的小节名（必须和 trace_write.INSIGHT_SECTIONS 逐字一致），
-    切换界面语言不该让它们变——变了就切错小节，用户在框里删不掉自己看见的东西。
+    例外只有那几张**封闭词表**（见 closed_vocab_literals）：它们不是界面文案，
+    是 project.md 里真实写着的字，而且各自被一条对着 trace_core 的一致性断言钉住。
     """
-    allowed = set(re.search(r"var INSIGHT_HEADINGS = \[([^\]]*)\];", APP).group(1).replace('"', "").split(", "))
+    allowed = closed_vocab_literals()
     bad = [(n, s) for n, s in js_string_literals(APP) if CJK.search(s) and s.strip() not in allowed]
     assert not bad, "app.js 里还有没走 i18n 的中文文案：" + "; ".join(f"{n}:{s[:40]}" for n, s in bad)
 
@@ -667,3 +704,274 @@ def test_translation_saves_carry_their_own_expect():
     assert "expect: s.digest" in save, "原文那条链不受影响"
     r = re.search(r"function resolveConflict[\s\S]*?\n  \}\n", APP).group(0)
     assert "putTranslation(c.id, c.lang" in r, "409 之后「用我的覆盖」不支持译文"
+
+
+# ---------------------------------------------------------------- ③ 结构化路径
+
+
+@needs_node
+def test_the_web_serialises_paths_exactly_like_the_core_does():
+    """编辑框里那几行 path 的写法，必须和 trace_core.format_path 逐字一样。
+
+    这是这一轮**最贵**的一条：网页的编辑框是整组回写的（框里有什么，磁盘上就
+    有什么）。少还原一段 role、少还原一个 `md5=`，用户改一下标题，刚核对完的
+    164 条校验和就没了，而且一声不响。两边的实现分头写了两份，那就必须对着
+    同一批真实形状逐条比对，不能靠「我看了一眼觉得一样」。
+    """
+    import trace_core as core  # noqa: PLC0415
+
+    rows = [
+        "/orange/lab/pockets | output | 纯 RNA 口袋 | n=4554 size=620756992 md5=7d4e1a9c",
+        "/blue/lab/cif_files | input | 原始 CIF | size=61203283968 missing=2026-08-09",
+        "/blue/组/用户/data/agnews-clean | 去重后的训练集，12 GB",
+        "https://github.com/x/y/tree/9b7d112 | script | 跑这一步的代码",
+        "s3://bucket/exports/run042.parquet",
+        "/x | 说明里有 | 竖线，还写了 lr=3e-4 的那次运行",
+        "/y | evidence | nodes=88 whatever=1",
+    ]
+    parsed = [dict(p) for p in core.parse_paths("\n".join(rows))]
+    want = [core.format_path(p) for p in parsed]
+    r = subprocess.run(
+        [NODE, "-e",
+         "const U=require('./web/app.js');"
+         "const rows=JSON.parse(process.argv[1]);"
+         "console.log(JSON.stringify(rows.map(U.formatPath)))",
+         json.dumps(parsed)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(ROOT))
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout) == want
+
+
+@needs_node
+def test_the_web_serialises_inputs_and_code_exactly_like_the_core_does():
+    """input / code 两条同理：写回去的那一行要能被 trace_core 原样读回来。"""
+    import trace_core as core  # noqa: PLC0415
+
+    inputs = [dict(x) for x in core.parse_inputs("013 | pocket_composition.csv\n014")]
+    codes = [dict(x) for x in core.parse_code(
+        "snapshot | /orange/lab/run_snapshots/20260809 | manifest=MANIFEST.md5 n=43\n"
+        "container | ghcr.io/lab/img | digest=sha256:aa")]
+    r = subprocess.run(
+        [NODE, "-e",
+         "const U=require('./web/app.js');const a=JSON.parse(process.argv[1]);"
+         "console.log(JSON.stringify({i:a.i.map(U.formatInput),c:a.c.map(U.formatCode)}))",
+         json.dumps({"i": inputs, "c": codes})],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(ROOT))
+    assert r.returncode == 0, r.stderr
+    got = json.loads(r.stdout)
+    assert got["i"] == [core.format_input(x) for x in inputs]
+    assert got["c"] == [core.format_code(x) for x in codes]
+
+
+def test_the_editor_writes_back_the_structured_form_not_a_flattened_one():
+    """`位置 | 说明` 那种老写法回写会静默抹掉 role / 校验和 / 最后核对日期。"""
+    m = re.search(r"function pathsToText[\s\S]*?\n  \}\n", APP).group(0)
+    assert "U.formatPath" in m, "回写没走结构化序列化"
+    assert "p.location + (p.note" not in m, "还留着「位置 | 说明」那条老路"
+    code = re.search(r"function codeToText[\s\S]*?\n  \}\n", APP).group(0)
+    assert 'c.from !== "commit"' in code, "派生出来的那条 code 不许进编辑框（写回去等于存第二份）"
+
+
+def test_paths_are_grouped_by_role_and_missing_ones_are_called_out():
+    """「别人能看到这一步做了什么」本质上就是分清读进来的/跑的/写出去的/留作凭据的。"""
+    m = re.search(r"function renderPaths[\s\S]*?\n  \}\n", APP).group(0)
+    assert "U.PATH_ROLES" in m, "没有按 role 分组"
+    assert "path.summary.missing" in m, "整块没有汇总「有几处已经不存在了」"
+    facts = re.search(r"function pathFacts[\s\S]*?\n  \}\n", APP).group(0)
+    for key in ("path.n", "path.checksum", "path.checked", "path.missing", "path.unchecked"):
+        assert key in facts, f"{key} 没接上——大小/条目数/校验和/核对状态各要有位置"
+    assert "path.attr.unknown.title" in facts, "未知属性被吃掉了：认不出来不等于该删掉"
+
+
+def test_a_gone_location_is_visible_from_the_whole_project_not_just_one_step():
+    """用户这次是手工核对 164 条路径才发现三个目录没了（57 GB 的那个）。"""
+    assert 'id="missbar"' in HTML
+    m = re.search(r"function renderMissingPaths[\s\S]*?\n  \}\n", APP).group(0)
+    assert 'p.state === "missing"' in m and "path.summary.missing" in m
+    assert "data-goto" in APP, "汇总里的 id 得能点过去"
+    assert "renderMissingPaths();" in APP, "算了却没在刷新时调用"
+
+
+# ---------------------------------------------------------------- ① 移动
+
+
+def test_moving_a_step_requires_a_reason_before_anything_is_sent():
+    """原因是这条记录里唯一无法自动生成的部分。一个可选的输入框会让人先点了
+    确定才发现要写，转头就回去用「把两步的正文对调」那种不留痕迹的老办法。"""
+    m = re.search(r"function submitMove[\s\S]*?\n  \}\n", APP).group(0)
+    assert "move.err.reason" in m
+    assert m.index("if (!reason)") < m.index("papi("), "请求都发出去了才检查原因"
+    assert "reason: reason" in m, "原因没跟着请求走"
+    assert 'required' in HTML.split('id="dlg-move"')[1].split("</dialog>")[0], "原因框在 HTML 上是可选的"
+
+
+def test_a_move_that_would_close_a_loop_is_refused_on_the_spot():
+    """成环 / 挂到自己的后代下面不是笔误，是想法本身有问题——不能等服务端 400。"""
+    m = re.search(r"function paintMoveErr[\s\S]*?\n  \}\n", APP).group(0)
+    assert "U.moveError" in m
+    for key in ("move.err.self", "move.err.descendant", "move.err.noop", "move.err.missing"):
+        assert key in m, f"{key} 没说出来"
+    assert '$("#mv-ok").disabled' in m, "判出问题了却还让人点得下去"
+
+
+def test_the_move_history_is_shown_and_says_who_and_why():
+    """一棵移动过的树本来就会和创建顺序对不上；不摆出来，那种对不上会被当成 bug。"""
+    m = re.search(r"function renderMoved[\s\S]*?\n  \}\n", APP).group(0)
+    for field in ("m.date", "m.from", "m.to", "m.reason", "m.by"):
+        assert field in m, f"移动记录里的 {field} 没显示"
+    assert "move.from.root" in m and "move.to.root" in m, "从根移走 / 移成根说不出来"
+    assert "renderMoved(s)" in APP, "算了却没插进详情面板"
+    marks = re.search(r"function nodeMarks[\s\S]*?\n  \}\n", APP).group(0)
+    assert "move.badge.title" in marks, "树上没有「这一步被移动过」的标记"
+
+
+# ---------------------------------------------------------------- ② 数据依赖
+
+
+def test_both_directions_of_the_data_dependency_are_listed_and_clickable():
+    m = re.search(r"function renderDeps[\s\S]*?\n  \}\n", APP).group(0)
+    assert "s.inputs" in m and "s.consumers" in m, "两个方向少一个"
+    assert "input.head" in m and "input.consumers.head" in m
+    assert "stepLink(" in m, "清单里的 id 点不过去"
+    assert "input.lead" in m, "少了「parent 是我当时接着哪一步想，input 是这些字节从哪来」那句话"
+    assert "renderDeps(s)" in APP
+
+
+def test_the_tree_views_admit_that_some_inputs_are_not_on_the_tree():
+    """不给这个标记，数据流视图就是一个没人知道该去点的按钮。"""
+    m = re.search(r"function nodeMarks[\s\S]*?\n  \}\n", APP).group(0)
+    assert "i.step !== s.parent" in m, "标记没有排掉「input 就是 parent」那种最常见的情况"
+    assert "count.inputs" in m and "input.parent.tip" in m
+
+
+def test_the_flow_view_is_a_third_view_not_a_panel():
+    """森林是单父树，数据流是 DAG——同一份文件的两种读法平级。"""
+    assert 'data-view="flow"' in HTML and 'id="fwrap"' in HTML
+    m = re.search(r"function renderFlow[\s\S]*?\n  \}\n", APP).group(0)
+    assert "U.flowLayout" in m, "布局没走纯函数层（那样就测不到，也不保证幂等）"
+    assert '"fedge k-" + e.kind' in m.replace("'", '"'), "边没有按 tree/data/both 分档画"
+    # 三档必须都真的有样子。少一档 = 那类边和别的长得一样，图例就在说谎。
+    for kind in ("k-tree", "k-data", "k-both"):
+        assert f".fedge.{kind}" in CSS or f"fedge.{kind}," in CSS, f"边的三档少了 {kind}"
+    assert "flowempty" in m, "一条 input 都没有时不说明，人会以为功能坏了"
+    ap = re.search(r"function applyView[\s\S]*?\n  \}\n", APP).group(0)
+    assert '$("#fwrap").hidden = view !== "flow"' in ap
+
+
+def test_the_flow_layout_is_deterministic_and_not_force_directed():
+    """力导向每次刷新形状都不一样，而形状本身是信息。"""
+    for banned in ("Math.random", "d3.force", "simulation"):
+        assert banned not in APP, f"数据流视图里出现了 {banned}"
+
+
+# ---------------------------------------------------------------- ⑤ code
+
+
+def test_all_three_kinds_of_code_location_are_shown():
+    m = re.search(r"function renderCode[\s\S]*?\n  \}\n", APP).group(0)
+    assert "code.kind." in m and "code.manifest" in m and "code.files" in m
+    assert 'c.from === "commit"' in m, "由 commit 派生出来的那条没有标出来"
+    assert "code.from.commit.title" in m
+    assert "renderCode(s)" in APP
+
+
+@needs_node
+def test_the_l2_explanation_no_longer_says_only_commit():
+    """L2 的判据放宽了：快照目录 + 逐文件校验和在可溯源性上不比 commit 差。"""
+    m = re.search(r"function renderTrace[\s\S]*?\n  \}\n", APP).group(0)
+    assert "code.l2.note" in m
+    r = subprocess.run([NODE, "-e", "const i=require('./web/i18n.js');"
+                                    "console.log(i.tIn('en','trace.level.L2.hint'))"],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(ROOT))
+    assert "snapshot" in r.stdout, "L2 的说明还只提 commit"
+
+
+# ---------------------------------------------------------------- ④ 洞察
+
+
+def test_superseded_insights_are_folded_not_deleted():
+    """你当初信的那件事是你走到今天的一部分；删了它，后来的更正看着像凭空冒出来。"""
+    m = re.search(r"function renderInsightBody[\s\S]*?\n  \}\n", APP).group(0)
+    assert "superseded_by" in m, "没有区分被取代的和当前的"
+    assert "insight.superseded.show" in m and "insold" in m
+    row = re.search(r"function insightRow[\s\S]*?\n  \}\n", APP).group(0)
+    assert "insight.supersedes" in row and "insight.superseded" in row, "两侧的标注少一边"
+    assert "insight.warn.missing" in row, "supersedes 指向不存在的 id 时不吭声"
+
+
+def test_one_insight_can_be_edited_by_its_id():
+    """重锚一条洞察就是改它文本里的 [[013]]——不该逼人整段重写。"""
+    assert "data-ins-edit" in APP and "insight.item.edit.prompt" in APP
+    assert "data-ins-sup" in APP and "insight.supersede.prompt" in APP
+    m = re.search(r'var ied = e\.target\.closest\("\[data-ins-edit\]"\);[\s\S]*?\n      return;\n    \}\n', APP).group(0)
+    assert "add_insight" in m and "id: eid" in m, "改一条洞察没有带上 id（那会变成新增一条）"
+
+
+def test_the_deleted_section_still_renders_verbatim():
+    """「## 已删除」里那几行是步骤被真删之后唯一还 grep 得到的证据。"""
+    m = re.search(r"function renderInsightBody[\s\S]*?\n  \}\n", APP).group(0)
+    assert "window.md.render(text" in m, "非洞察小节没有原样渲染出来"
+
+
+# ---------------------------------------------------------------- ⑥ 提示分档
+
+
+def test_hints_are_separated_from_the_warnings_that_actually_matter():
+    """混在一起显示，人很快就不再看警告栏了——而真会降级的条目才是要动手的。"""
+    m = re.search(r"function renderWarnings[\s\S]*?\n  \}\n", APP).group(0)
+    assert "U.warnLevel" in m
+    assert "lint.note" in m, "提示区没有写明「不影响等级」"
+    assert "lint.level." in m, "三个级别名没走 i18n"
+
+
+def test_hint_codes_are_exactly_the_ones_core_emits_without_changing_the_level():
+    """这张表要是和 core 对不上，要么真警告被降成提示、要么提示冒充警告。"""
+    m = re.search(r"var HINT_CODES = (\[[^\]]*\]);", APP)
+    assert m
+    got = set(json.loads(m.group(1)))
+    src = (ROOT / "trace_core.py").read_text(encoding="utf-8")
+    assert '"section_without_prose"' in src
+    # 另外两条 core 是拼出来的（f"{kind}_without_explanation"），所以查后缀
+    assert '_without_explanation"' in src, "core 不再发这一类 code 了，这张表就该跟着改"
+    assert {"section_without_prose", "table_without_explanation", "code_without_explanation"} == got
+    assert "missing_why" not in got, "真正会降级的诊断被降成了提示"
+
+
+def test_server_side_chinese_warnings_are_translated_where_we_know_how():
+    """服务端的 warning 是中文的。认得的换成本语言的说法，认不出的原样显示——
+    老老实实给中文，好过悄悄吞掉一条待办。"""
+    m = re.search(r"function warnText[\s\S]*?\n  \}\n", APP).group(0)
+    assert "return esc(w.message)" in m, "认不出来时把整条吞了（而且服务端那句话必须转义）"
+    assert "i18n.tHtml(m.key" in m, "文案里的 `行内代码` 会原样显示成反引号"
+    table = re.search(r"var WARN_MAP = \{[\s\S]*?\n  \};", APP).group(0)
+    for code in ("dangling_input", "self_input", "input_cycle",
+                 "section_without_prose", "table_without_explanation", "code_without_explanation"):
+        assert code in table, f"{code} 在界面上会漏出中文"
+
+
+@needs_node
+def test_the_chinese_warnings_really_do_get_translated_on_todays_messages():
+    """上一条只查了表在不在；这一条拿 trace_core **此刻真的发出来的那句中文**
+    走一遍界面侧的映射，占位符抠不出来就等于英文界面上原样漏出中文。"""
+    import trace_core as core  # noqa: PLC0415
+
+    a = core.Step(id="002", parent="", inputs=[{"step": "404", "note": ""}], dirname="002_x")
+    b = core.Step(id="003", parent="", inputs=[{"step": "003", "note": ""}], dirname="003_x")
+    ws = core.validate_inputs({"002": a, "003": b})
+    got = {w["code"]: w["message"] for w in ws}
+    assert {"dangling_input", "self_input"} <= set(got)
+    r = subprocess.run(
+        [NODE, "-e",
+         "const src=require('fs').readFileSync('web/app.js','utf8');"
+         "const m=/var WARN_MAP = \\{[\\s\\S]*?\\n  \\};/.exec(src)[0];"
+         "const WARN_MAP=eval('(' + m.replace(/^var WARN_MAP = /,'').replace(/;$/,'') + ')');"
+         "const ws=JSON.parse(process.argv[1]);"
+         "console.log(JSON.stringify(ws.map(w=>{const d=WARN_MAP[w.code];"
+         "if(!d||!d.pick) return {code:w.code,ok:!!d};"
+         "const g=d.pick.exec(w.message);return {code:w.code,ok:!!g,v:g&&g[1].trim()};})))",
+         json.dumps([{"code": k, "message": v} for k, v in got.items()])],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(ROOT))
+    assert r.returncode == 0, r.stderr
+    out = {x["code"]: x for x in json.loads(r.stdout)}
+    assert out["dangling_input"]["ok"] and out["dangling_input"]["v"] == "404", out
+    assert out["self_input"]["ok"] and out["self_input"]["v"] == "003", out

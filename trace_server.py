@@ -22,7 +22,10 @@ import hmac
 import json
 import mimetypes
 import secrets
+import time
 from contextlib import asynccontextmanager
+from datetime import date as _date
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
@@ -59,6 +62,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "token": "",
     "data_dir": ".",
     "git": {"enabled": False, "remote": "origin", "branch": "main", "debounce": 45},
+    # 定期核对外部路径。参数的取值理由见 sweep_path_checks 和 poller。
+    "paths": {"enabled": True, "every_hours": 24, "stale_days": 30, "budget": 500,
+              "first_delay": 300},
 }
 
 
@@ -137,6 +143,78 @@ def describe_oserror(exc: OSError) -> tuple[int, str, str]:
     return 500, "io_error", (
         f"文件系统报了一个没预料到的错误{tail}（errno={err}）。这次写入没有落盘，"
         "原来的内容还在。详细信息只写进了服务端日志——如果反复出现，去看服务器日志。")
+
+
+# ---------------------------------------------------------------- 路径核对
+
+
+def sweep_path_checks(root: Path, *, stale_days: int = 30, budget: int = 500,
+                      today: str = "") -> dict[str, int]:
+    """把本机看得见的外部路径逐条 stat 一遍，结果写回 `checked=` / `missing=`。
+
+    同步函数（磁盘 I/O 不小），调用方负责放进线程——poller 里那一段就是这么调的。
+    纯粹按参数工作、不读全局配置，所以测试可以直接调它而不用起一个服务。
+
+    **为什么服务端要自己跑一遍**：外部产物不在仓库里，只记了位置，而位置会失效。
+    用户上一次是**手工**核对 164 条路径才发现三个目录已经被删了（其中一个 57 GB）——
+    那本该是机器每天顺手做的事。
+
+    四道闸门，每一道都对着一种具体的伤害：
+
+    ① **远端一律不探测。** `s3://` / `https://` 交给 probe_path 判成够不着。
+       这条不是省事：任何能写记录的人都能往 `path:` 里塞一个内网地址，服务端要是
+       去发请求，就等于把「从这台机器发起请求」的权力交给了他（SSRF），而这台机器
+       恰好看得见整个数据仓。远端产物还在不在，只能由人核对后写回结论。
+
+    ② **够不着 ≠ 不存在。** 判据在 probe_path 里（上级目录看得见才敢下结论）。
+       服务器上没挂 /blue 时，一整批好好的记录会被盖上「已确认不存在」——
+       而 missing 是**结论**（P4），错误的结论比没有结论贵得多。
+
+    ③ **不数目录条目数。** stat 一个目录是毫秒级的，数它底下有多少个文件却要遍历
+       整棵树；那个 57 GB 的目录在网络盘上能跑几分钟，而这个 sweep 跑在服务进程里。
+       所以 n= 只在人显式要求时才数（trace_cli paths --check --count / MCP 的 count 参数）。
+
+    ④ **只在结论会变时才写。** 每天把 164 条 `checked=` 全刷一遍，等于每天给数据仓
+       造一次 164 个文件的 git 提交，而里面一个事实都没变。所以：从没核对过的写、
+       结论翻转的写、上次核对已经超过 stale_days 的写，其余跳过。
+
+    返回 {"probed", "written", "gone", "unreachable", "skipped"} —— 只是给日志用。
+    """
+    today = today or _date.today().isoformat()
+    fresh_after = (_date.fromisoformat(today) - timedelta(days=max(0, stale_days))).isoformat()
+    stat = {"probed": 0, "written": 0, "gone": 0, "unreachable": 0, "skipped": 0}
+
+    for p in core.scan_projects(root):
+        steps_dir = core.steps_dir_of(root, p.slug)
+        try:
+            steps, _files, _warns = core.scan(steps_dir, with_files=False)
+        except OSError:
+            continue
+        for s in steps:
+            for row in s.paths:
+                if stat["probed"] >= budget:
+                    stat["skipped"] += 1
+                    continue
+                last = row.get("checked") or row.get("missing") or ""
+                if row.get("state") and last >= fresh_after:
+                    stat["skipped"] += 1          # 还新鲜，没必要再看一眼
+                    continue
+                stat["probed"] += 1
+                state, size = mcp.probe_path(row["location"])
+                if state == mcp.PROBE_UNREACHABLE:
+                    stat["unreachable"] += 1
+                    continue
+                exists = state == mcp.PROBE_PRESENT
+                try:
+                    W.record_path_check(steps_dir, s.id, row["location"],
+                                        exists=exists, date=today, size=size)
+                except (W.WriteError, OSError):
+                    # 一条路径写不进去（记录被人手工改过、磁盘满了）不该让整轮扫描停下来。
+                    continue
+                stat["written"] += 1
+                if not exists:
+                    stat["gone"] += 1
+    return stat
 
 
 # ---------------------------------------------------------------- 状态
@@ -255,9 +333,9 @@ def search_hits(forests: list[tuple[str, str, dict[str, Any]]], query: str,
                 limit: int) -> tuple[list[dict[str, Any]], int]:
     """在若干个已经编译好的森林里做子串搜索。纯函数，方便整个丢进线程跑。
 
-    判定规则和 MCP 的 trace_search 一致（id / 标题 / 正文 / 标签 / **各语言的译文**，
-    大小写不敏感），人和 agent 搜同一个词必须搜到同一批东西——FORMAT.md 第 0 节
-    的「信息对等」。
+    判定规则和 MCP 的 trace_search 一致（id / 标题 / 正文 / 标签 /
+    **产物与代码的位置** / **各语言的译文**，大小写不敏感），人和 agent 搜同一个词
+    必须搜到同一批东西——FORMAT.md 第 0 节的「信息对等」。
 
     **译文也要搜**，这条不是可选项：这套系统的底线是「删掉全部程序，`grep -r` 还能
     回答『为什么放弃了 X』」，加了双语之后英文的 grep 也要能回答同一个问题。
@@ -288,6 +366,12 @@ def search_hits(forests: list[tuple[str, str, dict[str, Any]]], query: str,
                 where.append("tags")
             if q in s["id"].lower():
                 where.append("id")
+            # 「东西在哪」也要搜得到：「/orange/…/run042/best.pt 是哪一步产出的」
+            # 「谁用了 20260809 那个快照」正是 path: / code: 存在的主要用途，
+            # 而 `grep -rn best.pt projects/` 一秒就答得出。工具比 grep 弱的地方，
+            # 恰好是 agent 唯一够得到的地方。判据在 core，MCP 那侧用的是同一份。
+            if q in core.locations_haystack(s).lower():
+                where.append("paths")
 
             # 摘要优先取原文：原文是权威，译文只在原文没命中时才拿来当上下文，
             # 否则同一条命中在不同语言下会给出两段不一样的摘要。
@@ -357,10 +441,28 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
         debounce=float(cfg["git"].get("debounce", 45)),
     )
 
+    # 定期核对外部路径。默认开着、一天一遍：这件事的价值全在「不用记得去做」，
+    # 而它的代价被 sweep_path_checks 里那四道闸门压到了「几百次 stat + 只在结论
+    # 变了时才写」。first_delay 让头几分钟留给首屏——起服务的那一刻正是编译整棵树、
+    # 跑 git preflight 的时候，扫盘该往后站；顺带也让短命的进程（测试、`--selfcheck`）
+    # 一次都不会碰用户的记录。
+    psweep = {**(DEFAULT_CONFIG["paths"]), **(cfg.get("paths") or {})}
+
     async def poller() -> None:
+        next_sweep = time.monotonic() + float(psweep.get("first_delay", 300))
         while True:
             try:
                 await asyncio.sleep(POLL_SECONDS)
+                if psweep.get("enabled") and time.monotonic() >= next_sweep:
+                    next_sweep = time.monotonic() + float(psweep.get("every_hours", 24)) * 3600
+                    report = await asyncio.to_thread(
+                        sweep_path_checks, data_root,
+                        stale_days=int(psweep.get("stale_days", 30)),
+                        budget=int(psweep.get("budget", 500)))
+                    if report["gone"]:
+                        # 唯一值得打印的那一件事：有位置从「在」变成了「不在」。
+                        print(f"[trace] 路径核对：{report['gone']} 处外部产物已确认不存在"
+                              f"（记录保留，见各步的 path: … missing=）")
                 changed = await asyncio.to_thread(state.refresh_changed)
                 if changed:
                     # 同步由**文件变化**驱动，不由 API 调用驱动——这才是 P1
@@ -557,21 +659,42 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
 
     @app.patch(base + "/api/projects/{project}")
     async def api_update_project(project: str, request: Request) -> JSONResponse:
-        """改显示名和/或洞察。slug 不动——它是 URL 的一部分。"""
+        """改显示名和/或洞察。slug 不动——它是 URL 的一部分。
+
+        洞察那一条走 W.add_insight / W.update_insight（而不是 update_project 的 add=），
+        是为了把**分配到的 id** 放进响应：不知道刚写的那条叫 `p3`，调用方就说不出
+        下一句「· 取代 p3」，而「取代了谁」只写在取代者身上，没有别处能补。
+        带 `id` 就是就地改写那一条既有洞察——被它取代的那条一个字都不删。
+        """
         require_token(request)
         payload = await body_json(request)
-        add = None
-        if payload.get("add_insight"):
-            a = payload["add_insight"]
-            if not isinstance(a, dict) or not a.get("kind"):
-                raise W.WriteError('add_insight 要形如 {"kind": "idea", "text": "…"}')
-            add = (a["kind"], a.get("text", ""))
-        p = W.update_project(data_root, project,
-                             name=payload.get("name"),
-                             insights=payload.get("insights"),
-                             add=add)
+        info: dict[str, Any] = {}
+        a = payload.get("add_insight")
+        if a:
+            if not isinstance(a, dict) or not (a.get("kind") or a.get("id")):
+                raise W.WriteError(
+                    'add_insight 要形如 {"kind": "idea", "text": "…"}；'
+                    '要改既有的那一条就给 {"id": "p1", "text": "…"} 或 {"id": "p1", "supersedes": "p0"}')
+            lang = str(a.get("lang") or "")
+            if a.get("id"):
+                info = W.update_insight(data_root, project, str(a["id"]),
+                                        text=a.get("text"), supersedes=a.get("supersedes"), lang=lang)
+            else:
+                info = W.add_insight(data_root, project, str(a["kind"]), str(a.get("text") or ""),
+                                     supersedes=a.get("supersedes") or "", lang=lang)
+        if payload.get("name") is not None or payload.get("insights") is not None:
+            p = W.update_project(data_root, project,
+                                 name=payload.get("name"), insights=payload.get("insights"))
+        else:
+            hit = next((x for x in core.scan_projects(data_root) if x.slug == project), None)
+            if hit is None:
+                raise W.NotFound(f"项目 {project} 不存在")
+            p = hit
+        out = p.to_dict()
+        if info:
+            out["insight"] = info
         await touched([f"project:{p.slug}"])
-        return JSONResponse(p.to_dict())
+        return JSONResponse(out)
 
     # ---- 读 API ------------------------------------------------------
 
@@ -713,6 +836,10 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             key=payload.get("key", ""),
             tags=payload.get("tags"),
             paths=payload.get("paths"),
+            # 数据依赖和代码位置在建步骤时就该能写：一步的输入是「开跑之前」就知道的事，
+            # 逼调用方建完再 PATCH 一次，等于给「先建 wip 再开跑」这条规矩加了一道摩擦。
+            inputs=payload.get("inputs"),
+            code=payload.get("code"),
             lang=payload.get("lang", ""),
         )
         if created:
@@ -738,6 +865,36 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
         payload = await body_json(request)
         expect = read_expect(request, payload)
         steps = sd(project)
+
+        # `parent` 出现在 PATCH 里，而且和现在的值不一样 → 这是一次**移动**，
+        # 分流到 move_step（它会追加一行 moved: 审计，reason 必填）。
+        # 用户要的就是这个形状：PATCH {"parent": "013b", "reason": "…"}。
+        #
+        # 只在「真的变了」时分流：把整份步骤原样 PATCH 回来（网页保存正文就是这么干的）
+        # 里面必然带着一个没变的 parent，那不是一次移动，不该因为没写 reason 就 400，
+        # 更不该在历史里留下一条什么都没改的审计。
+        if "parent" in payload:
+            cur = W.load(steps).get(sid)
+            want = (str(payload.get("parent") or "").strip() or None)
+            if cur is not None and want != (cur.parent or None):
+                mixed = sorted(set(payload) - {"parent", "reason", "author", "date"})
+                if mixed:
+                    # 移动是一次独立的行为，它有自己的审计行。和改正文/状态混在一起发，
+                    # 要么得写两次盘（第二次的 expect 已经过期），要么得悄悄丢掉一半——
+                    # 两条都比多发一个请求糟。
+                    raise W.WriteError(
+                        "移动要单独发一次请求。这一次的请求体里还带着 "
+                        + "、".join(mixed)
+                        + " —— 先 PATCH {\"parent\": …, \"reason\": …} 把它移过去，"
+                        "再 PATCH 剩下的字段；那样两件事各自留下自己的记录。")
+                info = W.move_step(steps, sid, want, str(payload.get("reason") or ""),
+                                   by=str(payload.get("author") or ""),
+                                   date=str(payload.get("date") or ""), expect=expect)
+                await touched([f"{project}/{sid} 已移动"])
+                return JSONResponse(info)
+            payload.pop("parent")
+            payload.pop("reason", None)
+
         try:
             step = W.update_step(steps, sid, payload, expect=expect)
         except W.Conflict as exc:
@@ -749,6 +906,38 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             return JSONResponse(body, status_code=409)
         await touched([f"{project}/{sid}"])
         return JSONResponse(with_digest(steps, step))
+
+    @app.post(base + "/api/p/{project}/steps/{sid}/paths/check")
+    async def api_check_path(project: str, sid: str, request: Request) -> JSONResponse:
+        """记一次「这条路径还在不在」的核对结果。**只动机器字段，记录一律不删。**
+
+        为什么核对结果要有自己的写接口，而不是让扫描任务自己写文件：这个仓库只有
+        一条写入路径（trace_write），第二条写入路径正是上一代系统出 bug 的形状。
+        服务端的定期扫描、agent 的 trace_check_paths、CLI 的 `paths --check`，
+        三个入口最后都落到同一个 W.record_path_check 上。
+
+        `exists` **必须显式给 true / false**。默认成 false 的话，一个漏填字段的
+        客户端就能把「我没查」写成「已确认不存在」——而这条记录是要被后来人当成
+        结论读的。「够不着」的正确做法是**什么都不发**（见 trace_mcp.probe_path）。
+        """
+        require_token(request)
+        payload = await body_json(request)
+        exists = payload.get("exists")
+        if not isinstance(exists, bool):
+            raise W.WriteError(
+                'exists 必须显式给 true 或 false。「没给」不等于「不存在」——'
+                "看不见那条路径（远端位置、这台机器上没挂那个盘）时正确的做法是"
+                "不发这个请求，而不是发一个空的：missing 是要被人当成结论读的。")
+        for k in ("size", "n"):
+            v = payload.get(k)
+            if v is not None and (isinstance(v, bool) or not isinstance(v, int)):
+                raise W.WriteError(f"{k} 要么不给，要么是整数（size 是**字节数**，别写 \"12 GB\"）")
+        info = W.record_path_check(
+            sd(project), sid, str(payload.get("loc") or payload.get("location") or ""),
+            exists=exists, date=str(payload.get("date") or ""),
+            size=payload.get("size"), n=payload.get("n"))
+        await touched([f"{project}/{sid} 的路径核对"])
+        return JSONResponse(info)
 
     # ---- 翻译 --------------------------------------------------------
     #
