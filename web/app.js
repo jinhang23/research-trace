@@ -154,6 +154,16 @@
     (step.inputs || []).forEach(function (i) { bits.push(i.note || ""); });
     return bits.filter(Boolean).join(" ");
   }
+
+  /* 分叉那两句**人写的散文**：`decision:`（这个岔路口在决定什么）和候选自己那句
+     说明。理由和上面那条一模一样——`grep -rn "类别不平衡" projects/` 一秒就答得出
+     「当年是在哪个岔路口纠结这件事」，站内搜索答不出就等于比 grep 弱。
+     `decision:` 尤其不能漏：候选有谁、选中了谁都算得出来，唯独它只能人写。
+     取值（extends / alternative）**故意不收**：那不是散文，收进来搜任何一个词
+     都会命中半棵树。判据和 core.fork_haystack、服务端、MCP 是同一份。 */
+  function forkHay(step) {
+    return [step.decision || "", step.branch_note || ""].filter(Boolean).join(" ");
+  }
   function hay(step) {
     var tr = (step && step.tr) || {}, extra = "";
     Object.keys(tr).sort().forEach(function (l) {
@@ -161,7 +171,8 @@
       extra += " " + (e.title || "") + " " + (e.name || "") + " " + (e.body || "");
     });
     return (step.id + " " + (step.title || "") + " " + (step.body || "") + " "
-            + (step.tags || []).join(" ") + " " + locationsHay(step) + extra).toLowerCase();
+            + (step.tags || []).join(" ") + " " + locationsHay(step) + " " + forkHay(step)
+            + extra).toLowerCase();
   }
   function matches(step, q) {
     q = String(q || "").trim().toLowerCase();
@@ -425,8 +436,22 @@
    *
    * 这三条诊断服务端发的是 warn 级，但它们**不影响 L0–L4**。混在真警告里显示，
    * 人很快就不再看警告栏了——而警告栏里那些真的会降级的条目才是要人动手的。 */
-  var HINT_CODES = ["section_without_prose", "table_without_explanation", "code_without_explanation"];
+  /* 分叉那四条一起进来：它们同样一格等级都不降。尤其 undecided_fork ——
+     它的文案里明写着「同时开几条线是研究的常态，不是错」，把它摆进警告栏
+     就是拿一句安抚话去占一个要人动手的位置，人很快连真警告一起不看了。
+     decision_without_candidates 是 fork_without_decision 的镜像（写了「在决定
+     什么」却一个候选都没标），同样只差一句人写的话，和评级无关。 */
+  var HINT_CODES = ["section_without_prose", "table_without_explanation", "code_without_explanation",
+                    "lone_alternative", "fork_without_decision",
+                    "decision_without_candidates"];
+  /* 「还没做决定的岔路口」既不是缺陷也不是写法问题，是**待办**，
+     由页面上那条 #forkbar 专门说。它不进警告栏——
+     同一件事说两遍会让人以为自己犯了错，而人消除「错误」最省事的办法是
+     随手把一条支标成 dead，那是拿假结论换一屏干净的输出。
+     trace_cli.py 的 TODO_CODES 是同一条判断的另一半，两边必须一致。 */
+  var TODO_CODES = ["undecided_fork"];
   function warnLevel(w) {
+    if (w && TODO_CODES.indexOf(w.code) >= 0) return "todo";
     if (w && HINT_CODES.indexOf(w.code) >= 0) return "hint";
     return (w && w.level === "error") ? "error" : "warn";
   }
@@ -555,6 +580,206 @@
     return out;
   }
 
+  /* ==================================================== ⑦ 三种关系的几何
+   *
+   * 树上的父子边到现在为止只有一副样子，但它其实说着三件不同的事：
+   *   延伸    C 接着 A 往下做（绝大多数，**一个像素都不许动**）
+   *   互斥候选 A/B 是同一个问题的两个答案，只能选一条走下去
+   *   汇回    支线上的产物，被另一条线上更靠后的一步读了（它是 `input:`，不是树边）
+   *
+   * 规格里「颜色只作线型的补强」这一条按用户的要求放宽了：颜色可以承载信息，
+   * **但每一种关系必须再配一个非颜色的通道**——打印成灰度、或者看不见颜色的人，
+   * 丢掉的只该是那一眼，不是那个意思。于是：
+   *   互斥候选 → 强调色 ＋ 一道把这一组括起来的**弧形括弧**（forkBracket）
+   *   汇回     → 第三种颜色 ＋ **曲线加箭头**（rejoinCurve / railRejoin）
+   * 曲线这件事本身就说明「它不属于树」：树上的边永远是正交折线，从不弯。
+   *
+   * 线型仍然只归 status、不透明度仍然只归祖先链/搜索命中，这里一个都没碰。
+   *
+   * 几何全部剥进这一层是因为它们是最容易写错、又最看不出错的那类代码：
+   * 括弧少算一个端点只是「有点歪」，没人会去查，而它正是那半个非颜色通道。
+   */
+
+  var BRANCH_ALT = "alternative";
+
+  /* 一组候选在图视图上的括弧。返回 null = 这一组在当前布局里没有可画的位置。
+   *
+   * 端点取的是**每个候选卡片的水平中点**（和边的落点一致），所以括弧的两头
+   * 正好压在最左和最右那两条候选边上，读起来就是「这几条是一组」。
+   * 只有一个候选时（core 会报 lone_alternative）括弧照画，宽度给一个最小值：
+   * 那一条诊断说的正是「一个候选不成其为选择」，画出来才看得见它孤零零的。
+   */
+  function forkBracket(nodes, group, opts) {
+    opts = opts || {};
+    var nw = opts.nw || 176;
+    /* lift 有一个上限：层与层之间只有 V_GAP（38px），而这道括弧和它上面那句
+       标注都得挤在里面——括弧再往上抬，标注就顶进父节点的卡片里被压住了。
+       15 是「箭头（顶边往上 7px）之上留 3px、标注留 14px、再离父卡片 6px」凑出来的。 */
+    var lift = opts.lift === undefined ? 15 : opts.lift;   // 括弧离候选顶边多远
+    var tick = opts.tick === undefined ? 5 : opts.tick;    // 两端朝下的小竖线
+    var labelH = opts.labelH === undefined ? 17 : opts.labelH;
+    var xs = [], top = null;
+    (group && group.options || []).forEach(function (id) {
+      var n = nodes && nodes[id];
+      if (!n) return;
+      xs.push(n.x + nw / 2);
+      if (top === null || n.y < top) top = n.y;
+    });
+    if (!xs.length || top === null) return null;
+    var x1 = Math.min.apply(null, xs), x2 = Math.max.apply(null, xs);
+    var half = Math.max((x2 - x1) / 2, nw * 0.18);         // 单个候选也要看得见
+    var cx = (x1 + x2) / 2;
+    x1 = cx - half; x2 = cx + half;
+    var y = top - lift;
+    var r = Math.max(2, Math.min(8, half / 2));
+    /* 横杠在**不属于这一组的兄弟**头上断开。
+
+       候选和普通延伸挂在同一个父节点底下、而普通那条按 id 序正好排在两个候选之间
+       （很常见：019 是候选、019m 是顺手做的清洗、020 又是候选），
+       一道连续的横杠会把三张卡片一起圈住，牌子却写着「2 选 1」——
+       圈住的和数出来的对不上，而人相信的是自己看见的那一圈。
+       所以把横向那一段拆成几截，正对着外人的地方留一个真的口子。
+       它是形状，不是颜色：灰度打印下同样看得见「这里跳过去了」。 */
+    var runL = x1 + r, runR = x2 - r;
+    var cuts = (opts.skip || [])
+      .filter(function (x) { return x > runL + 6 && x < runR - 6; })
+      .sort(function (a, b) { return a - b; });
+    var gap = Math.min(11, Math.max(6, nw * 0.06));
+    var segs = [], at = runL;
+    cuts.forEach(function (x) {
+      if (x - gap > at) segs.push([at, x - gap]);
+      at = Math.max(at, x + gap);
+    });
+    segs.push([at, runR]);
+
+    var d = "M" + x1 + " " + (y + tick)
+      + "V" + (y + r)
+      + "Q" + x1 + " " + y + " " + runL + " " + y;
+    segs.forEach(function (s, i) {
+      d += (i ? "M" + s[0] + " " + y : "") + "H" + s[1];
+    });
+    d += "M" + runR + " " + y
+      + "Q" + x2 + " " + y + " " + x2 + " " + (y + r)
+      + "V" + (y + tick);
+
+    /* 三个以上候选时，中间那几个头上各落一个钩——数钩子就是数候选。 */
+    xs.sort(function (a, b) { return a - b; });
+    xs.forEach(function (x) {
+      if (x <= runL || x >= runR) return;                   // 两端已经有钩了
+      d += "M" + x + " " + y + "V" + (y + tick);
+    });
+    /* 根之间也能成一组（两种互斥的开局）。它上面没有节点，括弧顶到画布外面去了，
+       标注就没有地方摆在上方——这时候把标注挪到括弧右边，而不是让它被裁掉。 */
+    return { d: d, x1: x1, x2: x2, y: y, cx: cx, side: y - labelH < 0 };
+  }
+
+  /* 括弧旁边那句话说什么。三态一一对应，**不许**把 abandoned 说成错误：
+     「这个问题分出去的路全都走到了 dead」是一条结论（P4），不是一个待填的窟窿。 */
+  function forkLabel(group) {
+    if (!group) return null;
+    // 只有一个候选的「分叉」根本没做过选择——说它「已定」是在替人宣布一件没发生的事。
+    // core 的 state 只数还活着的候选，1 个活的就叫 decided，对 2 选 1 是对的，
+    // 对「从头到尾只有 1 条」是错的。CLI、MCP、以及本页顶上的提示栏都说
+    // 「只有一个候选（还不成其为选择）」，只有这块牌子说「已定」，页面自己打架。
+    if ((group.options || []).length < 2) {
+      return { key: "decision.lone", title: "decision.lone.title",
+               vars: { id: (group.options || [])[0] || "" }, state: "lone" };
+    }
+    if (group.state === "decided") {
+      return { key: "decision.settled", title: "decision.settled.title",
+               vars: { id: group.chosen }, state: "decided" };
+    }
+    if (group.state === "abandoned") {
+      return { key: "decision.alldead", title: "decision.alldead.title",
+               vars: {}, state: "abandoned" };
+    }
+    // 未决：N 是**还活着**的条数，不是候选总数——已经放弃掉的那几条不再是选项。
+    return { key: "decision.pick", title: "decision.pick.title",
+             vars: { n: (group.live || []).length }, state: "open" };
+  }
+
+  /* 一条曲线加一个箭头。控制点只在**水平**方向伸出去，于是无论两端怎么摆，
+     画出来都是一条 S 形——和树上那种「竖-横-竖」的正交折线在形状上永不重合，
+     这就是汇回的那半个非颜色通道。 */
+  function curveBetween(p1, p2, bow, head) {
+    head = head === undefined ? 7 : head;
+    // 两端同一行时，只往水平方向伸控制点会让四个点的 y 全相等——
+    // 画出来是一条**笔直**的横线，和普通的短正交边一模一样，
+    // 「曲线」这半个非颜色通道当场消失（灰度下就只剩卡片上的字形能救）。
+    // 而"生产者和消费者在同一层"恰恰是最常见的汇回形状。
+    // 所以同行时把弓弦转到**垂直**方向：拱起来的那一下就是形状本身。
+    var flat = Math.abs(p2.y - p1.y) < 1;
+    var lift = flat ? Math.max(14, Math.min(34, Math.abs(p2.x - p1.x) * 0.45)) : 0;
+    var c1 = { x: p1.x + bow, y: p1.y - lift }, c2 = { x: p2.x - bow, y: p2.y - lift };
+    var d = "M" + p1.x + " " + p1.y
+      + "C" + c1.x + " " + c1.y + " " + c2.x + " " + c2.y + " " + p2.x + " " + p2.y;
+    // 箭头指的是「谁汇进谁」。方向取末端那一小段的走向，而它恒为水平（控制点
+    // 只在水平方向伸），所以只用判正负，不用算角度。
+    var s = bow >= 0 ? 1 : -1;
+    var back = p2.x - s * head;
+    var arrow = "M" + back + " " + (p2.y - 4) + "L" + back + " " + (p2.y + 4)
+      + "L" + p2.x + " " + p2.y + "Z";
+    return { d: d, arrow: arrow, from: p1, to: p2 };
+  }
+
+  /* 图视图上的一条汇回边：从生产者卡片的侧边出发，扎进消费者卡片的侧边。
+     走侧边而不是上下边，是因为汇回的两端按定义分属两条支线——它们在水平方向
+     一定是分开的，而上下边已经被树边占满了（再叠上去就分不清哪条是父子）。 */
+  function rejoinCurve(a, b, opts) {
+    if (!a || !b) return null;
+    opts = opts || {};
+    var nw = opts.nw || 176, nh = opts.nh || 58;
+    var right = (b.x + nw / 2) >= (a.x + nw / 2);
+    var p1 = { x: right ? a.x + nw : a.x, y: a.y + nh / 2 };
+    var p2 = { x: right ? b.x : b.x + nw, y: b.y + nh / 2 };
+    var dx = Math.abs(p2.x - p1.x);
+    var bow = Math.max(28, Math.min(130, dx * 0.45)) * (right ? 1 : -1);
+    return curveBetween(p1, p2, bow);
+  }
+
+  /* 列表视图（轨道图）上的汇回。git graph 的语汇里，横过来的那条线就是这么画的，
+     所以这里不套图视图那一套，而是让曲线从右边的空档绕过去——轨道之间的竖线是
+     满的，从中间穿会和它们缠在一起。outX 由调用方给（轨道图右边专门留出来的
+     那条空档），同一张图上多条汇回各让开一点，免得叠成一条。 */
+  function railRejoin(p1, p2, outX, opts) {
+    opts = opts || {};
+    var gap = opts.gap === undefined ? 5.5 : opts.gap;   // 箭头不要压在节点点上
+    var end = { x: p2.x + gap, y: p2.y };
+    var c1 = { x: outX, y: p1.y }, c2 = { x: outX, y: p2.y };
+    var d = "M" + (p1.x + gap) + " " + p1.y
+      + "C" + c1.x + " " + c1.y + " " + c2.x + " " + c2.y + " " + end.x + " " + end.y;
+    var head = opts.head === undefined ? 6 : opts.head;
+    var arrow = "M" + (end.x + head) + " " + (end.y - 3.6)
+      + "L" + (end.x + head) + " " + (end.y + 3.6)
+      + "L" + end.x + " " + end.y + "Z";
+    return { d: d, arrow: arrow };
+  }
+
+  /* 一条汇回边跟当前选中的那一步有没有关系。
+   *
+   * **不能**沿用树边那条「两端都在祖先链上」的判据：汇回按定义就是两端分属两条
+   * 支线，那个判据下它永远为假——一选中任何节点，所有汇回边就集体淡掉，等于
+   * 这个功能在选中状态下不存在。这里问的是同一件事的正确版本：这条边碰没碰到
+   * 选中的那条链。通道没变，仍然是不透明度承载「和选中有没有关系」。 */
+  function rejoinRelated(m, sel, chain) {
+    if (!sel) return true;
+    if (!m) return false;
+    return !!(chain && (chain[m.from] || chain[m.to])) || m.from === sel || m.to === sel;
+  }
+
+  /* 这一步是哪一组候选里的。组是**派生**的，磁盘上只有它自己那句 branch:，
+     所以这里也只是去现成的 branch_groups 里按分叉点找，绝不另存一份归属。
+     根之间那一组的 at 是空串（core 的约定）。 */
+  function groupOf(groups, step) {
+    if (!step || step.branch !== BRANCH_ALT) return null;
+    var at = step.parent || "";
+    var got = null;
+    (groups || []).forEach(function (g) {
+      if (g.at === at && (g.options || []).indexOf(step.id) >= 0) got = g;
+    });
+    return got;
+  }
+
   var U = {
     LEVELS: LEVELS, REPRO_STATES: REPRO_STATES, INSIGHT_HEADINGS: INSIGHT_HEADINGS,
     INSIGHT_KIND_BY_HEADING: INSIGHT_KIND_BY_HEADING, SUPERSEDE_WORDS: SUPERSEDE_WORDS,
@@ -563,6 +788,7 @@
     splitInsightBody: splitInsightBody, foreignHeadings: foreignHeadings,
     draftKey: draftKey, matches: matches, snippet: snippet, locationsHay: locationsHay,
     pickLang: pickLang, headingsIn: headingsIn, langByHeadings: langByHeadings,
+    forkHay: forkHay,
     sizeUnit: sizeUnit, formatPath: formatPath, formatInput: formatInput, formatCode: formatCode,
     MEASURED_ATTRS: MEASURED_ATTRS, inheritPath: inheritPath,
     parseInsights: parseInsights, parseInsightLine: parseInsightLine,
@@ -570,6 +796,10 @@
     DRAG_SLOP: DRAG_SLOP, beyondSlop: beyondSlop, subtreeIds: subtreeIds,
     hitRect: hitRect, rowAt: rowAt, withinRect: withinRect,
     flowLayout: flowLayout, depClosure: depClosure,
+    BRANCH_ALT: BRANCH_ALT,
+    forkBracket: forkBracket, forkLabel: forkLabel, curveBetween: curveBetween,
+    rejoinCurve: rejoinCurve, railRejoin: railRejoin,
+    rejoinRelated: rejoinRelated, groupOf: groupOf,
   };
   global.traceUtil = U;
   if (typeof module !== "undefined" && module.exports) module.exports = U;
@@ -890,6 +1120,7 @@
     renderFlow();
     renderWarnings();
     renderMissingPaths();
+    renderForks();
     applyView();
     onHash();
   }
@@ -906,6 +1137,23 @@
   }
 
   /* -------------------------------------------------------------- 图视图 */
+
+  /* 一个分叉点底下**不属于候选组**的那些兄弟的中心 x。括弧要在它们头上留口子，
+     否则圈住的卡片数和牌子上数出来的对不上。
+     放在模块作用域而不是 renderDiagram 里面：renderForkLabels 是另一个函数，
+     它也要画同一道括弧——藏在 renderDiagram 内部的话它根本看不见，
+     一调用就抛，而抛点之后正好是画卡片那一句（症状是括弧在、卡片全没了）。 */
+  function outsiderXs(nodes, g, nw) {
+    var opt = {};
+    (g.options || []).forEach(function (id) { opt[id] = 1; });
+    var xs = [];
+    F.steps.forEach(function (s) {
+      if ((s.parent || "") !== (g.at || "") || opt[s.id]) return;
+      var n = nodes && nodes[s.id];
+      if (n) xs.push(n.x + nw / 2);
+    });
+    return xs;
+  }
 
   function renderDiagram() {
     var T = F.tree || { nodes: {}, w: 0, h: 0, node_w: 176, node_h: 58 };
@@ -937,11 +1185,38 @@
           + "Q" + cx + " " + midY + " " + cx + " " + (midY + r)
           + "V" + tip;
       }
-      out.push('<path class="dedge s-' + s.status + '" data-id="' + esc(s.id) + '" d="' + d + '"/>');
-      out.push('<path class="darrow s-' + s.status + '" data-id="' + esc(s.id) + '" d="M'
+      // b-alt 只换颜色。线型仍然是 s-<status>，不透明度仍然只归祖先链/搜索命中：
+      // 这条边说的是「A/B 只能选一条」，说的不是「它做完了没有」。
+      var rel = s.branch === U.BRANCH_ALT ? " b-alt" : "";
+      out.push('<path class="dedge s-' + s.status + rel + '" data-id="' + esc(s.id) + '" d="' + d + '"/>');
+      out.push('<path class="darrow s-' + s.status + rel + '" data-id="' + esc(s.id) + '" d="M'
         + (cx - 4.5) + " " + tip + "L" + (cx + 4.5) + " " + tip + "L" + cx + " " + (tip + 7) + 'Z"/>');
     });
+
+  /* 互斥候选的括弧。颜色一眼扫到，括弧说得准——灰度打印出来，「这几条是一组」
+       仍然看得见。它是纯叠加层：core 保证候选不会被重排、不额外占轨道，
+       所以直接按现成坐标画，一个节点都不用挪。 */
+    (F.branch_groups || []).forEach(function (g) {
+      var bk = U.forkBracket(T.nodes, g, { nw: NW, skip: outsiderXs(T.nodes, g, NW) });
+      if (!bk) return;
+      out.push('<path class="dfork" data-fork="' + esc(g.at) + '" d="' + bk.d + '"/>');
+    });
+
+    /* 汇回。曲线（不是正交折线）＋ 箭头，形状本身就说明它不属于树。
+       全部都画、不藏起来：汇回本来就少（两端必须分属两条支线才算），
+       藏起来的代价是「这条支线看着像死胡同，其实它绕回来了」——而那正是
+       这个功能要修的那件事。选中之后不相关的照常淡出（不透明度那个通道的
+       原意就是「和选中有没有关系」）。 */
+    (F.merges || []).forEach(function (m) {
+      var cv = U.rejoinCurve(T.nodes[m.from], T.nodes[m.to], { nw: NW, nh: NH });
+      if (!cv) return;
+      var tag = ' data-mfrom="' + esc(m.from) + '" data-mto="' + esc(m.to) + '"';
+      out.push('<path class="drejoin"' + tag + ' d="' + cv.d + '"/>');
+      out.push('<path class="drejoinhead"' + tag + ' d="' + cv.arrow + '"/>');
+    });
     svg.innerHTML = out.join("");
+
+    renderForkLabels(T, NW);
 
     holder.innerHTML = F.steps.map(function (s) {
       var n = T.nodes[s.id];
@@ -962,6 +1237,52 @@
         + "</div>";
     }).join("");
     setZoom(zoom);
+  }
+
+  /* 括弧旁边那句标注，以及「在决定什么」。
+   *
+   * 用 HTML 叠层而不是 SVG <text>：标注要截断、要 tooltip、要跟着深浅主题走，
+   * 这三件事在 HTML 里是三行 CSS，在 SVG 里都得自己算。层放在卡片**下面**，
+   * 于是它永远抢不走卡片的点击。
+   *
+   * 决策问题（父节点的 `decision:`）**默认不铺在图上**：它是自由文本，长度不定，
+   * 一直显示的话，一棵有三个岔路口的树上就有三段长句压在别的支线上，缩小之后
+   * 糊成一片。它改成两档：
+   *   一直在  —— 「3 选 1」/「已定：012b」这种两三个字的状态（这是真正的信息量），
+   *              整句问题挂在 title 里，悬停就有；
+   *   选中时  —— 选中这个岔路口或它的任何一个候选，整句问题就在括弧下方展开。
+   * 「点开这个岔路口」正是「告诉我这里在决定什么」这个动作本身，所以这一档
+   * 不需要另外教，而不选中的时候图形状一个像素都不变。
+   */
+  function renderForkLabels(T, NW) {
+    var box = $("#dmarks");
+    if (!box) return;
+    box.innerHTML = (F.branch_groups || []).map(function (g) {
+      var bk = U.forkBracket(T.nodes, g, { nw: NW, skip: outsiderXs(T.nodes, g, NW) });
+      var lab = U.forkLabel(g);
+      if (!bk || !lab) return "";
+      var q = g.at
+        ? (g.decision || i18n.t("decision.question.missing"))
+        : i18n.t("decision.roots.note");
+      var tip = i18n.t(lab.title, lab.vars) + " — " + q;
+      var cls = "forklabel f-" + lab.state + (bk.side ? " side" : "");
+      /* 两档定位，锚的边不一样：
+         · 普通：translate(-50%,-100%) 把盒子的**下沿**钉在 top 上，所以给的是
+           「括弧再往上 3px」——标注整条落在父卡片和括弧之间那道缝里。
+         · side（根之间那一组，括弧上面没有节点、也没有多少画布）：盒子的**上沿**
+           钉在 top 上，而且**夹到 0 以上**。以前这里也走居中（translate(0,-50%)），
+           于是标注一半落在 y<0，被滚动容器裁掉——`side` 这个分支本来就是为了
+           「别被裁掉」而存在的，居中让它只完成了一半：换到右边躲开了卡片，
+           却仍然被画布上沿切掉一半的字。 */
+      var style = bk.side
+        ? "left:" + (bk.x2 + 8) + "px;top:" + Math.max(bk.y - 8, 0) + "px"
+        : "left:" + bk.cx + "px;top:" + (bk.y - 3) + "px";
+      return '<div class="' + cls + '" data-fork="' + esc(g.at) + '" style="' + style + '"'
+        + ' title="' + esc(tip) + '">'
+        + '<span class="fstate">' + esc(i18n.t(lab.key, lab.vars)) + "</span>"
+        + '<span class="fq">' + esc(q) + "</span>"
+        + "</div>";
+    }).join("");
   }
 
   function setZoom(z) {
@@ -1041,10 +1362,17 @@
 
   /* -------------------------------------------------------------- 列表视图 */
 
+  /* 汇回的曲线要从轨道右边绕过去，所以有汇回时给轨道图多留一条空档。
+     轨道之间的竖线是满的，曲线从中间穿会和它们缠在一起。没有汇回就不留——
+     一条永远空着的白边只会把行文本推走。 */
+  var MERGE_GUTTER = 18;
+
   function renderRails() {
     var RH = F.row_h || 28, LW = F.lane_w || 14;
     var svg = $("#rails");
-    var w = RAIL_PAD * 2 + Math.max(0, (F.lane_count || 1) - 1) * LW;
+    var merges = F.merges || [];
+    var w = RAIL_PAD * 2 + Math.max(0, (F.lane_count || 1) - 1) * LW
+      + (merges.length ? MERGE_GUTTER : 0);
     var h = Math.max(F.steps.length * RH, 1);
     svg.setAttribute("width", w); svg.setAttribute("height", h);
     svg.setAttribute("viewBox", "0 0 " + w + " " + h);
@@ -1063,7 +1391,41 @@
         var R = Math.min(LW, RH / 2), dir = x2 > x1 ? 1 : -1;
         d = "M" + x1 + " " + y1 + "V" + (y2 - R) + "Q" + x1 + " " + y2 + " " + (x1 + dir * R) + " " + y2 + "H" + x2;
       }
-      out.push('<path class="edge s-' + s.status + '" data-id="' + esc(s.id) + '" d="' + d + '"/>');
+      var rel = s.branch === U.BRANCH_ALT ? " b-alt" : "";
+      out.push('<path class="edge s-' + s.status + rel + '" data-id="' + esc(s.id) + '" d="' + d + '"/>');
+    });
+
+    /* 轨道图有它自己的语汇，别硬套图视图那一套。
+       互斥候选：在分叉那一行的节点**正下方**画一道横跨这几条候选轨道的括弧。
+       定高行 + 十几像素宽的轨道装不下弧形括弧，所以压成一道带两端小钩的短线——
+       它仍然是那个「把这一组括起来」的记号，而且不占任何行高。
+       根之间那一组（at 为空）没有可以挂的那一行，只在顶栏的未决横幅和详情面板里说。 */
+    (F.branch_groups || []).forEach(function (g) {
+      var p = g.at && IDX[g.at];
+      if (!p) return;
+      var ls = (g.options || []).filter(function (id) { return IDX[id]; })
+        .map(function (id) { return IDX[id].lane; });
+      if (!ls.length) return;
+      // 两头各伸出 4px：不伸的话这道 ⊓ 正好和轨道之间那段拐弯一样宽，
+      // 在十几像素的沟里根本分不出「这是一道括弧」还是「这是又一条边」。
+      var a = x(Math.min.apply(null, ls)) - 4, b = x(Math.max.apply(null, ls)) + 4;
+      var by = y(p.row) + 7;                     // 紧贴分叉那个节点的下沿
+      out.push('<path class="railfork" data-fork="' + esc(g.at) + '" d="M'
+        + a + " " + (by + 3) + "V" + by + "H" + b + "V" + (by + 3) + '"/>');
+    });
+
+    /* 汇回：从右边的空档绕过去的一条曲线加箭头。git graph 里横过来并进主线的
+       那条线就是这个位置、这个形状，所以读起来不需要另外教。多条汇回各让开
+       几像素，免得叠成一条看不出有几处。 */
+    var outX = w - 4;
+    merges.forEach(function (m, i) {
+      var a = IDX[m.from], b = IDX[m.to];
+      if (!a || !b) return;
+      var cv = U.railRejoin({ x: x(a.lane), y: y(a.row) }, { x: x(b.lane), y: y(b.row) },
+                            outX - (i % 3) * 4);
+      var tag = ' data-mfrom="' + esc(m.from) + '" data-mto="' + esc(m.to) + '"';
+      out.push('<path class="railjoin"' + tag + ' d="' + cv.d + '"/>');
+      out.push('<path class="railjoinhead"' + tag + ' d="' + cv.arrow + '"/>');
     });
 
     F.steps.forEach(function (s) {
@@ -1138,6 +1500,28 @@
    */
   function nodeMarks(s) {
     var out = traceMarks(s);
+    /* 三种关系在**行/卡片自己身上**也各留一个字形——图上那些颜色和形状滚出
+       视野之后（列表里搜到一行、图上只看得见一张卡），这一个字符就是仅剩的线索。
+       Y 和 ~> 是记号不是词，两种语言里都不翻。字形是照着**字体真的有、而且
+       在 9px 下还分得开**挑的：⑂（U+2482）要回退到别的字体，糊成一个看不出
+       形状的小疙瘩；⤳ 回退之后只剩一条波浪线；⇝ 画出来和旁边那个 ⇢（数据来源
+       计数）几乎一样，而两者的颜色又都偏冷——两个通道同时失效。~> 是 ASCII，
+       哪儿都印得出来，也不可能和箭头认混。 */
+    if (s.fork) {
+      var lab = U.forkLabel(s.fork);
+      out += '<span class="cmk fork" title="'
+        + esc(i18n.t(lab.title, lab.vars) + " — "
+              + (s.decision || i18n.t("decision.question.missing")))
+        + '">Y' + (s.fork.options || []).length + "</span>";
+    }
+    if (s.branch === U.BRANCH_ALT) {
+      out += '<span class="cmk alt" title="' + esc(i18n.t("branch.badge.title")) + '">Y</span>';
+    }
+    var joins = (s.merge_in || []).length + (s.merge_out || []).length;
+    if (joins) {
+      out += '<span class="cmk join" title="' + esc(i18n.t("rejoin.badge.title")) + '">~&gt;'
+        + (joins > 1 ? joins : "") + "</span>";
+    }
     var off = (s.inputs || []).filter(function (i) { return i.step !== s.parent; }).length;
     if (off) {
       out += '<span class="cmk dep" title="'
@@ -1173,20 +1557,48 @@
     dangling_input: { key: "input.warn.missing", pick: /(\S+)\s*$/, as: "id" },
     self_input: { key: "input.warn.self", pick: /[（(]([^）)]+)[）)]/, as: "id" },
     input_cycle: { key: "input.warn.cycle", pick: /:\s*([^—]+)/, as: "chain" },
+    /* 分叉的三条。它们**没有 pick**：core 把该说的值结构化地放进了 w.vars，
+       而从中文句子里抠数字是那条老的、脆得离谱的退路，新代码不该再长出来。
+       lone_alternative 一个变量都不用（文案里没有占位符）。 */
+    lone_alternative: { key: "lint.alt.lone" },
+    fork_without_decision: { key: "lint.fork.noquestion", take: ["n"] },
+    undecided_fork: { key: "lint.fork.open", take: ["n"] },
+    decision_without_candidates: { key: "lint.fork.nocandidates", take: ["id"] },
+    /* `branch:` 拼错时 core 报的降级提醒。没有这一条的时候它会退回 esc(w.message)，
+       也就是在英文界面上原样漏出一整句中文——而这条恰恰是给写错字的人看的。 */
+    bad_branch: { key: "lint.branch.unknown", take: ["branch"] },
   };
+  /* w.vars 里那个值，取成字符串。**不许只认 string**：core 的
+     validate_branches 发的是 {"n": len(options)}，那是个**数字**，
+     用 typeof === "string" 判会把它判掉，于是整条退回去抠中文正则，
+     抠不出来就在英文界面上原样漏出一整句中文。 */
+  function warnVar(w, k) {
+    var v = w && w.vars ? w.vars[k] : undefined;
+    if (v === undefined || v === null || v === "") return "";
+    return String(v);
+  }
   /* 出的是 HTML：这些文案里有 `行内代码` 和 **粗体**，走 t() 的话反引号会原样
      显示给用户看。认不出来时退回服务端那句中文，那一条要 esc——它是别处来的字节。 */
   function warnText(w) {
     var m = WARN_MAP[w.code];
     if (!m || !i18n.has(m.key)) return esc(w.message);
+    if (m.take) {
+      var got = {}, ok = true;
+      m.take.forEach(function (k) {
+        var v = warnVar(w, k);
+        if (!v) ok = false; else got[k] = v;
+      });
+      return ok ? i18n.tHtml(m.key, got) : esc(w.message);
+    }
     if (!m.pick) return i18n.tHtml(m.key);
     var vars = {};
-    if (w.vars && typeof w.vars[m.as] === "string" && w.vars[m.as] !== "") {
-      vars[m.as] = w.vars[m.as];
+    var direct = warnVar(w, m.as);
+    if (direct) {
+      vars[m.as] = direct;
     } else {
-      var got = m.pick.exec(w.message || "");
-      if (!got) return esc(w.message);
-      vars[m.as] = got[1].trim();
+      var hit = m.pick.exec(w.message || "");
+      if (!hit) return esc(w.message);
+      vars[m.as] = hit[1].trim();
     }
     return i18n.tHtml(m.key, vars);
   }
@@ -1195,8 +1607,10 @@
     var bar = $("#warnbar"), ws = F.warnings || [];
     bar.hidden = !ws.length;
     if (!ws.length) return;
-    var by = { error: [], warn: [], hint: [] };
+    var by = { error: [], warn: [], hint: [], todo: [] };
     ws.forEach(function (w) { by[U.warnLevel(w)].push(w); });
+    bar.hidden = !(by.error.length || by.warn.length || by.hint.length);
+    if (bar.hidden) return;                 // 只剩待办时整条栏都不出现
     var block = function (lv) {
       if (!by[lv].length) return "";
       var mark = lv === "error" ? "✕ " : (lv === "hint" ? "· " : "⚠ ");
@@ -1226,6 +1640,28 @@
     var ids = hits.filter(function (id, i) { return hits.indexOf(id) === i; });
     bar.innerHTML = '<b>⊘ ' + esc(i18n.t("path.summary.missing", { n: hits.length })) + "</b>"
       + ids.map(function (id) { return " " + stepLink(id); }).join(" ·");
+  }
+
+  /* 「我还有几个岔路口没做决定」——这是整个候选组功能真正的收益，也是隔了一个月
+     回到一个项目时最该先看的一句话。它只画在单步详情里就等于没有：那要求人先
+     猜到该点哪一步。所以和「有几处位置已经不在了」一样，一条横幅摆在顶上、点得进去。
+
+     它不是警告：同时开几条线是研究的常态。所以样式走的是 #missbar 那一档
+     （一条陈述），不是 #warnbar 那一档。 */
+  function renderForks() {
+    var bar = $("#forkbar");
+    if (!bar) return;
+    var open = (F.branch_groups || []).filter(function (g) { return g.state === "open"; });
+    bar.hidden = !open.length;
+    if (!open.length) return;
+    bar.innerHTML = '<b title="' + esc(i18n.t("decision.open.summary.title")) + '">Y '
+      + esc(i18n.t("decision.open.summary", { n: open.length })) + "</b>"
+      + open.map(function (g) {
+          // 根之间那一组没有分叉点可以跳，跳到它的第一个候选——那是唯一
+          // 能让人看到这一组的地方（详情面板里那一块）。
+          var id = g.at || (g.options || [])[0] || "";
+          return id ? " " + stepLink(id) : "";
+        }).join(" ·");
   }
 
   function applyView() {
@@ -1282,6 +1718,39 @@
       var id = el.getAttribute("data-id");
       el.classList.toggle("faded", !!sel && !chain[id]);
       el.classList.toggle("sel", id === sel && el.classList.contains("node"));
+    });
+
+    /* 括弧跟着它的分叉点淡出（和树边同一条判据）。
+
+       根之间那一组的 at 是空串，没有分叉点可以查——但**不能因此就永远不淡**：
+       不透明度这个通道只表示「和你选中的那条链有没有关系」，一道满亮的括弧
+       压在两张已经灰掉的卡片上，读者读到的就是「这一组和你有关」，而它在另一棵树上。
+       根组的等价判据是「它的候选里有没有一个在你这条链上」——语义完全一致，
+       而且天然成立：选中哪棵树，哪棵树的根就在链上。 */
+    var groupAt = {};
+    (F.branch_groups || []).forEach(function (g) { groupAt[g.at || ""] = g; });
+    document.querySelectorAll("[data-fork]").forEach(function (el) {
+      var at = el.getAttribute("data-fork");
+      var near = at ? !!chain[at]
+                    : ((groupAt[""] || {}).options || []).some(function (o) { return !!chain[o]; });
+      el.classList.toggle("faded", !!sel && !near);
+    });
+    /* 汇回边**不能**套「两端都在祖先链上」那条判据：它按定义两端分属两条支线，
+       套上去就是一选中任何节点，所有汇回集体消失。判据在 U.rejoinRelated 里。 */
+    document.querySelectorAll("[data-mfrom]").forEach(function (el) {
+      var m = { from: el.getAttribute("data-mfrom"), to: el.getAttribute("data-mto") };
+      var near = U.rejoinRelated(m, sel, chain);
+      el.classList.toggle("faded", !near);
+      el.classList.toggle("sel", sel === m.from || sel === m.to);
+    });
+    /* 「在决定什么」只在选中这个岔路口、或选中它的任何一个候选时展开：
+       它是自由文本，一直铺在图上会压住别的支线，缩小之后糊成一片。 */
+    document.querySelectorAll("#dmarks .forklabel").forEach(function (el) {
+      var at = el.getAttribute("data-fork");
+      var g = null;
+      (F.branch_groups || []).forEach(function (x) { if (x.at === at) g = x; });
+      var on = !!sel && (sel === at || (g && (g.options || []).indexOf(sel) >= 0));
+      el.classList.toggle("on", !!on);
     });
   }
 
@@ -1532,6 +2001,13 @@
           var line = i.note
             ? i18n.tHtml("input.entry", { link: { html: link }, what: i.note })
             : i18n.tHtml("input.entry.bare", { link: { html: link } });
+          /* 哪一行 input 是汇回，问的是 step.merge_in——**不要**去 i 上找 rel：
+             inputs 是文件里那几行的逐字镜像，故意没有派生字段（别人被移动一次，
+             同一行的归类就会翻转，混在一起读的人会以为磁盘变了）。 */
+          if ((s.merge_in || []).indexOf(i.step) >= 0) {
+            line += ' <span class="joinbadge" title="' + esc(i18n.t("rejoin.kind.title")) + '">'
+              + esc(i18n.t("rejoin.kind")) + "</span>";
+          }
           return '<li' + (known ? "" : ' class="dangling"') + ">" + line
             + (known ? '<span class="deptitle">' + esc(titleOf(i.step)) + "</span>"
                      : '<span class="depwarn">' + esc(i18n.t("input.warn.missing", { id: i.step })) + "</span>")
@@ -1548,6 +2024,125 @@
       + up
       + '<h4 class="rhead">' + esc(i18n.t("input.consumers.head", { n: outs.length })) + "</h4>"
       + down + "</div>";
+  }
+
+  /* ⑦ 决策分叉：这一步底下那个岔路口，以及这一步自己是不是某个岔路口的候选。
+   *
+   * 两件事都是**派生**的，磁盘上只有每个候选自己那句 `branch: alternative`：
+   *   「这一组有谁」  扫兄弟现算（core 的 branch_groups）
+   *   「选中了哪个」  其余候选标 dead 就是选择本身，没有第二个字段
+   * 所以这一块里永远不会出现一个「标记赢家」按钮——那个按钮就是双真相源。
+   * 文案（decision.lead / decision.of.lead）把这句话直接说给用户听，因为不说
+   * 的话人会一直在界面上找它。
+   */
+  function candidateRows(g) {
+    return '<ul class="deplist candlist">' + (g.options || []).map(function (id) {
+      var c = IDX[id];
+      var link = stepLink(id);
+      var what = c ? (c.branch_note || stepTitle(c) || "") : "";
+      var line = what
+        ? i18n.tHtml("decision.candidate.entry", { link: { html: link }, what: what })
+        : i18n.tHtml("decision.candidate.entry.bare", { link: { html: link } });
+      var dead = c && c.status === "dead";
+      return '<li class="cand' + (dead ? " out" : "") + '">' + line
+        + '<span class="candst">'
+        + esc(i18n.t(dead ? "decision.candidate.dead" : "decision.candidate.live"))
+        + "</span></li>";
+    }).join("") + "</ul>";
+  }
+
+  function renderFork(s) {
+    var out = "";
+    var g = s.fork;
+    if (g) {
+      var lab = U.forkLabel(g);
+      var head = g.at
+        ? '<h3>' + esc(i18n.t("decision.head", { n: (g.options || []).length })) + "</h3>"
+        : '<h3>' + esc(i18n.t("decision.roots.head", { n: (g.options || []).length })) + "</h3>";
+      // 根之间那一组没有节点能承载 `decision:`，别让人到处找那个写问题的地方
+      var q = g.at
+        ? '<p class="decq"><b>' + esc(i18n.t("decision.question.label")) + "</b>"
+          + '<span title="' + esc(i18n.t("decision.question.title")) + '">'
+          + (s.decision ? esc(s.decision)
+                        : '<i class="quiet">' + esc(i18n.t("decision.question.missing")) + "</i>")
+          + "</span></p>"
+        : '<p class="decq quiet">' + esc(i18n.t("decision.roots.note")) + "</p>";
+      var note = g.state === "open"
+        ? '<p class="dropnote">' + esc(i18n.t("decision.open.note", { n: (g.live || []).length })) + "</p>"
+        : "";
+      out += '<div class="sec decbox">' + head
+        + '<p class="dropnote deplead">' + i18n.tHtml("decision.lead") + "</p>"
+        + q
+        + '<p class="decstate f-' + lab.state + '" title="' + esc(i18n.t(lab.title, lab.vars)) + '">'
+        + esc(i18n.t(lab.key, lab.vars)) + "</p>"
+        + candidateRows(g) + note + "</div>";
+    } else if (s.decision) {
+      /* 写了「在决定什么」，但底下一个候选都还没标。不显示的话，人刚写完那一行
+         就在界面上找不到它了，只会以为没保存成功——而这一行是这套东西里唯一
+         推导不出来、只能人写的字，最不该悄悄消失。 */
+      out += '<div class="sec decbox"><p class="decq"><b>'
+        + esc(i18n.t("decision.question.label")) + "</b>"
+        + '<span title="' + esc(i18n.t("decision.question.title")) + '">' + esc(s.decision) + "</span></p>"
+        /* 光把这一行摆出来还不够：人看到自己写的问题**在**页面上，却看不到任何
+           候选，最容易得出的结论是「界面坏了」。所以紧跟一句说清它现在的状态
+           ——记下来了，但还不成其为岔路口，以及下一步该做什么。 */
+        + '<p class="dropnote">' + i18n.tHtml("decision.question.orphan") + "</p>"
+        + "</div>";
+    }
+    if (s.branch === U.BRANCH_ALT) {
+      var mine = U.groupOf(F.branch_groups, s);
+      var others = mine ? (mine.options || []).length - 1 : 0;
+      var lead = s.parent
+        ? '<h3>' + esc(i18n.t("decision.of.head", { parent: s.parent })) + "</h3>"
+          + '<p class="dropnote deplead">' + i18n.tHtml("decision.of.lead", { parent: s.parent }) + "</p>"
+        : '<h3>' + esc(i18n.t("decision.roots.head", { n: mine ? (mine.options || []).length : 1 })) + "</h3>"
+          + '<p class="dropnote deplead">' + esc(i18n.t("decision.roots.note")) + "</p>";
+      var sibs = others > 0 && mine
+        ? '<h4 class="rhead">' + esc(i18n.t("decision.siblings.head", { n: others })) + "</h4>"
+          + candidateRows({ options: (mine.options || []).filter(function (id) { return id !== s.id; }) })
+        : '<p class="dropnote">' + esc(i18n.t("decision.siblings.lone")) + "</p>";
+      var pq = s.parent && IDX[s.parent] && IDX[s.parent].decision
+        ? '<p class="decq"><b>' + esc(i18n.t("decision.question.label")) + "</b>"
+          + esc(IDX[s.parent].decision) + "</p>"
+        : "";
+      out += '<div class="sec decbox altbox">' + lead + pq + sibs + "</div>";
+    }
+    return out;
+  }
+
+  /* 汇回。它**不是**第三种边，它就是 `input:`——只是以前只在数据流图和详情面板
+     的依赖清单里出现过，树上看不见，于是一条绕回来的支线读着像死胡同。
+     两个方向都要有：本步的产物汇回到了谁那儿，以及谁的产物汇进了本步。
+     「两条路是在哪儿分开的」（core 算的 LCA）一并说出来——不说的话，
+     「它绕回来了」只是一条曲线，没有具体的形状。 */
+  function renderRejoin(s) {
+    var ins = s.merge_in || [], outs = s.merge_out || [];
+    if (!ins.length && !outs.length) return "";
+    var at = function (from, to) {
+      var got = "";
+      (F.merges || []).forEach(function (m) { if (m.from === from && m.to === to) got = m.at; });
+      return got ? '<span class="joinat">' + esc(i18n.t("rejoin.at", { id: got })) + "</span>" : "";
+    };
+    var rows = function (ids, other) {
+      return '<ul class="deplist">' + ids.map(function (id) {
+        var link = stepLink(id), what = titleOf(id);
+        var line = what
+          ? i18n.tHtml("rejoin.entry", { link: { html: link }, what: what })
+          : i18n.tHtml("rejoin.entry.bare", { link: { html: link } });
+        return "<li>" + line + other(id) + "</li>";
+      }).join("") + "</ul>";
+    };
+    return '<div class="sec joinbox"><h3>' + esc(i18n.t("rejoin.kind")) + "</h3>"
+      + '<p class="dropnote deplead">' + i18n.tHtml("rejoin.lead") + "</p>"
+      + (outs.length
+          ? '<h4 class="rhead">' + esc(i18n.t("rejoin.out.head", { n: outs.length })) + "</h4>"
+            + rows(outs, function (id) { return at(s.id, id); })
+          : "")
+      + (ins.length
+          ? '<h4 class="rhead">' + esc(i18n.t("rejoin.in.head", { n: ins.length })) + "</h4>"
+            + rows(ins, function (id) { return at(id, s.id); })
+          : "")
+      + "</div>";
   }
 
   /* ① 移动审计。顺序即历史，只追加。
@@ -1937,6 +2532,21 @@
         + esc(i18n.t("move.badge.title", { n: s.moved.length })) + '">'
         + esc(i18n.t("move.badge")) + "</span>");
     }
+    /* 「我是一个候选」和「我底下是一个岔路口」得在第一眼就看得见：它们决定了
+       这一步该怎么读——一个候选的 dead 是「这条路没走通」，不是「这一步做砸了」。 */
+    if (s.branch === U.BRANCH_ALT) {
+      meta.push('<span class="altchip" title="' + esc(i18n.t("branch.badge.title")) + '">'
+        + esc(i18n.t("branch.badge")) + "</span>");
+    }
+    if (s.fork) {
+      var flab = U.forkLabel(s.fork);
+      meta.push('<span class="forkchip f-' + flab.state + '" title="'
+        + esc(i18n.t(flab.title, flab.vars)) + '">' + esc(i18n.t(flab.key, flab.vars)) + "</span>");
+    }
+    if ((s.merge_in || []).length || (s.merge_out || []).length) {
+      meta.push('<span class="joinchip" title="' + esc(i18n.t("rejoin.badge.title")) + '">'
+        + esc(i18n.t("rejoin.badge")) + "</span>");
+    }
     if ((s.children || []).length) meta.push(esc(i18n.t("count.children", { n: s.children.length })));
     (s.tags || []).forEach(function (tag) { meta.push('<span class="tag">' + esc(tag) + "</span>"); });
 
@@ -1951,6 +2561,17 @@
         // 那种老办法，而那种办法是不留痕迹的。
         + '<button data-act="move" title="' + esc(i18n.t("move.act.title")) + '">'
         + esc(i18n.t("move.act")) + "</button>"
+        /* 标成候选 / 取消。落盘的只有这一步自己那一行 `branch:`——绝不去兄弟
+           身上登记什么，也绝不写一个「选中了谁」的字段。 */
+        + '<button data-act="branch" title="'
+        + esc(i18n.t(s.branch === U.BRANCH_ALT ? "decision.unmark.act.title" : "decision.mark.act.title"))
+        + '">' + esc(i18n.t(s.branch === U.BRANCH_ALT ? "decision.unmark.act" : "decision.mark.act"))
+        + "</button>"
+        // 「在决定什么」写在**分叉点**上，所以只有底下真有支的步骤才给这个入口
+        + ((s.children || []).length || s.decision
+            ? '<button data-act="decision" title="' + esc(i18n.t("decision.write.act.title")) + '">'
+              + esc(i18n.t("decision.write.act")) + "</button>"
+            : "")
         + '<span class="sp"></span>'
         + '<button data-act="delete" class="danger" title="' + esc(i18n.t("detail.act.delete.title")) + '">'
         + esc(i18n.t("detail.act.delete")) + "</button>"
@@ -1993,7 +2614,8 @@
       + '<h1 class="title">' + esc(stepTitle(s) || i18n.t("common.untitled")) + "</h1>"
       + '<div class="meta">' + meta.join("") + "</div>" + acts + paths + renderCode(s)
       + trNotice(s)
-      + '<div class="prose">' + body + "</div>" + renderDeps(s) + back
+      + '<div class="prose">' + body + "</div>"
+      + renderFork(s) + renderDeps(s) + renderRejoin(s) + back
       + renderMoved(s) + renderTrace(s) + files;
     enhanceProse(el);
     el.scrollTop = 0;
@@ -2033,27 +2655,37 @@
     return { title: ($("#ed-title") || {}).value || "", body: b.value,
              paths: ($("#ed-paths") || {}).value || "",
              inputs: ($("#ed-inputs") || {}).value || "",
-             code: ($("#ed-code") || {}).value || "", lang: edLang };
+             code: ($("#ed-code") || {}).value || "",
+             // 和 paths/inputs/code 同一档：结构信息，只写进 note.md，译文里一行都没有
+             branch: ($("#ed-branch") || {}).value || "extends",
+             bnote: ($("#ed-bnote") || {}).value || "",
+             decision: ($("#ed-decision") || {}).value || "", lang: edLang };
   }
   /* 编辑器此刻对着的那一份磁盘内容。译文只有标题和正文——path / input / code
      都是结构信息，翻译文件里一行都不许有（写两份就是双真相源，而且 core 会
      把它们读都不读地丢掉并报一条 translation_structural_key）。 */
+  var EMPTY_TARGET = { title: "", body: "", paths: "", inputs: "", code: "",
+                       branch: "extends", bnote: "", decision: "" };
   function editTarget(s, l) {
-    if (!s) return { title: "", body: "", paths: "", inputs: "", code: "" };
+    if (!s) return Object.assign({}, EMPTY_TARGET);
     if (!l) {
       return { title: s.title || "", body: s.body || "", paths: pathsToText(s),
-               inputs: inputsToText(s), code: codeToText(s) };
+               inputs: inputsToText(s), code: codeToText(s),
+               branch: s.branch || "extends", bnote: s.branch_note || "",
+               decision: s.decision || "" };
     }
     var e = (s.tr || {})[l] || {};
-    return { title: e.title || "", body: e.body || "", paths: "", inputs: "", code: "" };
+    return Object.assign({}, EMPTY_TARGET, { title: e.title || "", body: e.body || "" });
   }
   function sameAsStep(s, st) {
     if (!s || !st) return false;
     var base = editTarget(s, st.lang || "");
-    // 老草稿里没有 inputs / code 两个键：undefined 当成空串比，
+    // 老草稿里没有 inputs / code / branch / decision 这几个键：缺的当成默认值比，
     // 否则升级之后每一份旧草稿都会被判成「有未保存改动」，每次进出都弹框。
     return st.title === base.title && st.body === base.body && st.paths === base.paths
-      && (st.inputs || "") === base.inputs && (st.code || "") === base.code;
+      && (st.inputs || "") === base.inputs && (st.code || "") === base.code
+      && (st.branch || "extends") === base.branch && (st.bnote || "") === base.bnote
+      && (st.decision || "") === base.decision;
   }
   function isDirty() {
     if (!editing) return false;
@@ -2338,7 +2970,28 @@
             + '<label class="edpaths">' + i18n.tHtml("editor.code.label")
             + '<textarea id="ed-code" rows="2" spellcheck="false" placeholder="'
             + esc(i18n.t("editor.code.placeholder")) + '">' + esc(base.code) + "</textarea>"
-            + '<span class="edtip">' + i18n.tHtml("editor.code.hint") + "</span></label>")
+            + '<span class="edtip">' + i18n.tHtml("editor.code.hint") + "</span></label>"
+            /* 这一步和它 parent 之间那条边是什么性质，以及这一步底下那个岔路口
+               在决定什么。两件事写在两个地方是有理由的：branch 说的是**这条边**，
+               decision 说的是**底下那个岔路口**，把它们混成一个字段就会出现
+               「从候选 A 往下走的每一步都变成候选」。 */
+            + '<div class="edrel">'
+            + '<label class="edpaths"><span>' + esc(i18n.t("editor.branch.label")) + "</span>"
+            + '<select id="ed-branch">'
+            + '<option value="extends"' + (base.branch !== U.BRANCH_ALT ? " selected" : "") + ">"
+            + esc(i18n.t("editor.branch.extends")) + "</option>"
+            + '<option value="alternative"' + (base.branch === U.BRANCH_ALT ? " selected" : "") + ">"
+            + esc(i18n.t("editor.branch.alternative")) + "</option>"
+            + "</select></label>"
+            + '<label class="edpaths"><span>' + esc(i18n.t("editor.branch.note.label")) + "</span>"
+            + '<input id="ed-bnote" maxlength="200" value="' + esc(base.bnote) + '" placeholder="'
+            + esc(i18n.t("editor.branch.note.placeholder")) + '"></label>'
+            + "</div>"
+            + '<span class="edtip">' + i18n.tHtml("editor.branch.hint") + "</span>"
+            + '<label class="edpaths"><span>' + esc(i18n.t("editor.decision.label")) + "</span>"
+            + '<input id="ed-decision" maxlength="300" value="' + esc(base.decision) + '" placeholder="'
+            + esc(i18n.t("editor.decision.placeholder")) + '">'
+            + '<span class="edtip">' + i18n.tHtml("editor.decision.hint") + "</span></label>")
       + '<div class="edtools">' + TOOLS.map(function (x) {
           return '<button type="button" data-md="' + x.k + '" title="'
             + esc(i18n.t("editor.tool." + x.k)) + '">' + x.html + "</button>";
@@ -2542,6 +3195,14 @@
     });
   }
 
+  /* 编辑器/新建框里那两个控件序列化成写入侧收的那一个字符串。
+     逐字对着存储格式：`branch: alternative | 说明`，extends 就发空串。 */
+  function branchField(st) {
+    if (!st || st.branch !== U.BRANCH_ALT) return "";
+    var note = String(st.bnote || "").trim();
+    return note ? U.BRANCH_ALT + " | " + note : U.BRANCH_ALT;
+  }
+
   function saveEditor() {
     var s = IDX[selected()];
     var st = editorState();
@@ -2564,6 +3225,11 @@
           // 删掉一行的意思就该是删掉那一行。
           inputs: textToPaths(st.inputs),
           code: textToPaths(st.code),
+          /* 说明必须跟着 branch 一起发（写入侧没有单独的 branch_note 字段）：
+             只改说明、不改 kind 的话，那句说明会挂在一个不存在的候选身份上。
+             改回 extends 就发空串——「标错了要能改回来」，和 lang 同一条。 */
+          branch: branchField(st),
+          decision: (st.decision || "").trim(),
           // 乐观并发控制：expect 是我打开这一步时读到的摘要。这期间别人改过就 409，
           // 由人来判怎么合，而不是谁最后按保存谁赢。
           expect: s.digest || "",
@@ -2649,12 +3315,35 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ parent: parent || null, reason: reason, author: "human",
                              date: todayISO(), expect: s.digest || "" }),
-    }).then(function () {
+    }).then(function (info) {
       return refresh().then(function () {
-        toast(parent ? i18n.t("toast.moved", { id: sid, parent: parent })
-                     : i18n.t("toast.moved.root", { id: sid }));
+        toast((parent ? i18n.t("toast.moved", { id: sid, parent: parent })
+                      : i18n.t("toast.moved.root", { id: sid }))
+              + movedForks(info));
       });
     }).catch(fail);
+  }
+
+  /* 移动一个**候选**的直接后果：它原来那一组少了一个，落脚的那一组多了一个。
+   *
+   * 这句话事后再也看不出来——候选组是派生的，重新拉一遍森林只看得到「现在是
+   * 什么样」，看不到「刚才这一下改了什么」。不说的话，人下次打开只会看到一条
+   * 来路不明的 lone_alternative 提示，还得自己想半天是哪次移动造成的。
+   *
+   * 数据是 move_step 现算的那一份（服务端把它整个 JSON 回来），这里一条判据都
+   * 没重写：组的成员和状态仍然只有 core.compute_branch_groups 一个来源。
+   */
+  function movedForks(info) {
+    var alt = (info || {}).alternatives || {};
+    var out = "";
+    ["left", "joined"].forEach(function (side) {
+      var g = alt[side];
+      if (!g) return;
+      var n = (g.options || []).length;
+      out += " · " + (g.at ? i18n.t("toast.moved.fork", { at: g.at, n: n })
+                           : i18n.t("toast.moved.fork.roots", { n: n }));
+    });
+    return out;
   }
 
   /* ------------------------------------------------------------ ①b 拖着改父节点
@@ -2905,6 +3594,8 @@
               inputs: $("#nf-inputs").value, code: $("#nf-code").value,
               commit: $("#nf-commit").value, status: $("#nf-status").value,
               lang: $("#nf-lang").value,
+              branch: $("#nf-branch").value, bnote: $("#nf-bnote").value,
+              decision: $("#nf-decision").value,
               parent: $("#nf-parent").dataset.pid || "", at: Date.now() };
     // 只有模板原样没动、其余都空时才算「没写东西」。判定要认两种语言的模板，
     // 否则切一下内容语言就会留下一份「什么都没写」的草稿在下次弹出来。
@@ -2934,6 +3625,12 @@
     $("#nf-paths").value = p ? (p.paths || []).map(U.inheritPath).map(U.formatPath).join("\n") : "";
     $("#nf-code").value = p ? codeToText(p) : "";
     $("#nf-inputs").value = "";
+    /* **branch / decision 一个字都不继承。** branch 说的是「我和我 parent 之间
+       那条边」，decision 说的是「我底下那个岔路口」——抄下去的结果是从候选 A
+       往下走的每一步都变成候选，一棵树上到处是假岔路口。 */
+    $("#nf-branch").value = "extends";
+    $("#nf-bnote").value = "";
+    $("#nf-decision").value = "";
 
     var d = newDraft();
     $("#nf-draft").hidden = !d;
@@ -2954,6 +3651,9 @@
     $("#nf-inputs").value = d.inputs || "";
     $("#nf-code").value = d.code || "";
     $("#nf-commit").value = d.commit || "";
+    $("#nf-branch").value = d.branch || "extends";
+    $("#nf-bnote").value = d.bnote || "";
+    $("#nf-decision").value = d.decision || "";
     if (d.status) $("#nf-status").value = d.status;
     if (d.lang && i18n.STRINGS[d.lang]) $("#nf-lang").value = d.lang;
     if (d.parent && IDX[d.parent]) {
@@ -2969,6 +3669,8 @@
     if (!title) { toast(i18n.t("toast.title.required"), true); return; }
     var wantInputs = textToPaths($("#nf-inputs").value);
     var wantCode = textToPaths($("#nf-code").value);
+    var wantBranch = branchField({ branch: $("#nf-branch").value, bnote: $("#nf-bnote").value });
+    var wantDecision = $("#nf-decision").value.trim();
     papi("/steps", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -2988,20 +3690,27 @@
         // 的记录界面就只能说「这是原文」——说不出是哪种语言的原文。
         // 这是一个用户看得见、能当场改的下拉框，所以它是**声明**，不是猜。
         lang: $("#nf-lang").value,
+        branch: wantBranch,
+        decision: wantDecision,
       }),
     }).then(function (step) {
       dropDraft(NEW_DRAFT_ID);
-      /* 建步骤那条路由**当前**还没有把 inputs / code 透传给写入层（见报告里的
-         接缝清单）。少写两个字段是静默丢数据，所以这里补一次 PATCH——那条路
-         已经收这两个键了。服务端补上之后这次 PATCH 自然不会发生（返回值里
-         已经有了），不需要回来改这段。 */
+      /* 建步骤那条路由**曾经**不把 inputs / code 透传给写入层，`branch` /
+         `decision` 刚加上时也一样。少写几个字段是静默丢数据——201 回来了，
+         磁盘上没有。判据看的是**返回的那一步身上有没有**，所以今天的服务端
+         （四个键全透传）走到这里 lack 就是 false，一次多余的请求都不会发；
+         对着一台还没升级的服务端（静态部署、旧的远端后端）它才补那一次 PATCH。
+         删掉它就等于让「建步骤时顺手写清这是哪条候选」在旧服务端上无声失效。 */
       var lack = (wantInputs.length && !(step.inputs || []).length)
-        || (wantCode.length && !(step.code || []).filter(function (c) { return c.from !== "commit"; }).length);
+        || (wantCode.length && !(step.code || []).filter(function (c) { return c.from !== "commit"; }).length)
+        || (wantBranch && step.branch !== U.BRANCH_ALT)
+        || (wantDecision && !(step.decision || ""));
       var go = lack
         ? papi("/steps/" + encodeURIComponent(step.id), {
             method: "PATCH",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ inputs: wantInputs, code: wantCode }),
+            body: JSON.stringify({ inputs: wantInputs, code: wantCode,
+                                   branch: wantBranch, decision: wantDecision }),
           }).catch(fail)
         : Promise.resolve();
       return go.then(refresh).then(function () {
@@ -3068,6 +3777,9 @@
         if ($("#ed-paths")) $("#ed-paths").value = dd.paths || "";
         if ($("#ed-inputs")) $("#ed-inputs").value = dd.inputs || "";
         if ($("#ed-code")) $("#ed-code").value = dd.code || "";
+        if ($("#ed-branch")) $("#ed-branch").value = dd.branch || "extends";
+        if ($("#ed-bnote")) $("#ed-bnote").value = dd.bnote || "";
+        if ($("#ed-decision")) $("#ed-decision").value = dd.decision || "";
         updatePreview(ds);
         toast(i18n.t("toast.draft.restored"));
       } else {
@@ -3199,6 +3911,36 @@
     if (name === "edit-insights") { openInsightEditor(); return; }
     if (name === "save-insights") { saveInsights(); return; }
     if (name === "move") { openMove(selected()); return; }
+    /* 标成 / 取消互斥候选。写的只有这一步自己那一行 `branch:`。
+       **界面上永远不会有一个「标记赢家」按钮**：那个按钮就是双真相源——
+       「选了哪个」是从其余候选标 dead 派生出来的，另存一份迟早会和 status 打架。 */
+    if (name === "branch") {
+      var bs = IDX[selected()];
+      if (!bs) return;
+      var toAlt = bs.branch !== U.BRANCH_ALT;
+      patch(bs.id, { branch: toAlt ? U.BRANCH_ALT : "", expect: bs.digest || "" })
+        .then(function () {
+          var g = U.groupOf(F.branch_groups, IDX[bs.id] || {});
+          toast(toAlt
+            ? i18n.t("toast.branch.alternative",
+                     { id: bs.id, n: g ? (g.options || []).length : 1, parent: bs.parent || "" })
+            : i18n.t("toast.branch.extends", { id: bs.id }));
+        }).catch(fail);
+      return;
+    }
+    /* 「在决定什么」。这句话推导不出来——候选有谁、选中了谁都算得出来，唯独它
+       只能人写，和「为什么」是同一类字段。所以它是一个 prompt，不是一个开关。 */
+    if (name === "decision") {
+      var qs = IDX[selected()];
+      if (!qs) return;
+      var q = prompt(i18n.t("decision.write.prompt"), qs.decision || "");
+      if (q === null) return;
+      patch(qs.id, { decision: q.trim(), expect: qs.digest || "" })
+        .then(function () {
+          toast(i18n.t(q.trim() ? "toast.decision.saved" : "toast.decision.cleared", { id: qs.id }));
+        }).catch(fail);
+      return;
+    }
     if (name === "edit") { startEditing(); }
     else if (name === "cancel") { guardLeave(function () { editing = false; renderDetail(); }); }
     else if (name === "child") { openNew(selected()); }
@@ -3282,10 +4024,12 @@
      那时人已经点过确定，注意力也已经从「我到底想把它挂到哪」上移开了。 */
   $("#mv-parent").addEventListener("change", paintMoveErr);
   $("#mv-ok").addEventListener("click", function (e) { e.preventDefault(); submitMove(); });
-  ["#nf-title", "#nf-body", "#nf-paths", "#nf-inputs", "#nf-commit", "#nf-code"].forEach(function (sel) {
+  ["#nf-title", "#nf-body", "#nf-paths", "#nf-inputs", "#nf-commit", "#nf-code",
+   "#nf-bnote", "#nf-decision"].forEach(function (sel) {
     var el = $(sel);
     if (el) el.addEventListener("input", saveNewDraft);
   });
+  $("#nf-branch").addEventListener("change", saveNewDraft);
   // <dialog> 按 Esc 会直接关，关之前把没写完的东西钉住
   $("#dlg-new").addEventListener("close", saveNewDraft);
 

@@ -62,6 +62,33 @@ INPUTS_DESC = (
     "例：\"013 | pocket_composition.csv\"、\"014 | rmscore_pairs.csv\"。\n"
     "目标步骤不存在时**不会拒绝**（建立顺序不定），只会在读的一侧给一条警告。"
 )
+BRANCH_DESC = (
+    "这一步和**它 parent 之间那条边**是什么性质。两选一：\n"
+    "  extends —— **默认，不用写**。普通延伸：接着上一步继续做。\n"
+    "  alternative —— **互斥候选**：我和我的兄弟们是同一个问题的几个答案，"
+    "**只能选一条走下去**。\n"
+    "**最容易搞错的一点**：「从 A 又分出一条支线 C 去试别的」**不是** alternative，"
+    "那就是普通的 extends。只有当几条并排的支线是**同一个问题的互斥答案**"
+    "（A 采样重加权 / B 损失重加权，最后只留一条）时才是 alternative。\n"
+    "可以带一句这个候选自己的角度：\"alternative | 先试最便宜的：只调采样权重\"。\n"
+    "三件必须知道的事：\n"
+    "  · 「**这一组有谁**」是扫出来现算的——同一个父节点底下所有 alternative 的孩子算一组。"
+    "父节点上**永远不写**孩子清单，兄弟之间也**不互相登记**：那是双真相源，"
+    "而且一个候选被 trace_move_step 挪走之后，存下来的清单立刻变成谎话。\n"
+    "  · 「**选了哪个**」不用另写字段：哪条走通了，就把**其余候选标 status=dead 并写清"
+    "为什么放弃**，「已定」就是从这里推出来的。一组里还有两个以上没标 dead ＝ "
+    "这个岔路口**还没决定**（那不是错，只是还没结掉）。\n"
+    "  · **汇回不要用它表达**。C 这条支线的产物后来又参与了 A 那条线上的某一步，"
+    "那是 `inputs`（\"013 | scores.csv\"），不是一种 branch —— branch 说的只有"
+    "「我和我 parent 那条边」，它表达不了跨支线的边。"
+)
+DECISION_DESC = (
+    "**写在分叉点（也就是父节点）身上**的一句话：它底下那几个互斥候选**在决定什么**。"
+    "例：\"类别不平衡怎么处理？只能选一条走下去\"。\n"
+    "候选有谁、哪个被选中，程序全都算得出来；**唯独这句话推导不出来，只能人写**——"
+    "半年后看到两条并排的支线，没有它就只剩猜。和「为什么」是同一类字段。\n"
+    "别写在候选自己身上：候选身上写的是 `branch`，分叉点身上写的是 `decision`。"
+)
 CODE_DESC = (
     "跑这一步的代码在哪，一条一行，写成 \"kind | 位置 | k=v …\"。kind 三选一：\n"
     "  git       —— 位置是仓库/树的 URL 或本地仓库路径（`commit:` 字段等价于这一种，"
@@ -93,7 +120,11 @@ BODY_TEMPLATE = (
 # 单独拷过去的（只有 TRACE_URL，没有 trace_core）。tests/test_mcp.py 拿 core 的
 # TR_STRUCT_KEYS 逐字核对这一份，漂移会当场被测出来。
 TR_STRUCT_KEYS = ("id", "parent", "status", "date", "commit", "author",
-                  "tags", "path", "repro", "key", "input", "code", "moved")
+                  "tags", "path", "repro", "key", "input", "code", "moved",
+                  # branch / decision 是**结构**（这条边什么意思、这个岔路口在问什么），
+                  # 不是正文。译文里写一句 `branch: alternative` 就等于让「谁和谁互斥」
+                  # 这件事在两个文件里各有一份答案，而它们只有在改了其中一份时才会打架。
+                  "branch", "decision")
 
 # 小节名的中英对照。agent 手上**没有别的地方**能知道这张表：FORMAT.md 在 pip 装的
 # 机器上根本不存在，而小节名是精确匹配的——写成 `## Why not`，评级和 check 就都
@@ -395,6 +426,7 @@ class LocalBackend:
             chain.append(cur)
             cur = idx[cur]["parent"]
         out["lineage"] = list(reversed(chain))
+        out.update(step_context(f, sid))
         return out
 
     def _guard(self, fn, *a, **kw):
@@ -446,6 +478,10 @@ class LocalBackend:
             tags=payload.get("tags"), paths=payload.get("paths"),
             inputs=payload.get("inputs"), code=payload.get("code"),
             lang=payload.get("lang", ""),
+            # 互斥候选多半是同一次想清楚之后一起建出来的（「A 和 B 只能选一条」）。
+            # 不在建的时候收下 branch/decision，就得建完再 PATCH 一次，而
+            # decision 那句话是整件事里唯一推导不出来的信息，多一道摩擦就永远空着。
+            branch=payload.get("branch", ""), decision=payload.get("decision", ""),
         )
         d = step.to_dict()
         d["created"] = created
@@ -634,6 +670,97 @@ def untranslated_report(forest: dict[str, Any], project: dict[str, Any] | None,
     }
 
 
+# ---------------------------------------------------------------- 三种关系
+
+# 树上的父子边现在有两种意思（`branch:`），另外还有一种边根本不在树上（`input:` 里
+# 那些「汇回」）。三样全是**派生**的，磁盘上只有每个孩子自己那句 branch: 和消费者
+# 自己那行 input:。下面这些函数只做**渲染**，一条判据都不重写 —— 判据在 trace_core
+# 的 compute_branch_groups / compute_merges 里，读单步和读整棵树看到的必须是同一次推导。
+
+
+def open_forks(forest: dict[str, Any]) -> list[dict[str, Any]]:
+    """还没做决定的岔路口：一组候选里还有两个以上没被标 dead。
+
+    这是整件事对研究者最直接的那个信号——「我手上还有几个岔路口悬着」。
+    它是**待办，不是缺陷**：同时开几条线是研究的常态，所以三个门面都不把它
+    算进错误、也不计进退出码。
+    """
+    return [g for g in (forest.get("branch_groups") or []) if g.get("state") == "open"]
+
+
+def step_context(forest: dict[str, Any], sid: str) -> dict[str, Any]:
+    """单步视图额外要的两样：它属于哪一组候选、它身上有哪几条汇回边。
+
+    `step` 自己带的 `fork` 只回答「**我**是不是分叉点」，`merge_in` / `merge_out`
+    只给对端的 id。而读一步的人真正要问的是「我是不是站在某个岔路口的一条岔上、
+    同组还有谁」以及「这条汇回边上的两条线是在哪里分开的」——两者都要看整片森林
+    才答得出，所以在这里补齐，而不是让每个门面各自去 forest 里翻一遍。
+
+    REST 的 `GET /steps/{id}` 和 MCP 的 LocalBackend.step 共用这一份，
+    于是远端后端（照着 REST 拿数据）和本地后端渲染出来的东西逐字一样。
+    """
+    at_me = [g for g in (forest.get("branch_groups") or []) if sid in (g.get("options") or [])]
+    return {
+        # 我是某一组候选里的一个 → 整组给出来（同组还有谁、定了没有、谁被选中）。
+        "in_fork": dict(at_me[0]) if at_me else None,
+        # 和本步有关的汇回边，两个方向都在里面（from/to 自带方向，不用分两个键）。
+        "rejoins": [dict(m) for m in (forest.get("merges") or [])
+                    if m.get("from") == sid or m.get("to") == sid],
+    }
+
+
+def fork_label(g: dict[str, Any]) -> str:
+    """一组候选现在是什么状态，一句话。
+
+    三态全部从 status 派生，磁盘上没有任何「选中了谁」的字段。
+    **「都不行」是结论不是错误**（P4），所以措辞里不带责备。
+    """
+    state = g.get("state")
+    # 只有一个候选时 core 算出来的是 decided（唯一一个还活着），但说成「已定」是骗人：
+    # 一个候选不成其为选择，多半是另一条支漏标了。这不是另一套判据，就是 core 的
+    # lone_alternative 那条诊断——只是把它说进标签里，免得清单上明晃晃写着「已定」。
+    if len(g.get("options") or []) == 1:
+        return "只有一个候选（还不成其为选择）"
+    if state == "decided":
+        return f"已定 → {g.get('chosen') or '?'}"
+    if state == "abandoned":
+        return "都不行（候选全部放弃——这是结论，不是窟窿）"
+    return f"未决 · {len(g.get('live') or [])} 选 1"
+
+
+def fmt_forks(forest: dict[str, Any], header: str, *, only_open: bool = True) -> str:
+    """岔路口清单。给 MCP 的 trace_read(forks=true) 和 CLI 的 `forks` 用。"""
+    groups = forest.get("branch_groups") or []
+    show = open_forks(forest) if only_open else groups
+    n_open = len(open_forks(forest))
+    lines = [header, f"共 {len(groups)} 个岔路口，其中 {n_open} 个还没做决定。", ""]
+    if not show:
+        lines.append("（每个岔路口都已经有结论了——`--all` / all=true 看全部。）" if groups else
+                     "（这个项目里还没有互斥候选。同一个问题的几个答案各写一句 "
+                     "`branch: alternative`，再在它们的父节点上写一句 `decision:` "
+                     "说清在决定什么；「又分出一条支线去试别的」不算，那是普通延伸。）")
+        return "\n".join(lines)
+    by_id = {s["id"]: s for s in forest.get("steps") or []}
+    for g in show:
+        at = g.get("at") or ""
+        head = f"⑂ {at}" if at else "⑂ （森林的根之间——没有父节点能承载 decision:）"
+        lines.append(f"{head}   {fork_label(g)}")
+        if at:
+            lines.append("   在决定什么: " + (g.get("decision")
+                         or "（没写。这句话推导不出来，只能人写——"
+                            "用 trace_update_step 给 " + at + " 补一个 decision）"))
+        for oid in g.get("options") or []:
+            s = by_id.get(oid) or {}
+            note = (s.get("branch_note") or "").strip()
+            lines.append(f"     · {oid:<6} [{s.get('status', '?')}] {s.get('title', '')}"
+                         + (f"  —— {note}" if note else ""))
+        if g.get("state") == "open":
+            lines.append("     还没定不是错：同时开几条线是研究的常态。"
+                         "等哪条走通了，把其余的标 status=dead 并写清为什么放弃，这个岔路口才算结掉。")
+        lines.append("")
+    return "\n".join(lines).rstrip("\n")
+
+
 # ---------------------------------------------------------------- 渲染
 
 ROLE_LABEL = {"input": "输入", "script": "脚本", "output": "产物", "evidence": "证据"}
@@ -671,8 +798,25 @@ def _locations_haystack(s: dict) -> str:
         return " ".join(b for b in bits if b)
 
 
+def _fork_haystack(s: dict) -> str:
+    """一步里和分叉有关的人写的散文（`decision:` 和候选说明），供 trace_search 用。
+
+    权威实现在 core.fork_haystack；这里同样只是「trace_mcp.py 被单独拷走」那条
+    老路上的退路，形状和 _locations_haystack 一模一样。
+    """
+    try:
+        import trace_core as _core  # noqa: PLC0415
+        return _core.fork_haystack(s)
+    except Exception:
+        bits = [str(s.get("decision") or ""), str(s.get("branch_note") or "")]
+        return " ".join(b for b in bits if b)
+
+
 def _matched_locations(s: dict, q: str) -> list[str]:
-    """命中落在「东西在哪」上时，把是哪一行说出来。用 note.md 里的原写法。"""
+    """命中落在正文之外（位置、`decision:`、候选说明）时，把是哪一行说出来。
+
+    一律用 note.md 里的原写法，于是 agent 看到的那一行和它 grep 出来的一模一样。
+    """
     out = []
     for p in s.get("paths") or []:
         if q in (str(p.get("location") or "") + " " + str(p.get("note") or "")).lower():
@@ -684,6 +828,13 @@ def _matched_locations(s: dict, q: str) -> list[str]:
     for i in s.get("inputs") or []:
         if q in str(i.get("note") or "").lower():
             out.append(f"input: {i.get('step', '')} | {i.get('note', '')}")
+    # 分叉那两句人写的散文同理：命中落在 `decision:` 上而正文里一个字都没提这件事，
+    # 是很常见的一种命中（「当年是在哪个岔路口纠结类别不平衡」）。不把那一行摆出来，
+    # 结果就只剩一个 id 和标题，读的人（尤其 agent）判不出这是不是误命中。
+    if q in str(s.get("decision") or "").lower():
+        out.append("decision: " + str(s["decision"]))
+    if q in str(s.get("branch_note") or "").lower():
+        out.append("branch: " + str(s.get("branch") or "") + " | " + str(s["branch_note"]))
     return out
 
 
@@ -729,6 +880,22 @@ def _fmt_tree(forest: dict, header: str) -> str:
         d = 0 if not s["parent"] else depth[s["parent"]] + 1
         depth[s["id"]] = d
         extra = []
+        # 三种关系放在最前面。缩进只表达「谁挂在谁下面」，表达不了「这两条只能选
+        # 一条」和「那条支线的产物又回到了主路径上」—— 而 agent 看不到网页上那些
+        # 括弧和曲线，缩进树是它唯一的结构视图，这里不说就等于这个功能不存在。
+        if s.get("branch") == "alternative":
+            note = (s.get("branch_note") or "").strip()
+            extra.append("候选" + (f"：{note}" if note else ""))
+        if s.get("fork"):
+            extra.append("⑂ 岔路口 " + fork_label(s["fork"]))
+        elif (s.get("decision") or "").strip():
+            # 写了「在决定什么」却还没有候选。它不成组，所以上面那一行不会出现，
+            # 而这句话是唯一只能人写的信息 —— 在树上也不留痕的话，它就彻底消失了。
+            extra.append("⑂ 写了在决定什么，还没有候选")
+        if s.get("merge_out"):
+            extra.append("汇回→ " + " ".join(s["merge_out"]))
+        if s.get("merge_in"):
+            extra.append("汇回← " + " ".join(s["merge_in"]))
         t = s.get("trace") or {}
         if t.get("self"):
             extra.append(t["self"] if t.get("chain") == t["self"] else f"{t['self']}→链{t['chain']}")
@@ -748,10 +915,86 @@ def _fmt_tree(forest: dict, header: str) -> str:
             + (f"   [{' · '.join(extra)}]" if extra else "")
             + (f"   {s['date']}" if s["date"] else "")
         )
+    # 未决的分叉单独汇总一次。**它不是警告**（下面那一栏才是）：一个岔路口悬着
+    # 是待办不是缺陷，混进警告栏只会稀释警告的分量。但它又是这棵树上最该被主动
+    # 说出口的东西——「我还有几条路没做决定」，逐个节点看是看不出来的。
+    todo = open_forks(forest)
+    if todo:
+        lines += ["", f"⑂ 还有 {len(todo)} 个岔路口没做决定（待办，不是缺陷）："]
+        for g in todo:
+            at = g.get("at") or "（根之间）"
+            lines.append(f"  {at}  {len(g['live'])} 选 1（{' / '.join(g['live'])}）"
+                         + (f" —— {g['decision']}" if g.get("decision") else ""))
+        lines.append("  逐个看：trace_read(forks=true)")
     warn = [w for w in forest["warnings"]]
     if warn:
         lines += ["", f"⚠ {len(warn)} 条警告："] + [f"  [{w['where'] or w['code']}] {w['message']}" for w in warn]
     return "\n".join(lines)
+
+
+def _fmt_relations(s: dict) -> list[str]:
+    """单步视图里那三种关系。**读一步的人应该看得出自己站在不在一个岔路口上。**
+
+    「子步骤: 002, 002b」这一行本身表达不了「这两个只能选一条」，而这恰恰是
+    读到 002 的人最需要先知道的一件事——不知道它有个互斥的兄弟，就会把一条
+    候选当成主线接着往下做。
+    """
+    out: list[str] = []
+    g = s.get("fork")
+    if g:
+        out.append(f"  ⑂ 这一步是一个**决策分叉点** —— {fork_label(g)}")
+        out.append("      在决定什么: " + (g.get("decision")
+                   or "（没写。候选有谁、选中了谁都算得出来，唯独这句话只能人写——"
+                      "请用 trace_update_step 的 decision 补上）"))
+        out.append("      候选（只能选一条走下去）: " + " / ".join(g.get("options") or []))
+        if g.get("state") == "open":
+            out.append("      还活着: " + " / ".join(g.get("live") or [])
+                       + " —— 这个岔路口还没定。同时开几条线是常态，不是错；"
+                         "等哪条走通了，把其余的标 status=dead 并写清为什么放弃。")
+        elif g.get("state") == "decided":
+            out.append(f"      「已定」是派生的：其余候选都标了 dead，只剩 {g['chosen']}。"
+                       "磁盘上没有任何「选中了谁」的字段。")
+        else:
+            out.append("      全部候选都已放弃 —— 这是一个结论（这条路走不通），不是缺口。")
+    elif (s.get("decision") or "").strip():
+        # `decision:` 写了，底下却一个候选都还没标 —— 这一步的 `fork` 是 None。
+        # 不在这儿说出来的话，人（或 agent）刚写完那句话，回头一读这一步，
+        # 它整个不见了：候选组是派生的，没有候选就没有组，没有组就没有这一块。
+        # 于是最合理的反应是「刚才没保存上」，再写一遍，或者干脆放弃——
+        # 而这一行偏偏是整套东西里唯一推导不出来、只能人写的那一句。
+        out.append("  ⑂ 这一步上写着**在决定什么**: " + s["decision"].strip())
+        out.append("      但底下还没有任何一步声明自己是候选，所以它现在**还不是**一个岔路口"
+                   "（不成组、trace_read(forks=true) 里也不出现）。给每条候选各调一次 "
+                   "trace_update_step(branch=\"alternative\") 它就立起来了；"
+                   "要是这里其实没有分叉，把 decision 改成空串撤回这句话。")
+    mine = s.get("in_fork")
+    if mine:
+        others = [o for o in (mine.get("options") or []) if o != s.get("id")]
+        at = mine.get("at") or ""
+        out.append(f"  ⑂ 这一步是{(at + ' 底下') if at else '森林的根之间'}"
+                   f"那一组的一个**互斥候选** —— {fork_label(mine)}")
+        out.append("      同组的其他候选: " + (" / ".join(others) or "（只有它一个——"
+                   "多半是另一条支漏标了 branch: alternative）"))
+        if (s.get("branch_note") or "").strip():
+            out.append("      这个候选自己的角度: " + s["branch_note"].strip())
+        if mine.get("decision"):
+            out.append(f"      {at} 上写着在决定什么: {mine['decision']}")
+        out.append("      同一组里**只能选一条走下去**，其余最后标 status=dead —— "
+                   "所以在这条上继续做之前，先看一眼决定做了没有。")
+    for m in (s.get("rejoins") or []):
+        me = s.get("id")
+        if m.get("from") == me:
+            out.append(f"  ⇢ 汇回: 本步的产物又参与了另一条线上的 {m['to']}"
+                       + (f"（两条线在 {m['at']} 分开）" if m.get("at") else "")
+                       + (f" —— {'、'.join(m['notes'])}" if m.get("notes") else ""))
+        else:
+            out.append(f"  ⇠ 汇回: {m['from']} 的产物参与了本步"
+                       + (f"（两条线在 {m['at']} 分开）" if m.get("at") else "")
+                       + (f" —— {'、'.join(m['notes'])}" if m.get("notes") else ""))
+    if s.get("rejoins"):
+        out.append("      汇回就是一条普通的 `input:`，只是两端分属两条支线 —— "
+                   "**别用 branch 去表达它**，branch 只说得了「我和我 parent 那条边」。")
+    return out
 
 
 def _fmt_step(project: str, s: dict) -> str:
@@ -786,14 +1029,19 @@ def _fmt_step(project: str, s: dict) -> str:
         head.append("  子步骤: " + ", ".join(s["children"]))
     if s.get("backlinks"):
         head.append("  被引用: " + ", ".join(s["backlinks"]))
+    head += _fmt_relations(s)
     # 数据依赖：**两个方向都要说**。树上只看得到 parent（记录的派生关系），
     # 而「这个数字是拿谁的产物算出来的」在 input 上。agent 看不到网页，
     # 这几行是它唯一能读到数据流的地方；缺了下游那一半，就答不了
     # 「我要改 013 的产物，谁会跟着错」。
     if s.get("inputs"):
         head.append("  消费了这些步骤的产物（数据依赖，和 parent 是两回事）:")
+        # 哪几行是**汇回**（对端在另一条支线上）逐行标出来。inputs 本身是文件里
+        # 那几行的逐字镜像，故意没有派生字段，所以归类只能在渲染的时候贴上去。
+        back = {m["from"] for m in (s.get("rejoins") or []) if m.get("to") == s.get("id")}
         for i in s["inputs"]:
-            head.append(f"    ← {i['step']}" + (f"  {i['note']}" if i.get("note") else ""))
+            head.append(f"    ← {i['step']}" + (f"  {i['note']}" if i.get("note") else "")
+                        + ("   [汇回：来自另一条支线]" if i["step"] in back else ""))
     if s.get("consumers"):
         head.append("  本步的产物被这些步骤消费: " + ", ".join(s["consumers"])
                     + "（派生，扫全项目算出来的）")
@@ -929,13 +1177,26 @@ TOOLS: list[dict[str, Any]] = [
         "description": (
             "读一个项目的步骤树；给了 step 就读那一步的全文（含到根的溯源链、子步骤、"
             "被引用、附件清单）。**开始任何新实验之前先调这个**，看看这条线走到哪了、"
-            "有没有人试过。"
+            "有没有人试过。\n"
+            "树上的父子边有两种意思，输出里都标出来了：普通延伸（默认）和**互斥候选**"
+            "（标了「候选」的那些，同一个父节点底下的候选**只能选一条走下去**）；"
+            "分叉点上会标 `⑂ 岔路口` 和它定了没有。另外还有一种边不在树上——**汇回**"
+            "（`汇回→` / `汇回←`），那是某条支线的产物又参与了另一条线上的某一步。\n"
+            "`forks=true` 只列**还没做决定的岔路口**（一组候选里还有两个以上没被标 dead）。"
+            "**那是待办，不是缺陷**——同时开几条线是研究的常态；但隔了几天回到一个项目，"
+            "「我还有几个岔路口悬着」是最该先问的一句。"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "project": {"type": "string", "description": "项目 slug，见 trace_projects"},
                 "step": {"type": "string", "description": "步骤 id，如 004 或 004b。不给就返回整棵树"},
+                "forks": {"type": "boolean", "default": False,
+                          "description": "只列岔路口（互斥候选组）：在决定什么、有哪些候选、"
+                                         "定了没有。默认只列**未决**的那些；"
+                                         "配 all=true 连已经定了的一起列。和 step 同时给时以 step 为准"},
+                "all": {"type": "boolean", "default": False,
+                        "description": "配合 forks 用：连已经做完决定的岔路口一起列出来"},
             },
             "required": ["project"],
         },
@@ -982,6 +1243,8 @@ TOOLS: list[dict[str, Any]] = [
                 "inputs": {"type": "array", "items": {"type": "string"}, "description": INPUTS_DESC},
                 "code": {"type": "array", "items": {"type": "string"}, "description": CODE_DESC},
                 "lang": {"type": "string", "description": "这份记录用什么语言写的（en / zh / ja …）。**声明**出来，别让读的一侧去猜——没有它，界面对没翻译的记录只能说「这是原文」，说不出是哪种语言的原文。"},
+                "branch": {"type": "string", "description": BRANCH_DESC},
+                "decision": {"type": "string", "description": DECISION_DESC},
             },
             "required": ["project", "title"],
         },
@@ -989,7 +1252,12 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "trace_update_step",
         "description": (
-            "改一个已有步骤：status / title / body / date / commit / tags / paths / inputs / code。\n"
+            "改一个已有步骤：status / title / body / date / commit / tags / paths / inputs / code / "
+            "branch / decision。\n"
+            "**「回头把两步标成互斥候选」是 branch 的主要用法**：两条路多半是各自建出来"
+            "跑了几天之后，才想明白当初那是同一个问题的两个答案。对每个候选各调一次 "
+            "`branch=\"alternative\"`，再对它们的**父节点**调一次 `decision=\"…\"` 说清在决定什么。"
+            "标错了也能改回来（`branch=\"\"` 就是取消候选身份）。\n"
             "**id 改不了**（会返回 409）——笔记里的 `[[003b]]` 和论文脚注里的引用永远有效，"
             "靠的就是它不动。**parent 不从这条路改**：它可以改，但必须写原因，请用 trace_move_step。\n"
             "跑完之后典型用法：status 改成 done 或 dead，同时用 append 把「结果」和「结论」追加进去。\n"
@@ -1019,6 +1287,11 @@ TOOLS: list[dict[str, Any]] = [
                          "description": "整组替换。" + CODE_DESC},
                 "add_code": {"type": "array", "items": {"type": "string"},
                              "description": "追加，比整组替换安全。" + CODE_DESC},
+                "branch": {"type": "string",
+                           "description": "空串＝取消候选身份、退回普通延伸（标错了要能改回来）。"
+                                          + BRANCH_DESC},
+                "decision": {"type": "string",
+                             "description": "空串＝撤回这句话。" + DECISION_DESC},
                 "repro": {
                     "type": "string",
                     "description": (
@@ -1222,9 +1495,16 @@ def t_read(be, args) -> str:
     project = args["project"]
     if args.get("step"):
         return _fmt_step(project, be.step(project, args["step"]))
+    if args.get("forks"):
+        # 「还有几个岔路口没定」在整棵树里是一条要人自己扫出来的信息，而它恰好是
+        # 隔几天回到一个项目时最该先问的一句。没有独立工具承载它（工具数是插件清单
+        # 对外宣称的规格），所以做成 trace_read 的一种视角。
+        return fmt_forks(be.forest(project), f"项目 {project} · 岔路口",
+                         only_open=not args.get("all"))
     f = be.forest(project)
     out = _fmt_tree(f, f"项目 {project} · {len(f['steps'])} 步"
-                       f"（● done / ○ wip / ▣ dead，缩进表示派生关系）")
+                       f"（● done / ○ wip / ▣ dead，缩进表示派生关系；"
+                       f"「候选」＝和兄弟只能选一条，⑂＝决策分叉点，汇回＝跨支线的数据依赖）")
     # 项目级的洞察放最前面：它是这个项目里已经沉淀下来的判断，
     # 比逐步去读更快让人（和你）进入状态。
     info = next((p for p in be.projects() if p["slug"] == project), None)
@@ -1246,6 +1526,10 @@ def t_search(be, args) -> str:
     「/orange/…/run042/best.pt 是哪一步产出的」「谁用了 20260809 那个快照」
     是这两个键存在的**主要**用途，而 `grep -rn best.pt projects/` 一秒就答得出。
     工具比 grep 弱的那部分，恰好就是 agent 唯一够得到的那部分。
+
+    `decision:`（在决定什么）和候选自己那句说明同理，而且更亏：`decision:` 是整套
+    东西里**唯一**推导不出来、只能人写的一句话，搜不到它，agent 就会把「没搜到」
+    读成「没记过」，然后重新纠结一遍同一个已经做过的决定。
     """
     q = args["query"].strip().lower()
     if not q:
@@ -1256,7 +1540,7 @@ def t_search(be, args) -> str:
         for s in be.forest(slug)["steps"]:
             tr = s.get("tr") or {}
             hay = " ".join([s["id"], s["title"], s["body"], " ".join(s["tags"]),
-                            _locations_haystack(s)]).lower()
+                            _locations_haystack(s), _fork_haystack(s)]).lower()
             langs = [c for c in sorted(tr)
                      if q in ((tr[c].get("title") or "") + "\n" + (tr[c].get("body") or "")).lower()]
             if q not in hay and not langs:
@@ -1386,7 +1670,8 @@ def t_new_step(be, args) -> str:
         be.create_project(project)
 
     payload = {k: args[k] for k in ("parent", "title", "status", "body", "date", "commit", "key",
-                                    "tags", "paths", "inputs", "code", "lang")
+                                    "tags", "paths", "inputs", "code", "lang",
+                                    "branch", "decision")
                if k in args and args[k] not in (None, "")}
     payload.setdefault("status", "wip")
     payload["author"] = args.get("author") or DEFAULT_AUTHOR
@@ -1398,7 +1683,50 @@ def t_new_step(be, args) -> str:
     if _why_is_blank(payload.get("body") or ""):
         tip = ("\n⚠「为什么」还是空的。请用 trace_update_step 补上——日志能自动存、commit 能自动记，"
                "只有「我当时为什么决定试这个」必须写出来，没有这段这条记录半年后就是废的。")
-    return f"已创建 {args['project']}/{s['id']}  [{s['status']}]  {s['title']}" + tip
+    lines = [f"已创建 {args['project']}/{s['id']}  [{s['status']}]  {s['title']}" + tip]
+    if payload.get("branch") or payload.get("decision"):
+        lines += _fork_feedback(be, args["project"], s["id"])
+    return "\n".join(lines)
+
+
+def _fork_feedback(be, project: str, sid: str) -> list[str]:
+    """刚动过分叉语义（或状态）之后，把**这一组现在长什么样**当场说出来。
+
+    候选组是派生的：写下去的只有这一步自己那一行 `branch:`，「这一组有谁、定了没有」
+    要扫完兄弟才知道。不当场说，调用方就得再拉一遍森林才看得见自己刚做了什么——
+    而最该被看见的两种情况恰恰是**没报错**的那两种：只标了一个候选（一个候选不成其
+    为选择），以及标完 dead 之后这个岔路口其实已经定了。
+    """
+    try:
+        f = be.forest(project)
+    except Exception:                       # 反馈是加分项，拿不到就闭嘴，别把主操作说成失败
+        return []
+    out: list[str] = []
+    for g in f.get("branch_groups") or []:
+        if sid not in (g.get("options") or []) and g.get("at") != sid:
+            continue
+        at = g.get("at") or "（森林的根之间）"
+        out.append(f"⑂ {at} 这一组候选: {' / '.join(g.get('options') or [])} —— {fork_label(g)}")
+        if len(g.get("options") or []) == 1:
+            out.append("  一组只有一个候选＝还不是选择。另一条支多半也要标 branch=alternative，"
+                       "否则这个岔路口在图上和清单里都立不起来。")
+        if g.get("at") and not g.get("decision"):
+            out.append(f"  {g['at']} 上还没写 decision（在决定什么）—— 那句话推导不出来，"
+                       "只能人写，现在补最省事。")
+    if out:
+        return out
+    # 一个组都没碰到，而这一步身上有 `decision:` —— 那句话刚写下去，但底下一个
+    # `branch: alternative` 都还没有，它现在什么都不做。回执里不说的话，agent
+    # 得到的是一句干净的「已更新」，然后在 trace_read 里再也找不到自己写的那句话
+    # （候选组是派生的：没有候选就没有组），于是把它读成「没写进去」。
+    me = next((x for x in f.get("steps") or [] if x.get("id") == sid), None)
+    if me and (me.get("decision") or "").strip():
+        out.append(f"⑂ {sid} 上记下了「在决定什么」: {me['decision'].strip()}")
+        out.append("  但底下还没有任何一步声明自己是候选，所以它现在**还不是**一个岔路口。"
+                   "对每个候选各调一次 trace_update_step(branch=\"alternative\") 才算立起来"
+                   "——「这一组有谁」永远是从孩子自己那行 branch: 扫出来的，"
+                   "父节点上绝不写候选清单。")
+    return out
 
 
 def t_update_step(be, args) -> str:
@@ -1416,7 +1744,10 @@ def t_update_step(be, args) -> str:
             "（reason 必填，会永久留在 note.md 的 moved: 那一行里）。"
             "顺带一提：如果你真正想说的是「这一步的数据来自那一步」，那是 inputs，不是 parent。")
     patch = {k: args[k] for k in ("status", "title", "date", "commit", "tags", "paths", "add_paths",
-                                  "inputs", "add_inputs", "code", "add_code", "lang")
+                                  "inputs", "add_inputs", "code", "add_code", "lang",
+                                  # 空串是有意义的取值（取消候选身份 / 撤回那句话），
+                                  # 所以这里过滤的是 None 而不是假值。
+                                  "branch", "decision")
              if k in args and args[k] is not None}
     if args.get("repro"):
         patch["add_repro"] = [args["repro"]]
@@ -1430,7 +1761,12 @@ def t_update_step(be, args) -> str:
     if not patch:
         raise ToolError("没有要改的字段")
     s = be.update(project, sid, patch)
-    return f"已更新 {project}/{s['id']}  [{s['status']}]  {s['title']}"
+    lines = [f"已更新 {project}/{s['id']}  [{s['status']}]  {s['title']}"]
+    # status 也算：把一个候选标成 dead **就是**做出选择——「已定」全靠它派生。
+    # 改完不说一声，做决定的那一刻反而是整条链上唯一没有回执的一步。
+    if {"branch", "decision", "status"} & set(patch):
+        lines += _fork_feedback(be, project, sid)
+    return "\n".join(lines)
 
 
 def t_move_step(be, args) -> str:
@@ -1475,12 +1811,19 @@ def _flow_closure(steps: list[dict], sid: str, direction: str) -> list[str]:
 
 def t_flow(be, args) -> str:
     project, sid = args["project"], args["step"]
-    steps = be.forest(project)["steps"]
+    f = be.forest(project)
+    steps = f["steps"]
     by_id = {s["id"]: s for s in steps}
     if sid not in by_id:
         raise ToolError(f"步骤 {sid} 不存在")
     want = (args.get("direction") or "both").lower()
     me = by_id[sid]
+    # 哪几条数据依赖是**汇回**（对端在另一条支线上、谁都不是谁的祖先）。判据在
+    # trace_core.compute_merges 里，这里只把它标出来：同样一条 input 边，
+    # 「顺着往下走的那一步读了上一步的产物」和「另一条支线的产物回到了这条路上」
+    # 在图上是两件事，混成一样的话「那条废掉的支其实还在喂着主线」就永远看不见。
+    rejoin = {m["from"]: m for m in (f.get("merges") or []) if m["to"] == sid}
+    rejoin.update({m["to"]: m for m in (f.get("merges") or []) if m["from"] == sid})
     out = [f"{project}/{sid}  {me['title']}",
            "（数据依赖 input，不是树上的 parent —— 前者是「这些字节从哪来」，"
            "后者是「我当时接着哪一步想」）"]
@@ -1490,9 +1833,14 @@ def t_flow(be, args) -> str:
         out.append(f"{head}（{len(ids)} 步）:" if ids else f"{head}: {empty}")
         for i in ids:
             s = by_id[i]
-            out.append(f"  {'●' if i in direct else '·'} {i:<6} [{s['status']}] {s['title']}")
+            m = rejoin.get(i)
+            out.append(f"  {'●' if i in direct else '·'} {i:<6} [{s['status']}] {s['title']}"
+                       + (f"   ⇢ 汇回：另一条支线，两条线在 {m['at']} 分开" if m else ""))
         if ids:
             out.append("  （● 是直接相邻的一层，· 是再往外的传递依赖）")
+        if any(i in rejoin for i in ids):
+            out.append("  （标了「汇回」的那几条不在同一条路上：它们是从另一条支线"
+                       "汇过来的，树上看不见这条边）")
 
     if want in ("up", "both"):
         block("上游 · 这一步消费了谁的产物",
@@ -1730,7 +2078,7 @@ def dispatch(backend, name: str, args: dict[str, Any]) -> str:
 # 的客户端连上来跑一遍互操作。
 
 SERVER_NAME = "trace"
-SERVER_VERSION = "1.5.0"
+SERVER_VERSION = "1.6.0"
 
 # 收到客户端要的版本就原样回它（前提是我们认识），否则回我们最新的。
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
@@ -1780,6 +2128,26 @@ FORMAT_ESSENTIALS = (
     "`moved: 日期 | 原 parent | 新 parent | 谁 | 原因`；`id` 仍然永不可改。"
     "代码位置用 `code: <kind> | <位置> | <k=v …>`，kind ∈ git / snapshot / container；"
     "`commit:` 等价于一条 code: git，两者只写一份。"
+    # ⑤c 三种关系。没有这一条，agent 只会写普通的 parent，于是「A/B 只能选一个」
+    # 和「顺着往下做」在树上长得一模一样 —— 而这正是这一轮要分开的东西。
+    "⑤c **树上的父子边有两种意思，另外还有一种边根本不在树上**，三者别混："
+    "（1）**普通延伸**：接着上一步继续做。默认，`branch:` 那一行不用写。"
+    "（2）**互斥候选**：`branch: alternative`（可以带说明 `alternative | 只调采样权重`）。"
+    "意思是「我和我的兄弟们是同一个问题的几个答案，**只能选一条走下去**」——"
+    "注意「从 A 又分出一条支线去试别的」**不是**这个，那就是普通延伸。"
+    "一组候选是**扫出来的**（同一个父节点底下所有 alternative 的孩子），"
+    "父节点上绝不写孩子清单、兄弟之间也不互相登记（那是双真相源，一次 move 就过期）。"
+    "分叉点（父节点）上写一句 `decision: 类别不平衡怎么处理？只能选一条走下去`，"
+    "说清**在决定什么**——候选有谁、选了谁都算得出来，唯独这句话只能人写。"
+    "「**选了哪个**」不需要任何新字段：**其余候选标 `status: dead` 并写清为什么放弃**，"
+    "「已定」就是从这里推出来的；一组里还有两个以上没标 dead ＝ 这个岔路口还没决定"
+    "（那是待办，不是错——同时开几条线是常态）。"
+    "（3）**汇回**：某条支线的产物后来又参与了另一条线上的某一步。**它就是 `input:`**，"
+    "没有新键，也**不要**拿 branch 去表达（branch 只说得了「我和我 parent 那条边」）。"
+    "四条 warn 级提醒，一条都不降级：`lone_alternative`（一组只有一个候选）、"
+    "`fork_without_decision`（有候选却没写 decision）、`undecided_fork`（还有两个以上候选活着）、"
+    "`decision_without_candidates`（写了 decision 却一个候选都没标 —— 那一行现在什么都不做，"
+    "不成组、不进 forks 清单，看着像没保存上）。"
     "⑥ 可溯源性等级：L0 不可溯源（缺「为什么」/「做了什么」，或有图没图注，或 done/dead 没结论）；"
     "L1 可读；L2 可定位（L1 + 代码找得回来 + 记了产物位置）——代码找得回来指**任何一条** code 记录"
     "（commit / 有位置的 snapshot / container），快照目录加逐文件校验和一样算数，"
@@ -1829,7 +2197,12 @@ INSTRUCTIONS = (
     "定期用 trace_check_paths 在**看得见那些路径的机器上**核对一遍；"
     "⑦ id 写下就不可改；parent 可以改，但只能走 trace_move_step 并写清原因（会留下审计）；"
     "别把 parent 当数据依赖用 —— 「这些字节从哪来」是 inputs，能有好几个，用 trace_flow 看；"
-    "⑧ 要双语就用 trace_translate 单独补一份译文（`note.en.md`），它碰不到原文——"
+    "⑧ 两条路只能选一条时（同一个问题的两个答案），给每个候选写 `branch: alternative`，"
+    "并在它们的**父节点**上写一句 `decision:` 说清在决定什么；走通一条之后把其余的标 dead —— "
+    "「选了哪个」就是这么派生出来的，没有第二个字段。**「又分出一条支线去试别的」不是互斥候选**，"
+    "那是普通延伸；**「那条支线的产物后来回到了主路径上」也不是**，那是 inputs。"
+    "隔几天回到一个项目先 `trace_read(forks=true)` 看还有几个岔路口没定；"
+    "⑨ 要双语就用 trace_translate 单独补一份译文（`note.en.md`），它碰不到原文——"
     "建完步骤马上调就是立刻翻译，过几天再调就是延迟翻译，同一条路径；"
     "隔了几天先用 trace_untranslated 看还欠哪些。\n\n"
     + FORMAT_ESSENTIALS

@@ -1,6 +1,7 @@
 """布局算法的断言。order / lanes 是纯函数，这里完全不碰 IO、不碰 HTTP。"""
 
-from trace_core import Step, build_children, compute_lanes, compute_order
+from trace_core import (Step, build_children, compute_lanes, compute_order,
+                        compute_tree)
 
 
 def mk(*pairs):
@@ -50,6 +51,40 @@ def test_heir_is_chosen_by_subtree_height_not_by_subtree_size():
     assert lane["002"] == 1, "死胡同（子树最大但最矮）不该霸占主线轨道"
     mainline = [sid for sid in order if lane[sid] == 0]
     assert mainline == ["001", "003", "020", "021", "022", "023"], "验收清单：单根主线必须整条在轨道 0"
+
+
+def test_branch_semantics_do_not_move_a_single_coordinate():
+    """分叉语义（`branch:` / `decision:`）只加**含义**，不动**几何**。
+
+    防的是一个很容易滑进来的「顺手优化」：既然知道了 012 / 012b 是一组互斥候选，
+    不如把它们排在一起 / 给它们单独留轨道 / 让 heir 避开 dead 的候选。一旦这么做，
+    同一份记录在标上 branch 之后图就整个跳一次，而人只是补了一句「这两个是候选」。
+    order / lanes / tree 三者一个数都不许变。
+    """
+    pairs = [("011", None), ("012", "011"), ("012b", "011"), ("012c", "011"),
+             ("013", "012b"), ("014", "012")]
+
+    plain = {sid: Step(id=sid, parent=p, title=sid) for sid, p in pairs}
+    # 同一棵树，只是补上分叉语义：三个候选、其中两个已经废掉、父节点写了 decision。
+    marked = {sid: Step(id=sid, parent=p, title=sid) for sid, p in pairs}
+    marked["011"].decision = "类别不平衡怎么处理？只能选一条走下去"
+    for sid, st in (("012", "done"), ("012b", "dead"), ("012c", "dead")):
+        marked[sid].branch = "alternative"
+        marked[sid].status = st
+    # 顺便带一条汇回边（013 的产物参与了 012 那条线上的 014）。
+    marked["014"].inputs = [{"step": "013", "note": "scores.csv"}]
+
+    got = []
+    for by_id in (plain, marked):
+        children = build_children(by_id)
+        order = compute_order(by_id, children)
+        lane, end = compute_lanes(by_id, children, order)
+        got.append((order, lane, end, compute_tree(by_id, children, order)))
+
+    assert got[0][0] == got[1][0], "order 变了"
+    assert got[0][1] == got[1][1], "lanes 变了"
+    assert got[0][2] == got[1][2], "end 变了"
+    assert got[0][3] == got[1][3], "树坐标变了"
 
 
 def test_heir_ties_on_height_go_to_the_smallest_id():

@@ -109,6 +109,17 @@
       "list.legend.done": "done — solid",
       "list.legend.wip": "wip — dashed",
       "list.legend.dead": "dead — dotted",
+      /* ⑦ 三种关系的图例。摆在 status 那三条后面是有意的：读者先分清「线型说的是
+         状态」，再看「颜色说的是关系」，两套通道就不会在脑子里打架。
+         每条写成「名字 —— 一句话」，因为第一次看见彩色边的人全靠这里知道它是什么
+         意思；名字刻意避开「分支 / 主线」，那两个词在 git 里已经有别的含义了。 */
+      "list.legend.extends": "continues — one step further down the same road",
+      "list.legend.alternative": "alternative — one of several answers to the same question, and only one road gets taken",
+      "list.legend.rejoin": "rejoins — something made on this side road was read by a later step on another one",
+      "list.legend.extends.title": "The ordinary case, and the one you should never have to think about: this step picks up where its parent left off.",
+      "list.legend.alternative.title": "A question was asked at the parent and these are the answers on offer. The set is read off the tree — every child that calls itself a candidate is in it. Siblings never register each other, so there is no way for two of them to disagree about who is whose alternative.",
+      "list.legend.rejoin.title": "Not a tree edge at all. It is a declared input, drawn here so that a side road which came back does not read as a dead end. The curve and the arrowhead say so by themselves: a tree edge is never curved.",
+      "list.legend.note": "Colour is for scanning, shape is for reading. A set of alternatives is bracketed and a rejoin is always a curve with an arrowhead — so a greyscale printout, or a reader who sees no colour, loses the glance and not the meaning.",
       "list.legend.l0": "chain broken here",
       "list.legend.reprofail": "reproduction failed",
       "list.zoom.out": "Zoom out",
@@ -230,6 +241,88 @@
       "lint.subheads": "`{section}` has no prose of its own, only sub-headings beneath it. That counts as written — this line is here so you know how it was read.",
       "lint.table.nodesc": "A table with nothing said about it. Someone handed only the numbers has to guess which direction is better.",
       "lint.pre.nodesc": "A code block with nothing said about it — say what it does, or what its output turned out to mean.",
+      /* ⑦ 的三条诊断。全是提示级：一个岔路口没做决定不是缺陷，是研究的正常状态，
+         所以每一条都要自己说出「这不影响等级」——lint.note 那句总说明会被人当背景板
+         略过，而这三条恰恰最容易被误读成「我这里做错了」。 */
+      "lint.alt.lone": "Marked as a candidate with nothing beside it — a choice between one road. Either the road not taken never got written down, or this is a plain next step and the mark can come off. Neither reading changes the level.",
+      "lint.fork.noquestion": "{n} roads leave this step and no line says what the choice is between. That there were two roads is visible from the tree; what the fork was about is exactly the part the tree cannot hold. A hint only — the level is untouched.",
+      "lint.fork.open": "{n} candidates here are still live, so this fork has no answer yet. Nothing is wrong: running several roads at once is how the work actually goes. It is listed because an open fork is a question you are still carrying, and because marking the roads you gave up on as dead is far easier now than a year from now. The level is untouched.",
+      /* fork_without_decision 的镜像。它比那一条更容易被当成 bug：写下的问题在
+         页面上看得见，可它不成组、不进 forks 清单、图上也没有括弧——人最先想到的
+         解释是「没保存上」。所以这句话要先说「记下了」，再说「还差什么」。 */
+      "lint.fork.nocandidates": "{id} says what the choice is between, but no step below it has declared itself a candidate. The line is saved; it just isn't a fork yet — nothing is grouped, no bracket is drawn, and it won't show up among the open decisions. Mark each road with `alternative` and it stands up. The level is untouched either way.",
+      /* branch: 那一行拼错时的降级提醒。没有这条 key，英文界面上会原样漏出
+         服务端那句中文——而这一条恰恰是给刚打错字的人看的。 */
+      "lint.branch.unknown": "`branch: {branch}` isn't a value this reads. The step is being treated as a plain continuation, which means the mark you wrote is having no effect at all. The two values are `extends` and `alternative`.",
+
+      /* ---- ⑦ 决策分叉与汇回：树上的边不再只有一种含义 ----
+         存储上只多了两个键（候选自己写 `branch: alternative`，分叉点自己写
+         `decision:`），"这一组是互斥的""选了哪一个"全是扫出来的派生结论。
+         文案要把这一点说出来，否则人会去找一个"标记赢家"的按钮，找不到就以为
+         功能缺了一半——而那个按钮正是双真相源本身。 */
+      "branch.kind.extends": "continuation",
+      "branch.kind.alternative": "alternative",
+      "branch.kind.extends.title": "Carries on from the parent. This is what an edge means when nothing says otherwise, which is why it is never written into the note.",
+      "branch.kind.alternative.title": "One of the roads out of a question, and the roads are exclusive — taking this one means giving the others up. Each candidate says that about itself; the set is what you get by reading them together.",
+      "branch.badge": "candidate",
+      "branch.badge.title": "This step is one of several answers to the same question. The others sit right beside it, under the same parent.",
+
+      "decision.pick": "1 of {n}",
+      "decision.pick.title": "{n} roads leave this question and one of them gets taken. Which one is not stored anywhere — the moment the others are marked dead, the survivor is the answer.",
+      "decision.settled": "settled · {id}",
+      "decision.settled.title": "Every other candidate here is marked dead, so {id} is the road that was taken. Nobody wrote that down; it is what the dead ones add up to.",
+      "decision.alldead": "all abandoned",
+      "decision.alldead.title": "Every road out of this question ended in dead. The question still stands, and that it has no answer is a finding in its own right — not a gap to be tidied away.",
+      // 一个候选不成其为选择。这块牌子以前跟着 state 说「已定」——而 state 只数
+      // 还活着的候选，1 个活的就叫已定，对 2 选 1 是对的，对「从头到尾只有 1 条」
+      // 是在替人宣布一件没发生的事。CLI、MCP 和顶上的提示栏说的都是这一句。
+      "decision.lone": "only one road",
+      "decision.lone.title": "{id} is marked as a candidate with nothing beside it. A choice between one road was never a choice — either the other candidate is missing its own branch: alternative, or this one is just an ordinary continuation.",
+      "decision.open": "not decided yet",
+      "decision.open.title": "More than one candidate here is still alive. That says where the work stands, not that anything is wrong with it.",
+      "decision.open.note": "{n} of these roads are still live, so nothing has been decided here yet — a perfectly normal place to be. It reads as settled the moment the roads you gave up on are marked dead, which is worth doing while you still remember why you gave them up.",
+      "decision.open.summary": { one: "{n} decision is still open", other: "{n} decisions are still open" },
+      "decision.open.summary.title": "Forks where more than one candidate is still alive. This is the list to read first when you come back to a project after a month away — an open fork is a question you are still carrying around.",
+      "decision.question.label": "What is being decided",
+      "decision.question.title": "Written by hand, on the step the roads leave from. Nothing can work it out for you: two children prove there were two roads, never what the choice was between.",
+      "decision.question.missing": "Nothing here says what the choice is between. The roads are visible; the question they answer is not.",
+      /* 「问题写了、候选还没标」。这一步的 fork 是 null，所以详情面板里只有孤零零
+         一行问题——不说清它现在还不成其为岔路口，人只会以为界面漏掉了候选。 */
+      "decision.question.orphan": "Saved — but no step below has said `branch: alternative` about itself yet, so this isn't a fork yet: nothing is grouped, no bracket is drawn on the tree, and it stays out of the open-decisions list. Mark each road as a candidate and the question stands up around them.",
+      "decision.head": { one: "Decision point · {n} candidate", other: "Decision point · {n} candidates" },
+      "decision.lead": "The roads below are answers to one question, and only one of them carries on. Which one won is not a field anywhere — it is read off the others being marked `dead`, so there is no second copy of it to go stale.",
+      "decision.candidate.entry": "{link} — {what}",
+      "decision.candidate.entry.bare": "{link}",
+      "decision.candidate.dead": "ruled out",
+      "decision.candidate.live": "still live",
+      "decision.of.head": "A candidate at the fork on {parent}",
+      "decision.of.lead": "This step is one answer to the question asked at {parent}. Only one of the roads there carries on; the rest end up marked `dead`, and that is the whole record of which one won.",
+      "decision.siblings.head": { one: "The other candidate · {n}", other: "The other candidates · {n}" },
+      "decision.siblings.lone": "Nothing else under this parent carries the mark, so the set holds one road. Either the road not taken was never written down, or this was simply the next step and the mark can come off.",
+      /* 根之间也能成一组（两种互斥的开局）。它没有分叉点，于是没有任何一步能承载
+         那句 `decision:`——界面得如实说出来，不然人会到处找那个写问题的地方。 */
+      "decision.roots.head": { one: "{n} way to start", other: "{n} ways to start, and one gets taken" },
+      "decision.roots.note": "These candidates are roots: there is no step above them to hang the question on, so what is being decided has nowhere to live here. Put it in the title of each road instead.",
+      "decision.mark.act": "Mark as a candidate",
+      "decision.mark.act.title": "Say that this step and its siblings answer the same question, and that only one of them will be carried on with.",
+      "decision.unmark.act": "Not a candidate after all",
+      "decision.unmark.act.title": "Back to an ordinary continuation. The id, the note and every sibling stay exactly as they are — what changes is how the edge above this step reads.",
+      "decision.write.act": "✎ Write what is being decided",
+      "decision.write.act.title": "One line on the question these roads answer. It hangs on this step, the one they all leave from.",
+      "decision.write.prompt": "What is being decided here? One line, phrased as the question the roads below are answers to:",
+
+      "rejoin.kind": "rejoin",
+      "rejoin.kind.title": "An input that crosses from one road to another: work done off to the side was read by a later step over here. It is the same line the data-flow view draws — the tree simply stopped hiding it.",
+      "rejoin.lead": "A side road doesn't always end where it stops. When something it produced is read later by another line, that is a rejoin — and it is an `input:`, not a second kind of parent. No new field was invented for it; the edge has been in the file all along.",
+      "rejoin.out.head": { one: "This step's output rejoined {n} step", other: "This step's output rejoined {n} steps" },
+      "rejoin.in.head": { one: "Rejoined here from {n} other road", other: "Rejoined here from {n} other roads" },
+      "rejoin.entry": "{link} — {what}",
+      "rejoin.entry.bare": "{link}",
+      /* 汇回边自带「两条路是在哪儿分开的」（core 算的 LCA）。说出这个岔路口，
+         「它绕回来了」才有具体的形状——否则读者只知道有一条曲线。 */
+      "rejoin.at": "the two roads parted at {id}",
+      "rejoin.badge": "rejoins",
+      "rejoin.badge.title": "Something produced on another road was read here, or something produced here was read over there. The curved edges on the graph are these.",
 
       /* ---- 可溯源性 · L0–L4 ---- */
       "trace.title": "Traceability · L0–L4",
@@ -320,6 +413,18 @@
       "editor.code.label": "Code · one per line, `kind | location | k=v`",
       "editor.code.placeholder": "snapshot | /orange/lab/run_snapshots/20260809 | manifest=MANIFEST.md5 n=43",
       "editor.code.hint": "`kind` is `git`, `snapshot` or `container`. An existing `commit:` line keeps working and shows up here as a git entry — it is read from that one line, not copied into a second one.",
+      /* ⑦ 编辑侧只有两个输入：候选自己声明「我是候选」，分叉点自己写「在决定什么」。
+         hint 要把「标成候选意味着什么」说完整——尤其是「其余的最终会被标 dead」，
+         因为界面上永远不会有一个「选它」按钮：那个按钮就是双真相源。 */
+      "editor.branch.label": "How this step relates to its parent",
+      "editor.branch.extends": "extends — carries on from the parent",
+      "editor.branch.alternative": "alternative — one road out of a question, and only one gets taken",
+      "editor.branch.hint": "Calling this an alternative says the parent asked a question and this is one of the answers to it. The siblings are never told about each other: every candidate carries the mark itself, and the set is whatever you get by reading them together. When one road wins you mark the others `dead` — that, and nothing else, is what records the decision.",
+      "editor.branch.note.label": "This candidate in one line · optional",
+      "editor.branch.note.placeholder": "resample the minority class instead of reweighting the loss",
+      "editor.decision.label": "The question this step opens · optional",
+      "editor.decision.placeholder": "How should the class imbalance be handled? Only one of these roads gets taken",
+      "editor.decision.hint": "This goes on the step the roads leave from, not on the roads. Two children prove there were two roads; only this line says what the choice was between — and like \"Why\", it is a line nothing can generate for you.",
       "editor.hint": "Paste a screenshot with **Ctrl+V** and it uploads and inserts itself; anything copied out of Excel or a web table turns into a markdown table; files can be dropped straight into the box. `id` never changes and is never handed out twice — a `[[003b]]` written down anywhere has to keep working forever. `parent` can be moved, but only with a reason, and the move gets written into the note.",
       "editor.status.uploading": "Uploading…",
       "editor.status.inserted": { one: "Inserted {n} file", other: "Inserted {n} files" },
@@ -393,6 +498,14 @@
       "search.where.tags": "tags",
       "search.where.id": "id",
       "search.where.paths": "artifact / code location",
+      /* `decision:` 和候选自己那句说明。它们和标题、正文一样是人写的散文，
+         grep 找得到，站内搜索也必须找得到。 */
+      "search.where.fork": "what was being decided",
+      /* 命中落在译文里。没有这两条时 whereLabel 会原样显示服务端发的 "tr.title"
+         ——双语这一整套功能的意义就是英文那一侧也答得出同一个问题，结果连
+         「命中在哪」都还说着内部字段名。 */
+      "search.where.tr.title": "translated title",
+      "search.where.tr.body": "translated text",
       "search.hit.where": "matched in {where}",
       "search.searching": "Searching…",
       "search.failed": "Search failed: {error}",
@@ -471,6 +584,16 @@
       "toast.insight.superseded": "{id} supersedes {old}; {old} is folded up, not gone",
       "toast.moved": "Moved {id} under {parent} — the old parent and your reason are in the note now",
       "toast.moved.root": "{id} is a root of its own now — the move is recorded in the note",
+      /* 移动一个候选的直接后果。事后看不出来：组是派生的，重新读一遍只告诉你
+         「现在是什么样」。不说的话，下次见到的是一条来路不明的「只有一个候选」。 */
+      "toast.moved.fork": { one: "the fork at {at} is down to {n} candidate",
+                            other: "the fork at {at} now holds {n} candidates" },
+      "toast.moved.fork.roots": { one: "the candidates among the roots are down to {n}",
+                                  other: "the roots now hold {n} candidates between them" },
+      "toast.branch.alternative": "{id} is a candidate now — {n} roads leave {parent}, and one of them gets taken",
+      "toast.branch.extends": "{id} reads as an ordinary continuation again",
+      "toast.decision.saved": "The question is written on {id}",
+      "toast.decision.cleared": "The question line is gone from {id}; the candidates under it are untouched",
       "toast.copied.path": "Path copied",
       "toast.copy.failed": "Copy failed",
       "toast.draft.restored": "Draft restored",
@@ -516,6 +639,8 @@
       "count.moves": { one: "{n} move", other: "{n} moves" },
       "count.inputs": { one: "{n} input", other: "{n} inputs" },
       "count.consumers": { one: "{n} consumer", other: "{n} consumers" },
+      "count.alternatives": { one: "{n} candidate", other: "{n} candidates" },
+      "count.rejoins": { one: "{n} rejoin", other: "{n} rejoins" },
       "unit.b": "{n} B",
       "unit.kb": "{n} KB",
       "unit.mb": "{n} MB",
@@ -582,6 +707,13 @@
       "list.legend.done": "done 实线",
       "list.legend.wip": "wip 虚线",
       "list.legend.dead": "dead 点线",
+      "list.legend.extends": "延伸 —— 同一条路上再往下走的一步",
+      "list.legend.alternative": "互斥候选 —— 同一个问题的几个答案，只能选一条走下去",
+      "list.legend.rejoin": "汇回 —— 这条支线做出来的东西，被另一条线上更靠后的一步读了",
+      "list.legend.extends.title": "最平常的那一种，也是本来就不该费神去想的那一种：这一步接着父步骤往下做。",
+      "list.legend.alternative.title": "父步骤那里提了一个问题，这些是摆出来的答案。这一组是从树上读出来的——凡是自称候选的孩子都在组里。兄弟之间互不登记，所以永远不会出现两条记录对「谁是谁的候选」各执一词。",
+      "list.legend.rejoin.title": "它根本不是树上的边，而是一条声明出来的输入，画在这里是为了让一条又绕回来的支线不至于看着像死胡同。曲线加箭头本身就说明了这件事：树上的边从来不弯。",
+      "list.legend.note": "颜色负责一眼扫到，形状负责说得准。一组候选外面有一道括弧，汇回永远是带箭头的曲线——于是灰度打印出来、或者看不见颜色的人，丢掉的只是那一眼，不是那个意思。",
       "list.legend.l0": "链断了",
       "list.legend.reprofail": "复现失败",
       "list.zoom.out": "缩小",
@@ -702,6 +834,79 @@
       "lint.subheads": "`{section}` 下面没有自己的正文，只有子标题。这算写了——写这一行只是让你知道它是怎么被读的。",
       "lint.table.nodesc": "表格没有一句说明。只拿到一堆数字的人，只能猜哪个方向算好。",
       "lint.pre.nodesc": "代码块没有一句说明——说清它做什么，或者它的输出后来说明了什么。",
+      "lint.alt.lone": "标了候选，旁边却没有别的候选——只有一条路可选，就没什么可选的。要么另一条路当时没写下来，要么这本来就只是下一步，把这个标记取掉即可。两种情况都不影响等级。",
+      "lint.fork.noquestion": "这一步下面分出 {n} 条候选，却没有一行说清在决定什么。当时有几条路，树上看得见；这个岔路口是为了什么，恰恰是树装不下的那部分。只是提示，不影响等级。",
+      "lint.fork.open": "这里还有 {n} 个候选活着，这个岔路口还没有答案。这不是错：同时开几条线本来就是研究的常态。列出来是因为「未决的分叉」就是你还背着的问题，而且把放弃掉的那几条标成 dead，现在做比一年以后做容易得多。不影响等级。",
+      "lint.fork.nocandidates": "{id} 上写了在决定什么，底下却还没有任何一步声明自己是候选。这一行已经存下来了，只是它还不构成一个岔路口——不成组、图上不画括弧、未决清单里也不出现。给每条路各标一个 `alternative`，这个问题就立起来了。两种情况都不影响等级。",
+      "lint.branch.unknown": "`branch: {branch}` 这个取值认不出来，这一步已经按普通延伸处理了——也就是说你写的那个标记现在一点作用都没有。可用的取值只有 `extends` 和 `alternative` 两个。",
+
+      /* ---- ⑦ 决策分叉与汇回：树上的边不再只有一种含义 ----
+         存储上只多了两个键（候选自己写 `branch: alternative`，分叉点自己写
+         `decision:`），"这一组是互斥的""最后选了哪一个"全是扫出来的派生结论。
+         文案必须把这一点说出来，否则人会去找一个"标记赢家"的按钮，找不到就以为
+         功能缺了一半——而那个按钮本身就是双真相源。 */
+      "branch.kind.extends": "延伸",
+      "branch.kind.alternative": "互斥候选",
+      "branch.kind.extends.title": "接着父步骤往下做。什么都不写的时候，一条边就是这个意思，所以它从不写进笔记。",
+      "branch.kind.alternative.title": "一个问题分出来的几条路之一，而这些路是互斥的——走了这一条，就意味着放弃其余几条。每个候选只声明自己；把它们放在一起读，才得到那一组。",
+      "branch.badge": "候选",
+      "branch.badge.title": "这一步是同一个问题的几个答案之一。其余几个就挂在它旁边，同一个父步骤下面。",
+
+      "decision.pick": "{n} 选 1",
+      "decision.pick.title": "这个问题分出 {n} 条路，最后走一条。走的是哪条并不存在任何字段里——其余几条被标成 dead 的那一刻，活下来的那条就是答案。",
+      "decision.settled": "已定：{id}",
+      "decision.settled.title": "这里其余的候选都标了 dead，于是 {id} 就是当时选的那条路。没有人专门记过这件事，它是那几条 dead 加起来的结果。",
+      /* 逐字是「都不行」，不是「全部作废」：README 的「三种边的视觉编码」那一行、
+         FORMAT.md 15.3 的状态表、MCP 的 fork_label 三处都是这三个字，而「作废」
+         听着像是这几条记录出了问题被撤销了 —— 它们没有，它们各自都是走到底的
+         结论，只是这个问题的答案恰好是「都不行」（P4）。 */
+      "decision.alldead": "都不行",
+      "decision.alldead.title": "这个问题分出去的路全都走到了 dead。问题还立在那里，而「它至今没有答案」本身就是一条结论，不是要顺手补齐的窟窿。",
+      "decision.lone": "只有一条",
+      "decision.lone.title": "{id} 被标成了候选，旁边却没有别的路。一个候选不成其为选择——要么是另一条忘了标 branch: alternative，要么这条本来就只是普通的延伸。",
+      "decision.open": "还没定",
+      "decision.open.title": "这里还有不止一个候选活着。它说的是工作现在走到哪了，不是说哪里做错了。",
+      "decision.open.note": "这里还有 {n} 条路活着，所以这个岔路口还没做决定——这是很正常的状态。等你把放弃掉的那几条标成 dead，它就自动读作「已定」；趁还记得为什么放弃，顺手标了最划算。",
+      "decision.open.summary": "还有 {n} 个岔路口没做决定",
+      "decision.open.summary.title": "还有不止一个候选活着的那些岔路口。隔了一个月回到一个项目，最该先看的就是这份清单——一个未决的分叉，就是一个你还背在身上的问题。",
+      "decision.question.label": "在决定什么",
+      "decision.question.title": "人手写在分叉的那一步上。这句话推导不出来：两个孩子只能证明当时有两条路，永远说不出这两条路是在选什么。",
+      "decision.question.missing": "没有一行说清这里在选什么。几条路看得见，它们回答的那个问题看不见。",
+      "decision.question.orphan": "记下来了——但底下还没有任何一步声明自己是 `branch: alternative`，所以它现在还不是一个岔路口：不成组、树上不画括弧、也不出现在「还没做决定」那份清单里。把每条路各标成一个候选，这个问题就在它们上面立起来了。",
+      "decision.head": "决策点 · {n} 个候选",
+      "decision.lead": "下面这几条路是同一个问题的答案，最后只有一条走得下去。选中的是哪一条不是任何地方的一个字段——它是从其余几条被标成 `dead` 读出来的，于是不存在第二份会过期的拷贝。",
+      "decision.candidate.entry": "{link} —— {what}",
+      "decision.candidate.entry.bare": "{link}",
+      "decision.candidate.dead": "已放弃",
+      "decision.candidate.live": "还活着",
+      "decision.of.head": "{parent} 那个岔路口的一个候选",
+      "decision.of.lead": "这一步是 {parent} 提出的那个问题的一个答案。那里的几条路最后只有一条走得下去，其余的会被标成 `dead`——而那就是「当时选了哪个」的全部记录。",
+      "decision.siblings.head": "并列的其他候选 · {n}",
+      "decision.siblings.lone": "这个父步骤下面没有别的候选，于是这一组里只有一条路。要么当时没走的那条压根没写下来，要么这本来就只是下一步，标记可以取掉。",
+      /* 根之间也能成一组（两种互斥的开局）。它没有分叉点，于是没有任何一步能承载
+         那句 `decision:`——界面得如实说出来，不然人会到处找那个写问题的地方。 */
+      "decision.roots.head": "{n} 种开局，最后走一种",
+      "decision.roots.note": "这几个候选都是根：它们上面没有一步可以挂那句问题，所以「在决定什么」在这里没有地方可写。把它写进每条路自己的标题里。",
+      "decision.mark.act": "标成互斥候选",
+      "decision.mark.act.title": "声明这一步和它的兄弟们在回答同一个问题，而且最后只会有一条被走下去。",
+      "decision.unmark.act": "其实不是候选",
+      "decision.unmark.act.title": "改回普通的延伸。id、笔记、兄弟节点全都原样不动，变的只是它头上那条边怎么读。",
+      "decision.write.act": "✎ 写清在决定什么",
+      "decision.write.act.title": "一行字说清这几条路在回答什么问题。它挂在这一步上，也就是几条路分出去的那一步。",
+      "decision.write.prompt": "这里在决定什么？一行字，写成下面这几条路所回答的那个问题：",
+
+      "rejoin.kind": "汇回",
+      "rejoin.kind.title": "一条从别的路横过来的 input：在旁边那条线上做出来的东西，被这边更靠后的一步读了。它和数据流视图画的是同一条线——只是树以前一直没把它画出来。",
+      "rejoin.lead": "一条支线不一定在停下的地方就结束了。它产出的东西后来被另一条线读走，那就是一次汇回——而它是一条 `input:`，不是第二种父节点。为它没有新增任何字段，这条边一直就在文件里。",
+      "rejoin.out.head": "本步的产物汇回到 {n} 步",
+      "rejoin.in.head": "从 {n} 条别的路汇进本步",
+      "rejoin.entry": "{link} —— {what}",
+      "rejoin.entry.bare": "{link}",
+      /* 汇回边自带「两条路是在哪儿分开的」（core 算的 LCA）。说出这个岔路口，
+         「它绕回来了」才有具体的形状——否则读者只知道有一条曲线。 */
+      "rejoin.at": "两条路是在 {id} 分开的",
+      "rejoin.badge": "有汇回",
+      "rejoin.badge.title": "别的路上产出的东西被这里读了，或者这里产出的东西被别的路读了。图上那些弯曲的边就是它们。",
 
       /* ---- 可溯源性 · L0–L4 ---- */
       "trace.title": "可溯源性 · L0–L4",
@@ -792,6 +997,18 @@
       "editor.code.label": "代码 · 每行一条，`kind | 位置 | k=v`",
       "editor.code.placeholder": "snapshot | /orange/lab/run_snapshots/20260809 | manifest=MANIFEST.md5 n=43",
       "editor.code.hint": "`kind` 是 `git` / `snapshot` / `container`。已有的 `commit:` 那一行照旧管用，会作为一条 git 显示在这里——它是从那一行读出来的，不是复制成了第二份。",
+      /* ⑦ 编辑侧只有两个输入：候选自己声明「我是候选」，分叉点自己写「在决定什么」。
+         hint 要把「标成候选意味着什么」说完整——尤其是「其余的最终会被标 dead」，
+         因为界面上永远不会有一个「选它」按钮：那个按钮就是双真相源。 */
+      "editor.branch.label": "这一步和父步骤是什么关系",
+      "editor.branch.extends": "延伸 —— 接着父步骤往下做",
+      "editor.branch.alternative": "互斥候选 —— 一个问题分出来的一条路，最后只走一条",
+      "editor.branch.hint": "标成候选，说的是父步骤那里提了一个问题，而这一步是它的答案之一。兄弟之间不会互相登记：每个候选只在自己身上写这个标记，把它们放在一起读才得到那一组。哪条路赢了，你就把其余几条标成 `dead`——记录这次决定的就只有这件事，再没有别的。",
+      "editor.branch.note.label": "这个候选一句话 · 可不写",
+      "editor.branch.note.placeholder": "对少数类重采样，而不是给损失加权",
+      "editor.decision.label": "这一步开出的那个问题 · 可不写",
+      "editor.decision.placeholder": "类别不平衡怎么处理？只能选一条走下去",
+      "editor.decision.hint": "写在分叉的那一步上，不是写在分出去的路上。两个孩子只能证明当时有两条路；只有这一行说得出这两条路是在选什么——和「为什么」一样，它是机器替你生成不了的那种句子。",
       "editor.hint": "截图 **Ctrl+V** 直接粘贴会自动上传并插入；从 Excel / 网页表格复制的内容粘贴会自动转成 markdown 表格；文件也可以拖进编辑框。`id` 不可改、也不会重发——任何地方写下的 `[[003b]]` 都必须永远有效。`parent` 可以移动，但必须写原因，而且这次移动会被记进笔记。",
       "editor.status.uploading": "上传中…",
       "editor.status.inserted": "已插入 {n} 个文件",
@@ -865,6 +1082,9 @@
       "search.where.tags": "标签",
       "search.where.id": "编号",
       "search.where.paths": "产物／代码位置",
+      "search.where.fork": "当时在决定什么",
+      "search.where.tr.title": "译文标题",
+      "search.where.tr.body": "译文正文",
       "search.hit.where": "命中：{where}",
       "search.searching": "搜索中…",
       "search.failed": "搜索失败：{error}",
@@ -943,6 +1163,12 @@
       "toast.insight.superseded": "{id} 取代了 {old}；{old} 折起来了，没有删",
       "toast.moved": "已把 {id} 挂到 {parent} 下——原来的父节点和你写的原因都进笔记了",
       "toast.moved.root": "{id} 现在自己是一棵树的根了——这次移动已记进笔记",
+      "toast.moved.fork": "{at} 那个岔路口现在剩 {n} 个候选",
+      "toast.moved.fork.roots": "森林的根之间那一组候选现在剩 {n} 个",
+      "toast.branch.alternative": "{id} 现在是候选了——{parent} 下面共 {n} 条路，最后走一条",
+      "toast.branch.extends": "{id} 又读作普通的延伸了",
+      "toast.decision.saved": "「在决定什么」已写在 {id} 上",
+      "toast.decision.cleared": "{id} 上那行决策问题已删掉；下面的候选一个没动",
       "toast.copied.path": "已复制路径",
       "toast.copy.failed": "复制失败",
       "toast.draft.restored": "已恢复草稿",
@@ -984,6 +1210,8 @@
       "count.moves": "{n} 次移动",
       "count.inputs": "{n} 条输入",
       "count.consumers": "{n} 个下游",
+      "count.alternatives": "{n} 个候选",
+      "count.rejoins": "{n} 处汇回",
       "unit.b": "{n} B",
       "unit.kb": "{n} KB",
       "unit.mb": "{n} MB",

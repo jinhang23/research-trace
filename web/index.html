@@ -71,6 +71,12 @@
      只是标出来——一个曾经装着 57 GB、现在空了的位置是一条发现，不是笔误。 -->
 <div id="missbar" hidden></div>
 
+<!-- 「还有几个岔路口没做决定」。这是互斥候选这件事真正的收益：隔一个月回到一个
+     项目，最该先看的就是这份清单。只画在单步详情里等于没有——那要求人先猜到
+     该点哪一步。它**不是**警告：同时开几条线是研究的常态，所以它长得像
+     #missbar 那种陈述，不像 #warnbar 那种待办。 -->
+<div id="forkbar" hidden></div>
+
 <!-- 项目索引：没有选中项目时显示 -->
 <section id="home" hidden>
   <div class="home-head">
@@ -87,6 +93,10 @@
       <div id="dwrap" hidden>
         <div id="diagram">
           <svg id="dedges" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"></svg>
+          <!-- 分叉点的括弧标注（「3 选 1」/「已定：012b」/「都不行」）。用 HTML
+               叠层而不是 SVG <text>：要截断、要 tooltip、要跟着深浅主题走。
+               排在 #dnodes **之前**，于是它永远抢不走卡片的点击。 -->
+          <div id="dmarks" aria-hidden="true"></div>
           <div id="dnodes"></div>
         </div>
       </div>
@@ -120,17 +130,38 @@
       <b data-i18n="drag.root.label"></b><span data-i18n="drag.root.hint"></span>
     </div>
     <footer id="legend">
+      <!-- 图例分三组：**线型 = 状态**、**边 = 三种关系**、**字形 = 那五个标记**。
+           不分组的话这一行就是十一个并排的小东西，而它们分属三个互不相干的通道，
+           混排会让人以为「实线 = 延伸」——那正是这次要说清的反面。 -->
       <span id="treelegend">
-        <span><i class="lg done"></i><span data-i18n="list.legend.done"></span></span>
-        <span><i class="lg wip"></i><span data-i18n="list.legend.wip"></span></span>
-        <span><i class="lg dead"></i><span data-i18n="list.legend.dead"></span></span>
+        <span class="lgset">
+          <span><i class="lg done"></i><span data-i18n="list.legend.done"></span></span>
+          <span><i class="lg wip"></i><span data-i18n="list.legend.wip"></span></span>
+          <span><i class="lg dead"></i><span data-i18n="list.legend.dead"></span></span>
+        </span>
+        <!-- 三种关系。色样里那几个 SVG 就是图上真正画出来的形状：延伸是正交折线、
+             互斥候选是一道括起来的括弧、汇回是带箭头的曲线。颜色一眼扫到，
+             形状说得准——灰度打印和色觉障碍下丢掉的只是那一眼。
+             SVG 走 currentColor，颜色由 <i> 上的 class 给，深浅主题各一套。 -->
+        <span class="lgset lgrels">
+          <span class="lgm"><i class="lgrel r-ext"><svg viewBox="0 0 20 12" aria-hidden="true"><path d="M4 1V6h12v5" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></i><span class="lgtext" data-i18n="list.legend.extends" data-i18n-title="list.legend.extends.title"></span></span>
+          <span class="lgm"><i class="lgrel r-alt"><svg viewBox="0 0 20 12" aria-hidden="true"><path d="M3 4V2h14v2M3 4v7M17 4v7" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></i><span class="lgtext" data-i18n="list.legend.alternative" data-i18n-title="list.legend.alternative.title"></span></span>
+          <span class="lgm"><i class="lgrel r-join"><svg viewBox="0 0 20 12" aria-hidden="true"><path d="M2 3C8 3 7 9 12 9" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M11 6.4v5.2l4.6-2.6z" fill="currentColor"/></svg></i><span class="lgtext" data-i18n="list.legend.rejoin" data-i18n-title="list.legend.rejoin.title"></span></span>
+        </span>
         <!-- 字形标记是第四个通道：不抢线型（status）也不抢不透明度（祖先链/搜索）。
-             ↺✕ L0 ⇢ ⇄ ⊘ 这些字形在两种语言里都不翻——它们是记号，不是词 -->
-        <span class="lgm"><i class="cmk lv0">L0</i><span data-i18n="list.legend.l0"></span></span>
-        <span class="lgm"><i class="cmk rfail">↺✕</i><span data-i18n="list.legend.reprofail"></span></span>
-        <span class="lgm"><i class="cmk dep">⇢</i><span data-i18n="flow.legend.data"></span></span>
-        <span class="lgm"><i class="cmk moved">⇄</i><span data-i18n="move.badge"></span></span>
-        <span class="lgm"><i class="cmk gone">⊘</i><span data-i18n="path.missing.badge"></span></span>
+             ↺✕ L0 ⇢ ⇄ ⊘ Y ~> 这些字形在两种语言里都不翻——它们是记号，不是词 -->
+        <span class="lgset">
+          <span class="lgm"><i class="cmk lv0">L0</i><span data-i18n="list.legend.l0"></span></span>
+          <span class="lgm"><i class="cmk rfail">↺✕</i><span data-i18n="list.legend.reprofail"></span></span>
+          <span class="lgm"><i class="cmk dep">⇢</i><span data-i18n="flow.legend.data"></span></span>
+          <span class="lgm"><i class="cmk fork">Y</i><span data-i18n="branch.kind.alternative" data-i18n-title="branch.kind.alternative.title"></span></span>
+          <span class="lgm"><i class="cmk join">~&gt;</i><span data-i18n="rejoin.kind" data-i18n-title="rejoin.kind.title"></span></span>
+          <span class="lgm"><i class="cmk moved">⇄</i><span data-i18n="move.badge"></span></span>
+          <span class="lgm"><i class="cmk gone">⊘</i><span data-i18n="path.missing.badge"></span></span>
+        </span>
+        <!-- 「颜色负责一眼扫到，形状负责说得准」那句话。压成一行加省略号、整句在
+             title 里：图例是常驻的，让它长到三行就是永久吃掉一块画布。 -->
+        <span class="lgnote" data-i18n-html="list.legend.note" data-i18n-title="list.legend.note"></span>
       </span>
       <!-- 数据流的图例分三条是刻意的：「parent 和 input 是同一步」占了绝大多数边，
            不给它单独一档，读者会以为这张图把树边画丢了。 -->
@@ -188,6 +219,25 @@
     <label><span data-i18n="newstep.field.code"></span>
       <textarea id="nf-code" rows="2" spellcheck="false" data-i18n-ph="editor.code.placeholder"></textarea>
     </label>
+    <!-- 这一步和父步骤之间那条边是什么性质，以及这一步自己开出的那个问题。
+         两者都**不从父步骤继承**（见 app.js 的 openNew）：branch 说的是「我和我
+         parent 之间那条边」，抄下去就会让从候选 A 往下走的每一步都变成候选。 -->
+    <div class="row2">
+      <label><span data-i18n="editor.branch.label"></span>
+        <select id="nf-branch">
+          <option value="extends" data-i18n="editor.branch.extends"></option>
+          <option value="alternative" data-i18n="editor.branch.alternative"></option>
+        </select>
+      </label>
+      <label><span data-i18n="editor.branch.note.label"></span>
+        <input id="nf-bnote" maxlength="200" data-i18n-ph="editor.branch.note.placeholder">
+      </label>
+    </div>
+    <p class="hint" data-i18n-html="editor.branch.hint"></p>
+    <label><span data-i18n="editor.decision.label"></span>
+      <input id="nf-decision" maxlength="300" data-i18n-ph="editor.decision.placeholder">
+    </label>
+    <p class="hint" data-i18n-html="editor.decision.hint"></p>
     <!-- 正文语言 ≠ 界面语言。界面是英文的人完全可能用中文记笔记，而这几个小节
          标题是要写进 note.md 的**内容**，写错了 trace_core 就找不到「为什么」，
          评级和 check 一起失灵。所以这里给一个显式的选择，默认值由

@@ -28,6 +28,24 @@ STEPS_DIR = "steps"
 STATUSES = ("wip", "done", "dead")
 DEFAULT_STATUS = "wip"
 
+# 一条父子边**是什么意思**。树上所有边长得一样，但它们表达的关系不同：
+#   extends      我接着上一步往下做（绝大多数，默认，不写就是它）
+#   alternative  我是同一个问题的一个候选，和兄弟里其他 alternative **只能选一条走下去**
+#
+# 为什么写在**孩子**身上而不是在兄弟之间互相登记（`alt: 012b` 那种）：互斥是一组
+# 关系，登记在兄弟之间就要写 N×(N−1) 份，改一处漏一处——同一个事实存在多处正是
+# 上一代系统的死因。每个候选只声明「我是一个候选」，**这一组有谁**是扫父节点的
+# 孩子现算出来的（compute_branch_groups），绝不存储。
+BRANCH_KINDS = ("extends", "alternative")
+DEFAULT_BRANCH = "extends"
+
+# 一组候选的三种结局。**由 status 派生**，不另存一个「选中了谁」的字段：
+# 「选了 A」写下来就是「B 标 dead」，两处都写就是双真相源。
+#   decided    只剩一个非 dead 的候选 —— 就是它了
+#   abandoned  一个不剩 —— 整条路都走不通，这**是结论不是错误**（P4）
+#   open       还有两个以上活着 —— 这个岔路口还没做决定
+BRANCH_STATES = ("open", "decided", "abandoned")
+
 # 列表视图：行高与轨道宽。前端要用同一组数字，这里是唯一来源。
 # 行高必须固定——轨道 SVG 和行文本是两套坐标系，只靠它对齐。
 ROW_H = 28
@@ -123,7 +141,10 @@ PROJECT_TR_ONLY_KEYS = ("name",)     # 项目的翻译文件里唯一允许的�
 
 # 结构键：只有 note.md / project.md 说了算。翻译文件里写了也一律忽略（见 parse_translation）。
 TR_STRUCT_KEYS = ("id", "parent", "status", "date", "commit", "author",
-                  "tags", "path", "repro", "key", "input", "code", "moved")
+                  "tags", "path", "repro", "key", "input", "code", "moved",
+                  # branch / decision 是**结构**（这条边什么意思、这个岔路口在问什么），
+                  # 不是正文。译文里写一份，页面就会按不同的边画同一棵树的两个版本。
+                  "branch", "decision")
 
 _HPC_RE = re.compile(r"^(/blue/|/orange/|/red/|/scratch/|/gpfs/|/lustre/|/work/)", re.I)
 _WIN_RE = re.compile(r"^[a-z]:[\\/]", re.I)
@@ -421,6 +442,29 @@ def locations_haystack(step: dict[str, Any]) -> str:
     return " ".join(b for b in bits if b)
 
 
+def fork_haystack(step: dict[str, Any]) -> str:
+    """一步里所有和分叉有关的**人写的散文**，拼成一串供搜索用。**只读，不存。**
+
+    收两样：`decision:`（这个岔路口在决定什么）和 `branch:` 竖线右边那句说明
+    （这个候选自己的角度）。它们和标题、正文一样是人写的自然语言，不是取值——
+    `alternative` / `extends` 这两个**取值**故意不收，否则搜任何一个词都会命中
+    半棵树。
+
+    为什么这也得能搜：`grep -rn "类别不平衡" projects/` 一秒就能答出「当年是在哪个
+    岔路口纠结这件事」，而站内搜索答不出就等于比 grep 弱——G4 的底线正是「删掉
+    全部程序，grep 还答得了」。更要命的是 agent 只够得到工具那一侧：它拿到「没
+    搜到」会读成「没记过」，然后重新纠结一遍同一个已经做过的决定。
+
+    `decision:` 尤其不能漏：它是整套东西里唯一推导不出来、只能人写的一句话
+    （候选有谁、选中了谁都算得出来）。唯一那份靠人的信息搜不到，是最亏的一种。
+
+    入参是 Step.to_dict() 或 forest 里的 step（两边形状一样），
+    服务端 / MCP / 网页三处搜索共用这一份，不会再各写各的。
+    """
+    bits = [str(step.get("decision") or ""), str(step.get("branch_note") or "")]
+    return " ".join(b for b in bits if b)
+
+
 def parse_inputs(raw: str) -> list[dict[str, str]]:
     """每行一条 `<步骤 id> | <消费的是哪份产物>`。
 
@@ -445,6 +489,32 @@ def parse_inputs(raw: str) -> list[dict[str, str]]:
 def format_input(i: dict[str, str]) -> str:
     note = str(i.get("note", "") or "").strip()
     return f"{i.get('step', '')}" + (f" | {note}" if note else "")
+
+
+def parse_branch(raw: str) -> dict[str, str]:
+    """`branch: alternative | 说明` → `{"kind": "alternative", "note": "说明"}`。
+
+    沿用整个 front-matter 的 `位置 | 说明` 惯例：竖线左边是机器读的取值，右边是
+    这个候选自己的角度（「先试最便宜的那条」）。说明里再有竖线一律留着不动——
+    那是人写的字，重新拼装等于替人改文案。
+
+    **不判合法性**：未知取值要报出是哪个步骤写的（这里拿不到 dirname），
+    所以校验留给 build_step，和 `status:` 走同一条路——报一声、退回默认值、
+    继续建树。一个拼错的词不该让这一步从图上消失。
+    """
+    kind, _, note = str(raw or "").partition("|")
+    return {"kind": kind.strip().lower(), "note": note.strip()}
+
+
+def format_branch(b: dict[str, str]) -> str:
+    """还原成 note.md 里的一行（不含 `branch: ` 前缀）。
+
+    是否**省略**默认值那一行由写入侧决定（`branch: extends` 和不写是同一个意思，
+    存后者等于把一个派生默认值写死进文件）；这里只管拼字符串。
+    """
+    kind = str(b.get("kind") or "").strip()
+    note = str(b.get("note") or "").strip()
+    return f"{kind} | {note}" if note else kind
 
 
 def parse_code(raw: str) -> list[dict[str, Any]]:
@@ -638,6 +708,15 @@ class Step:
     code: list[dict[str, Any]] = field(default_factory=list)
     # parent 的移动审计（`moved:`）。顺序即历史，只追加。
     moved: list[dict[str, str]] = field(default_factory=list)
+    # 这条**父子边**是什么意思（`branch:`）：extends 普通延伸 / alternative 互斥候选。
+    # 声明在孩子身上，因为「我是不是一个候选」只有我自己说得清；「这一组候选有谁」
+    # 是扫兄弟现算的（compute_branch_groups），绝不存储。
+    branch: str = DEFAULT_BRANCH
+    branch_note: str = ""
+    # 这个节点底下的分叉**在决定什么**（`decision:`）。和「为什么」一样是这套系统里
+    # 少数无法自动生成的字段之一：候选有哪些、选中了谁都算得出来，唯独「当时在纠结
+    # 什么」推导不出来。半年后看到两条并排的支线，没有这句话就只剩猜。
+    decision: str = ""
     body: str = ""
     dirname: str = ""
     # note.md 自己声明的语言（front-matter 的 `lang:`）。**没声明就是空串**，
@@ -671,6 +750,9 @@ class Step:
             # 只许写 from == "code" 的那些，否则同一个事实在磁盘上有两份。
             "code": [_copy_row(c) for c in code_records(self)],
             "moved": [dict(m) for m in self.moved],
+            "branch": self.branch,
+            "branch_note": self.branch_note,
+            "decision": self.decision,
             "body": self.body,
             "dirname": self.dirname,
             "digest": self.digest,
@@ -1038,6 +1120,20 @@ def build_step(dirname: str, meta: dict[str, str], body: str) -> tuple[Step, lis
     if parent.lower() in ("", "none", "null", "-"):
         parent = None
 
+    # `branch:` 和 `status:` 走同一条路：未知取值报一声、退回默认值、继续建树。
+    # 拼错一个词（`alternatives` / `alt`）不该让这一步从图上消失，也不该让整份
+    # 记录变成解析失败——记录留着、边照画，只是暂时按普通延伸画。
+    b = parse_branch(meta.get("branch", ""))
+    branch, branch_note = b["kind"], b["note"]
+    if not branch:
+        branch = DEFAULT_BRANCH
+    elif branch not in BRANCH_KINDS:
+        warnings.append(warn("warn", "bad_branch",
+                             f"未知 branch {branch!r}，回退到 {DEFAULT_BRANCH}（可用取值："
+                             + " / ".join(BRANCH_KINDS) + "）",
+                             dirname, {"branch": branch}))
+        branch = DEFAULT_BRANCH
+
     step = Step(
         id=sid,
         parent=parent,
@@ -1053,6 +1149,10 @@ def build_step(dirname: str, meta: dict[str, str], body: str) -> tuple[Step, lis
         inputs=parse_inputs(meta.get("input", "")),
         code=parse_code(meta.get("code", "")),
         moved=parse_moved(meta.get("moved", "")),
+        branch=branch,
+        branch_note=branch_note,
+        # 自由文本，不做任何词表约束：「在决定什么」是人话，不是枚举。
+        decision=(meta.get("decision") or "").strip(),
         body=body,
         dirname=dirname,
         # 没写就是空串。**不做任何猜测**：字符集探测能把一段引用了中文论文标题的
@@ -1401,6 +1501,210 @@ def build_children(by_id: dict[str, Step]) -> dict[str, list[str]]:
     for kids in children.values():
         kids.sort(key=id_key)
     return children
+
+
+# -------------------------------------------------- 分叉：候选组与汇回边
+#
+# 树上的父子边有三种含义，这一节把后两种从「长得都一样」里分出来：
+#   1. 普通延伸  branch: extends（默认）—— 什么都不用算
+#   2. 互斥候选  同一个父节点底下所有 branch: alternative 的孩子构成**一组**
+#   3. 汇回      某条支线的产物被另一条线上的步骤 `input:` 消费 —— 数据早就有了
+#
+# 三种全是**派生**的：磁盘上只有每个孩子自己那句 `branch:` 和消费者自己那行
+# `input:`，「这一组有谁」「谁选中了」「哪条 input 边是汇回」一律扫出来现算。
+
+
+def _copy_group(g: dict[str, Any]) -> dict[str, Any]:
+    """候选组要同时挂在 forest["branch_groups"] 和分叉点那个 step 上。
+
+    共享同一个 dict 意味着谁改了一处两处都变——派生结果本该是只读的，但拦不住，
+    所以宁可拷一份。组很小（几个 id），代价可以忽略。
+    """
+    out = dict(g)
+    out["options"] = list(g.get("options") or [])
+    out["live"] = list(g.get("live") or [])
+    return out
+
+
+def compute_branch_groups(
+    by_id: dict[str, Step], children: dict[str, list[str]]
+) -> list[dict[str, Any]]:
+    """派生出所有「候选组」：一个节点底下所有 `branch: alternative` 的孩子算一组。
+
+    「选了哪个」不需要新字段——**其余候选标 dead 就是选择本身**。于是白拿一个
+    这套系统最需要的派生信号：一组里还有两个以上没标 dead ⇒ 这个岔路口**还没决定**。
+    研究者最想知道的就是「我手上还有几个岔路口悬着」。
+
+    根节点之间也算一组（`at` 为空串）：两条互斥的开局没有共同的父节点可挂，
+    不给它成组等于让那两句 `branch: alternative` 悄悄失效——写了却什么都不发生，
+    比报错更难查。这一组自然没有 `decision:`（没有节点能承载那句话）。
+    """
+    groups: list[dict[str, Any]] = []
+    # 根之间那一组的父是「没有父」，用空串表示；其余按父节点 id。
+    buckets: list[tuple[str, list[str]]] = [
+        ("", sorted((sid for sid, s in by_id.items() if not s.parent), key=id_key))
+    ]
+    buckets += [(p, children[p]) for p in sorted(children, key=id_key)]
+
+    for at, kids in buckets:
+        options = [c for c in kids if by_id[c].branch == "alternative"]
+        if not options:
+            continue
+        live = [c for c in options if by_id[c].status != "dead"]
+        if len(live) == 1:
+            state, chosen = "decided", live[0]
+        elif not live:
+            # 全废也是一种结论（P4），不是错误：这个问题的答案是「都不行」。
+            state, chosen = "abandoned", ""
+        else:
+            state, chosen = "open", ""
+        groups.append({
+            "at": at,
+            "decision": (by_id[at].decision if at else ""),
+            "options": options,
+            "live": live,
+            "state": state,
+            "chosen": chosen,
+        })
+    return groups
+
+
+def validate_branches(
+    by_id: dict[str, Step], groups: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """四条 warn 级提醒，一条都不降级——分叉的写法有问题时树照样画得出来。"""
+    out: list[dict[str, str]] = []
+
+    # `decision:` 写了，底下却一个 `branch: alternative` 都没有。
+    #
+    # 这是 fork_without_decision 的**镜像**，而且后果更重：那一条至少还有两条并排的
+    # 支线摆在图上，人看得见「这里有个岔路口，只是没写在决定什么」；这一条写下去
+    # 之后**什么都不发生**——不成组、不进 branch_groups、图上没有括弧、清单里也没有。
+    # 写的人刚敲完那句话就在界面上找不到它，只会以为没保存成功，然后重写一遍或者
+    # 干脆放弃。而它偏偏是整套东西里唯一推导不出来、只能人写的那一句。
+    #
+    # 判据只看这一步自己的孩子，不看孙子：`decision:` 说的就是「**我底下**那个岔路口」。
+    forks_at = {s.parent for s in by_id.values() if s.branch == "alternative" and s.parent}
+    for sid in sorted(by_id, key=id_key):
+        s = by_id[sid]
+        if not s.decision or sid in forks_at:
+            continue
+        out.append(warn(
+            "warn", "decision_without_candidates",
+            f"{sid} 上写着 `decision:`（在决定什么），底下却没有任何一步声明自己是候选。"
+            "这一行现在还不构成岔路口——不成组、图上没有括弧、`forks` 清单里也不出现。"
+            "给每条候选各写一行 `branch: alternative` 它就立起来了；"
+            "要是这里其实没有分叉，把 `decision:` 那一行删掉",
+            s.dirname, {"id": sid}))
+
+    for g in groups:
+        at, options = g["at"], g["options"]
+        # where 指到能改的那个文件：有父节点就指父节点（decision 写在那里），
+        # 根之间那一组只能指第一个候选。
+        where = by_id[at].dirname if at else by_id[options[0]].dirname
+        opts = " / ".join(options)
+
+        if len(options) == 1:
+            out.append(warn(
+                "warn", "lone_alternative",
+                f"这一组候选只有一个（{options[0]}）：一个候选不成其为选择。"
+                "多半是另一条支漏标了 `branch: alternative`，"
+                "或者它其实是普通延伸（把这一行改成 extends 或删掉）",
+                where, {"id": at, "option": options[0]}))
+
+        # 根之间那一组跳过：`decision:` 得写在分叉点上，而它没有分叉点，
+        # 报一条改不动的警告只会训练人忽略警告。
+        elif at and not g["decision"]:
+            out.append(warn(
+                "warn", "fork_without_decision",
+                f"{at} 底下有 {len(options)} 条并列的候选（{opts}），却没写 `decision:`。"
+                "「当时在决定什么」是推导不出来的——候选有谁、选中了谁都算得出来，"
+                "唯独这句话只能人写。半年后看到两条并排的支线，没有它就只剩猜",
+                where, {"id": at, "n": len(options), "options": opts}))
+
+        if g["state"] == "open":
+            live = " / ".join(g["live"])
+            out.append(warn(
+                "warn", "undecided_fork",
+                f"这个岔路口还没定：{len(g['live'])} 条候选（{live}）都还活着。"
+                "同时开几条线是研究的常态，不是错——只是等哪条走通了，"
+                "记得把其余的标成 dead 并写清为什么放弃，这个岔路口才算结掉",
+                where, {"id": at, "n": len(g["live"]), "options": live}))
+    return out
+
+
+def _ancestry(by_id: dict[str, Step], order: list[str]) -> tuple[dict[str, int], dict[str, str]]:
+    """每个节点的深度和它所属的根。order 是前序，父必定排在子之前。"""
+    depth: dict[str, int] = {}
+    root: dict[str, str] = {}
+    for sid in order:
+        p = by_id[sid].parent
+        if p is None:
+            depth[sid], root[sid] = 0, sid
+        else:
+            depth[sid], root[sid] = depth[p] + 1, root[p]
+    return depth, root
+
+
+def _lca(by_id: dict[str, Step], depth: dict[str, int], a: str, b: str) -> str:
+    """最近公共祖先。只在 a、b 同属一棵树时调用，否则不会终止。"""
+    while depth[a] > depth[b]:
+        a = by_id[a].parent                                  # type: ignore[assignment]
+    while depth[b] > depth[a]:
+        b = by_id[b].parent                                  # type: ignore[assignment]
+    while a != b:
+        a = by_id[a].parent                                  # type: ignore[assignment]
+        b = by_id[b].parent                                  # type: ignore[assignment]
+    return a
+
+
+def compute_merges(
+    by_id: dict[str, Step], order: list[str]
+) -> list[dict[str, Any]]:
+    """哪些 `input:` 边是**汇回**：一条支线的产物，参与了另一条线上的某一步。
+
+    判据只有两条，都只看树的形状，机械可判：
+
+      1. 两端在**同一棵树**里（有共同祖先）；
+      2. 谁都不是谁的祖先（LCA 既不是生产者也不是消费者）。
+
+    满足 ⇒ 汇回，并带上它们分开的那个岔路口（LCA）；否则一律是**普通数据依赖**。
+
+    为什么是这两条：
+    * 生产者在消费者的**祖先链上**时，这条数据依赖和树边走的是同一条路，树已经把
+      它画出来了；再叠一条曲线只是把主干描粗一遍。
+    * 谁都不是谁的祖先，就意味着两端在 LCA 处分了家、各走各的，而字节却从一边流到
+      了另一边——这正是「支线的产物汇回主路径」那件事。**不需要知道哪条是主线**：
+      heir 是列表视图挑轨道用的几何启发式，拿它当语义会让「哪条边是汇回」跟着排版变。
+    * 不同的树之间没有共同祖先，两端从来就没在同一条线上过，谈不上「汇回」；
+      跨项目/孤儿造成的那些边老实算成普通数据依赖，不硬凑。
+
+    刻意**不**看行序：`order` 是按 id 的前序遍历，不是时间轴。011 分叉出 012/012b，
+    012b 底下的 013 汇回 012 底下的 014 时，前序是 011 012 014 012b 013 ——
+    生产者 013 的行号反而比消费者 014 大。拿行序当"先后"会把这个最典型的汇回判掉。
+    """
+    depth, root = _ancestry(by_id, order)
+    seen: dict[tuple[str, str], dict[str, Any]] = {}
+    out: list[dict[str, Any]] = []
+    for sid in order:                       # 按行序遍历消费者：输出顺序确定（P3）
+        for i in by_id[sid].inputs:
+            src = (i.get("step") or "").strip()
+            if not src or src == sid or src not in by_id:
+                continue                    # 悬空 / 指向自己：validate_inputs 已经报过
+            if root[src] != root[sid]:
+                continue                    # 两棵树，从来没在同一条线上
+            at = _lca(by_id, depth, src, sid)
+            if at == src or at == sid:
+                continue                    # 祖先链上：树边已经画出这条路了
+            rec = seen.get((src, sid))
+            if rec is None:
+                rec = {"from": src, "to": sid, "at": at, "notes": []}
+                seen[(src, sid)] = rec
+                out.append(rec)
+            note = (i.get("note") or "").strip()
+            if note and note not in rec["notes"]:
+                rec["notes"].append(note)   # 同一对之间可以有好几行 input:
+    return out
 
 
 # ---------------------------------------------------------------- order
@@ -2066,6 +2370,17 @@ def compile_forest(steps_dir: Path, with_files: bool = True) -> dict[str, Any]:
     consumers = compute_consumers(by_id)              # 派生，不存储
     w_inputs = validate_inputs(by_id)
 
+    # 候选组 / 汇回边：同样是派生，磁盘上只有各个孩子自己那句 branch: 和 input:。
+    groups = compute_branch_groups(by_id, children)
+    fork_at = {g["at"]: g for g in groups}
+    merges = compute_merges(by_id, order)
+    merge_in: dict[str, list[str]] = {}
+    merge_out: dict[str, list[str]] = {}
+    for m in merges:                                  # merges 已按行序，这里跟着确定
+        merge_in.setdefault(m["to"], []).append(m["from"])
+        merge_out.setdefault(m["from"], []).append(m["to"])
+    w_branch = validate_branches(by_id, groups)
+
     traces = compute_traces(by_id, order)             # 派生，不存储
 
     w_lint: list[dict[str, str]] = []
@@ -2078,6 +2393,18 @@ def compile_forest(steps_dir: Path, with_files: bool = True) -> dict[str, Any]:
         d["backlinks"] = back.get(sid, [])
         # 「谁用了本步的产物」——inputs 的反向边，和 backlinks 一样现算。
         d["consumers"] = consumers.get(sid, [])
+        # 这一步是不是一个决策分叉点：是就给出整组候选（含决定定了没有），不是就 None。
+        # 键恒在，值可以是 None——静态导出要逐字节确定，键的有无不能随内容变。
+        g = fork_at.get(sid)
+        d["fork"] = _copy_group(g) if g else None
+        # 哪些 input 边是汇回（生产者 id），以及本步的产物汇回到了谁那里（消费者 id）。
+        #
+        # 刻意**不**把这个标进 d["inputs"] 里的那几条记录：inputs 是文件里那几行
+        # `input:` 的原样镜像，而「是不是汇回」是从树的形状算出来的——同一行 input
+        # 会因为别人被移动而改变归类。混进同一个 dict，读的人就分不清哪些字段是
+        # 文件里写着的、哪些是这一轮算出来的（移动一步 → inputs 看着变了 = 假象）。
+        d["merge_in"] = merge_in.get(sid, [])
+        d["merge_out"] = merge_out.get(sid, [])
         # 用目录名取附件，不用 id：两个目录写了同一个 id 时，validate 只改得动
         # 后一个的 id（→ 001~dup2），而附件是按目录扫出来的，用 id 做键会把
         # 001 的清单换成 001~dup2 那个目录的文件（点开 404，自己的附件消失）。
@@ -2093,7 +2420,11 @@ def compile_forest(steps_dir: Path, with_files: bool = True) -> dict[str, Any]:
         "lanes": {sid: lane[sid] for sid in order},
         "lane_count": (max(lane.values()) + 1) if lane else 0,
         "tree": compute_tree(by_id, children, order),
-        "warnings": w_scan + w_val + w_inputs + w_lint,
+        # 互斥候选组（按分叉点排序，根之间那一组在最前）与汇回边。两者都是**边和组的
+        # 语义**，不是几何：布局（order / lanes / tree）一个数都不因为它们而变。
+        "branch_groups": [_copy_group(g) for g in groups],
+        "merges": merges,
+        "warnings": w_scan + w_val + w_inputs + w_branch + w_lint,
         "row_h": ROW_H,
         "lane_w": LANE_W,
     }

@@ -483,6 +483,7 @@ def test_new_can_write_inputs_and_a_code_snapshot(sandbox, tmp_path: Path, monke
     new_args = type("A", (), {"project": None, "parent": None, "status": "wip", "date": "",
                               "commit": "", "author": "human", "tags": "", "path": None,
                               "title": "配对", "input": ["001 | pocket.csv"],
+                              "branch": "", "decision": "",
                               "code": ["snapshot | /orange/snap/20260809 | manifest=MANIFEST.md5"]})()
     sd = core.steps_dir_of(data, "第一个课题")
     W.create_step(sd, title="上游")
@@ -524,3 +525,121 @@ def test_paths_shows_the_role_and_the_last_verdict(sandbox, tmp_path: Path, monk
     out = capsys.readouterr().out
     assert "产物" in out and "4554 条" in out and "MB" in out
     assert "从未核对过" in out, "没查过和查过说「还在」是两回事，不能长得一样"
+
+
+# ------------------------------------------------------------ 岔路口（fork / forks / check）
+#
+# 这几条钉的是 CLI 这个门面。它和 REST / MCP 用的是同一份判据（core 的候选组），
+# 所以这里不重验「谁和谁是一组」，只验**分档**：哪些算错误、哪些只是写法提示、
+# 哪些连毛病都不是（未决的岔路口是待办）。分错档的后果是人整体忽略这一段。
+
+
+def fork_args(**kw):
+    return type("A", (), {"project": None, "decision": "", "note": None, **kw})()
+
+
+def forks_args(**kw):
+    return type("A", (), {"project": None, "all": False, **kw})()
+
+
+@pytest.fixture()
+def forked(sandbox, tmp_path: Path, monkeypatch):
+    """001 底下两条互斥候选，都还活着 —— 一个还没做决定的岔路口。"""
+    import trace_write as W
+
+    data = tmp_path / "forkdata"
+    data.mkdir()
+    init(sandbox, data_dir=str(data))
+    monkeypatch.setattr(cli, "load_config", lambda: {"data_dir": str(data)})
+    sd = core.steps_dir_of(data, "第一个课题")
+    body = "## 为什么\n试试\n## 做了什么\n跑\n## 结论\n有\n"
+    W.create_step(sd, title="基线", status="done", commit="abc",
+                  paths=["/blue/x | output | 训练集"], body=body)
+    W.create_step(sd, parent="001", title="调采样权重", status="done", commit="abc",
+                  paths=["/blue/x | output | 训练集"], body=body)
+    W.create_step(sd, parent="001", title="改损失函数", status="done", commit="abc",
+                  paths=["/blue/x | output | 训练集"], body=body)
+    return data
+
+
+def test_fork_marks_a_group_and_writes_the_question_on_the_parent(forked, capsys):
+    assert cli.cmd_fork(fork_args(ids=["002", "002b"], decision="类别不平衡怎么处理？",
+                                  note=["002=先试最便宜的"])) == 0
+    out = capsys.readouterr().out
+    assert "标成互斥候选" in out and "未决 · 2 选 1" in out
+    import trace_write as W
+    sd = core.steps_dir_of(forked, "第一个课题")
+    assert W.load(sd)["002"].branch == "alternative"
+    assert W.load(sd)["002"].branch_note == "先试最便宜的"
+    assert W.load(sd)["001"].decision == "类别不平衡怎么处理？"
+
+
+def test_fork_refuses_steps_that_do_not_share_a_parent(forked):
+    """跨父节点标只会得到几个各含一个候选的组，一条错都不报——
+    而人以为自己刚记下了一个岔路口。同父校验是这个子命令存在的主要理由。"""
+    import trace_write as W
+
+    with pytest.raises(W.WriteError) as e:
+        cli.cmd_fork(fork_args(ids=["001", "002"]))
+    assert "同一个父节点" in str(e.value)
+
+
+def test_forks_lists_only_the_undecided_ones_unless_asked(forked, capsys):
+    cli.cmd_fork(fork_args(ids=["002", "002b"], decision="类别不平衡怎么处理？"))
+    capsys.readouterr()
+    assert cli.cmd_forks(forks_args()) == 0
+    out = capsys.readouterr().out
+    assert "共 1 个岔路口，其中 1 个还没做决定" in out
+    assert "类别不平衡怎么处理？" in out and "002b" in out
+
+    import trace_write as W
+    W.update_step(core.steps_dir_of(forked, "第一个课题"), "002b",
+                  {"status": "dead", "body": "## 为什么\n试试\n## 做了什么\n跑\n"
+                                             "## 结论\n重加权反而更差，放弃这条\n"})
+    cli.cmd_forks(forks_args())
+    assert "已经有结论了" in capsys.readouterr().out, "定了的不再天天列出来"
+    cli.cmd_forks(forks_args(all=True))
+    assert "已定 → 002" in capsys.readouterr().out
+
+
+def test_check_files_the_undecided_fork_as_a_todo_not_as_a_warning(forked, capsys):
+    """**它不是缺陷，是待办。**混进警告栏会稀释警告的分量，而人消除「警告」
+    最省事的办法是随手把一条支标成 dead —— 那是拿假结论换绿色。"""
+    cli.cmd_fork(fork_args(ids=["002", "002b"], decision="类别不平衡怎么处理？"))
+    capsys.readouterr()
+    assert cli.cmd_check(check_args()) == 0
+    out = capsys.readouterr().out
+    assert "还有 1 个岔路口没做决定" in out
+    assert "待办，不是缺陷，不计入退出码" in out
+    body = out.split("岔路口没做决定")[0]
+    assert "⚠ [001" not in body and "undecided_fork" not in body, \
+        "内核那条 undecided_fork 不该在警告栏里再说一遍"
+
+
+def test_an_undecided_fork_never_fails_strict(forked, capsys):
+    """--strict 是给 CI 用的闸门。用「你还有个决定没做」拦住一次合并，
+    等于逼人在还没想清楚的时候先编一个结论。"""
+    cli.cmd_fork(fork_args(ids=["002", "002b"], decision="类别不平衡怎么处理？"))
+    assert cli.cmd_check(check_args(strict=True)) == 0
+
+
+def test_the_two_fork_writing_hints_are_hints_not_warnings(forked, capsys):
+    """「一组只有一个候选」「有候选却没写在决定什么」说的是这条记录还差一句人写的话，
+    和 L0–L4 无关：一个岔路口写不写得清楚，不改变「这个结果追不追得到」。"""
+    import trace_write as W
+
+    W.update_step(core.steps_dir_of(forked, "第一个课题"), "002", {"branch": "alternative"})
+    assert cli.cmd_check(check_args(strict=True)) == 0
+    out = capsys.readouterr().out
+    assert "写法提示" in out
+    assert "只有一个" in out.split("写法提示")[1]
+
+
+def test_mv_says_what_it_did_to_both_forks(forked, capsys):
+    """移动会改变**两个**岔路口的成员。事后只能靠再跑一遍 forks 才看得见，
+    而人下次看到的会是一条来路不明的「这一组只有一个候选」。"""
+    cli.cmd_fork(fork_args(ids=["002", "002b"], decision="类别不平衡怎么处理？"))
+    capsys.readouterr()
+    cli.cmd_mv(mv_args(id="002b", parent=None, reason="002b 其实是独立的一条线"))
+    out = capsys.readouterr().out
+    assert "原来那个岔路口 001" in out and "只有一个候选" in out

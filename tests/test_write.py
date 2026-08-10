@@ -645,3 +645,21 @@ def test_attach_auto_blocks_path_traversal_in_the_filename(tmp_path: Path):
 def test_slugify_keeps_cjk_and_drops_path_hostile_chars():
     assert W.slugify("试了 3:1 采样 / AUC 0.82") == "试了-3-1-采样-auc-0-82"
     assert W.slugify("!!!") == "step"
+
+
+def test_a_new_child_never_inherits_the_fork_semantics_of_its_parent(tmp_path: Path):
+    """路径是**继承**的（同一条线上数据在哪多半没变），分叉语义正相反。
+
+    `branch:` 说的是「我和我 parent 之间那条边是什么关系」，`decision:` 说的是
+    「我底下那个岔路口在决定什么」——两句话都只对写下它的那一步成立。抄下去的
+    结果是：从候选 A 接着往下做的每一步都变成候选，一棵树上到处是假岔路口。
+    这条钉住写入层的默认，同时也是给网页那条「从父步骤继承路径」的路划的线。
+    """
+    d = mkroot(tmp_path)
+    W.create_step(d, title="分叉点", decision="用哪种口袋定义？")
+    W.create_step(d, parent="001", title="候选 A", branch="alternative")
+    child, _ = W.create_step(d, parent="002", title="接着 A 往下做")
+
+    text = (d / child.dirname / core.NOTE_NAME).read_text(encoding="utf-8")
+    assert "branch:" not in text and "decision:" not in text
+    assert child.branch == "extends" and child.decision == ""

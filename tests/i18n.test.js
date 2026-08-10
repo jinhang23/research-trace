@@ -517,6 +517,199 @@ test("⑥ 新诊断有文案，并且写明「只是提示，不影响等级」"
   assert.deepEqual(placeholders(one("zh", "lint.subheads")), ["section"]);
 });
 
+/* ------------------------------------------------ ⑦ 决策分叉 · 互斥候选 · 汇回
+ *
+ * 这一组文案挡的是同一件事：树上的边从此有三种含义，而**含义是看不见的**——
+ * 一条边画成什么样，全靠图例把它翻译回人话。所以这里的断言比别处更硬：
+ * 名字要准（不许和 git 的「分支/合并」撞车）、每种关系都要有一句说明、
+ * 非颜色的那条冗余通道不许被后来的人顺手删掉、未决的措辞不许变成责备。
+ */
+
+test("⑦ 图例：三种关系各自的名字与说明都在 —— 图例是这块改动唯一的解释入口", () => {
+  needKeys([
+    "list.legend.extends", "list.legend.alternative", "list.legend.rejoin",
+    "list.legend.extends.title", "list.legend.alternative.title", "list.legend.rejoin.title",
+    "list.legend.note",
+    "branch.kind.extends", "branch.kind.alternative",
+    "branch.kind.extends.title", "branch.kind.alternative.title",
+    "branch.badge", "branch.badge.title",
+    "rejoin.kind", "rejoin.kind.title",
+  ], "第一次看到彩色的边，人只能从图例知道那是什么意思；缺一条就等于那种边没解释");
+
+  // 「这是蓝色的线」不解释任何事。每条图例都要说清它**意味着**什么。
+  for (const lang of ["en", "zh"]) {
+    for (const k of ["list.legend.extends", "list.legend.alternative", "list.legend.rejoin"]) {
+      assert.ok(one(lang, k).length > 12, `${lang}.${k} 只有个名字，没说它意味着什么`);
+    }
+    for (const k of ["list.legend.alternative.title", "list.legend.rejoin.title"]) {
+      assert.ok(one(lang, k).length > 40, `${lang}.${k} 太短，说不出这条边为什么长这样`);
+    }
+  }
+});
+
+test("⑦ 关系的名字不许和 git 撞车 —— 「分支 / 主线 / 合并」在读者脑子里已经有别的意思", () => {
+  // 这套树记的是「当时接着哪一步想」，不是版本控制。名字一旦借用 git 的词，
+  // 读者会自动套上 git 的模型（可以合并、可以 rebase、主线是唯一的），全是错的。
+  const named = ["list.legend.extends", "list.legend.alternative", "list.legend.rejoin",
+                 "branch.kind.extends", "branch.kind.alternative", "rejoin.kind",
+                 "branch.badge"];
+  for (const k of named) {
+    assert.ok(!/\bbranch(es|ing|ed)?\b|\bmerge[ds]?\b|\bmaster\b|\bmainline\b|\btrunk\b/i.test(one("en", k)),
+      `en.${k} 用了 git 的词：${one("en", k)}`);
+    assert.ok(!/分支|主线|合并|主干/.test(one("zh", k)),
+      `zh.${k} 用了 git 的词：${one("zh", k)}`);
+  }
+});
+
+test("⑦ 图例里那条「颜色之外还有形状」不许丢 —— 打印成灰的、看不见颜色的人靠它", () => {
+  // 规格放宽了「颜色不单独承载信息」，代价是必须写明冗余通道在哪。
+  // 这句话一旦被后来的人当成啰嗦删掉，无障碍那一半就只剩口头承诺。
+  assert.match(one("en", "list.legend.note"), /curve/i);
+  assert.match(one("en", "list.legend.note"), /bracket|brace/i);
+  assert.match(one("zh", "list.legend.note"), /曲线/);
+  assert.match(one("zh", "list.legend.note"), /括弧|括号/);
+});
+
+test("⑦ 分叉点：N 选 1 / 已定 / 都不行 / 还没定，四种状态都有文案", () => {
+  needKeys([
+    "decision.pick", "decision.pick.title",
+    "decision.settled", "decision.settled.title",
+    "decision.alldead", "decision.alldead.title",
+    "decision.open", "decision.open.title", "decision.open.note",
+    "decision.open.summary", "decision.open.summary.title",
+    "decision.question.label", "decision.question.title", "decision.question.missing",
+  ], "一组候选有四种可能的样子，少一种那个分叉点就只能显示 key 名");
+
+  // 「N 选 1」要说得出 N，「已定：012b」要说得出是哪一个
+  assert.deepEqual(placeholders(one("en", "decision.pick")), ["n"]);
+  assert.deepEqual(placeholders(one("zh", "decision.pick")), ["n"]);
+  assert.deepEqual(placeholders(one("en", "decision.settled")), ["id"]);
+  assert.deepEqual(placeholders(one("zh", "decision.settled")), ["id"]);
+});
+
+test("⑦ 「未决」不许写成责备 —— 同时开几条线是研究的常态，不是没做完的作业", () => {
+  // 这是这个功能真正的收益：把「我还有几个岔路口没定」摆出来。措辞一旦带上
+  // 「漏了 / 应该 / 忘了」的味道，人会为了让界面干净而随手标 dead——
+  // 那是拿一条假结论换一块绿色。
+  for (const k of ["decision.open", "decision.open.title", "decision.open.note",
+                   "decision.open.summary", "lint.fork.open"]) {
+    assert.ok(!/\bshould have\b|\bforgot|\bfail(ed|ure)?\b|\berror\b|\bmust\b|\bmissing\b/i.test(one("en", k)),
+      `en.${k} 像在责备用户：${one("en", k)}`);
+    assert.ok(!/错误|失败|忘了|忘记|应该|必须|警告|遗漏/.test(one("zh", k)),
+      `zh.${k} 像在责备用户：${one("zh", k)}`);
+  }
+  // 光是不责备还不够，得正面说一句「这是正常的」
+  assert.match(one("en", "lint.fork.open"), /nothing is wrong|normal|how the work/i);
+  assert.match(one("zh", "lint.fork.open"), /不是错|正常|常态/);
+});
+
+test("⑦ 「选了哪个」是派生的：文案要说清它是从其余几条 dead 读出来的", () => {
+  // 界面上永远不会有「标记赢家」那个按钮——那个按钮就是双真相源。
+  // 不把这件事说出来，人会一直找它，找不到就以为功能缺了一半。
+  for (const lang of ["en", "zh"]) {
+    for (const k of ["decision.settled.title", "decision.lead", "editor.branch.hint"]) {
+      assert.match(one(lang, k), /dead/i, `${lang}.${k} 没说清「已定」是从 dead 推出来的`);
+    }
+  }
+});
+
+test("⑦ 详情面板：既要能说「我是某个决策的候选」，也要能说「我就是那个决策点」", () => {
+  needKeys([
+    "decision.head", "decision.lead",
+    "decision.candidate.entry", "decision.candidate.entry.bare",
+    "decision.candidate.dead", "decision.candidate.live",
+    "decision.of.head", "decision.of.lead",
+    "decision.siblings.head", "decision.siblings.lone",
+    "decision.roots.head", "decision.roots.note",
+    "count.alternatives",
+  ], "一条边有两个端点，两边的面板都要说得出这条边是什么");
+
+  assert.deepEqual(placeholders(one("en", "decision.of.head")), ["parent"]);
+  assert.deepEqual(placeholders(one("zh", "decision.of.head")), ["parent"]);
+});
+
+test("⑦ 根之间也能成一组：得说清这一组没有地方写「在决定什么」", () => {
+  // 两种互斥的开局没有共同的父节点，`decision:` 无处可挂。不说，人会去找那个
+  // 输入框，找不到就以为自己漏填了——而这里根本没有能填的地方。
+  assert.match(one("en", "decision.roots.note"), /root/i);
+  assert.match(one("zh", "decision.roots.note"), /根/);
+  for (const lang of ["en", "zh"]) {
+    assert.ok(one(lang, "decision.roots.note").length > 40,
+      `${lang}.decision.roots.note 说不出为什么这里写不了那句问题`);
+  }
+});
+
+test("⑦ 汇回不是新字段：文案两边都要点明它就是 input", () => {
+  needKeys([
+    "rejoin.lead", "rejoin.out.head", "rejoin.in.head",
+    "rejoin.entry", "rejoin.entry.bare", "rejoin.at",
+    "rejoin.badge", "rejoin.badge.title",
+    "count.rejoins",
+  ], "汇回在详情面板里是两个方向的清单：本步的产物汇到哪去了、哪些支线汇进了本步");
+
+  // 「在哪儿分开的」是 core 算好一起发过来的（merges[].at）。丢了它，一条汇回
+  // 就只剩「有条曲线」，读者拼不出「从哪岔开、又从哪回来」这个形状。
+  assert.deepEqual(placeholders(one("en", "rejoin.at")), ["id"]);
+  assert.deepEqual(placeholders(one("zh", "rejoin.at")), ["id"]);
+
+  // 说成「第三种父子关系」的话，人会去找一个记录它的字段，然后自己造一个出来——
+  // 那正是双真相源。它是 input，数据早就有了，缺的只是把它画出来。
+  for (const lang of ["en", "zh"]) {
+    assert.match(one(lang, "rejoin.lead"), /input/);
+    assert.match(one(lang, "rejoin.kind.title"), /input/);
+  }
+  assert.deepEqual(placeholders(one("en", "rejoin.out.head")), ["n"]);
+  assert.deepEqual(placeholders(one("zh", "rejoin.in.head")), ["n"]);
+});
+
+test("⑦ 编辑：标成候选 / 取消 / 写决策问题，三个动作和它们的解释都在", () => {
+  needKeys([
+    "editor.branch.label", "editor.branch.extends", "editor.branch.alternative",
+    "editor.branch.hint", "editor.branch.note.label", "editor.branch.note.placeholder",
+    "editor.decision.label", "editor.decision.placeholder", "editor.decision.hint",
+    "decision.mark.act", "decision.mark.act.title",
+    "decision.unmark.act", "decision.unmark.act.title",
+    "decision.write.act", "decision.write.act.title", "decision.write.prompt",
+    "toast.branch.alternative", "toast.branch.extends",
+    "toast.decision.saved", "toast.decision.cleared",
+  ], "写得进去这个功能才成立；只能看不能标的话，页面上永远只有一种边");
+
+  // 「标成候选意味着什么」要讲全：一组只能选一个，其余最终会被标 dead
+  for (const lang of ["en", "zh"]) {
+    assert.ok(one(lang, "editor.branch.hint").length > 60,
+      `${lang}.editor.branch.hint 太短，说不清标成候选之后会发生什么`);
+  }
+  // 决策问题是人写的那一句，hint 要点出它推导不出来
+  assert.match(one("en", "editor.decision.hint"), /nothing can generate|cannot|can't/i);
+  assert.match(one("zh", "editor.decision.hint"), /生成不了|推导不出|说不出/);
+});
+
+test("⑦ 三条新诊断：各自说清为什么值得一提，并且都写明不影响等级", () => {
+  needKeys([
+    "lint.alt.lone", "lint.fork.noquestion", "lint.fork.open",
+  ], "只有一个候选 / 分叉没写 decision / 未决的分叉——三条都是提示级");
+
+  for (const lang of ["en", "zh"]) {
+    for (const k of ["lint.alt.lone", "lint.fork.noquestion", "lint.fork.open"]) {
+      assert.ok(one(lang, k).length > 50, `${lang}.${k} 太短，说不出为什么值得一提`);
+    }
+    // 顶栏那句总说明（lint.note）会被当成背景板略过，所以每条自己也要说一遍：
+    // 这三条最容易被误读成「我这里判低了」。
+    assert.match(one("en", "lint.alt.lone"), /level/i);
+    assert.match(one("en", "lint.fork.noquestion"), /level/i);
+    assert.match(one("en", "lint.fork.open"), /level/i);
+    assert.match(one("zh", "lint.alt.lone"), /不影响等级/);
+    assert.match(one("zh", "lint.fork.noquestion"), /不影响等级/);
+    assert.match(one("zh", "lint.fork.open"), /不影响等级/);
+  }
+  // warnText 一条只喂得进一个变量（app.js 的 WARN_MAP），所以这两条只能用 {n}
+  assert.deepEqual(placeholders(one("en", "lint.fork.noquestion")), ["n"]);
+  assert.deepEqual(placeholders(one("zh", "lint.fork.noquestion")), ["n"]);
+  assert.deepEqual(placeholders(one("en", "lint.fork.open")), ["n"]);
+  assert.deepEqual(placeholders(one("zh", "lint.fork.open")), ["n"]);
+  assert.deepEqual(placeholders(one("en", "lint.alt.lone")), []);
+});
+
 test("title= 里不写 ** 和 ` —— 那些地方走 t()，标记不会展开，只会原样显示给用户", () => {
   // tHtml 才展开行内标记；tooltip / placeholder 是 textContent 级的目的地。
   // 这条以前靠自觉，这一轮新增了二十多条 .title，改成机器管。
@@ -544,4 +737,61 @@ test("契约里承诺的那几个名字都在", () => {
     assert.ok(k in i18n, "window.i18n 少了 " + k);
   }
   assert.ok(i18n.STRINGS.en && i18n.STRINGS.zh);
+});
+
+/* ------------------------------------------------ ⑦ 补上的四组：接缝上那几条
+ *
+ * 这四组的共同点是**当时谁都没敢加**：core 发了 code，strings 那位怕加了没人接、
+ * web 那位怕指向一个不存在的 key，两边互相等，于是英文界面上原样漏出中文整句。
+ * 点名在这里，就没有「两边一样地缺、测试全绿」这条路了。 */
+
+test("⑦ `branch:` 拼错时那条降级提醒有文案 —— 否则英文界面上漏出一整句中文", () => {
+  needKeys(["lint.branch.unknown"],
+    "core 的 bad_branch 认不出 key 就退回服务端那句中文，而它恰恰是给刚打错字的人看的");
+  for (const lang of ["en", "zh"]) {
+    assert.deepEqual(placeholders(one(lang, "lint.branch.unknown")), ["branch"],
+      `${lang}.lint.branch.unknown 得说出拼错的是哪个值`);
+    // 必须说清后果：那个标记现在一点作用都没有，而不是「格式不对」
+    assert.ok(/extends/.test(one(lang, "lint.branch.unknown")),
+      `${lang}.lint.branch.unknown 没说它被当成什么处理了`);
+  }
+});
+
+test("⑦ 「问题写了、候选还没标」有自己的一句话，而且说得出下一步", () => {
+  needKeys(["lint.fork.nocandidates", "decision.question.orphan"],
+    "写下的问题在页面上看得见、周围却什么都没有，人只会以为没保存成功");
+  for (const lang of ["en", "zh"]) {
+    for (const k of ["lint.fork.nocandidates", "decision.question.orphan"]) {
+      assert.ok(/alternative/.test(one(lang, k)),
+        `${lang}.${k} 只说了「还不是岔路口」，没说该做什么`);
+    }
+    // 和「未决」同一条规矩：这不是错，别写成责备。人一被责备就会去删那句话，
+    // 而它是整套东西里唯一只能人写的信息。
+    assert.ok(!/\bshould have\b|\bforgot|\berror\b|\bmissing\b/i.test(one("en", "decision.question.orphan")),
+      `en.decision.question.orphan 像在责备用户：${one("en", "decision.question.orphan")}`);
+    assert.ok(!/错误|失败|忘了|遗漏/.test(one("zh", "decision.question.orphan")),
+      `zh.decision.question.orphan 像在责备用户：${one("zh", "decision.question.orphan")}`);
+  }
+});
+
+test("⑦ 「都不行」逐字就是这三个字 —— README / FORMAT.md / MCP 三处都这么承诺的", () => {
+  // 曾经是「全部作废」。图例说谎比没有图例更糟，而且「作废」听着像这几条记录
+  // 出了问题被撤销了 —— 它们没有，它们各自都是走到底的结论（P4）。
+  assert.equal(one("zh", "decision.alldead"), "都不行");
+  assert.ok(/选 1/.test(one("zh", "decision.pick")));
+  assert.ok(/已定/.test(one("zh", "decision.settled")));
+});
+
+test("⑦ 移动一个候选之后说得出两个岔路口各剩下谁", () => {
+  needKeys(["toast.moved.fork", "toast.moved.fork.roots"],
+    "组是派生的，事后重新拉一遍森林只看得到「现在是什么样」，看不到「刚才改了什么」");
+  assert.deepEqual(placeholders(one("en", "toast.moved.fork")), ["at", "n"]);
+  assert.deepEqual(placeholders(one("zh", "toast.moved.fork")), ["at", "n"]);
+  // 根之间那一组没有分叉点 id 可说，所以它只吃 n
+  assert.deepEqual(placeholders(one("en", "toast.moved.fork.roots")), ["n"]);
+  assert.deepEqual(placeholders(one("zh", "toast.moved.fork.roots")), ["n"]);
+});
+
+test("⑦ 搜索命中「当时在决定什么」时，那一档有名字", () => {
+  needKeys(["search.where.fork"], "否则英文界面上原样漏出 fork 这个词");
 });

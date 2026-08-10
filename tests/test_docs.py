@@ -361,9 +361,11 @@ def test_format_md_lists_every_front_matter_key_render_note_can_emit(tmp_path):
 
     `lang` 是这么漏掉的：双语上线时 render_note 学会了回写它，而第 2 节的键表
     还是十一行——照文档写的人不知道自己可以声明正文是什么语言。所以构造的
-    Step 必须把**每一个**可选键都填上，包括 lang。
+    Step 必须把**每一个**可选键都填上，包括 lang、branch、decision。
     """
     step = core.Step(id="001", parent="000", status="done", title="t", lang="zh",
+                     branch="alternative", branch_note="先试最便宜的那条",
+                     decision="类别不平衡怎么处理？",
                      date="2026-01-01",
                      commit="c", author="a", key="k", tags=["x"],
                      paths=[{"location": "/blue/x", "note": "n", "kind": "hpc"}],
@@ -581,9 +583,16 @@ def test_the_front_matter_key_order_in_format_md_is_the_order_render_note_emits(
     这句话是有代价的承诺：静态导出要逐字节确定，而人照着这个顺序手写的文件
     过一次工具之后不该被重排得面目全非。所以判据是 render_note 真写出来的顺序，
     不是照着代码抄的一份清单。
+
+    `branch` / `decision` 必须**在这里也填上**：它们不是每条记录都有的键，构造的 Step
+    漏填哪一个，这条测试就对那一个键的位置一言不发——`lang` 当年就是这么在键表里
+    漏了一年的。这两个尤其容易错位：`branch` 修饰上面那行 `parent`、`decision` 修饰
+    上面那行 `title`，写反了文件仍然合法，只是读起来不再是一句话。
     """
     step = core.Step(id="001", parent="000", status="done", title="t", lang="zh",
                      date="2026-01-01", commit="c", author="a", key="k", tags=["x"],
+                     branch="alternative", branch_note="先试最便宜的那条",
+                     decision="类别不平衡怎么处理？",
                      moved=[{"date": "2026-01-02", "from": "000", "to": "001b",
                              "by": "human", "reason": "r"}],
                      inputs=[{"step": "000", "note": "a.csv"}],
@@ -1054,6 +1063,234 @@ def test_the_inlined_standard_carries_the_translation_rule_too():
     for key in ("why", "conclusion"):
         assert core.SECTION_NAMES[key]["en"] in ins, \
             f"内联摘要没给出英文小节名 {core.SECTION_NAMES[key]['en']}"
+
+
+# ------------------------------------------------- 分叉与汇回（FORMAT.md 第 15 节）
+# 这一节是 agent 写 `branch:` / `decision:` 时**唯一**的规范来源，而它讲的三样东西
+# 全是精确匹配的字符串：两个取值、三种结局、三条诊断的 code。任何一个和代码对不上，
+# 照着写的人得到的是「写下去了、什么都没发生」——`branch:` 拼错会静静退回 extends，
+# 不会有人来告诉他。所以这里不校对散文，只把文档里的**示例**整块喂给真代码。
+
+
+def fork_section() -> str:
+    return format_numbered_section("三种边")
+
+
+def section_note_examples(section: str) -> list[str]:
+    """某一节里那些「这就是一份 note.md」的示例块。"""
+    return [b for b in re.findall(r"```[a-z]*\n(.*?)```", section, re.S)
+            if b.startswith("---\nid:")]
+
+
+def build_forest(metas: dict[str, dict[str, str]]):
+    """把一组 front-matter 直接喂给真解析器，返回 (by_id, children, order)。"""
+    by_id = {}
+    for sid, meta in metas.items():
+        step, warns = core.build_step(f"{sid}_例子", {"id": sid, **meta}, "")
+        assert not warns, f"{sid} 的 front-matter 解析出警告: {warns}"
+        by_id[sid] = step
+    children = core.build_children(by_id)
+    return by_id, children, core.compute_order(by_id, children)
+
+
+def test_the_branch_values_in_format_md_are_exactly_the_ones_the_parser_knows():
+    """`branch:` 是闭词表（core.BRANCH_KINDS）。文档多写一个取值，照着写的人得到的是
+    一条 `bad_branch` 警告加一次**静默降级**——那一步从候选变回普通延伸，
+    括弧不画了、「N 选 1」不显示了，而记录本身看着一切正常。少写一个则相反。
+    顺序也要对上，那张表就是照着常量列的。
+    """
+    listed = table_first_column(fork_section(), "| 取值 |")
+    assert tuple(listed) == core.BRANCH_KINDS, \
+        f"FORMAT.md 第 15 节的取值表是 {listed}，core.BRANCH_KINDS 是 {list(core.BRANCH_KINDS)}"
+    assert f"`{core.DEFAULT_BRANCH}` | 我接着 parent 往下做。**默认" in fork_section(), \
+        f"第 15 节没说清默认值是 {core.DEFAULT_BRANCH}（不写就是它）"
+
+
+def test_the_fork_example_in_format_md_really_forms_one_group_the_code_recognises():
+    """第 15 节的三个示例块是整块拿来抄的：一个分叉点 + 两个候选。
+
+    所以直接喂给 compute_branch_groups——它们必须真的成为**同一组**候选，
+    而不是三份各自合法、凑在一起什么都不发生的 front-matter。同时钉住这一节
+    最核心的两条主张：「这一组有谁」是扫出来的（父节点上没有任何清单），
+    「选了哪个」是 `status: dead` 派生出来的（磁盘上没有 chosen 这种字段）。
+    """
+    blocks = section_note_examples(fork_section())
+    assert len(blocks) >= 3, f"第 15 节的分叉示例只找到 {len(blocks)} 块（要 1 个分叉点 + 2 个候选）"
+
+    metas = {}
+    for raw in blocks:
+        meta, body, warns = core.parse_note(raw)
+        assert not warns, f"第 15 节的示例解析出警告: {warns}"
+        metas[meta["id"]] = {k: v for k, v in meta.items() if k != "id"}
+    by_id, children, _ = build_forest(metas)
+
+    groups = core.compute_branch_groups(by_id, children)
+    assert len(groups) == 1, f"第 15 节的示例没有凑成恰好一组候选: {groups}"
+    g = groups[0]
+    fork = g["at"]
+    assert len(g["options"]) == 2, f"两个候选没被算进同一组: {g}"
+    assert fork and by_id[fork].decision, "分叉点上的 `decision:` 没被读出来"
+    assert g["decision"] == by_id[fork].decision, \
+        "候选组的 decision 不是分叉点那一行 —— 它只能从那里来"
+    # 「选了哪个」完全由 status 决定：示例里一个 dead 一个不是 ⇒ decided。
+    assert g["state"] == "decided" and g["chosen"] in g["options"], \
+        f"示例里恰好一个候选没标 dead，应当算 decided: {g}"
+    assert by_id[g["chosen"]].status != "dead"
+    # 父节点身上不许有任何「候选清单」，兄弟之间也不许互相指名（那就是双真相源）。
+    for raw in blocks:
+        meta, _, _ = core.parse_note(raw)
+        for banned in ("options", "alt", "rivals", "chosen"):
+            assert banned not in meta, \
+                f"第 15 节的示例里出现了 `{banned}:` —— 那是把双真相源请回来"
+
+
+def test_the_fork_states_in_format_md_are_the_three_the_code_derives():
+    """三种结局全部**从 status 派生**。文档漏掉 `abandoned` 那一档，读的人就会把
+    「一组候选全标了 dead」当成数据坏了，而它是这套系统里最该被保留的一种结论（P4）。
+    """
+    sec = fork_section()
+    for state in core.BRANCH_STATES:
+        assert f"`{state}`" in sec, f"第 15 节没写出 {state} 这一档"
+
+    # 三档各造一个，判据是真函数算出来的，不是照着表抄的。
+    def state_of(statuses: list[str]) -> str:
+        metas = {"001": {"status": "done", "decision": "选哪条"}}
+        for i, st in enumerate(statuses):
+            metas["002" + "b" * i] = {"parent": "001", "branch": "alternative", "status": st}
+        by_id, children, _ = build_forest(metas)
+        return core.compute_branch_groups(by_id, children)[0]["state"]
+
+    assert state_of(["done", "dead"]) == "decided"
+    assert state_of(["dead", "dead"]) == "abandoned"
+    assert state_of(["wip", "wip"]) == "open"
+
+
+def test_the_fork_diagnostics_in_format_md_are_the_real_codes_and_change_no_level():
+    """第 15 节承诺这三条「只提示、不进 L0–L4」——和第 3 / 6 节那六条同一档。
+
+    两个方向都盯着：文档列的 code 必须是 validate_branches 真报得出来的（列错一个，
+    照着 grep 的人永远搜不到），validate_branches 报得出来的也必须都被列上
+    （漏一条，界面上冒出来一句没人解释得了的提示）。
+
+    「不降级」这条尤其容易被顺手违反：把「这个岔路口还没决定」塞进评级只要一行，
+    而违反之后的表现是「明明补齐了 commit 和 path 却上不了 L2」，没人猜得到原因。
+    更坏的是它会教人**为了消掉警告随手标一个 `dead`**——拿假结论换绿色。
+    """
+    sec = fork_section()
+    # 只取带下划线的那些：诊断 code 长这样，而同一节里还有 `extends` / `alternative`
+    # 这种取值表，它们不是 code。
+    documented = set(re.findall(r"^\|\s*`([a-z]+_[a-z_]+)`\s*\|", sec, re.M))
+    assert "bad_branch" in sec, "第 15 节没提 `bad_branch`（拼错取值时的静默降级提醒）"
+
+    # 一次造齐四条：001 底下两个都活着且没写 decision，003 底下只有一个候选，
+    # 005 写了 decision 却一个候选都没有（那一行现在什么都不做）。
+    by_id, children, _ = build_forest({
+        "001": {"status": "done"},
+        "002": {"parent": "001", "branch": "alternative", "status": "wip"},
+        "002b": {"parent": "001", "branch": "alternative", "status": "wip"},
+        "003": {"status": "done", "decision": "只标了一条的那个岔路口"},
+        "004": {"parent": "003", "branch": "alternative", "status": "wip"},
+        "005": {"status": "done", "decision": "问题写了，候选还一个都没标"},
+        "006": {"parent": "005", "status": "wip"},
+    })
+    warns = core.validate_branches(by_id, core.compute_branch_groups(by_id, children))
+    emitted = {w["code"] for w in warns}
+    assert emitted == {"lone_alternative", "fork_without_decision", "undecided_fork",
+                       "decision_without_candidates"}, \
+        f"validate_branches 报出来的是 {sorted(emitted)}，造用例的场景该更新了"
+    assert emitted <= documented, f"第 15 节没列全这几条: {sorted(emitted - documented)}"
+    assert documented <= emitted | {"bad_branch"}, \
+        f"第 15 节列了 validate_branches 报不出来的 code: {sorted(documented - emitted)}"
+    assert all(w["level"] == "warn" for w in warns), "分叉诊断里出现了 error 级"
+
+    # 同一份记录，加不加分叉语义，等级必须一模一样。
+    body = "## 为什么\n因为。\n\n## 做了什么\n跑了 `a.py`。\n\n## 结论\n成立。\n"
+    plain = core.Step(id="002", status="done", title="t", commit="c1d2e3f", body=body,
+                      paths=[{"location": "/blue/x", "note": "n", "kind": "hpc"}],
+                      dirname="002_t")
+    forked = core.Step(id="002", status="done", title="t", commit="c1d2e3f", body=body,
+                       paths=[{"location": "/blue/x", "note": "n", "kind": "hpc"}],
+                       branch="alternative", branch_note="先试最便宜的那条",
+                       decision="下一个岔路口在决定什么", dirname="002_t")
+    assert core.traceability(forked)["level"] == core.traceability(plain)["level"] == "L2", \
+        "分叉语义把等级动了 —— 第 15 节说它一条都不降级"
+
+
+def test_the_rejoin_criterion_in_the_docs_is_the_one_compute_merges_uses():
+    """第 6 / 15 节把汇回的判据写成一句话：**两端在同一棵树里，且谁都不是谁的祖先**。
+
+    这句话是有代价的承诺，两个反面尤其要兑现：祖先链上的那条 `input:`（树边已经画过
+    这条路）和跨树的那条（从来没在同一条线上过）都**不是**汇回，老实算普通数据依赖。
+    把它们也画成曲线，图上会凭空多出一堆「支线汇回」，而那正是第 6 节说的
+    「把主干描粗一遍」。所以直接构造这三种，喂给真函数。
+    """
+    for doc, sec in ((FORMAT, format_numbered_section("三种关系")), (FORMAT, fork_section())):
+        assert "谁都不是谁的祖先" in sec, \
+            f"{where(doc)} 的汇回判据那句话不见了（第 6 / 15 节都要有）"
+
+    by_id, _, order = build_forest({
+        "011": {"status": "done", "decision": "两条路只能选一条走下去"},
+        "012": {"parent": "011", "branch": "alternative", "status": "dead"},
+        "012b": {"parent": "011", "branch": "alternative", "status": "done"},
+        "013": {"parent": "012b", "status": "done"},
+        # 014 读了另一支的 013：这是汇回。同时也读了自己的祖先 011：那不是。
+        "014": {"parent": "012", "status": "done",
+                "input": "013 | scores.csv\n011 | split.json"},
+        # 另一棵树，读的还是 013 —— 没有共同祖先，谈不上「汇回」。
+        "020": {"status": "done", "input": "013 | scores.csv"},
+    })
+    merges = core.compute_merges(by_id, order)
+    assert merges == [{"from": "013", "to": "014", "at": "011", "notes": ["scores.csv"]}], \
+        f"汇回判出来的是 {merges} —— 和第 6 / 15 节写的判据对不上"
+
+
+def test_the_skill_is_honest_about_which_front_doors_carry_the_fork_fields():
+    """和 inputs/code 那条同一个理由：**静默丢字段是最坏的一类缺陷**。
+
+    `branch` / `decision` 已经进了 W.MUTABLE，REST 的 PATCH 把请求体整个透传，
+    所以那条路现在就能用；但 MCP 的 `trace_update_step` 是**白名单**转发的，
+    `POST …/steps` 也不读这两个键——从那两个门进来的字段会一声不吭地消失。
+    在门面补齐之前 SKILL.md 必须明说；补齐之后那段注意事项必须删掉，
+    否则 agent 会一直多发一个 PATCH。两个方向都盯着。
+    """
+    mcp_src = (ROOT / "trace_mcp.py").read_text(encoding="utf-8")
+    m = re.search(r"def t_update_step\(.*?\n\ndef ", mcp_src, re.S)
+    assert m, "trace_mcp.py 里找不到 t_update_step 了（函数名变了？）"
+    mcp_ok = all(f'"{k}"' in m.group(0) for k in ("branch", "decision"))
+
+    server_src = (ROOT / "trace_server.py").read_text(encoding="utf-8")
+    c = re.search(r"async def api_create\(.*?\n\n", server_src, re.S)
+    assert c, "trace_server.py 里找不到建步骤那条路由了（函数名变了？）"
+    server_ok = all(f'payload.get("{k}"' in c.group(0) for k in ("branch", "decision"))
+
+    wired = mcp_ok and server_ok
+    warned = "尚未透传" in text(SKILL)
+    assert wired != warned, (
+        "两个门面都收 branch/decision 了，请删掉 SKILL.md 里那段「尚未透传」的注意事项"
+        if wired else
+        "MCP 的 trace_update_step / POST …/steps 仍然丢掉 branch/decision，"
+        "SKILL.md 必须明说这件事（agent 会以为记上了）")
+
+
+def test_the_readme_and_format_md_name_the_three_edges_the_same_way():
+    """两份文档各讲一遍三种边（README 讲怎么看，FORMAT 讲怎么写），名字必须是同一套。
+
+    这三个词是**新造的术语**，没有别处可查：README 叫「汇回」而 FORMAT 叫「合并」，
+    读的人不会意识到说的是同一条边，只会以为漏了一种关系。
+    （刻意避开 git 的词汇也是这个原因——「合并」「分支」会让人自动套上一个
+    可 rebase、有唯一主干的模型，那个模型在这里全是错的。）
+    """
+    fork = fork_section()
+    readme = text(README)
+    for name in ("普通延伸", "互斥候选", "汇回"):
+        assert name in fork, f"FORMAT.md 第 15 节没有「{name}」这个说法"
+        assert name in readme, f"README 没有「{name}」这个说法"
+    # README 那张视觉表必须给每一种关系都配一个非颜色的通道，否则打印/色觉障碍下读不出。
+    vis = readme.split("### 三种边的视觉编码", 1)
+    assert len(vis) == 2, "README 里找不到「三种边的视觉编码」那一节"
+    for channel in ("折线", "括弧", "曲线"):
+        assert channel in vis[1][:1200], \
+            f"README 的视觉编码表里没写出「{channel}」这个非颜色通道"
 
 
 def test_the_skill_tells_the_truth_about_what_the_create_endpoint_accepts():

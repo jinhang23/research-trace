@@ -1,7 +1,7 @@
 {
   "name": "research-trace",
   "displayName": "科研溯源 trace",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "把科研过程记录成一棵只追加的步骤树：每一步自带代码、日志、产物和一句「我为什么要做这一步」，从任何结果都能回溯到最初的问题。带 14 个 MCP 工具（零依赖，手写 JSON-RPC）、多项目、图/列表/数据流三视图、外部产物路径溯源（结构化 path 与失效核对）、L0–L4 可溯源性评级、项目级洞察沉淀。",
   "author": {
     "name": "Jinhang Wei"

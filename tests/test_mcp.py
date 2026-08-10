@@ -1051,3 +1051,170 @@ def test_the_http_backend_gets_the_same_date_from_the_server(tmp_path: Path, mon
     with TestClient(app) as c:
         r = c.post("/api/p/alpha/steps", json={"title": "没给日期"})
     assert r.json()["date"] == f"{datetime.datetime.now():%Y-%m-%d}"
+
+
+# ------------------------------------------------------------ 三种关系
+#
+# agent 是最容易把这三种关系搞混的读者：它看不到网页上那些括弧和曲线，
+# MCP 渲染出来的文本就是它对结构的全部认知。**渲染里不说，就等于这个功能不存在。**
+
+
+def _fork_fixture(be):
+    """011 底下两条互斥候选；002b 那条支线的产物又汇回到 002 这条线上的 004。"""
+    call(be, "trace_new_step", project="alpha", title="根", decision="类别不平衡怎么处理？")
+    call(be, "trace_new_step", project="alpha", parent="001", title="调采样权重",
+         branch="alternative | 先试最便宜的")
+    call(be, "trace_new_step", project="alpha", parent="001", title="改损失函数",
+         branch="alternative")
+    call(be, "trace_new_step", project="alpha", parent="002b", title="支线产物")
+    call(be, "trace_new_step", project="alpha", parent="002", title="主路径后续",
+         inputs=["003 | scores.csv"])
+
+
+def test_the_tree_tells_the_three_kinds_of_edge_apart(be):
+    """缩进只表达「谁挂在谁下面」。它表达不了「这两条只能选一条」，
+    也表达不了「那条支线的产物又回到了另一条线上」——不标出来，agent 会把
+    一条候选当成主线接着往下做。"""
+    _fork_fixture(be)
+    out = call(be, "trace_read", project="alpha")
+    line = next(l for l in out.splitlines() if l.strip().startswith(("●", "○", "▣")) and " 002 " in l)
+    assert "候选：先试最便宜的" in line, out
+    assert "⑂ 岔路口" in out and "未决 · 2 选 1" in out
+    assert "汇回→ 004" in out and "汇回← 003" in out
+
+
+def test_the_tree_sums_up_how_many_forks_are_still_undecided(be):
+    """「我还有几个岔路口悬着」逐个节点看是看不出来的，而它是隔几天回来
+    第一句要问的话。**它是待办不是缺陷**，所以不写进警告那一栏。"""
+    _fork_fixture(be)
+    out = call(be, "trace_read", project="alpha")
+    head, _, warn = out.partition("⚠")
+    assert "还有 1 个岔路口没做决定（待办，不是缺陷）" in head
+    assert "undecided" not in head.lower()
+    assert "岔路口" in warn, "内核那条提醒照旧出现在警告栏里，这里只是多说一次人话"
+
+
+def test_reading_a_candidate_says_it_is_one_of_a_group_that_only_keeps_one(be):
+    _fork_fixture(be)
+    out = call(be, "trace_read", project="alpha", step="002")
+    assert "互斥候选" in out and "同组的其他候选: 002b" in out
+    assert "类别不平衡怎么处理？" in out, "在决定什么写在父节点上，读候选时也得看得到"
+    assert "只能选一条走下去" in out
+    assert "先试最便宜的" in out, "这个候选自己的角度"
+
+
+def test_reading_a_fork_point_says_what_is_being_decided(be):
+    _fork_fixture(be)
+    out = call(be, "trace_read", project="alpha", step="001")
+    assert "决策分叉点" in out and "候选（只能选一条走下去）: 002 / 002b" in out
+    assert "类别不平衡怎么处理？" in out
+
+
+def test_a_fork_without_the_question_says_that_only_a_human_can_write_it(be):
+    """候选有谁、选中了谁都算得出来，唯独「在决定什么」推导不出来。
+    不点破的话 agent 只会以为这一栏是可选的装饰。"""
+    call(be, "trace_new_step", project="alpha", title="根")
+    call(be, "trace_new_step", project="alpha", parent="001", title="A", branch="alternative")
+    call(be, "trace_new_step", project="alpha", parent="001", title="B", branch="alternative")
+    out = call(be, "trace_read", project="alpha", step="001")
+    assert "只能人写" in out and "decision" in out
+
+
+def test_reading_a_step_marks_which_input_lines_are_rejoins(be):
+    """同一行 `input:`，「顺着往下走读了上一步的产物」和「另一条支线的产物回到
+    这条路上」是两件事。混成一样，「那条废掉的支其实还在喂着主线」就永远看不见。"""
+    _fork_fixture(be)
+    out = call(be, "trace_read", project="alpha", step="004")
+    assert "⇠ 汇回: 003 的产物参与了本步（两条线在 001 分开）" in out
+    assert "[汇回：来自另一条支线]" in out
+    assert "别用 branch 去表达它" in out
+
+
+def test_read_forks_lists_only_the_undecided_ones_unless_asked(be):
+    _fork_fixture(be)
+    call(be, "trace_new_step", project="alpha", title="另一个根")
+    call(be, "trace_new_step", project="alpha", parent="005", title="C", branch="alternative")
+    call(be, "trace_new_step", project="alpha", parent="005", title="D", branch="alternative",
+         status="dead")
+    out = call(be, "trace_read", project="alpha", forks=True)
+    assert "共 2 个岔路口，其中 1 个还没做决定" in out
+    assert "⑂ 001" in out and "⑂ 005" not in out
+    assert "⑂ 005" in call(be, "trace_read", project="alpha", forks=True, all=True)
+
+
+def test_the_undecided_wording_never_blames_anyone(be):
+    """措辞一带责备味，人就会为了让输出干净随手把一条支标成 dead ——
+    那是拿假结论换绿色，而假结论正是这套系统要防的东西。"""
+    _fork_fixture(be)
+    out = call(be, "trace_read", project="alpha", forks=True)
+    assert "常态" in out and "不是错" in out
+    for word in ("忘了", "应该", "遗漏", "错误"):
+        assert word not in out, f"未决的岔路口不是毛病，别用「{word}」"
+
+
+def test_marking_the_last_rival_dead_reports_the_fork_as_settled(be):
+    """把一个候选标成 dead **就是**做出选择。改完不回执，做决定的那一刻反而是
+    整条链上唯一没有回音的一步。"""
+    _fork_fixture(be)
+    out = call(be, "trace_update_step", project="alpha", step="002b", status="dead")
+    assert "已定 → 002" in out
+    assert "只有一个候选" not in out
+
+
+def test_marking_a_single_step_as_a_candidate_says_the_group_is_not_a_choice_yet(be):
+    """一组只有一个候选＝还不是选择，而这一步**不报错**（另一条支可能还没建）。
+    不当场说一句，人会以为自己已经记下了一个岔路口。"""
+    call(be, "trace_new_step", project="alpha", title="根")
+    call(be, "trace_new_step", project="alpha", parent="001", title="A")
+    out = call(be, "trace_update_step", project="alpha", step="002", branch="alternative")
+    assert "只有一个候选" in out
+    assert "001 上还没写 decision" in out
+
+
+def test_taking_the_candidacy_back_is_one_call(be):
+    """标错了要能改回来。收得进去、撤不回来的字段等于一次手滑就永久留在那儿。"""
+    call(be, "trace_new_step", project="alpha", title="根")
+    call(be, "trace_new_step", project="alpha", parent="001", title="A", branch="alternative")
+    call(be, "trace_update_step", project="alpha", step="002", branch="")
+    assert "互斥候选" not in call(be, "trace_read", project="alpha", step="002")
+
+
+def test_flow_separates_rejoins_from_ordinary_data_dependencies(be):
+    _fork_fixture(be)
+    out = call(be, "trace_flow", project="alpha", step="004", direction="up")
+    assert "⇢ 汇回：另一条支线，两条线在 001 分开" in out
+    assert "树上看不见这条边" in out
+
+
+def test_the_branch_description_keeps_the_three_relations_apart(be):
+    """agent 手上唯一的说明就是这段描述。三件必须说清的事：
+    「支线不等于互斥候选」「选了哪个＝其余标 dead」「汇回是 inputs 不是 branch」。"""
+    d = next(t for t in M.TOOLS if t["name"] == "trace_new_step")["inputSchema"]
+    b = d["properties"]["branch"]["description"]
+    assert "只能选一条走下去" in b
+    assert "不是** alternative" in b or "**不是** alternative" in b, "支线≠互斥候选要点破"
+    assert "status=dead" in b, "「选了哪个」是从 dead 派生的，没有第二个字段"
+    assert "`inputs`" in b and "汇回" in b, "汇回不要用 branch 表达"
+    q = d["properties"]["decision"]["description"]
+    assert "只能人写" in q and "父节点" in q
+
+
+def test_the_inlined_standard_explains_the_three_kinds_of_edge(be):
+    """pip 装的机器上没有 FORMAT.md，instructions 是唯一一定送达的通道。
+    这三条不进去，那台机器上的 agent 永远不会写 branch / decision。"""
+    ins = M.INSTRUCTIONS
+    assert "branch: alternative" in ins and "decision:" in ins
+    assert "status: dead" in ins or "status=dead" in ins or "标 dead" in ins
+    for code in ("lone_alternative", "fork_without_decision", "undecided_fork"):
+        assert code in ins, f"{code} 没送到 agent 手上"
+    assert "trace_read(forks=true)" in ins
+
+
+def test_the_translation_side_ignores_the_two_new_structural_keys(be):
+    """`branch` / `decision` 是结构，不是正文。写进译文就是双真相源。"""
+    import trace_core as core  # noqa: PLC0415
+
+    for k in ("branch", "decision"):
+        assert k in M.TR_STRUCT_KEYS and k in core.TR_STRUCT_KEYS
+    with pytest.raises(M.ToolError):
+        M._reject_front_matter("---\nbranch: alternative\n---\n\n## Why\na\n")

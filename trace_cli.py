@@ -5,6 +5,8 @@
     python trace_cli.py new-project --name "SMARTAffinity"
     python trace_cli.py new -P <项目> --title "..."       新建一步
     python trace_cli.py mv <id> --parent 013b --reason "…" 改挂到别的父节点下（原因必填）
+    python trace_cli.py fork 012 012b --decision "…"     把几步标成互斥候选（只能选一条）
+    python trace_cli.py forks                            还有几个岔路口没做决定
     python trace_cli.py paths --check                    逐条核对外部路径还在不在
     python trace_cli.py check [-P <项目>]                 校验不变量
     python trace_cli.py tr [-P <项目>] [--lang en]        还缺哪些语言版本 / 补一份译文
@@ -44,7 +46,17 @@ LEVEL_LABEL = {"L0": "不可溯源", "L1": "可读", "L2": "可定位", "L3": "�
 # 纯写法提示：内核发的是 warn 级，但它们**一条都不影响 L0–L4**，也不该让 --strict 失败。
 # 单独列出来而不是靠 level 字段区分，是因为 level 说的是「有多确定」，
 # 这里要分的是「有什么后果」——两者不是一回事，混用会让真正的警告被一起忽略。
-HINT_CODES = ("section_without_prose", "table_without_explanation", "code_without_explanation")
+#
+# 后三条是分叉的写法诊断：「一组只有一个候选」「有候选却没写在决定什么」，以及它的
+# 镜像「写了在决定什么却一个候选都没标」。它们说的是这条记录还差一句人写的话，
+# 和评级无关——一个岔路口写不写得清楚，不改变「这个结果追不追得到」。
+HINT_CODES = ("section_without_prose", "table_without_explanation", "code_without_explanation",
+              "lone_alternative", "fork_without_decision", "decision_without_candidates")
+
+# 「还没做决定的岔路口」既不是缺陷也不是写法问题，是**待办**。它从警告和提示两栏里
+# 都摘出去，由下面那一段专门说——同一件事说两遍会让人以为自己犯了错，而人消除
+# 「错误」最省事的办法是随手把一条支标成 dead，那是拿假结论换一屏干净的输出。
+TODO_CODES = ("undecided_fork",)
 
 
 def data_root(cfg: dict) -> Path:
@@ -257,9 +269,85 @@ def cmd_new(args) -> int:
         paths=args.path or None,
         inputs=args.input or None,
         code=args.code or None,
+        branch=args.branch or "",
+        decision=args.decision or "",
     )
     print(("已创建 " if created else "已存在 ") + f"{slug}/{step.id}")
     print(sd / step.dirname / core.NOTE_NAME)
+    if args.branch or args.decision:
+        for line in _fork_lines(core.compile_forest(sd), step.id):
+            print(line)
+    return 0
+
+
+# ---------------------------------------------------------------- 岔路口
+
+
+def _fork_lines(forest: dict, sid: str) -> list[str]:
+    """刚动过分叉语义之后，把**这一组现在长什么样**当场说出来。
+
+    候选组是派生的：落盘的只有这一步自己那一行 `branch:`，「这一组有谁、定了没有」
+    要扫完兄弟才知道。不当场说，人就得再跑一次 check 才看得见自己刚做了什么——
+    而最该被看见的恰恰是**不报错**的那两种：只标了一个候选（一个候选不成其为选择），
+    以及标完 dead 之后这个岔路口其实已经定了。
+    """
+    out = []
+    for g in forest.get("branch_groups") or []:
+        if sid not in (g.get("options") or []) and g.get("at") != sid:
+            continue
+        at = g.get("at") or "（森林的根之间）"
+        out.append(f"⑂ {at} 这一组候选: {' / '.join(g['options'])} —— {mcp.fork_label(g)}")
+        if g.get("at") and not g.get("decision"):
+            out.append(f"  {g['at']} 上还没写 decision（在决定什么）——"
+                       "候选有谁、选中了谁都算得出来，唯独这句话只能人写。")
+    return out
+
+
+def cmd_fork(args) -> int:
+    """把几个兄弟成组标成互斥候选，顺手把「在决定什么」写在它们的父节点上。
+
+    这个子命令的意义不是「能标」——`new --branch` 和一次 PATCH 都做得到。它的意义
+    是**同父校验**：候选组是「同一个父节点底下所有 alternative 的孩子」现算出来的，
+    一次只标一个的话，把两个不同父节点下的步骤各标一次，得到的是两个各含一个候选
+    的组，一条错都不报，而人以为自己刚记下了一个岔路口。
+    """
+    cfg = load_config()
+    root = data_root(cfg)
+    slug = pick_project(root, args.project)
+    sd = core.steps_dir_of(root, slug)
+    notes = {}
+    for raw in (args.note or []):
+        sid, _, text = raw.partition("=")
+        if not text.strip():
+            raise W.WriteError(f"--note 要写成 步骤id=这个候选自己的角度，收到 {raw!r}")
+        notes[sid.strip()] = text.strip()
+    info = W.mark_alternatives(sd, args.ids, decision=args.decision or "", notes=notes or None)
+    print(f"已把 {'、'.join(info['marked'])} 标成互斥候选"
+          + (f"（挂在 {info['parent']} 底下）" if info["parent"] else "（都是根）"))
+    if info.get("decision"):
+        print(f"  在决定什么: {info['decision']}")
+    for line in _fork_lines(core.compile_forest(sd), info["marked"][0]):
+        print("  " + line)
+    print("  「选了哪个」不用另写：走通哪条，把其余的标 dead 并写清为什么放弃"
+          "（rm 是给误建用的，失败的实验是结论）。")
+    return 0
+
+
+def cmd_forks(args) -> int:
+    """列出岔路口。默认只列**还没做决定**的那些。
+
+    **它不是 check 的一部分。**「还有三个岔路口悬着」是待办，不是缺陷：同时开几条
+    线是研究的常态，把它塞进警告栏只会稀释警告的分量，人很快就会为了让输出干净
+    随手把一条标成 dead —— 那是拿假结论换绿色。所以它自己一条命令，也不进退出码。
+    """
+    cfg = load_config()
+    root = data_root(cfg)
+    slugs = [pick_project(root, args.project)] if args.project \
+        else [p.slug for p in core.scan_projects(root)]
+    for slug in slugs:
+        f = core.compile_forest(core.steps_dir_of(root, slug))
+        print(mcp.fmt_forks(f, f"[{slug}]", only_open=not args.all))
+        print()
     return 0
 
 
@@ -415,6 +503,14 @@ def cmd_mv(args) -> int:
     print("  " + info["moved"])
     if info["subtree"]:
         print(f"⚠ 跟着一起走的还有 {len(info['subtree'])} 个后代：" + "、".join(info["subtree"]))
+    # 移动会改变**两个**岔路口的成员：走掉的那个和加入的那个。候选组是现算的，
+    # 事后只能靠再跑一遍 forks 才看得见，而「011 那组现在只剩一个候选了」正是
+    # 这次移动的直接后果 —— 不说的话，人下次看到的是一条来路不明的 lone_alternative。
+    for label, g in (("原来那个岔路口", (info.get("alternatives") or {}).get("left")),
+                     ("移过去之后那个岔路口", (info.get("alternatives") or {}).get("joined"))):
+        if g:
+            print(f"  {label} {g['at'] or '（根之间）'}: "
+                  f"{' / '.join(g['options'])} —— {mcp.fork_label(g)}")
     print("id 没变，inputs 也没动 —— 数据依赖是另一件事。")
     return 0
 
@@ -535,7 +631,8 @@ def cmd_check(args) -> int:
         errors += len(errs)
         # 提示不进 warns：--strict 是给 CI 用的闸门，而「这张表没配一句说明」
         # 不是缺陷，用它拦住一次合并只会让人加 --no-verify。
-        warns += len([w for w in ws if w["level"] != "error" and w["code"] not in HINT_CODES])
+        warns += len([w for w in ws if w["level"] != "error"
+                      and w["code"] not in HINT_CODES and w["code"] not in TODO_CODES])
         steps = f["steps"]
         print(f"[{slug}] {len(steps)} 步 · {f['lane_count']} 轨道 · "
               f"树 {f['tree']['w']}×{f['tree']['h']}px · 警告 {len(ws)}（错误 {len(errs)}）")
@@ -563,11 +660,15 @@ def cmd_check(args) -> int:
             for m in t.get("missing", []):
                 print(f"      · {m}")
 
-        # 三档，按**后果**分，不按 level 字段分：新加的三条诊断都是 warn 级，
+        # 四档，按**后果**分，不按 level 字段分：写法诊断和分叉诊断都是 warn 级，
         # 但它们一个都不影响 L0–L4。混在一起打，人会以为「表格没写说明」和
         # 「dead 没写结论」一样严重，然后开始整体忽略这一段——而那正是警告失效的方式。
+        #   ✕ 错误      结构性问题，进退出码
+        #   ⚠ 警告      内容层缺陷，--strict 才拦
+        #   ⓘ 写法提示  不影响等级，也不影响退出码
+        #   ⑂ 待办      未决的岔路口，连「有问题」都不是
         for w in ws:
-            if w["code"] in HINT_CODES:
+            if w["code"] in HINT_CODES or w["code"] in TODO_CODES:
                 continue
             print(("  ✕ " if w["level"] == "error" else "  ⚠ ") + f"[{w['where'] or w['code']}] {w['message']}")
         hints = [w for w in ws if w["code"] in HINT_CODES]
@@ -575,6 +676,20 @@ def cmd_check(args) -> int:
             print(f"  ⓘ {len(hints)} 条写法提示（**不影响 L0–L4，也不影响退出码**）：")
             for w in hints:
                 print(f"      [{w['where'] or w['code']}] {w['message']}")
+
+        # 未决的岔路口。**既不是错误也不是提示，是待办**：同时开几条线是研究的常态。
+        # 单独一栏而不是并进上面那两栏，是因为「有几个决定还没做」是人主动想知道的
+        # 东西，而不是被指出来的毛病；措辞里也不能带责备——一带责备，人就会为了让
+        # 输出干净随手把一条支标成 dead，那是拿假结论换绿色。
+        todo = mcp.open_forks(f)
+        if todo:
+            print(f"  ⑂ 还有 {len(todo)} 个岔路口没做决定"
+                  f"（**待办，不是缺陷，不计入退出码**；同时开几条线是常态）：")
+            for g in todo:
+                at = g["at"] or "（森林的根之间）"
+                print(f"      {at}  {len(g['live'])} 选 1（{' / '.join(g['live'])}）"
+                      + (f"  —— {g['decision']}" if g.get("decision") else "  —— 还没写在决定什么"))
+            print("      逐个看：forks ／ 结掉一个：把没走通的候选标 dead 并写清为什么放弃")
 
         # 已确认不存在的外部位置。**不是警告，也不进退出码**：路径没了是溯源
         # 结论（P4），不是这份记录写错了。但 check 是三个出口里唯一一个人会
@@ -738,7 +853,29 @@ def main(argv: list[str] | None = None) -> int:
                    help='代码在哪，可重复。kind ∈ git/snapshot/container。'
                         '如 --code "snapshot | /orange/lab/snap/20260809 | manifest=MANIFEST.md5 n=43"。'
                         '代码不在 git 里时用 snapshot，它一样能上 L2 —— 别再把快照路径塞进 --commit')
+    p.add_argument("--branch", default="", metavar="extends|alternative[|说明]",
+                   help='这一步和它 parent 之间那条边是什么性质。默认 extends（普通延伸，不用写）；'
+                        'alternative 是**互斥候选**——「我和我的兄弟们是同一个问题的几个答案，'
+                        '只能选一条走下去」。可带说明：--branch "alternative | 先试最便宜的"。'
+                        '注意「又分出一条支线去试别的」不是互斥候选，那就是普通延伸')
+    p.add_argument("--decision", default="", metavar="在决定什么",
+                   help='写在**分叉点自己**身上的一句话：它底下那几个互斥候选在决定什么。'
+                        '候选有谁、选了谁都算得出来，唯独这句话只能人写')
     p.set_defaults(fn=cmd_new)
+
+    p = sub.add_parser("fork", help="把几个兄弟成组标成互斥候选（同一个问题的几个答案，只能选一条）")
+    p.add_argument("ids", nargs="+", metavar="步骤id", help="至少两个，必须是同一个父节点下的兄弟")
+    p.add_argument("-P", "--project", default=None)
+    p.add_argument("--decision", default="", metavar="在决定什么",
+                   help="顺手写在它们父节点上的那句话，如「类别不平衡怎么处理？只能选一条走下去」")
+    p.add_argument("--note", action="append", metavar="步骤id=说明",
+                   help="某个候选自己的角度，可重复，如 --note \"012=先试最便宜的：只调采样权重\"")
+    p.set_defaults(fn=cmd_fork)
+
+    p = sub.add_parser("forks", help="列出岔路口（默认只列还没做决定的那些）")
+    p.add_argument("-P", "--project", default=None)
+    p.add_argument("--all", action="store_true", help="连已经做完决定的岔路口一起列")
+    p.set_defaults(fn=cmd_forks)
 
     p = sub.add_parser("rm", help="真删一步（只用于误建/测试数据；失败的实验请标 dead）")
     p.add_argument("id")

@@ -58,6 +58,28 @@ def test_consumers_are_derived_never_stored(tmp_path: Path):
     assert "consumers" not in (tmp_path / "steps" / "013_x" / "note.md").read_text(encoding="utf-8")
 
 
+def test_classifying_an_input_as_a_merge_changes_nothing_about_the_data_flow(tmp_path: Path):
+    """汇回（`merges`）是**同一批 input 边的一个子集**，不是新的一张图。
+
+    防的是：既然树上要把汇回单独画出来，顺手就把它从数据流图里挪走 / 双算一遍。
+    数据流问的是「这些字节从哪来」，那个答案和这条边在树上长什么样毫无关系——
+    consumers、dep_edges、inputs 三处都必须原样。
+    """
+    mk(tmp_path, "011")
+    mk(tmp_path, "012", "parent: 011\n")
+    mk(tmp_path, "012b", "parent: 011\n")
+    mk(tmp_path, "013", "parent: 012b\n")
+    steps = mk(tmp_path, "014", "parent: 012\ninput: 013 | scores.csv\n")
+    f = core.compile_forest(steps)
+    by = {s["id"]: s for s in f["steps"]}
+
+    assert [m["from"] for m in f["merges"]] == ["013"], "先确认这确实被判成了汇回"
+    assert by["013"]["consumers"] == ["014"]
+    assert by["014"]["inputs"] == [{"step": "013", "note": "scores.csv"}]
+    by_id, _ = core.validate(core.scan(steps)[0])
+    assert core.dep_edges(by_id, "014") == ["012", "013"]
+
+
 def test_a_dangling_or_self_input_is_reported_but_never_stops_the_build(tmp_path: Path):
     """和 dangling_parent 同一个处理方式：说出来，然后继续画图。
     十年后的日志一定是残缺的。"""

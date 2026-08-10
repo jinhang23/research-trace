@@ -8,7 +8,15 @@
  *       status                → 线型（实/虚/点）+ 节点填充
  *       是否在选中的祖先链上   → 不透明度
  *       是否命中搜索          → 行不透明度（不动轨道）
- *     颜色只作线型的补强，不单独承载信息（打印与色盲可读）。
+ *
+ *     「颜色只作线型的补强」这一条按用户的要求**放宽了，但没作废**：颜色现在
+ *     承载「这条边是三种关系里的哪一种」（延伸 / 互斥候选 / 汇回），
+ *     **但每一种关系必须再配一个非颜色的通道**——
+ *       延伸    正交折线（不变，绝大多数的边）
+ *       互斥候选 一道把这一组括起来的括弧 ＋「N 选 1 / 已定 / 都不行」
+ *       汇回    曲线 ＋ 箭头（树上的边从不弯，形状本身就说明它不属于树）
+ *     灰度打印出来、或者看不见颜色的人，丢掉的只该是那一眼，不是那个意思。
+ *     线型和不透明度一个都没被这次改动碰过。
  */
 
 :root {
@@ -27,6 +35,14 @@
   --wip: #ab7716;
   --dead: #a8453a;
 
+  /* 三种关系各一色。刻意都避开 --done/--wip/--dead（那三个归 status）和
+     --accent（那个归选中和链接）：一条边上同时有「什么状态」和「什么关系」
+     两件事，两套颜色撞在一起就分不清读到的是哪一件。
+     紫和青在两种主题下都和上面五个拉得开，而且 deuteranopia / protanopia 下
+     它们与绿/红的明度差也够——形状（括弧 / 曲线箭头）仍然是那半个保底通道。 */
+  --alt: #6d3fc0;
+  --join: #0d7f8a;
+
   --mono: ui-monospace, "Cascadia Mono", "Cascadia Code", Consolas, "DejaVu Sans Mono", monospace;
   --serif: "Source Han Serif SC", "Noto Serif CJK SC", "Songti SC", Georgia, "Times New Roman", serif;
   --sans: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
@@ -44,6 +60,10 @@
     --done: #5fbf85;
     --wip: #d6a441;
     --dead: #e07a6d;
+    /* 深色底上把这两个提亮：#6d3fc0 在 #15161a 上几乎读不出来，而括弧和曲线
+       都是 1.5–1.8px 的细线，细线对对比度比色块敏感得多。 */
+    --alt: #b393f0;
+    --join: #4fd1c5;
   }
 }
 
@@ -1000,6 +1020,11 @@ button.danger:hover { background: color-mix(in srgb, var(--dead) 12%, transparen
 #legend .lgm i.moved { border-color: var(--rule); color: var(--muted); }
 #legend .lgm i.gone { border-color: var(--dead); color: var(--dead); }
 #treelegend, #flowlegend { display: flex; gap: 14px; align-items: center; }
+/* 自带 display 的元素必须自己补一张 [hidden]（同 #track / #gitwarn / #lightbox）：
+   UA 样式表里的 display:none 权重比作者规则低，不补的话 applyView() 把
+   #flowlegend.hidden 设成 true，那三条数据流图例照样挂在树视图的图例条上，
+   于是「实线」和「parent」并排摆着，读者只能理解成「实线 = 树边」。 */
+#treelegend[hidden], #flowlegend[hidden] { display: none; }
 #legend .fl {
   display: inline-block; width: 18px; border-top-width: 2px; border-top-style: solid;
   vertical-align: middle; margin-right: 5px;
@@ -1007,6 +1032,204 @@ button.danger:hover { background: color-mix(in srgb, var(--dead) 12%, transparen
 #legend .fl.tree { border-color: var(--muted); border-top-width: 1.5px; }
 #legend .fl.data { border-color: var(--accent); }
 #legend .fl.both { border-color: var(--accent); border-top-width: 4px; }
+
+/* ============================================== ⑦ 决策分叉 · 支路 · 汇回
+ *
+ * 三种关系各有一色 ＋ 一个非颜色的通道。**线型和不透明度一格都没动**：
+ * 下面所有规则要么只写 stroke / fill / color（颜色通道），要么画的是本来就
+ * 不存在的新形状（括弧、曲线、箭头）。
+ */
+
+/* ---- 图视图 · 互斥候选：边换色，分叉处一道括弧 ---- */
+
+/* 只换颜色。stroke-dasharray 一个字都不写——那是 status 的，写在上面的
+   .dedge.s-wip / .s-dead 里，b-alt 不能把它覆盖掉。 */
+#dedges .dedge.b-alt { stroke: var(--alt); }
+#dedges .darrow.b-alt { fill: var(--alt); }
+
+/* 括弧：把一组候选括起来的那道线。这是「互斥」的非颜色通道，灰度打印下
+   「这几条是一组」全靠它。实线、不带任何 dash —— 它说的不是状态。 */
+#dedges .dfork {
+  fill: none; stroke: var(--alt); stroke-width: 1.6;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+#dedges .dfork.faded { opacity: .24; }
+
+/* 括弧旁边的标注。默认只有两三个字的状态；选中这个岔路口或它任何一个候选时，
+   整句「在决定什么」才在下面展开——它是自由文本，一直铺在图上会压住别的支线。 */
+#dmarks { position: absolute; left: 0; top: 0; pointer-events: none; }
+/* 一行，不是一列：层与层之间只有 V_GAP（38px），一列摆下去第二行就顶进父节点的
+   卡片里被压住了。展开「在决定什么」时它往两边长，仍然待在同一道缝里。 */
+.forklabel {
+  position: absolute; transform: translate(-50%, -100%);
+  display: flex; align-items: center; gap: 6px; white-space: nowrap;
+  pointer-events: auto; cursor: default;
+}
+/* side 那一档钉的是盒子的**上沿**（app.js 那边把 top 夹到了 0 以上）。
+   曾经这里是 translate(0, -50%)：换到括弧右边躲开了卡片，却仍然被画布上沿
+   切掉一半的字——而这个分支存在的全部理由就是「别被裁掉」。 */
+.forklabel.side { transform: translate(0, 0); }
+/* 展开的那一条要盖过旁边支线的卡片才读得完。只在选中时抬起来：不选中的时候
+   它是一枚两三个字的小牌子，抢层级只会把别人的标题挡掉。 */
+.forklabel.on { z-index: 4; }
+.forklabel .fstate {
+  font-family: var(--mono); font-size: 9.5px; line-height: 14px; white-space: nowrap;
+  padding: 0 5px; border-radius: 3px;
+  border: 1px solid var(--alt); color: var(--alt); background: var(--bg);
+}
+/* 「都不行」是**结论**不是错误（P4），所以它和另外两档长得**完全一样**：不给红色、
+   不给告警底纹，也**不压淡**。
+   曾经这里写着 `.forklabel.f-abandoned .fstate { opacity: .72 }`，两处都错：
+   (a) 不透明度这个通道已经归「和选中有没有关系 / 有没有命中搜索」了，借出去之后
+       一枚淡掉的牌子就说不清是「这一组全废了」还是「它不在你选中的那条链上」——
+       而它俩会**相乘**（.faded 的 .24 × .72 ＝ .17，比别的 faded 牌子还暗一档）；
+   (b) P4 明说过「变灰的语义是不相关，不是结论为否」，把一条结论调暗正是那句话
+       禁的事。三档之间的差别由牌子上那几个字承担（「N 选 1」/「已定：012b」/
+       「都不行」）——那本来就是它的非颜色通道。 */
+.forklabel .fq {
+  display: none; max-width: 340px; padding: 1px 7px; border-radius: 4px;
+  font-size: 10.5px; line-height: 15px;
+  overflow: hidden; text-overflow: ellipsis;
+  color: var(--ink); background: var(--panel); border: 1px solid var(--rule);
+}
+.forklabel.on .fq { display: block; }
+.forklabel.faded { opacity: .24; }
+
+/* ---- 图视图 · 汇回：曲线 ＋ 箭头 ---- */
+
+/* 曲线是汇回的非颜色通道：树上的边永远是正交折线，一条弯的边不可能被读成父子。
+   比树边细一点，因为它是叠加层，不该抢主干的视觉重量。 */
+#dedges .drejoin { fill: none; stroke: var(--join); stroke-width: 1.4; }
+#dedges .drejoinhead { fill: var(--join); }
+/* 和树边同一个值。同一个通道上出现两档，等于让不透明度也捎带说了一句
+   「这是哪种边」——而那正是这次改动答应过不做的事（那件事归颜色和形状）。 */
+#dedges .drejoin.faded, #dedges .drejoinhead.faded { opacity: .24; }
+#dedges .drejoin.sel { stroke-width: 2.2; }
+
+/* ---- 列表视图 · 轨道图有它自己的语汇 ---- */
+
+#rails .edge.b-alt { stroke: var(--alt); }
+/* 分叉那一行节点正下方的短括弧。定高行 + 十几像素宽的轨道装不下弧形，
+   压成一道带两端小钩的横线——记号还是那个记号，而且不占任何行高。 */
+#rails .railfork { fill: none; stroke: var(--alt); stroke-width: 1.4; stroke-linejoin: round; }
+#rails .railfork.faded { opacity: .28; }
+/* 汇回从右边那条专门留出来的空档绕过去。git graph 里横过来并进主线的那条线
+   就是这个位置、这个形状。 */
+#rails .railjoin { fill: none; stroke: var(--join); stroke-width: 1.3; }
+#rails .railjoinhead { fill: var(--join); }
+#rails .railjoin.faded, #rails .railjoinhead.faded { opacity: .16; }
+#rails .railjoin.sel { stroke-width: 2; }
+
+/* ---- 字形标记（第四通道，和 L0 / ↺✕ / ⇢ / ⇄ / ⊘ 同一档） ---- */
+
+.cmk.fork, .cmk.alt, .cmk.join {
+  font-family: var(--mono); font-size: 9px; line-height: 13px; padding: 0 3px;
+  border-radius: 2px; border: 1px solid var(--rule); color: var(--muted); opacity: 1;
+}
+.cmk.fork, .cmk.alt { border-color: var(--alt); color: var(--alt); }
+.cmk.join { border-color: var(--join); color: var(--join); }
+.row .cmk.fork, .row .cmk.alt, .row .cmk.join { flex: 0 0 auto; }
+
+/* ---- 顶栏「还有几个岔路口没定」 ---- */
+
+/* 和 #missbar 同一档：一句陈述，不是一条待办。用 --alt 而不是 --wip——
+   未决不是警告，同时开几条线是研究的常态。 */
+#forkbar {
+  padding: 6px 14px; font-size: 12px; line-height: 1.7; flex: 0 0 auto;
+  background: color-mix(in srgb, var(--alt) 8%, var(--panel));
+  border-bottom: 1px solid var(--rule); color: var(--ink);
+}
+#forkbar b { color: var(--alt); margin-right: 6px; }
+#forkbar a { color: var(--accent); font-family: var(--mono); text-decoration: none; }
+#forkbar a:hover { text-decoration: underline; }
+
+/* ---- 详情面板 ---- */
+
+.altchip { border-bottom: 1px dotted var(--alt); color: var(--alt); }
+.forkchip {
+  padding: 0 5px; border-radius: 3px;
+  border: 1px solid var(--alt); color: var(--alt);
+}
+/* 同上：详情面板那枚徽章也不给 f-abandoned 压不透明度。「都不行」是结论，
+   不是一条要人回来补的窟窿，说清它的是徽章上的字，不是它有多暗。 */
+.joinchip { border-bottom: 1px dotted var(--join); color: var(--join); }
+
+.decbox .decq { margin: 0 0 10px; font-size: 12.5px; line-height: 1.8; }
+.decbox .decq b {
+  font-size: 10px; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--muted); margin-right: 8px;
+}
+.decbox .decq .quiet, .decbox .decq.quiet { color: var(--muted); font-style: normal; }
+.decstate {
+  display: inline-block; margin: 0 0 8px; padding: 1px 7px; border-radius: 3px;
+  font-family: var(--mono); font-size: 11px;
+  border: 1px solid var(--alt); color: var(--alt);
+}
+/* 详情面板里那枚状态牌同样不压不透明度（理由见上面 .forklabel 那一段）。
+   三档的差别全部由牌子上的字承担：「N 选 1」/「已定：012b」/「都不行」。 */
+.candlist .cand { line-height: 1.9; }
+.candlist .cand::marker { color: var(--alt); }
+.candst { margin-left: 8px; font-size: 11px; color: var(--muted); }
+/* 放弃掉的候选**不隐藏、不折叠**：P4——「这条路走不通」是结论，而且是
+   「已定」这件事唯一的证据。只是划一道线，和 dead 那一套保持一致。 */
+.candlist .cand.out .deptitle, .candlist .cand.out { color: var(--muted); }
+.candlist .cand.out .candst { color: var(--dead); }
+
+.joinbox .joinat, .deplist .joinat {
+  margin-left: 8px; font-size: 11px; color: var(--muted);
+  border-bottom: 1px dotted var(--join);
+}
+.joinbadge {
+  margin-left: 6px; font-size: 10px; padding: 0 5px; border-radius: 3px;
+  border: 1px solid var(--join); color: var(--join);
+}
+
+/* ---- 编辑器里的两个新字段 ---- */
+
+.edrel { display: flex; gap: 12px; align-items: flex-start; }
+.edrel > .edpaths { flex: 1; }
+.edrel select, .edpaths input {
+  display: block; width: 100%; margin-top: 4px; padding: 6px 9px; font: inherit;
+  border: 1px solid var(--rule); border-radius: 5px; background: var(--panel); color: var(--ink);
+}
+.edrel select:focus, .edpaths input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+/* ---- 图例：三组 ＋ 一句话 ---- */
+
+/* 十一个小东西并排会让人以为「实线 = 延伸」——而线型归 status、颜色归关系，
+   正是这次最要说清的一件事。所以分组，组间给一条竖线。 */
+/* 三层都要能换行，否则窄一点的屏上这一条就横着溢出去被裁掉：
+   #legend 是 flex 行、#treelegend 是它的一个 flex 项（默认 min-width:auto，
+   不给 0 就缩不到内容以下）、每个 .lgset 自己也得能断。缺任何一层，
+   最右边那几条关系图例就在 550px 宽的屏上直接看不见了。 */
+#legend { flex-wrap: wrap; }
+#treelegend { flex: 1 1 auto; min-width: 0; flex-wrap: wrap; row-gap: 4px; }
+#legend .lgset { display: inline-flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+#legend .lgset + .lgset {
+  padding-left: 12px; border-left: 1px solid var(--rule);
+}
+#legend .lgrel {
+  width: 20px; height: 12px; border: 0; margin-right: 5px;
+  display: inline-flex; align-items: center;
+}
+#legend .lgrel svg { width: 20px; height: 12px; display: block; }
+#legend .lgrel.r-ext { color: var(--muted); }
+#legend .lgrel.r-alt { color: var(--alt); }
+#legend .lgrel.r-join { color: var(--join); }
+/* 这三条图例的文案是**整句话**（「互斥候选 —— 同一个问题的几个答案，只能选一条
+   走下去」），不是「done — solid」那种两个词。整句铺在常驻的图例条上会把它撑到
+   三行，所以压成一行加省略号：破折号左边那个**词**（互斥候选 / alternative）
+   才是要一眼认出来的东西，右边那半句和更深的解释都在 title 里。 */
+#legend .lgtext { max-width: 26ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#legend .lgm i.fork, #legend .lgm i.join { border-width: 1px; }
+#legend .lgm i.fork { border-color: var(--alt); color: var(--alt); }
+#legend .lgm i.join { border-color: var(--join); color: var(--join); }
+/* 「颜色一眼扫到，形状说得准」那句话压成一行加省略号，整句在 title 里：
+   图例是常驻的，让它长到三行就是永久吃掉一块画布。 */
+#legend .lgnote {
+  flex: 1 1 100%; min-width: 0; opacity: .85; font-style: italic;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 
 /* 编辑器里那三块结构化文本各带一句「这几段竖线是什么意思」——人第一次看到
    多出来的段时，唯一能自学的地方就是这里。 */
@@ -1048,6 +1271,9 @@ button.danger:hover { background: color-mix(in srgb, var(--dead) 12%, transparen
   .dlgbody menu { justify-content: stretch; }
   .dlgbody menu button { flex: 1 1 auto; }
   #legend { flex-wrap: wrap; gap: 8px 12px; }
+  /* 窄屏上先保住那三个词（互斥候选 / 汇回 / 延伸），后半句让位 */
+  #legend .lgtext { max-width: 15ch; }
+  #legend .lgset + .lgset { padding-left: 0; border-left: 0; }
   .prose table { font-size: 12px; }
   .file, .thumb { max-width: 100%; }
 }
@@ -1055,4 +1281,13 @@ button.danger:hover { background: color-mix(in srgb, var(--dead) 12%, transparen
   .hit { grid-template-columns: auto 1fr; }
   .hit .hd { display: none; }        /* 日期在手机上不值一列 */
   #legend .lgm { display: none; }
+  /* 但三种关系那一组要留下。它是屏幕上**正在用颜色说话**的东西：
+     手机上紫色的候选轨道和青色的汇回曲线照常在画，把解释它们的图例连坐掉，
+     读者看到的就是三种颜色加零个说明。760px 那条规则的注释写的也是
+     「窄屏上先保住那三个词」——之前这两条是互相矛盾的。
+     真正该让位的是字形那一组：那些记号在详情面板里各自都有文字说明。 */
+  #legend .lgrels .lgm { display: inline-flex; }
+  #legend .lgrels .lgtext { max-width: 10ch; }
+  #legend .lgnote { display: none; }   /* 「颜色一眼扫到、形状说得准」那句让位 */
+  #legend .lgset + .lgset { padding-left: 0; border-left: 0; }
 }

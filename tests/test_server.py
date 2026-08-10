@@ -84,6 +84,10 @@ WRITES = [
     # 路径核对写的是 note.md 里的 checked= / missing=。不设防的话，任何人都能给
     # 每一条外部产物盖上「已确认不存在」——那是要被后来人当成溯源结论读的。
     ("POST", "/api/p/课题/steps/001/paths/check", {"loc": "/x", "exists": False}),
+    # 成组标互斥候选写的是每个孩子的 `branch:` 和父节点的 `decision:`。不设防的话，
+    # 任何人都能把一条正常的延伸说成「这两条只能选一个」，而读的人会照着它去
+    # 判断哪条路已经被放弃了。
+    ("POST", "/api/p/课题/forks", {"ids": ["001", "002"], "decision": "谁都能写这句话"}),
 ]
 
 
@@ -1054,3 +1058,128 @@ def test_editing_an_insight_in_place_keeps_its_id(client):
     items = core.parse_insights(body)["fails"]
     assert len(items) == 1 and items[0]["id"] == "p1"
     assert "[[013b]]" in items[0]["text"]
+
+
+# ------------------------------------------------------- 分叉：候选 / 决定 / 汇回
+#
+# 这一层要钉的不是「树画得对不对」（内核那边有），是**门面有没有把字段真的传下去**。
+# 静默丢字段是最坏的一类缺陷：调用方填了 branch，拿到 201，磁盘上什么都没有。
+
+
+def test_creating_a_step_over_rest_really_writes_the_fork_semantics(client):
+    """POST 收 branch / decision —— 不收的话，「A 和 B 只能选一条」在远端模式下
+    只有手写 note.md 一条入口，而远端模式恰恰是 agent 唯一够得着的那条路。"""
+    mkstep(client, title="分叉点")
+    r = client.post("/api/p/课题/steps", headers=AUTH,
+                    json={"title": "候选 A", "parent": "001",
+                          "branch": "alternative | 先试最便宜的：只调采样权重"})
+    assert r.status_code == 201, r.text
+    assert r.json()["branch"] == "alternative"
+    assert r.json()["branch_note"] == "先试最便宜的：只调采样权重"
+    text = note_of(client, "002").read_text(encoding="utf-8")
+    assert "branch: alternative | 先试最便宜的：只调采样权重" in text, "字段得真的落盘"
+
+
+def test_creating_a_step_over_rest_really_writes_the_decision(client):
+    r = client.post("/api/p/课题/steps", headers=AUTH,
+                    json={"title": "分叉点", "decision": "类别不平衡怎么处理？只能选一条走下去"})
+    assert r.status_code == 201, r.text
+    assert "decision: 类别不平衡怎么处理？只能选一条走下去" in \
+        note_of(client, "001").read_text(encoding="utf-8")
+
+
+def test_patching_branch_to_empty_takes_the_candidacy_back(client):
+    """标错了要能改回来。收得进去、撤不回来的字段等于一次手滑就永久留在那儿。"""
+    mkstep(client, title="根")
+    mkstep(client, parent="001", title="A", branch="alternative")
+    assert client.patch("/api/p/课题/steps/002", headers=AUTH,
+                        json={"branch": ""}).json()["branch"] == "extends"
+    assert "branch:" not in note_of(client, "002").read_text(encoding="utf-8")
+
+
+def test_the_step_endpoint_tells_a_candidate_who_its_rivals_are(client):
+    """详情面板拉的就是这一条。「子步骤: 002, 002b」表达不了「这两个只能选一条」，
+    而读到 002 的人不知道自己站在岔路上，就会把一条候选当主线接着往下做。"""
+    mkstep(client, title="根")
+    mkstep(client, parent="001", title="A", branch="alternative")
+    mkstep(client, parent="001", title="B", branch="alternative")
+    g = client.get("/api/p/课题/steps/002").json()["in_fork"]
+    assert g["at"] == "001" and g["options"] == ["002", "002b"]
+    assert g["state"] == "open", "两个候选都还活着 —— 这个岔路口还没定"
+    assert client.get("/api/p/课题/steps/001").json()["fork"]["options"] == ["002", "002b"]
+
+
+def test_the_step_endpoint_says_where_the_two_lines_split_for_a_rejoin(client):
+    """汇回边的两端和它们分家的岔路口。光给对端 id 说不出「这条边不属于这棵树」。"""
+    mkstep(client, title="根")
+    mkstep(client, parent="001", title="A", branch="alternative")
+    mkstep(client, parent="001", title="B", branch="alternative")
+    mkstep(client, parent="002b", title="支线产物")
+    mkstep(client, parent="002", title="主路径后续", inputs=["003 | scores.csv"])
+    got = client.get("/api/p/课题/steps/004").json()["rejoins"]
+    assert got and got[0]["from"] == "003" and got[0]["to"] == "004"
+    assert got[0]["at"] == "001", "两条线是在 001 分开的 —— 画曲线和写说明都要它"
+
+
+def test_the_forks_endpoint_lists_only_the_undecided_ones_by_default(client):
+    """「我还有几个岔路口没做决定」是这个功能对研究者最直接的价值。
+    默认只列未决的：已经定了的那些是历史，天天列出来会把未决的那条淹掉。"""
+    mkstep(client, title="根")
+    mkstep(client, parent="001", title="A", branch="alternative")
+    mkstep(client, parent="001", title="B", branch="alternative")
+    other = mkstep(client, title="另一个根").id
+    mkstep(client, parent=other, title="C", branch="alternative")
+    mkstep(client, parent=other, title="D", branch="alternative", status="dead")
+
+    d = client.get("/api/p/课题/forks").json()
+    assert d["total"] == 2 and d["open"] == 1
+    assert [g["at"] for g in d["forks"]] == ["001"]
+    assert d["titles"]["002"] == "A", "只给 id 的话调用方还得再拉一遍森林才打印得出来"
+    every = client.get("/api/p/课题/forks?scope=any").json()
+    assert [g["at"] for g in every["forks"]] == ["001", other]
+    assert [g["state"] for g in every["forks"]] == ["open", "decided"]
+
+
+def test_deciding_is_marking_the_rivals_dead_and_nothing_else(client):
+    """「选了哪个」没有字段：其余候选标 dead 就是选择本身。
+    这条钉的是「别人后来加了个 chosen 字段」——那就是第二份真相。"""
+    mkstep(client, title="根")
+    mkstep(client, parent="001", title="A", branch="alternative")
+    mkstep(client, parent="001", title="B", branch="alternative")
+    client.patch("/api/p/课题/steps/002b", headers=AUTH, json={"status": "dead"})
+    g = client.get("/api/p/课题/forks?scope=any").json()["forks"][0]
+    assert g["state"] == "decided" and g["chosen"] == "002"
+    assert "chosen" not in note_of(client, "001").read_text(encoding="utf-8")
+
+
+def test_the_forks_endpoint_is_public_like_every_other_read(client):
+    mkstep(client, title="根")
+    assert client.get("/api/p/课题/forks").status_code == 200
+
+
+def test_marking_a_group_writes_one_line_per_child_and_nothing_on_the_parent(client):
+    """父节点上**绝不写孩子清单**：那是双真相源，一次 move_step 就让它过期。"""
+    mkstep(client, title="根")
+    mkstep(client, parent="001", title="A")
+    mkstep(client, parent="001", title="B")
+    r = client.post("/api/p/课题/forks", headers=AUTH,
+                    json={"ids": ["002", "002b"], "decision": "类别不平衡怎么处理？",
+                          "notes": {"002": "只调采样权重"}})
+    assert r.status_code == 200, r.text
+    assert r.json()["group"]["options"] == ["002", "002b"]
+    parent = note_of(client, "001").read_text(encoding="utf-8")
+    assert "decision: 类别不平衡怎么处理？" in parent
+    assert "002b" not in parent, "父节点上不许出现孩子清单"
+    assert "branch: alternative | 只调采样权重" in note_of(client, "002").read_text(encoding="utf-8")
+
+
+def test_marking_a_group_refuses_steps_that_do_not_share_a_parent(client):
+    """跨父节点标只会得到几个各含一个候选的组：一条错都不报，而人以为自己
+    刚记下了一个岔路口。同父校验只有在看得见整组的地方做得了，就是这条端点。"""
+    mkstep(client, title="根")
+    mkstep(client, parent="001", title="A")
+    mkstep(client, title="另一个根")
+    r = client.post("/api/p/课题/forks", headers=AUTH, json={"ids": ["002", "003"]})
+    assert r.status_code == 400 and "同一个父节点" in r.json()["error"]
+    assert "branch:" not in note_of(client, "002").read_text(encoding="utf-8"), \
+        "校验全部前置：不许留下「两个候选只标了一个」的半成品"

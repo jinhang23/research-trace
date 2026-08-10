@@ -369,6 +369,20 @@ test("三条新诊断是提示级 —— 它们不影响 L0–L4，混进警告�
   ["section_without_prose", "table_without_explanation", "code_without_explanation"].forEach((c) => {
     assert.equal(U.warnLevel({ level: "warn", code: c }), "hint", c);
   });
+  /* 分叉那几条同样一格等级都不降。 */
+  ["lone_alternative", "fork_without_decision",
+   "decision_without_candidates"].forEach((c) => {
+    assert.equal(U.warnLevel({ level: "warn", code: c }), "hint", c);
+  });
+  /* undecided_fork 连提示栏都不进，它是**待办**，由页面上那条 #forkbar 专门说。
+     以前它两处都说：警告栏里逐条一遍，forkbar 里又汇总一遍。同一件事说两遍会让
+     人以为自己犯了错，而人消除「错误」最省事的办法是随手把一条支标成 dead——
+     那是拿假结论换一屏干净的输出。trace_cli.py 的 TODO_CODES 是同一条判断。 */
+  assert.equal(U.warnLevel({ level: "warn", code: "undecided_fork" }), "todo");
+  /* bad_branch 反过来：它**不是**提示。`branch: alterative` 落盘之后既不算候选、
+     也不在页面上留下任何痕迹，而人以为自己标过了 —— 那是「你写下的东西正在被
+     忽略」，和 bad_status 同一档，属于真警告。 */
+  assert.equal(U.warnLevel({ level: "warn", code: "bad_branch" }), "warn");
   assert.equal(U.warnLevel({ level: "warn", code: "dangling_input" }), "warn");
   assert.equal(U.warnLevel({ level: "error", code: "bad_frontmatter" }), "error");
 });
@@ -513,4 +527,208 @@ test("可视区域的边界算在里面", () => {
   for (const [x, y] of [[10, 10], [100, 100], [10, 100], [100, 10]])
     assert.ok(U.withinRect(view, x, y), `角点 ${x},${y} 应当算命中`);
   assert.ok(!U.withinRect(view, 101, 50));
+});
+
+/* ============================================ ⑦ 三种关系的几何与判据
+ *
+ * 这一整块钉的是「非颜色的那半个通道真的存在」。颜色是这次改动的主角，但规格
+ * 只放宽了一半：每一种关系必须再配一个形状。几何算错了，屏幕上只是「有点歪」，
+ * 没人会去查——而歪掉的正是灰度打印和色觉障碍下唯一还剩的那条信息。
+ */
+
+const NODES = {
+  "012": { x: 0, y: 200 },      // 三个候选，同一层
+  "012b": { x: 200, y: 200 },
+  "012c": { x: 400, y: 200 },
+  "011": { x: 200, y: 100 },    // 分叉点
+};
+const GROUP = { at: "011", decision: "怎么办", options: ["012", "012b", "012c"],
+                live: ["012b"], state: "decided", chosen: "012b" };
+
+test("括弧横跨整组候选：两端落在最左和最右那个候选的中线上", () => {
+  const bk = U.forkBracket(NODES, GROUP, { nw: 100 });
+  assert.equal(bk.x1, 50, "左端要压在 012 的中线上");
+  assert.equal(bk.x2, 450, "右端要压在 012c 的中线上");
+  assert.equal(bk.cx, 250);
+  assert.ok(bk.y < 200, "括弧必须在候选**上方**，不能压在卡片上");
+});
+
+test("只有一个候选时括弧照画 —— lone_alternative 说的正是「一个候选不成其为选择」", () => {
+  // 宽度收成 0 的话，那条诊断在图上就完全看不见，人只会以为自己标错了地方。
+  const bk = U.forkBracket(NODES, { at: "011", options: ["012b"], live: [], state: "abandoned" },
+                           { nw: 100 });
+  assert.ok(bk.x2 - bk.x1 >= 30, "退化成一个点了：" + (bk.x2 - bk.x1));
+  assert.equal(bk.cx, 250, "还是要居中在那一个候选上");
+});
+
+test("括弧和它的标注全部挤在层与层之间那道缝里 —— 溢出去就被父节点的卡片压住", () => {
+  // V_GAP 是 38（trace_core），卡片高 NODE_H。lift 一大，标注就顶进父卡片里，
+  // 而 #dmarks 排在 #dnodes 之前 —— 被压住就等于这句话在图上根本不存在。
+  const V_GAP = 38, NH = 58;
+  const nodes = { p: { x: 0, y: 0 }, a: { x: 0, y: NH + V_GAP }, b: { x: 180, y: NH + V_GAP } };
+  const bk = U.forkBracket(nodes, { at: "p", options: ["a", "b"] }, { nw: 176 });
+  const parentBottom = NH;
+  assert.ok(bk.y > parentBottom + 3, "括弧顶进父卡片了");
+  assert.ok(bk.y - 17 > parentBottom, "标注（括弧上方 ~17px）顶进父卡片了");
+  assert.equal(bk.side, false, "有父节点的组不该走「标注挪到右边」那一档");
+});
+
+test("根之间那一组会说「标注没地方摆在上面」—— 它上面没有节点，摆上去就被裁掉", () => {
+  const roots = { a: { x: 0, y: 24 }, b: { x: 200, y: 24 } };   // PAD = 24
+  const bk = U.forkBracket(roots, { at: "", options: ["a", "b"] }, { nw: 176 });
+  assert.equal(bk.side, true);
+});
+
+test("布局里没有这一组的坐标时返回 null，不返回一条画在原点的括弧", () => {
+  assert.equal(U.forkBracket({}, GROUP, { nw: 100 }), null);
+  assert.equal(U.forkBracket(NODES, { at: "x", options: [] }, {}), null);
+  assert.equal(U.forkBracket(NODES, null, {}), null);
+});
+
+test("三态各说各的话，而「都不行」是结论不是错误", () => {
+  assert.equal(U.forkLabel(GROUP).key, "decision.settled");
+  assert.equal(U.forkLabel(GROUP).vars.id, "012b", "「已定」要指名是哪一条活下来了");
+
+  const dead = { options: ["a", "b"], live: [], state: "abandoned" };
+  assert.equal(U.forkLabel(dead).key, "decision.alldead");
+  // P4：全废是这个问题的答案（「都不行」），不是一个待填的窟窿。
+  // 文案 key 里出现 warn / error / missing 就说明它被当成缺陷了。
+  assert.ok(!/warn|error|missing|lint/.test(U.forkLabel(dead).key + U.forkLabel(dead).title));
+
+  const open = { options: ["a", "b", "c"], live: ["a", "b"], state: "open" };
+  assert.equal(U.forkLabel(open).key, "decision.pick");
+  assert.equal(U.forkLabel(open).vars.n, 2, "「N 选 1」的 N 是还活着的条数，不是候选总数");
+  assert.equal(U.forkLabel(null), null);
+});
+
+test("汇回是曲线，树边是正交折线 —— 形状本身就说明它不属于树", () => {
+  // 这是汇回那半个非颜色通道。改成折线的话，灰度打印下它和父子边一模一样，
+  // 读者只会把它读成「第二个 parent」，而那正是 P1 最不想让人误会的事。
+  const cv = U.rejoinCurve({ x: 0, y: 0 }, { x: 400, y: 300 }, { nw: 100, nh: 50 });
+  assert.ok(cv.d.includes("C"), "不是三次贝塞尔：" + cv.d);
+  assert.ok(!/[VH]/.test(cv.d), "混进了正交段：" + cv.d);
+  assert.ok(cv.arrow.endsWith("Z"), "箭头不是闭合三角形：" + cv.arrow);
+});
+
+test("汇回从卡片的侧边进出，不抢上下边 —— 上下边是父子边的地盘", () => {
+  const cv = U.rejoinCurve({ x: 0, y: 0 }, { x: 400, y: 300 }, { nw: 100, nh: 50 });
+  assert.ok(cv.d.startsWith("M100 25"), "该从生产者的右边出去：" + cv.d);
+  assert.ok(cv.d.endsWith("400 325"), "该扎进消费者的左边：" + cv.d);
+});
+
+test("消费者在左边时整条曲线镜像过来，箭头跟着掉头", () => {
+  const cv = U.rejoinCurve({ x: 400, y: 0 }, { x: 0, y: 300 }, { nw: 100, nh: 50 });
+  assert.ok(cv.d.startsWith("M400 25"), "该从生产者的左边出去：" + cv.d);
+  assert.ok(cv.d.endsWith("100 325"), "该扎进消费者的右边：" + cv.d);
+  // 箭头的底边要在尖端的**右侧**（指向左），否则画出来是一个倒着的箭头
+  const back = Number(/^M([-\d.]+)/.exec(cv.arrow)[1]);
+  assert.ok(back > 100, "箭头掉头失败：" + cv.arrow);
+});
+
+test("生产者在消费者下面（更深的一层）照样画得出来 —— 汇回不看行序", () => {
+  // 011 分叉出 012/012b，012b 底下的 013 汇回 012 底下的 014 时，
+  // 生产者的行号反而比消费者大。几何这一层要是偷偷假设「从上往下」，
+  // 最典型的那种汇回就画反了。
+  const cv = U.rejoinCurve({ x: 0, y: 400 }, { x: 300, y: 100 }, { nw: 100, nh: 50 });
+  assert.ok(cv.d.includes("C"));
+  assert.ok(cv.d.endsWith("300 125"), cv.d);
+});
+
+test("轨道图上的汇回从右边那条空档绕过去，箭头朝左扎回节点", () => {
+  // git graph 里横过来并进主线的那条线就是这个位置。从轨道中间穿的话，
+  // 它会和一根根竖着的轨道线缠在一起，谁也看不出哪条是哪条。
+  const cv = U.railRejoin({ x: 12, y: 50 }, { x: 26, y: 400 }, 90);
+  assert.ok(cv.d.includes("C90 50 90 400"), "控制点没落在留出来的空档上：" + cv.d);
+  assert.ok(cv.d.includes("C"), cv.d);
+  const tip = Number(/L[-\d.]+ [-\d.]+L([-\d.]+)/.exec(cv.arrow)[1]);
+  const back = Number(/^M([-\d.]+)/.exec(cv.arrow)[1]);
+  assert.ok(back > tip, "箭头得朝左指回节点：" + cv.arrow);
+});
+
+test("汇回边的淡出判据不能套「两端都在祖先链上」—— 那样它永远是淡的", () => {
+  // 汇回按定义两端分属两条支线，绝不可能同时在一条祖先链上。套那条判据的话，
+  // 一选中任何节点，所有汇回边集体消失 = 这个功能在选中状态下不存在。
+  const m = { from: "013", to: "014", at: "011" };
+  const chain = { "014": 1, "011": 1, "001": 1 };     // 选中 014 时的祖先链
+  assert.ok(U.rejoinRelated(m, "014", chain), "选中消费者时这条边必须亮着");
+  assert.ok(U.rejoinRelated(m, "013", { "013": 1, "012b": 1 }), "选中生产者时也一样");
+  assert.ok(!U.rejoinRelated(m, "099", { "099": 1 }), "跟选中毫无关系时才淡出");
+  assert.ok(U.rejoinRelated(m, "", {}), "没有选中时一条都不淡");
+});
+
+test("「我是哪一组的候选」是现算的，不看任何存下来的归属字段", () => {
+  const groups = [
+    { at: "", options: ["001", "001b"] },
+    { at: "011", options: ["012", "012b"] },
+  ];
+  assert.equal(U.groupOf(groups, { id: "012", parent: "011", branch: "alternative" }).at, "011");
+  // 根之间那一组：parent 为空，对应 at === ""
+  assert.equal(U.groupOf(groups, { id: "001b", parent: "", branch: "alternative" }).at, "");
+  // 没标 branch 的普通延伸不属于任何一组，哪怕它的兄弟是候选
+  assert.equal(U.groupOf(groups, { id: "013", parent: "011", branch: "extends" }), null);
+  assert.equal(U.groupOf(groups, { id: "012", parent: "011" }), null);
+});
+
+test("「互斥候选」这个取值只有一个字面量 —— 和 trace_core.BRANCH_KINDS 对得上", () => {
+  // core 那一侧写的是 ("extends", "alternative")。这边多一个字母，整张图上的
+  // 候选就一条都认不出来，而页面不会报任何错。
+  assert.equal(U.BRANCH_ALT, "alternative");
+});
+
+/* ------------------------------------------------ ⑦ 分叉那两句散文进搜索干草堆 */
+
+test("`decision:` 和候选说明搜得到 —— grep 一秒答得出的事，站内搜索不能答不出", () => {
+  const s = { id: "011", title: "基线", body: "跑了一遍。", tags: [],
+              decision: "类别不平衡怎么处理？只能选一条走下去" };
+  const c = { id: "012", title: "只调采样权重", body: "", tags: [],
+              branch: "alternative", branch_note: "先试最便宜的" };
+  assert.ok(U.matches(s, "类别不平衡"), "搜不到 decision —— 那是唯一只能人写的一句话");
+  assert.ok(U.matches(c, "最便宜"), "搜不到候选自己那句说明");
+  // 取值不进干草堆：进了的话搜 "alternative" 会命中半棵树
+  assert.equal(U.forkHay(c).indexOf("alternative"), -1);
+  assert.equal(U.forkHay({ id: "013", decision: "", branch_note: "" }), "");
+});
+
+test("干草堆只加东西不改判据 —— 没有 decision 的一步，搜出来的结果和从前一样", () => {
+  const s = { id: "013", title: "产出分数", body: "写了 scores.csv", tags: ["数据"] };
+  assert.ok(U.matches(s, "scores"));
+  assert.ok(U.matches(s, "数据"));
+  assert.ok(!U.matches(s, "类别不平衡"));
+});
+
+/* -------------------- ⑦ 验收时在浏览器里抓到的三处几何/语义错 */
+
+test("只有一个候选的分叉不许被说成「已定」", () => {
+  // core 的 state 只数**还活着**的候选，1 个活的就叫 decided —— 对 2 选 1 是对的，
+  // 对「从头到尾只有 1 条」是在替人宣布一件没发生的事。
+  // CLI、MCP、以及同一个页面顶上的提示栏说的都是「只有一个候选」，
+  // 只有这块牌子说「已定」，页面自己跟自己打架。
+  const lone = U.forkLabel({ at: "013", state: "decided", options: ["014"], live: ["014"], chosen: "014" });
+  assert.equal(lone.state, "lone");
+  const real = U.forkLabel({ at: "005", state: "decided", options: ["006", "007"], live: ["006"], chosen: "006" });
+  assert.equal(real.state, "decided", "两个候选里定下一个，那才是真的已定");
+});
+
+test("括弧在不属于这一组的兄弟头上开一个真的口子", () => {
+  // 候选和普通延伸挂在同一个父节点下、普通那条按 id 序正好夹在中间时，
+  // 一道连续的横杠会圈住三张卡片而牌子写「2 选 1」——圈住的和数出来的对不上，
+  // 而人相信的是自己看见的那一圈。
+  const nodes = { a: { x: 0, y: 200 }, m: { x: 200, y: 200 }, b: { x: 400, y: 200 } };
+  const g = { at: "p", options: ["a", "b"] };
+  const withOut = U.forkBracket(nodes, g, { nw: 176, skip: [288] });   // m 的中心
+  const solid = U.forkBracket(nodes, g, { nw: 176 });
+  const subpaths = d => (d.match(/M/g) || []).length;
+  assert.ok(subpaths(withOut.d) > subpaths(solid.d), "横杠必须真的断开，不是画两道竖挡了事");
+  assert.ok(!/H\s*-?\d/.test(""), "占位");
+});
+
+test("同一层的汇回不许退化成一条直线", () => {
+  // 控制点只往水平方向伸时，两端同 y 会让四个点的 y 全相等——画出来是笔直的横线，
+  // 和普通的短正交边一模一样。而「生产者和消费者在同一层」恰恰是最常见的汇回形状，
+  // 灰度下曲线是唯一还能分辨它的东西。
+  const flat = U.curveBetween({ x: 0, y: 100 }, { x: 120, y: 100 }, 24);
+  const ys = (flat.d.match(/-?\d+(\.\d+)?/g) || []).filter((_, i) => i % 2 === 1).map(Number);
+  assert.ok(Math.max(...ys) - Math.min(...ys) > 6, "同层时必须拱起来，否则形状通道当场消失");
+  const slope = U.curveBetween({ x: 0, y: 100 }, { x: 120, y: 260 }, 24);
+  assert.ok(/C/.test(slope.d), "不同层时仍然是曲线");
 });

@@ -303,3 +303,62 @@ def test_the_forest_reflects_the_move(chain: Path):
     assert got["003"] == "001" and got["004"] == "003"
     assert not [w for w in f["warnings"] if w["level"] == "error"]
     assert re.search(r"^moved:", note(chain, "003"), re.M)
+
+
+# ------------------------------------------------------------ 移动和互斥候选组
+
+
+@pytest.fixture()
+def rivals(steps: Path) -> Path:
+    """001 底下两个互斥候选 002 / 002b，外加一个空的落脚点 003。"""
+    W.create_step(steps, title="类别不平衡")
+    W.create_step(steps, parent="001", title="重采样")
+    W.create_step(steps, parent="001", title="focal loss")
+    W.create_step(steps, title="另一条线")
+    W.mark_alternatives(steps, ["002", "002b"], decision="类别不平衡怎么处理？")
+    return steps
+
+
+def test_a_moved_candidate_keeps_its_branch_line_untouched(rivals: Path):
+    """候选组是**派生**的：磁盘上只有孩子自己那一行 `branch:`，父节点上没有清单。
+
+    收益正好在这里兑现——把 002 挪到 003 底下，写入侧一个字都不用改，
+    它的含义自动从「001 那个岔路口的候选」变成「003 那个岔路口的候选」。
+    要是父节点上存了一份孩子清单，这一步就必须同时改两个文件，漏一个就是双真相源。
+    """
+    W.move_step(rivals, "002", "003", "它其实是在回答另一个问题")
+    assert "branch: alternative" in note(rivals, "002")
+    assert W.load(rivals)["002"].branch == "alternative"
+
+    by_id = W.load(rivals)
+    at = {g["at"]: g["options"]
+          for g in core.compute_branch_groups(by_id, core.build_children(by_id))}
+    assert at["003"] == ["002"] and at["001"] == ["002b"], "组的归属跟着 parent 自动变"
+
+
+def test_a_move_reports_both_forks_it_touched(rivals: Path):
+    """理由和 subtree 那条一模一样：这是移动的**直接后果**，事后只能靠重新拉一遍
+    森林才看得见，而移动的人这会儿正好在做决定。「011 那组现在只剩 012b 一个」
+    是他现在就该听到的一句话。"""
+    out = W.move_step(rivals, "002", "003", "它其实是在回答另一个问题")
+    assert out["alternatives"]["left"]["options"] == ["002b"]
+    assert out["alternatives"]["joined"]["options"] == ["002"]
+    assert out["alternatives"]["left"]["decision"] == "类别不平衡怎么处理？"
+
+
+def test_moving_something_that_is_no_candidate_reports_no_fork(chain: Path):
+    """没牵扯到任何岔路口的移动就该明说没有，而不是回一个空壳让调用方去猜。"""
+    out = W.move_step(chain, "003", "001", "挂错了")
+    assert out["alternatives"] == {"left": None, "joined": None}
+
+
+def test_a_move_that_leaves_a_lone_candidate_is_never_refused(rivals: Path):
+    """只剩一个候选不是错误——完全可能正是本意（「B 不再是候选了，它是独立的
+    一条线」），而一组候选做完决定之后本来就只剩一个不是 dead 的。P4：结论不是错误。
+
+    拒绝移动只会逼人先把 `branch:` 那一行删掉再移，留下的历史更差。
+    """
+    out = W.move_step(rivals, "002", "003", "它其实是在回答另一个问题")
+    assert out["new_parent"] == "003"
+    assert out["alternatives"]["left"]["state"] == "decided", "core 说这叫「定了」，不是错"
+    assert W.load(rivals)["001"].decision == "类别不平衡怎么处理？", "父节点上那句话不动"

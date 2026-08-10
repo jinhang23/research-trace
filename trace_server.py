@@ -34,7 +34,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
 
 import trace_core as core
-import trace_mcp as mcp          # 只为了 untranslated_report：见 api_untranslated 的注释
+import trace_mcp as mcp          # untranslated_report / step_context / open_forks：判据只留一份
 import trace_write as W
 from trace_git import GitSync
 
@@ -334,7 +334,8 @@ def search_hits(forests: list[tuple[str, str, dict[str, Any]]], query: str,
     """在若干个已经编译好的森林里做子串搜索。纯函数，方便整个丢进线程跑。
 
     判定规则和 MCP 的 trace_search 一致（id / 标题 / 正文 / 标签 /
-    **产物与代码的位置** / **各语言的译文**，大小写不敏感），人和 agent 搜同一个词
+    **产物与代码的位置** / **`decision:` 与候选说明** / **各语言的译文**，
+    大小写不敏感），人和 agent 搜同一个词
     必须搜到同一批东西——FORMAT.md 第 0 节的「信息对等」。
 
     **译文也要搜**，这条不是可选项：这套系统的底线是「删掉全部程序，`grep -r` 还能
@@ -372,6 +373,11 @@ def search_hits(forests: list[tuple[str, str, dict[str, Any]]], query: str,
             # 恰好是 agent 唯一够得到的地方。判据在 core，MCP 那侧用的是同一份。
             if q in core.locations_haystack(s).lower():
                 where.append("paths")
+            # 「当年是在哪个岔路口纠结这件事」同理：`decision:` 是整套东西里唯一
+            # 只能人写的一句话，`grep -rn 类别不平衡 projects/` 一秒就答得出，
+            # 站内搜索答不出就等于比 grep 弱。判据在 core，MCP 和网页用的是同一份。
+            if q in core.fork_haystack(s).lower():
+                where.append("fork")
 
             # 摘要优先取原文：原文是权威，译文只在原文没命中时才拿来当上下文，
             # 否则同一条命中在不同语言下会给出两段不一样的摘要。
@@ -717,6 +723,11 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             chain.append(cur)
             cur = idx[cur]["parent"]
         out["lineage"] = list(reversed(chain))
+        # 「我是不是某一组互斥候选里的一个」「这条汇回边上的两条线在哪分开」都要看
+        # 整片森林才答得出，而单步这个响应正是详情面板唯一拉的东西。判据和渲染都在
+        # trace_mcp.step_context 那一份里，MCP 的本地后端用的是同一个函数——
+        # 各写一遍的话，同一步在网页上和在 agent 眼里会给出不同的归属。
+        out.update(mcp.step_context(forest, sid))
         return JSONResponse(out)
 
     @app.get(base + "/api/search")
@@ -772,6 +783,33 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
         out = mcp.untranslated_report(forest, p, lang)
         out["version"] = state.version
         return JSONResponse(out)
+
+    # 岔路口（互斥候选组）。**读，所以公开**——和 forest / search 一致。
+    #
+    # 数据全部来自同一次 compile_forest，这里只是把「还没做决定的那几组」摘出来并
+    # 配上标题。要它单独成一条路由，是因为「我还有几个岔路口悬着」是研究者隔几天
+    # 回来第一句问的话，而让每个客户端各自下载整片森林再自己筛一遍，等于把这条
+    # 判据复制到每个门面里——迟早分家。
+    #
+    @app.get(base + "/api/p/{project}/forks")
+    async def api_forks(project: str, scope: str = "open") -> JSONResponse:
+        sd(project)
+        forest = await state.forest(project)
+        groups = forest.get("branch_groups") or []
+        want = groups if scope in ("any", "all") else mcp.open_forks(forest)
+        ids = {i for g in want for i in g.get("options") or []} | {
+            g["at"] for g in want if g.get("at")}
+        titles = {s["id"]: s["title"] for s in forest["steps"] if s["id"] in ids}
+        return JSONResponse({
+            "project": project,
+            "forks": want,
+            "total": len(groups),
+            # 「还没决定」是从 status 派生的（其余候选标 dead 就是选择本身），
+            # 磁盘上没有任何「选中了谁」的字段，所以这个数字每次都是现算的。
+            "open": len(mcp.open_forks(forest)),
+            "titles": titles,
+            "version": state.version,
+        })
 
     @app.get(base + "/api/git")
     async def api_git(request: Request) -> JSONResponse:
@@ -841,6 +879,11 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             inputs=payload.get("inputs"),
             code=payload.get("code"),
             lang=payload.get("lang", ""),
+            # 分叉语义同理，而且更急：A / B 两条互斥的路多半是同一次想清楚之后一起
+            # 建出来的，`decision`（整件事里唯一推导不出来的那句话）如果要等建完再
+            # PATCH 一次才写得进去，大概率就永远空着了。
+            branch=payload.get("branch", ""),
+            decision=payload.get("decision", ""),
         )
         if created:
             await touched([f"{project}/{step.id}"])
@@ -906,6 +949,31 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             return JSONResponse(body, status_code=409)
         await touched([f"{project}/{sid}"])
         return JSONResponse(with_digest(steps, step))
+
+    @app.post(base + "/api/p/{project}/forks")
+    async def api_mark_fork(project: str, request: Request) -> JSONResponse:
+        """把一组兄弟**成组**标成互斥候选，顺手把「在决定什么」写在它们的父节点上。
+
+        为什么不让客户端对每个孩子各 PATCH 一次 `branch`（那条路一直都在，也没被
+        关掉）：候选组是派生的——「同一个父节点底下所有 alternative 的孩子」。一次
+        只看得见一个孩子的话，把两个**不同父节点**下的步骤各标一次，得到的是两个
+        各含一个候选的组：一条错都不报，而人以为自己刚记下了一个岔路口。同父校验
+        只有在看得见整组的地方做得了，那个地方就是 W.mark_alternatives。
+
+        落盘的东西一个字没多：每个孩子一行 `branch:`，父节点一行 `decision:`。
+        **父节点上绝不写孩子清单**，兄弟之间也不互相登记——那是双真相源，而且一次
+        move_step 就让存下来的清单变成谎话。
+        """
+        require_token(request)
+        payload = await body_json(request)
+        notes = payload.get("notes")
+        if notes is not None and not isinstance(notes, dict):
+            raise W.WriteError('notes 要写成 {"步骤id": "这个候选自己的角度"} 这样的对象')
+        info = W.mark_alternatives(sd(project), payload.get("ids") or payload.get("steps") or [],
+                                   decision=str(payload.get("decision") or ""),
+                                   notes=notes)
+        await touched([f"{project}/{i}" for i in info["marked"]])
+        return JSONResponse(info)
 
     @app.post(base + "/api/p/{project}/steps/{sid}/paths/check")
     async def api_check_path(project: str, sid: str, request: Request) -> JSONResponse:

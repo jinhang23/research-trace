@@ -23,6 +23,12 @@ CLI、网页表单、agent API 全部调这里，不允许任何一方绕过去�
 （误建、测试数据、粘进去的令牌）。它和 status=dead 是两件事——dead 是研究结论。
 代价（id 可能被重用、子步骤变孤儿）在那个函数的说明里写清楚了。
 
+分叉语义（`branch:` / `decision:`）这一版新加，形状和只追加原则不冲突：落盘的**只有**
+每个候选自己那一行「我是一个候选」，和分叉点自己那一句「我在决定什么」。
+「谁和谁是一组」「选中了哪个」「这个岔路口还没决定」全部是扫出来现算的（core），
+写入侧一个判据都不重写，父节点上也绝不存一份孩子清单——存了它，孩子被 move_step
+挪走的那一刻就过期，而那正是双真相源最典型的长法。
+
 双语（note.<lang>.md）同样只有一条写入路径：write_translation /
 write_project_translation / drop_translation。它们碰不到原文，也写不出结构键——
 见文件下半部分「翻译」那一节的长注释。
@@ -55,7 +61,9 @@ except ImportError:       # pragma: no cover - POSIX
     msvcrt = None         # type: ignore[assignment]
 
 from trace_core import (
+    BRANCH_KINDS,
     CODE_KINDS,
+    DEFAULT_BRANCH,
     NOTE_NAME,
     PATH_ROLES,
     PROJECT_NOTE,
@@ -66,8 +74,10 @@ from trace_core import (
     Project,
     Step,
     build_children,
+    compute_branch_groups,
     find_insight,
     fmt_id,
+    format_branch,
     format_code,
     format_input,
     format_insight,
@@ -75,6 +85,7 @@ from trace_core import (
     format_path,
     id_key,
     next_insight_id,
+    parse_branch,
     parse_code,
     parse_inputs,
     parse_insights,
@@ -98,6 +109,12 @@ from trace_core import (
 # 写入侧在这里只做一件 core 不该管的事：**校验**。core 面对残缺输入要尽量读出
 # 东西来（十年后的日志一定是残缺的），写入侧面对不合法输入要当场拒绝。
 # SUPERSEDES_WORD 是重导出，MCP / 服务端要拿它拼提示文案。
+#
+# 分叉语义（`branch:` / `decision:`）走的是同一条规矩：词表 BRANCH_KINDS、
+# 这一行的 parse/format、以及**候选组怎么算**（compute_branch_groups）全在 core，
+# 写入侧一个判据都不重写。尤其是候选组：写完之后当场告诉人的那句「011 那组现在
+# 只剩 012b」和界面上画出来的必须是同一次推导，各写一份的话两边看着都对，
+# 只有在某个刚被 move_step 挪走的候选身上才对不上。
 
 # 双语用到的那几张表，权威定义在 trace_core —— 读侧要按同一张表解析翻译文件，
 # 两边各存一份就是双真相源的开端。
@@ -860,13 +877,44 @@ def _ordered_attrs(attrs: dict[str, Any], what: str) -> dict[str, str]:
     return {k: clean[k] for k in known + sorted(k for k in clean if k not in PATH_ATTR_ORDER)}
 
 
+def _branch_of(step: Step) -> dict[str, str]:
+    """从 Step 上取 core 那对 parse/format 用的 {kind, note}。
+
+    getattr 兜底的理由和 lang 那一条一样：纯手工造出来的 Step（测试、演算）
+    可能连这两个字段都没有。kind 空 = 没写 = 默认的 extends。
+    """
+    return {"kind": _clean_line(getattr(step, "branch", "")).lower() or DEFAULT_BRANCH,
+            "note": _clean_line(getattr(step, "branch_note", ""))}
+
+
 def render_note(step: Step) -> str:
     """序列化成 note.md。键顺序固定，保证同样的数据永远产出同样的字节。"""
     lines = ["---", f"id: {step.id}"]
     if step.parent:
         lines.append(f"parent: {step.parent}")
+    # branch 限定的是**上面那条 parent 边**，所以紧贴着 parent 写：
+    # 「parent: 011 / branch: alternative」连着读才是一句完整的话
+    # （「我挂在 011 下面，而且是 011 那个岔路口的一个候选」）。
+    #
+    # 默认值 extends **不落盘**。两条理由：
+    #   * 「没写 branch」和「写了 branch: extends」是同一个意思，存后者等于把一个
+    #     推导得出来的默认值写成数据；
+    #   * 已有的 164 条记录会在下一次编辑时集体多出一行 diff，而那一行什么都没说。
+    # 唯一的例外是带了说明的：说明是人写的字，丢了就没了（`branch: extends |
+    # 这条是主线，A/B 都试过之后接着走的` 是一句有信息的话）。
+    b = _branch_of(step)
+    if b["kind"] != DEFAULT_BRANCH or b["note"]:
+        lines.append("branch: " + format_branch(b))
     lines.append(f"status: {step.status}")
     lines.append(f"title: {step.title}")
+    # decision 说的是这个节点**在决定什么**（「类别不平衡怎么处理？只能选一条走
+    # 下去」），限定的是它下面那一组候选。它和 title 一样是人写的自由文本——
+    # 「一组候选在决定什么」这句话推导不出来，只能人写——所以挨着 title 放。
+    # 注意父节点上**只有这句话**，绝不写孩子清单：那是双真相源，而且孩子一移动
+    # 就过期。「谁和谁是一组候选」永远从孩子自己的 branch: 现算。
+    decision = _clean_line(getattr(step, "decision", ""))
+    if decision:
+        lines.append(f"decision: {decision}")
     # lang 也要写回去。它是这份 note.md 自己声明的主语言，翻译文件靠它判断
     # 「这个语言不用翻」。render_note 是全量重写 front-matter 的，漏掉一个键
     # 就等于每次在网页上点一下 done 都把用户手写的那一行悄悄删掉。
@@ -1065,6 +1113,45 @@ def norm_code(raw: Any) -> list[dict[str, Any]]:
     return out
 
 
+def norm_branch(raw: Any) -> dict[str, str]:
+    """把外部传来的 branch 规整成 core 那对 parse/format 用的 {kind, note}。
+
+    接受 `"alternative"`、`"alternative | 只调采样，不动损失函数"`、
+    `{"kind": …, "note": …}`；`None` / 空串 / `"extends"` 都归到默认值，
+    也就是**取消候选身份**——标错了要能改回来，否则一次手滑就永久留在那儿了。
+
+    校验放在写入侧而不是读侧：读侧面对十年后的残缺日志要尽量读出东西来（core 对
+    未知 kind 是报一声 `bad_branch` 再退回 extends 继续建树），写入侧面对一个笔误
+    当场就该问清楚。`branch: alterative` 一旦落盘，它既不算候选也不会在页面上留下
+    任何痕迹，只是安静地退回一条普通延伸——而人以为自己标过了。
+    """
+    if isinstance(raw, dict):
+        kind = _clean_line(raw.get("kind")).lower()
+        note = _clean_line(raw.get("note") if raw.get("note") is not None else raw.get("desc"))
+    else:
+        got = parse_branch(_clean_line(raw))
+        kind, note = got["kind"], got["note"]
+    # 只写了说明没写类别，是「这条普通延伸想顺便说句话」，不是笔误。
+    kind = kind or DEFAULT_BRANCH
+    if kind not in BRANCH_KINDS:
+        raise WriteError(
+            f"branch 只能是 {'/'.join(BRANCH_KINDS)} 之一，收到 {kind!r}。"
+            "alternative 的意思是「这是同一个问题的一个候选答案，一组里只能选一条"
+            "走下去」，其余候选最后标 dead；接着往下做就是 extends（默认值，不用写）。")
+    return {"kind": kind, "note": note}
+
+
+def _branch_groups(by_id: dict[str, Step]) -> dict[str, dict[str, Any]]:
+    """按分叉点 id 索引的候选组（根之间那一组的键是空串）。
+
+    **判据一条都不在这里**——直接用 core.compute_branch_groups。「谁和谁是一组」
+    「选中了谁」「这个岔路口还没决定」全是派生的，写完之后当场说给人听的那句话
+    和界面上画出来的必须出自同一次推导；各写一份的话两边平时看着都对，只有在
+    某个刚被 move_step 挪走的候选身上才对不上，而那正是最需要它说对的时候。
+    """
+    return {g["at"]: g for g in compute_branch_groups(by_id, build_children(by_id))}
+
+
 def _hydrate(step: Step, text: str) -> Step:
     """改写一份既有 note.md 之前，把 **validate() 改写过的字段**从原文读回来。
 
@@ -1078,6 +1165,15 @@ def _hydrate(step: Step, text: str) -> Step:
     meta, _body, _w = parse_note(text)
     raw_parent = (meta.get("parent") or "").strip()
     step.parent = None if raw_parent.lower() in _ROOT_WORDS else raw_parent
+    # branch 和 parent 是同一类：build_step 会把认不出来的 kind（`alterative` 这种
+    # 笔误）**退回 extends** 并报一条 bad_branch 警告——那也是给渲染用的临时修正。
+    # 照着它写回磁盘，等于在人还没来得及改好那个词之前，先把「这一步本来是个候选」
+    # 这个事实永久删掉，连同那条本来在催人去改的警告一起。所以原文里是什么就读回
+    # 什么，校验只管这次**新传进来**的值。
+    b = parse_branch(meta.get("branch", ""))
+    step.branch = b["kind"]                                # type: ignore[attr-defined]
+    step.branch_note = b["note"]                           # type: ignore[attr-defined]
+    step.decision = _clean_line(meta.get("decision", ""))  # type: ignore[attr-defined]
     return step
 
 
@@ -1100,6 +1196,8 @@ def create_step(
     inputs: Any = None,
     code: Any = None,
     lang: str = "",
+    branch: Any = "",
+    decision: str = "",
 ) -> tuple[Step, bool]:
     """新建一步。返回 (step, created)；created=False 表示命中幂等键返回了既有步骤。
 
@@ -1130,6 +1228,13 @@ def create_step(
         if not title:
             raise WriteError("title 不能为空")
 
+        # 建的时候就能声明分叉语义。A/B 两条互斥的路多半是同一次想清楚之后一起
+        # 建出来的，逼人建完再 PATCH 一次，`decision` 那句话（整件事里唯一推导
+        # 不出来的信息）大概率就永远空着了。校验放在 mkdir 之前：非法值一个
+        # 目录都不该留下。
+        branch_row = norm_branch(branch)
+        decision = _clean_line(decision)
+
         sid = alloc_id(by_id, parent)
         step = Step(
             id=sid,
@@ -1157,6 +1262,12 @@ def create_step(
         # 实例上（dataclass 没有 __slots__）。render_note 用 getattr 取它们。
         step.inputs = norm_inputs(inputs)      # type: ignore[attr-defined]
         step.code = norm_code(code)            # type: ignore[attr-defined]
+        # 分叉语义同理直接挂在实例上。branch 说的是**这一步和它 parent 之间那条边**
+        # 的性质，decision 说的是**这一步下面那个岔路口在决定什么**，两件事，
+        # 各写各的一行。
+        step.branch = branch_row["kind"]        # type: ignore[attr-defined]
+        step.branch_note = branch_row["note"]   # type: ignore[attr-defined]
+        step.decision = decision                # type: ignore[attr-defined]
 
         text = _utf8_bytes(render_note(step), "正文")
         d = steps_dir / step.dirname
@@ -1174,7 +1285,11 @@ def create_step(
 
 MUTABLE = ("status", "title", "body", "date", "commit", "author", "tags",
            "paths", "add_paths", "add_repro", "lang",
-           "inputs", "add_inputs", "code", "add_code")
+           "inputs", "add_inputs", "code", "add_code",
+           # 分叉语义必须可变，而且这才是**主要**用法：两步先各自建出来，过几天
+           # 回头才想明白「当时这两条是互斥的，只能选一条」。只在 create 时给，
+           # 等于要求人在还没纠结完的时候就说清自己在纠结什么。
+           "branch", "decision")
 
 
 def norm_repro(raw: Any) -> list[dict[str, str]]:
@@ -1318,11 +1433,116 @@ def _update_step_locked(steps_dir: Path, sid: str, patch: dict[str, Any], expect
         # 写错了要能改回来，否则一个手滑的 lang: ja 会永久留在那儿。
         raw = _clean_line(patch["lang"])
         step.lang = norm_lang(raw) if raw else ""
+    if "branch" in patch:
+        # 空串 / extends 是**取消候选身份**，和 lang 一条理由：标错了要能改回来。
+        # 注意这里不查「另一个候选还在不在」——一组里只剩一个候选不是错误，
+        # 可能正是本意（「B 我不当候选了，它是独立的一条线」）。P4：结论不是错误。
+        row = norm_branch(patch["branch"])
+        step.branch = row["kind"]                             # type: ignore[attr-defined]
+        step.branch_note = row["note"]                        # type: ignore[attr-defined]
+    if "decision" in patch:
+        # 分叉点上那句「在决定什么」。空串是撤回（这儿不再是个岔路口了）。
+        step.decision = _clean_line(patch["decision"])        # type: ignore[attr-defined]
 
     # 目录名不跟着 title 改：目录名里的 id 是给 shell 补全用的，
     # 改名会让所有已经发出去的相对链接失效。
     write_atomic(note_path, _utf8_bytes(render_note(step), "正文"))
     return step
+
+
+def mark_alternatives(steps_dir: Path, ids: Any, *, decision: str = "",
+                      notes: dict[str, str] | None = None) -> dict[str, Any]:
+    """把一组兄弟**成组**标成互斥候选，顺手把分叉点那句话写在它们的父节点上。
+
+    为什么值得有这个入口，而不是让调用方对每个孩子各调一次 update_step
+    （三条理由，每一条都对应一种「各调一次」拦不住的坏结果）：
+
+      1. **「一组」这件事只有在这里看得见。**候选组是派生的——「parent 底下所有
+         branch: alternative 的孩子」。update_step 一次只看得见一个孩子，于是把
+         两个**不同父节点**下的步骤各标一次 alternative，得到的是两个各只有一个
+         候选的组：一次都不报错，而人以为自己刚记下了一个岔路口。这里在写之前
+         就能看见整组，同父校验是这个函数存在的主要理由。
+      2. **要么全成、要么全不成。**校验全部前置、整段在同一把项目锁里，中途因为
+         一个笔误退出不会留下「两个候选只标了一个」的半成品——而那个半成品恰好
+         长得和 core 的「这组只剩一个候选」诊断一模一样，人会收到一条假诊断。
+      3. **decision 会被顺手写掉。**「我在决定 X，A 和 B 是它的两个答案」是一句
+         完整的话，拆成两次调用，人标完候选就走了，那句唯一无法自动生成的话就
+         永远空着。这里让它成为同一个动作的一半。
+
+    它**不是**唯一入口：update_step 照样能单独改一个孩子的 branch（回头补标第三个
+    候选、或者把某一个改回普通延伸），两条路最终落盘的都只有孩子自己那一行。
+
+    落盘的东西一个字都没多：每个孩子一行 `branch: alternative`，父节点一行
+    `decision:`。**父节点上绝不写孩子清单**——那是双真相源，而且孩子一被
+    move_step 挪走就过期。
+    """
+    want: list[str] = []
+    for i in (ids or []):
+        s = _clean_line(i)
+        if s and s not in want:
+            want.append(s)
+    if len(want) < 2:
+        raise WriteError(
+            "成组标候选至少要两步：一个候选的「分叉点」不是分叉点。"
+            "只想标一步（比如回头补上第三个候选）请用 update_step 的 branch 字段。")
+    notes = {_clean_line(k): _clean_line(v) for k, v in (notes or {}).items()}
+
+    with project_lock(steps_dir.parent):
+        by_id = load(steps_dir)
+        missing = [i for i in want if i not in by_id]
+        if missing:
+            raise NotFound("这些步骤不存在: " + ", ".join(missing))
+        # 同父校验。互斥的前提是「同一个问题的几个答案」，而「同一个问题」在这棵树上
+        # 就是同一个父节点；挂在不同父节点下的两步根本不构成一组候选。
+        homes = {i: (by_id[i].parent or "") for i in want}
+        if len(set(homes.values())) > 1:
+            raise WriteError(
+                "互斥候选必须是同一个父节点下的兄弟，收到的这几步挂在不同地方: "
+                + "; ".join(f"{i} → {homes[i] or '（根）'}" for i in want)
+                + "。候选组是从「父节点底下谁声明了 alternative」现算出来的，"
+                  "跨父节点标只会得到几个各含一个候选的组，而且一条错都不报。"
+                  "要先把它们挪到一起请用 move_step（原因必填）。")
+        parent = by_id[want[0]].parent or None
+
+        decision = _clean_line(decision)
+        if decision and parent is None:
+            raise WriteError(
+                "这几步都是根节点，没有共同的父节点，那句「在决定什么」没有地方写。"
+                "decision 写在分叉点**自己**身上，候选是它的孩子。")
+        unknown = [i for i in notes if i not in want]
+        if unknown:
+            raise WriteError("notes 里有不在这一组里的步骤: " + ", ".join(sorted(unknown)))
+
+        # 走的仍然是 update_step 那条路（本模块唯一的写入路径），不另开一条写文件的
+        # 代码——上一代系统的 bug 根源就是存在第二条写入路径。锁是线程内可重入的，
+        # 所以这里嵌套进来不会自锁。
+        done: list[str] = []
+        try:
+            for sid in want:
+                _update_step_locked(
+                    steps_dir, sid,
+                    {"branch": {"kind": "alternative", "note": notes.get(sid, "")}}, "")
+                done.append(sid)
+            if decision:
+                _update_step_locked(steps_dir, parent, {"decision": decision}, "")
+        except Exception as exc:
+            # 还一个字节都没写（比如第一步的 note.md 是 GBK）：原样把真正的原因抛出去，
+            # 包一层只会把「先去转码」这句可执行的话埋掉。
+            if not done:
+                raise
+            # 真的只写了一半（磁盘满、文件被占用）：说清楚哪几步已经落盘了。
+            # 半成品长得和 core 的 lone_alternative 诊断一模一样，不说清楚，
+            # 人下一眼看到的是一条自己看不懂的假诊断。
+            raise WriteError(
+                f"这一组只标到一半就写不下去了（已经落盘的是 {', '.join(done)}）: {exc}。"
+                "剩下的请重跑一次——重复标同一组是幂等的。") from exc
+
+        # 标完之后重新扫一遍，把这一组**现在**的样子交回去（谁在组里、还没决定
+        # 还是已经定了）。这是 core 算的那一份，不是这里另算的一份。
+        group = _branch_groups(load(steps_dir)).get(parent or "")
+
+    return {"parent": parent or "", "decision": decision,
+            "marked": list(want), "group": group}
 
 
 def _ancestors(by_id: dict[str, Step], sid: str) -> list[str]:
@@ -1428,6 +1648,18 @@ def move_step(steps_dir: Path, sid: str, new_parent: str | None, reason: str,
                     f"整棵子树会从森林上掉下来。要把 {new_parent} 那一支拿出来，"
                     f"请先把它移到别处，再移 {sid}。")
 
+        # 候选组是派生的，所以移动一步**写入侧什么都不用做**：012 从 011 挪到 013
+        # 底下，它那一行 `branch: alternative` 一个字不改，含义自动从「011 那个岔路口
+        # 的候选」变成「013 那个岔路口的候选」。这正是不在父节点上存孩子清单的收益。
+        #
+        # 但要不要**当场说一声**「011 那组现在只剩 012b 一个候选了」？要。理由和下面
+        # subtree 那条一模一样：那是这次移动的直接后果，事后只能靠重新拉一遍森林才
+        # 看得见，而移动的人这会儿正好在做决定。用的是 core 的那一份推导，不另算。
+        #
+        # 明确**不**做的两件事：不拦、不改数据。只剩一个候选完全可能正是本意
+        # （「B 不再是候选了，它是独立的一条线」），而且一组候选做完决定之后本来就
+        # 只剩一个不是 dead 的（core 把那叫 decided，不是错误）。拒绝移动只会逼人
+        # 先把 branch 那一行删掉再移，留下更差的历史。P4：结论不是错误。
         day = _clean_line(date) or today()
         if not _DATE_RE.match(day):
             raise WriteError(f"移动日期要写成 YYYY-MM-DD，收到 {day!r}")
@@ -1437,6 +1669,9 @@ def move_step(steps_dir: Path, sid: str, new_parent: str | None, reason: str,
         step.moved = list(getattr(step, "moved", None) or []) + [entry]   # type: ignore[attr-defined]
         step.parent = new_parent
         write_atomic(note_path, _utf8_bytes(render_note(step), "正文"))
+        # 移完再扫一遍：两边候选组**现在**长什么样，才是要说给人听的那句话。
+        after = _branch_groups(load(steps_dir))
+        alt_left, alt_joined = after.get(old_parent or ""), after.get(new_parent or "")
 
     return {"id": sid, "old_parent": old_parent, "new_parent": new_parent,
             "reason": reason, "by": entry["by"], "date": entry["date"],
@@ -1444,6 +1679,10 @@ def move_step(steps_dir: Path, sid: str, new_parent: str | None, reason: str,
             # 移动带走的是整棵子树。调用方要能当场把这件事说给人听——
             # 「你移的是一步」和「你移的是一步和它下面的 9 步」是两个决定。
             "subtree": sorted(subtree, key=id_key),
+            # 移动之后，原来那个岔路口和新的那个岔路口各自剩下什么。派生量，
+            # 现算，不落盘（见上面那段说明）。两边都可能是 None：那一头压根没有
+            # 候选组——「这次移动和任何一个岔路口都无关」也是一句要说清的话。
+            "alternatives": {"left": alt_left, "joined": alt_joined},
             "digest": digest_of(note_path)}
 
 

@@ -1068,7 +1068,23 @@ def test_hints_are_separated_from_the_warnings_that_actually_matter():
 
 
 def test_hint_codes_are_exactly_the_ones_core_emits_without_changing_the_level():
-    """这张表要是和 core 对不上，要么真警告被降成提示、要么提示冒充警告。"""
+    """这张表要是和 core 对不上，要么真警告被降成提示、要么提示冒充警告。
+
+    ⑦ 之后这张表多了分叉那四条。**这是语义变化，不是把断言放松**：断言仍然是
+    「恰好等于这一组」，只是这一组按 core 新发出来的诊断长了四条。四条各自的
+    理由和原来那三条是同一个——它们一格 L0–L4 都不降：
+      lone_alternative       一组只有一个候选。可能是另一条支漏标了，也可能它
+                             本来就是普通延伸；两种读法都不让这一步变得更不可溯源。
+      fork_without_decision  没写「在决定什么」。缺的是人的判断，不是记录的完整度。
+      undecided_fork         还有两条以上候选活着。core 的措辞自己就写着「同时开
+                             几条线是研究的常态，不是错」——把一句安抚话摆进警告栏，
+                             等于训练人连真警告一起跳过去。
+      decision_without_candidates
+                             写了「在决定什么」却一个候选都没标。它是上面第二条的
+                             镜像，缺的同样是一句人写的话；而且它最该被人看见的
+                             地方是详情面板里那一行，不是警告栏——摆进警告栏
+                             只会让人以为自己刚才写坏了什么。
+    """
     m = re.search(r"var HINT_CODES = (\[[^\]]*\]);", APP)
     assert m
     got = set(json.loads(m.group(1)))
@@ -1076,8 +1092,20 @@ def test_hint_codes_are_exactly_the_ones_core_emits_without_changing_the_level()
     assert '"section_without_prose"' in src
     # 另外两条 core 是拼出来的（f"{kind}_without_explanation"），所以查后缀
     assert '_without_explanation"' in src, "core 不再发这一类 code 了，这张表就该跟着改"
-    assert {"section_without_prose", "table_without_explanation", "code_without_explanation"} == got
+    todo = set(json.loads(re.search(r"var TODO_CODES = (\[[^\]]*\]);", APP).group(1)))
+    assert {"section_without_prose", "table_without_explanation", "code_without_explanation",
+            "lone_alternative", "fork_without_decision",
+            "decision_without_candidates"} == got
+    # undecided_fork 从提示里摘出去，进了「待办」——它由 #forkbar 专门说，
+    # 两处都说会让人以为自己犯了错。CLI 早就这么分了，这里核的是两边一致。
+    assert todo == {"undecided_fork"}
+    cli = (ROOT / "trace_cli.py").read_text(encoding="utf-8")
+    assert re.search(r'TODO_CODES = \(\s*"undecided_fork",?\s*\)', cli),         "网页和 CLI 对「待办」的划分必须一致，否则同一份数据两个门面说的不是一件事"
     assert "missing_why" not in got, "真正会降级的诊断被降成了提示"
+    # 这四条必须真的是 core 发的 warn 级，而不是界面自己编出来降级的
+    for code in ("lone_alternative", "fork_without_decision", "undecided_fork",
+                 "decision_without_candidates"):
+        assert f'"{code}"' in src, f"core 不发 {code} 了，这张表就该跟着改"
 
 
 def test_server_side_chinese_warnings_are_translated_where_we_know_how():
@@ -1153,3 +1181,271 @@ def test_the_page_is_a_column_so_a_tall_warning_bar_cannot_push_the_bottom_off_s
         "min-height:0 不能省：flex 项默认不肯缩到内容以下，缺了它 main 照样撑出视口"
     assert re.search(r"^body \{[^}]*flex-direction: column", live, re.M), \
         "header / #warnbar / main 要由 body 自己排成一列，谁高谁矮都不用再算"
+
+
+# ------------------------------------------------- ⑦ 决策分叉 / 支路 / 汇回
+
+# 这一整块钉的是同一件事：**颜色可以承载信息了，但每一种关系必须再配一个非颜色
+# 的通道**。规格里「颜色只作线型的补强」按用户的要求放宽了一半，没作废——灰度
+# 打印出来、或者看不见颜色的人，丢掉的只该是那一眼，不是那个意思。
+
+
+def test_the_three_relations_never_steal_the_channels_that_are_already_taken():
+    """线型只归 status、不透明度只归祖先链/搜索命中。这两条一格都没放宽。
+
+    抢了会怎样：把互斥候选画成虚线，它就和 wip 撞了；把汇回画淡，它就和
+    「不在选中的链上」撞了。两种情况下读者都会读出一个根本不存在的结论。
+    """
+    live = re.sub(r"/\*[\s\S]*?\*/", "", CSS)
+    for sel in (r"#dedges \.dedge\.b-alt", r"#dedges \.darrow\.b-alt",
+                r"#rails \.edge\.b-alt"):
+        m = re.search(sel + r" \{([^}]*)\}", live)
+        assert m, f"{sel} 这条规则不见了：候选边不再换色了"
+        decl = m.group(1)
+        assert "dash" not in decl, f"{sel} 动了线型（那是 status 的）：{decl}"
+        assert "opacity" not in decl, f"{sel} 动了不透明度（那是祖先链的）：{decl}"
+        assert "stroke-width" not in decl, f"{sel} 借了线宽：{decl}"
+
+
+def test_a_set_of_alternatives_is_bracketed_and_a_rejoin_is_a_curve():
+    """颜色之外的那一半。没有它，灰度打印下三种边长得一模一样。"""
+    dia = re.search(r"function renderDiagram\(\)[\s\S]*?\n  \}\n", APP).group(0)
+    assert "U.forkBracket" in dia, "图上不再画那道把一组候选括起来的括弧了"
+    assert "U.rejoinCurve" in dia, "图上不再画汇回那条曲线了"
+    assert "drejoinhead" in dia, "汇回没有箭头，就说不出「谁汇进谁」"
+    rails = re.search(r"function renderRails\(\)[\s\S]*?\n  \}\n", APP).group(0)
+    assert "railfork" in rails, "轨道图上那道括弧没了"
+    assert "U.railRejoin" in rails, "轨道图上的汇回没了"
+
+
+@needs_node
+def test_the_curve_is_what_says_a_rejoin_is_not_a_tree_edge():
+    """树边永远是正交折线，汇回永远是曲线——形状本身就是那半个非颜色通道。
+
+    真去问几何：拿一对坐标算一遍，看画出来的到底是不是三次贝塞尔。
+    只在源码里 grep 一个 "C" 是查不出「有人把它改回折线」的。
+    """
+    r = subprocess.run(
+        [NODE, "-e",
+         "const U=require('./web/app.js');"
+         "const c=U.rejoinCurve({x:0,y:0},{x:400,y:300},{nw:100,nh:50});"
+         "console.log(JSON.stringify({d:c.d,arrow:c.arrow}))"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(ROOT))
+    assert r.returncode == 0, r.stderr
+    got = json.loads(r.stdout)
+    assert "C" in got["d"], "汇回不是曲线了：" + got["d"]
+    assert "V" not in got["d"] and "H" not in got["d"], "汇回混进了正交段：" + got["d"]
+    assert got["arrow"].endswith("Z"), "箭头不是闭合三角形：" + got["arrow"]
+
+
+def test_the_two_new_colours_exist_in_both_themes_and_are_not_the_status_colours():
+    """深浅两套都要有。细线对对比度比色块敏感得多，浅色主题那两个值直接搬到
+    深色底上是读不出来的。而且它们不能复用 --done/--wip/--dead——一条边上同时
+    有「什么状态」和「什么关系」两件事，共用一个色就分不清读到的是哪一件。"""
+    root = re.search(r"^:root \{([^}]*)\}", CSS, re.M).group(1)
+    dark = re.search(r"@media \(prefers-color-scheme: dark\) \{\s*:root \{([^}]*)\}", CSS).group(1)
+    vals = {}
+    for block, where in ((root, "light"), (dark, "dark")):
+        for name in ("--alt", "--join", "--done", "--wip", "--dead", "--accent"):
+            m = re.search(re.escape(name) + r":\s*([^;]+);", block)
+            assert m, f"{where} 主题里没有 {name}"
+            vals[(where, name)] = m.group(1).strip()
+    for where in ("light", "dark"):
+        for name in ("--done", "--wip", "--dead", "--accent"):
+            assert vals[(where, "--alt")] != vals[(where, name)], f"{where}: --alt 和 {name} 撞了"
+            assert vals[(where, "--join")] != vals[(where, name)], f"{where}: --join 和 {name} 撞了"
+    assert vals[("light", "--alt")] != vals[("dark", "--alt")], "深色主题直接沿用了浅色的紫"
+    assert vals[("light", "--join")] != vals[("dark", "--join")], "深色主题直接沿用了浅色的青"
+
+
+def test_the_legend_explains_all_three_relations_or_the_colours_are_just_noise():
+    """图例是这次改动唯一的解释入口。彩色的边加上去而图例不接，等于噪声。"""
+    legend = HTML.split('id="treelegend"')[1].split('id="flowlegend"')[0]
+    for key in ("list.legend.extends", "list.legend.alternative", "list.legend.rejoin"):
+        assert f'data-i18n="{key}"' in legend, f"图例少了 {key}"
+        assert f'data-i18n-title="{key}.title"' in legend, f"{key} 没有解释它为什么长这样的 tooltip"
+    assert 'data-i18n-html="list.legend.note"' in legend, \
+        "图例没有说明「括弧 + 带箭头的曲线」这两条非颜色通道"
+    # 色样必须画出真正的形状（折线 / 括弧 / 带箭头的曲线），不能只是三段彩色横线
+    assert legend.count("<svg") == 3, "三种关系的色样不是形状，只是三段彩色的线"
+    assert "currentColor" in legend, "色样写死了颜色，深浅主题下会有一套是错的"
+
+
+@needs_node
+def test_the_fork_state_labels_exist_in_both_languages():
+    """forkLabel 出的是 key，不是字面量，所以上面那条「i18n.t("…") 里的 key 都在」
+    的扫描抓不到它们。漏一个的后果是括弧旁边直接摆着一个点分的 key。"""
+    keys = i18n_keys()
+    r = subprocess.run(
+        [NODE, "-e",
+         "const U=require('./web/app.js');"
+         "const out=[];"
+         "[{state:'decided',chosen:'012',options:['012'],live:['012']},"
+         " {state:'abandoned',options:['a','b'],live:[]},"
+         " {state:'open',options:['a','b'],live:['a','b']}]"
+         ".forEach(function(g){var l=U.forkLabel(g);out.push(l.key);out.push(l.title);});"
+         "console.log(JSON.stringify(out))"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(ROOT))
+    assert r.returncode == 0, r.stderr
+    used = set(json.loads(r.stdout))
+    assert len(used) == 6, f"三态没有各自的说法：{sorted(used)}"
+    for lang in ("en", "zh"):
+        assert not used - keys[lang], f"{lang} 缺这些 key：{sorted(used - keys[lang])}"
+
+
+def test_the_open_forks_get_a_banner_because_that_is_the_whole_point():
+    """「我还有几个岔路口没定」是这件事真正的收益。只画在单步详情里等于没有——
+    那要求人先猜到该点哪一步。和「有几处位置已经不在了」同一个位置、同一档语气。"""
+    assert 'id="forkbar"' in HTML
+    fn = re.search(r"function renderForks\(\)[\s\S]*?\n  \}\n", APP).group(0)
+    assert 'state === "open"' in fn, "横幅数的不是未决的那些组"
+    assert "decision.open.summary" in fn, "横幅上的字没走 i18n"
+    assert "stepLink(" in fn, "横幅上的 id 点不进去"
+    live = re.sub(r"/\*[\s\S]*?\*/", "", CSS)
+    bar = re.search(r"#forkbar \{([^}]*)\}", live)
+    assert bar, "#forkbar 没有样式"
+    # 未决不是警告：同时开几条线是研究的常态。用 --wip / --dead 就是在说它错了。
+    assert "--wip" not in bar.group(1) and "--dead" not in bar.group(1), \
+        "未决的分叉被画成了警告：" + bar.group(1)
+
+
+def test_the_detail_panel_answers_all_three_questions():
+    """候选：和谁并列、决策问题是什么、定了没有。分叉点：候选有谁、现在什么状态。
+    汇回：本步的产物去了哪几步 / 哪几条支线汇进了本步，而且都点得过去。"""
+    fork = re.search(r"function renderFork\(s\)[\s\S]*?\n  \}\n", APP).group(0)
+    assert "decision.head" in fork and "decision.of.head" in fork
+    assert "decision.question.label" in fork and "decision.question.missing" in fork
+    assert "decision.siblings" in fork, "候选看不到跟它并列的是谁"
+    assert "decision.roots" in fork, "根之间那一组（at 为空）没有说法"
+    # 「选了哪个」永远是从其余标 dead 派生的：界面上不许出现一个「标记赢家」的动作
+    assert not re.search(r'data-act="(win|choose|chosen|pick)"', APP), \
+        "出现了一个「标记赢家」按钮——那就是把双真相源请回来"
+    join = re.search(r"function renderRejoin\(s\)[\s\S]*?\n  \}\n", APP).group(0)
+    assert "s.merge_in" in join and "s.merge_out" in join, "汇回只画了一个方向"
+    assert "rejoin.at" in join, "没说这两条路是在哪儿分开的（core 算好的 LCA）"
+    assert "stepLink(" in join, "汇回的两端点不过去"
+    # 逐条标注某一行 input 是不是汇回，只能问 merge_in——inputs 是文件的逐字镜像
+    deps = re.search(r"function renderDeps\(s\)[\s\S]*?\n  \}\n", APP).group(0)
+    assert "s.merge_in" in deps, "依赖清单里分不出哪一行是汇回"
+    assert "i.rel" not in deps, "去 inputs 的记录上找派生字段了（那里故意没有）"
+
+
+def test_marking_a_candidate_writes_only_that_step_s_own_line():
+    """落盘的只有这一步自己那一行 `branch:`。往父节点上写一份候选清单、或者另存
+    一个「选中了谁」，都是把上一代系统的死因请回来。"""
+    body = APP[APP.index('if (name === "branch")'):]
+    body = body[:body.index("\n      return;\n    }") + 4]
+    assert "U.BRANCH_ALT" in body and "branch:" in body
+    for banned in ("options:", "alt:", "rivals:", "chosen:", "winner"):
+        assert banned not in body, f"往磁盘上写了派生出来的东西：{banned}"
+    assert "expect:" in body, "没带 expect，两个人同时改就会互相无声覆盖"
+
+
+def test_a_new_step_never_inherits_the_fork_semantics_of_its_parent():
+    """branch 说的是「我和我 parent 之间那条边」，decision 说的是「我底下那个岔路口」。
+    照抄下去的结果是从候选 A 往下走的每一步都变成候选，一棵树上到处是假岔路口。
+    写入层有一条同名的测试钉着默认值，但那条管不到这个对话框。"""
+    fn = re.search(r"function openNew\(parentId\)[\s\S]*?\n  \}\n", APP).group(0)
+    assert '$("#nf-branch").value = "extends";' in fn
+    assert '$("#nf-bnote").value = "";' in fn
+    assert '$("#nf-decision").value = "";' in fn
+    # 路径和 code 仍然继承（那是对的），所以不能靠「整个函数里没有 p ?」来判
+    assert "p ? codeToText(p)" in fn, "顺手把代码位置的继承也删了"
+
+
+def test_both_writing_surfaces_can_set_branch_and_decision():
+    """写入层收了、界面上看不见，等于这个字段不存在。编辑器和新建框都得有。"""
+    assert 'id="nf-branch"' in HTML and 'id="nf-decision"' in HTML
+    ed = re.search(r"function renderEditor\(s\)[\s\S]*?\n  \}\n", APP).group(0)
+    assert 'id="ed-branch"' in ed and 'id="ed-decision"' in ed and 'id="ed-bnote"' in ed
+    # 译文里一行结构信息都不许有（写两份就是双真相源，core 会读都不读地丢掉）
+    assert ed.index('id="ed-branch"') > ed.index("edLang ?"), \
+        "译文那一份也长出了 branch 字段"
+    save = re.search(r"function saveEditor\(\)[\s\S]*?\n  \}\n", APP).group(0)
+    assert "branch: branchField(st)" in save and "decision:" in save
+    # 说明必须跟着 branch 一起发：分开发会让说明挂在一个不存在的候选身份上
+    assert "bnote:" not in save, "把 branch_note 当成独立字段发出去了"
+
+
+def test_the_new_warning_codes_read_their_values_structurally_not_by_regex():
+    """core 发的 vars.n 是**数字**。只认字符串的话整条会退回去抠中文正则，
+    抠不出来就在英文界面上原样漏出一整句中文。"""
+    table = re.search(r"var WARN_MAP = \{[\s\S]*?\n  \};", APP).group(0)
+    for code in ("lone_alternative", "fork_without_decision", "undecided_fork"):
+        assert code in table, f"{code} 在英文界面上会漏出中文"
+    assert "pick:" not in table.split("lone_alternative")[1], \
+        "新的三条又去抠中文正则了——core 已经把值结构化发过来了"
+    fn = re.search(r"function warnVar\(w, k\)[\s\S]*?\n  \}\n", APP).group(0)
+    assert 'typeof v === "string"' not in fn, "又只认字符串了，vars.n 是数字"
+    assert "String(v)" in fn
+
+
+@needs_node
+def test_the_hint_texts_really_come_out_in_english_on_todays_messages():
+    """上一条只查了表在不在；这一条拿 trace_core **此刻真的发出来的那两条**
+    走一遍界面侧的映射，漏一条就是英文界面上摆着一整段中文。"""
+    import trace_core as core  # noqa: PLC0415
+
+    by_id = {
+        "011": core.Step(id="011", parent=None, dirname="011_x"),
+        "012": core.Step(id="012", parent="011", branch="alternative", dirname="012_x"),
+        "012b": core.Step(id="012b", parent="011", branch="alternative", dirname="012b_x"),
+    }
+    groups = core.compute_branch_groups(by_id, {"011": ["012", "012b"]})
+    ws = core.validate_branches(by_id, groups)
+    codes = {w["code"] for w in ws}
+    assert {"fork_without_decision", "undecided_fork"} <= codes, codes
+    script = (
+        "const i18n=require('./web/i18n.js');"
+        "const src=require('fs').readFileSync('web/app.js','utf8');"
+        "const m=/var WARN_MAP = [{][^]*?\\n  [}];/.exec(src)[0];"
+        "const W=eval('(' + m.replace(/^var WARN_MAP = /,'').replace(/;$/,'') + ')');"
+        "const ws=JSON.parse(process.argv[1]);"
+        "console.log(JSON.stringify(ws.map(function(w){var d=W[w.code];"
+        "if(!d) return {code:w.code, ok:false};"
+        "var v={};(d.take||[]).forEach(function(k){v[k]=String(w.vars[k]);});"
+        "return {code:w.code, ok:i18n.has(d.key), text:i18n.tIn('en',d.key,v)};})))"
+    )
+    r = subprocess.run(
+        [NODE, "-e", script,
+         json.dumps([{"code": w["code"], "vars": w["vars"]} for w in ws])],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(ROOT))
+    assert r.returncode == 0, r.stderr
+    for got in json.loads(r.stdout):
+        assert got["ok"], f"{got['code']} 没有对应的英文文案"
+        assert not CJK.search(got["text"]), f"{got['code']} 的英文里漏出了中文：{got['text']}"
+        if got["code"] != "lone_alternative":
+            assert "2" in got["text"], f"{got['code']} 的数字没插进去：{got['text']}"
+
+
+# ---------------------------------------------------------------- ⑦ 验收抓到的两处
+
+def test_the_root_group_bracket_fades_like_everything_else():
+    """不透明度这个通道只表示「和你选中的那条链有没有关系」。
+
+    根之间那一组没有分叉点可以查，以前就干脆永不淡出——于是一道满亮的括弧
+    压在两张已经灰掉的卡片上，读者读到的是「这一组和你有关」，而它在另一棵树上。
+    正确的等价判据是「它的候选里有没有一个在你这条链上」。
+    """
+    body = APP[APP.index("document.querySelectorAll(\"[data-fork]\")"):]
+    body = body[:body.index("});") + 3]
+    assert "chain[at]" in body, "有分叉点的组仍然按分叉点判"
+    assert "options" in body and "some" in body,         "根组要按「候选是否在链上」判，不能整条豁免"
+    assert "!!at &&" not in body, "那句「at 为空就永不淡」是被修掉的东西，别又回来了"
+
+
+def test_the_three_relationship_legend_items_survive_the_phone_breakpoint():
+    """手机上紫色的候选轨道和青色的汇回曲线照常在画。
+
+    把解释它们的图例连坐掉，读者看到的就是三种颜色加零个说明——
+    而这三种关系正是这次改动的全部内容。760px 那条规则的注释写的也是
+    「窄屏上先保住那三个词」，之前两条规则是互相矛盾的。
+    """
+    live = re.sub(r"/\*.*?\*/", "", CSS, flags=re.S)
+    m = re.search(r"@media \(max-width: 480px\) \{(.*?)\n\}", live, re.S)
+    assert m, "找不到 480px 那条媒体查询"
+    phone = m.group(1)
+    assert "#legend .lgm { display: none; }" in phone, "字形那一组仍然让位"
+    assert re.search(r"#legend \.lgrels \.lgm \{[^}]*display:\s*inline-flex", phone), \
+        "三种关系那一组要显式留下"
+    assert 'class="lgset lgrels"' in HTML, "那一组要有自己的钩子，不能只靠位置"

@@ -283,3 +283,55 @@ def test_broken_config_file_does_not_crash(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("TRACE_CONFIG", str(cfg))
     with pytest.raises(M.ToolError, match="没有配置后端"):
         M.make_backend()
+
+
+# ------------------------------------------------------------ 分叉语义走一遍协议
+#
+# 这几个字段是这一轮唯一走到**写入**的新参数，而它们最容易在协议层丢：
+# forks 是这份 schema 里少见的 boolean，branch 是唯一一个「空串有意义」的字符串。
+
+
+def test_the_fork_view_survives_the_protocol_as_a_real_boolean(be):
+    """客户端发的是 JSON 的 true，不是字符串 "true"。schema 认 boolean，
+    校验器也必须放它过去 —— 卡在这里的话，agent 得到的是「参数类型不对」。"""
+    r = M.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                  "params": {"name": "trace_read",
+                             "arguments": {"project": "alpha", "forks": True}}},
+                 _session_with(be))
+    assert not r["result"].get("isError"), r
+    assert "岔路口" in r["result"]["content"][0]["text"]
+    bad = M.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": "trace_read",
+                               "arguments": {"project": "alpha", "forks": "true"}}},
+                   _session_with(be))
+    assert bad["result"]["isError"], "字符串 \"true\" 该被 schema 拦下，不该悄悄当成真"
+
+
+def test_an_empty_branch_over_the_protocol_really_takes_the_candidacy_back(be):
+    """`branch: ""` 是有意义的取值（取消候选身份），不是「没给」。
+    处理函数按假值过滤的话，标错了就永远撤不回来。"""
+    import trace_write as W
+
+    sd = be._sd("alpha")
+    W.create_step(sd, title="根")
+    W.create_step(sd, parent="001", title="A", branch="alternative")
+    r = M.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                  "params": {"name": "trace_update_step",
+                             "arguments": {"project": "alpha", "step": "002", "branch": ""}}},
+                 _session_with(be))
+    assert not r["result"].get("isError"), r
+    assert W.load(sd)["002"].branch == "extends"
+
+
+def test_an_unknown_branch_value_is_refused_at_write_time_not_silently_downgraded(be):
+    """读侧对笔误是「报一声再退回 extends」（十年后的残缺日志要尽量读出东西来），
+    写侧必须当场问清楚：`branch: alterative` 落了盘就既不算候选、也不留痕迹。"""
+    import trace_write as W
+
+    W.create_step(be._sd("alpha"), title="根")
+    r = M.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                  "params": {"name": "trace_update_step",
+                             "arguments": {"project": "alpha", "step": "001",
+                                           "branch": "alterative"}}},
+                 _session_with(be))
+    assert r["result"]["isError"], "笔误不该被默默吞掉"
