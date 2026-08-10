@@ -108,6 +108,17 @@
       </div>
       <p id="empty" hidden data-i18n-html="list.empty"></p>
     </div>
+    <!-- 「提为根」的落区。只在拖动期间出现，而且**只有落在它上面才算**：
+         「没落在任何卡片上就当成提为根」是最容易误触发的判定，而误触发的代价是
+         一条写进 note.md 的永久审计外加一句被逼出来的原因。落在别的空白处
+         等于取消。
+         它是 #scroller 的**兄弟**，不是盖在上面的浮层：浮层在列表视图里会正好压住
+         最上面那两行，于是那两步永远拖不上去——一条落区不该吃掉别的落点。
+         排在 #scroller 之后（贴着图例），出现时滚动区从下面缩短，画布内容一个像素
+         都不动。pointer-events 关掉：命中与否由坐标判，它不该抢走任何点击。 -->
+    <div id="droot" hidden aria-hidden="true">
+      <b data-i18n="drag.root.label"></b><span data-i18n="drag.root.hint"></span>
+    </div>
     <footer id="legend">
       <span id="treelegend">
         <span><i class="lg done"></i><span data-i18n="list.legend.done"></span></span>
@@ -210,6 +221,9 @@
       <input id="mv-reason" maxlength="300" required data-i18n-ph="move.reason.placeholder">
     </label>
     <p class="hint req" data-i18n="move.reason.required"></p>
+    <!-- 只有拖出来的移动才显示：手势很容易让人以为「我把这条线接到别处去了」，
+         而拖拽动的只有 parent。inputs 说的是字节从哪来，它一个字都没变。 -->
+    <p class="hint" id="mv-dragnote" hidden data-i18n-html="move.dragged.note"></p>
     <p class="hint mverr" id="mv-err" hidden></p>
     <menu>
       <button value="cancel" data-i18n="move.cancel"></button>
@@ -255,6 +269,13 @@
     </menu>
   </div>
 </dialog>
+
+<!-- 跟着指针走的小标签。三格分别是「拖的是谁」「要落到哪（或者为什么落不下）」
+     「跟着走的还有几步」。第三格最要紧：拖一棵二十步的子树和拖一个光杆节点
+     在屏幕上长得一模一样，而后果差二十倍。字全部由 app.js 按 i18n 填。 -->
+<div id="dghost" hidden aria-hidden="true">
+  <span id="dg-id" class="mono"></span><span id="dg-what"></span><span id="dg-carry"></span>
+</div>
 
 <div id="lightbox" hidden>
   <button id="lb-close" data-i18n-title="common.close">×</button>

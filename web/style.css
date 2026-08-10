@@ -63,6 +63,7 @@ html, body {
   display: flex; align-items: center; gap: 10px;
   padding: 8px 14px; border-bottom: 1px solid var(--rule);
   background: var(--panel); position: sticky; top: 0; z-index: 5;
+  flex: 0 0 auto;   /* body 现在是 flex 列，顶栏不许被压扁也不许被拉长 */
 }
 #proj {
   font: inherit; font-weight: 600; max-width: 220px;
@@ -141,10 +142,26 @@ button.on { background: var(--hi); border-color: var(--accent); }
 
 /* ---------------------------------------------------------------- layout */
 
-main { display: flex; height: calc(100% - 41px); align-items: stretch; }
+/* 页面是一列：header · #warnbar · main。
+   以前 main 的高度写死成 calc(100% - 41px)——只减了顶栏，没减警告栏。
+   于是一有警告，整块 main 就比视口高出警告栏那么多，被顶到屏幕外面去的正是
+   #left 底部的东西：图例、缩放条，以及拖拽时那条「提为根」的落区。
+   实测警告栏到 60px 就够把落区推出视口，而它是提为根的**唯一**入口——
+   一个只在"项目足够干净"时才存在的功能，比没有更糟。
+   改成让 body 自己排这一列，main 吃掉剩下的高度，谁高谁矮都不用再算。
+   min-height: 0 是必需的：flex 项默认 min-height:auto 不肯缩到内容以下，
+   缺了它 main 照样会把自己撑出视口。 */
+body { display: flex; flex-direction: column; }
+#warnbar { flex: 0 0 auto; }
+main { display: flex; flex: 1; min-height: 0; align-items: stretch; }
 #left { flex: 0 0 46%; min-width: 340px; display: flex; flex-direction: column; border-right: 1px solid var(--rule); }
 #scroller { flex: 1; overflow: auto; position: relative; }
 #track { display: flex; align-items: flex-start; min-height: 100%; }
+/* [hidden] 是 UA 样式表里的 display:none，作者写的 display:flex 比它权重高——
+   于是 applyView() 把 #track.hidden 设成 true，列表却照样画在图视图下面，
+   两个视图同时在屏幕上。这一行是那条规则的补票。同一页里 #gitwarn、#lightbox、
+   #hitlist 早就各自补过一张，凡是自带 display 的元素都得补。 */
+#track[hidden] { display: none; }
 #rails { flex: 0 0 auto; display: block; }
 #rows { flex: 1; min-width: 0; }
 #empty { padding: 24px; color: var(--muted); line-height: 1.8; }
@@ -449,6 +466,68 @@ dialog menu { display: flex; justify-content: flex-end; gap: 8px; padding: 0; ma
 }
 .toast.err { border-color: var(--dead); color: var(--dead); }
 
+/* -------------------------------------------------------------- ①b 拖着改父节点
+ *
+ * 规格里那条硬约束在这里最要紧：**一个视觉通道只承载一件事**。这一页上
+ *   线型（border-style）= status，
+ *   不透明度 = 在不在选中的祖先链上 / 有没有命中搜索，
+ *   颜色只作线型的补强，
+ *   字形标记（🖼 📎 L0 ↺✕ ⇄ ⊘）是第四通道，也满了。
+ * 所以拖拽一个都不碰，用的是三样此前没人用过的东西：
+ *   1) outline —— 它画在 border **之外**，和 border-style 是两个属性，
+ *      所以 status 的线型一个像素都不变。细圈 = 跟着走的那一片，
+ *      粗圈（带 offset，明显离开卡片一圈）= 接得住的新父。
+ *   2) 跟着指针走的小标签（#dghost）—— 只在拖动期间存在的浮层。
+ *   3) 顶上的落区（#droot）—— 同样只在拖动期间存在。
+ * 松手之后三样全消失：静止画面和拖之前逐像素相同。
+ *
+ * 「非法落点」不给红圈：红/线型都是已经被占用的通道，而且真正的答案是
+ * **它根本不该看起来像个落点**——不高亮、接不住，理由由跟手的标签说。
+ */
+
+/* 抓手光标只在写得进去的时候给。给了却抓不动比不给更像坏了。 */
+body.canwrite #dnodes .card, body.canwrite #rows .row { cursor: grab; }
+body.dragging, body.dragging * { cursor: grabbing !important; user-select: none; }
+
+#dnodes .card.dsub, #rows .row.dsub, #fnodes .fcard.dsub {
+  outline: 1.5px solid var(--accent); outline-offset: 0;
+}
+#dnodes .card.dtarget, #rows .row.dtarget {
+  outline: 2.5px solid var(--accent); outline-offset: 3px;
+}
+
+/* 落区。刻意**不是浮层**：绝对定位盖在滚动区顶上的话，列表视图里它正好压住最上面
+   那两行，于是那两步永远拖不上去——一条要求「有意落上去」的落区不该顺手吃掉别的
+   落点。它是 #scroller 在 flex 流里的兄弟，排在图例上方：出现时滚动区从**下面**
+   缩短，画布内容一个像素都不动（从上面挤会让整棵树在手底下往下跳）。 */
+#droot {
+  flex: 0 0 auto; margin: 0 10px 6px;
+  display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap;
+  padding: 8px 12px; border-radius: 6px;
+  border: 1.5px dashed var(--accent); background: var(--panel);
+  font-size: 11.5px; color: var(--muted); pointer-events: none;
+}
+/* 自带 display 的元素必须自己补一张 [hidden]：UA 样式表里的 display:none
+   权重比作者规则低，不补的话这两个浮层从进页面那一刻就挂在屏幕上。 */
+#droot[hidden], #dghost[hidden] { display: none; }
+#droot b { font-size: 12.5px; color: var(--ink); }
+#droot.on { border-style: solid; background: color-mix(in srgb, var(--accent) 14%, var(--panel)); }
+/* 本来就是根的步骤没有「提为根」可言：落区如实地退到一边，而不是接了再报错 */
+#droot.off { opacity: .3; }
+
+#dghost {
+  position: fixed; z-index: 30; pointer-events: none;
+  display: flex; gap: 7px; align-items: baseline; max-width: 40ch;
+  padding: 5px 10px; border-radius: 5px;
+  background: var(--panel); border: 1.5px solid var(--accent);
+  box-shadow: 0 6px 20px rgba(0,0,0,.22); font-size: 12px; line-height: 1.5;
+}
+#dghost #dg-id { font-weight: 700; }
+#dghost #dg-carry { color: var(--muted); font-size: 11px; }
+/* 落不下去的时候：标签退成一句灰色说明，看起来就不像一个「按下去会发生事情」
+   的东西。不用红色——颜色这个通道归线型补强，借来一次就再也说不清了。 */
+#dghost.bad { border-color: var(--rule); color: var(--muted); }
+
 /* ---------------------------------------------------------------- 图视图 */
 
 /* 边画在 SVG 上，节点是叠在上面的 HTML 卡片——这样文本截断、hover、
@@ -504,7 +583,10 @@ dialog menu { display: flex; justify-content: flex-end; gap: 8px; padding: 0; ma
 
 /* ---------------------------------------------------------------- 项目索引 */
 
-#home { padding: 26px 30px 60px; overflow: auto; height: calc(100% - 41px); }
+/* 和 main 同一个毛病、同一个修法：索引页以前也把顶栏的高度写死进自己的高度里，
+   于是首页一有警告，项目卡片列表的底部就被顶出视口。body 现在自己排这一列，
+   #home 吃掉剩下的高度即可。min-height: 0 见 main 那一段的理由。 */
+#home { padding: 26px 30px 60px; overflow: auto; flex: 1; min-height: 0; }
 .home-head { display: flex; align-items: center; gap: 14px; margin-bottom: 20px; }
 .home-head h1 { font-size: 18px; margin: 0; flex: 1; }
 #cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(258px, 1fr)); gap: 14px; }

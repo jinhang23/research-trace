@@ -165,6 +165,26 @@
       "move.err.project": "A step can only move inside its own project. Ids restart at 001 in every project, so across projects every `[[…]]` would become ambiguous.",
       "move.err.missing": "There is no step {parent} in this project.",
 
+      /* ---- ①b 拖着改父节点 ----
+         手势省掉的是「在下拉框里翻 id」的那十几秒，不是那句原因。所以这一组文案
+         全都短——它们贴着指针走，读它们的人正在拖东西，一眼一句。
+         唯一长的一句是 move.dragged.note：它要挡住手势最容易造成的误会，
+         也就是「我刚才把数据流也接过去了」。 */
+      "move.dragged.note": "Dragging picked the new parent, and nothing else. `parent` is which step the thinking continued from. `inputs` — where the bytes came from — is untouched, and so is every word of the note.",
+      "drag.aim.parent": "→ hangs under {parent}",
+      "drag.aim.root": "→ becomes a root of its own",
+      "drag.aim.none": "Drop it on a step to hang it there",
+      "drag.no.self": "A step can't be its own parent",
+      "drag.no.descendant": "{parent} grew out of {id}",
+      "drag.no.noop": "Already hangs right here",
+      "drag.no.missing": "No such step",
+      "drag.carry": { one: "{n} step below comes along", other: "{n} steps below come along" },
+      "drag.root.label": "Make it a root of its own",
+      "drag.root.hint": "Only here. Dropping on blank space anywhere else calls the move off.",
+      "drag.cancelled": "Move called off — nothing was written.",
+      "drag.readonly": "This page is a static export: a photograph of the record, not the record. Moving a step appends a line to its note, and only the server can write that.",
+      "drag.flow": "The edges here are inputs — where the bytes came from. Dragging changes parent — which step the thinking continued from. Move a step in the tree or the list; the two are kept apart on purpose.",
+
       /* ---- ② 数据依赖：树是记录，input 是字节 ---- */
       "input.lead": "**`parent` is the step I was thinking from. `input` is where the bytes came from.** Most of the time that's the same step; when it isn't, these lines are the only place that says so — a tree holds one parent, a pipeline can eat four artifacts at once.",
       "input.parent.tip": "The tree keeps one parent per step. Data flow is a graph, so it is recorded as inputs instead of bending the tree into one.",
@@ -616,6 +636,26 @@
       "move.err.noop": "{id} 本来就挂在 {parent} 下，没有要记的改动。",
       "move.err.project": "只能在同一个项目内移动。每个项目的 id 都从 001 重新开始，跨项目之后每个 `[[…]]` 都会变得有歧义。",
       "move.err.missing": "这个项目里没有 {parent} 这一步。",
+
+      /* ---- ①b 拖着改父节点 ----
+         手势省掉的是「在下拉框里翻 id」的那十几秒，不是那句原因。所以这一组文案
+         全都短——它们贴着指针走，读它们的人正在拖东西，一眼一句。
+         唯一长的一句是 move.dragged.note：它要挡住手势最容易造成的误会，
+         也就是「我刚才把数据流也接过去了」。 */
+      "move.dragged.note": "拖拽只挑了新的父步骤，别的什么都没动。`parent` 说的是当时接着哪一步想；`inputs`（这些字节从哪来）一个字没变，笔记正文也一样。",
+      "drag.aim.parent": "→ 挂到 {parent} 下面",
+      "drag.aim.root": "→ 自己成为一棵树的根",
+      "drag.aim.none": "落在某一步上，就挂到那一步下面",
+      "drag.no.self": "不能挂到自己身上",
+      "drag.no.descendant": "{parent} 是从 {id} 长出来的",
+      "drag.no.noop": "本来就挂在这里",
+      "drag.no.missing": "没有这一步",
+      "drag.carry": "下面 {n} 步跟着一起走",
+      "drag.root.label": "让它自己成为一棵树的根",
+      "drag.root.hint": "只有这里算。落在别的空白处等于取消。",
+      "drag.cancelled": "移动取消了——什么都没写。",
+      "drag.readonly": "这一页是静态导出：记录的一张照片，不是记录本身。移动会往笔记里追加一行，只有服务端写得了。",
+      "drag.flow": "这张图上的边是 inputs——这些字节从哪来。拖拽改的是 parent——当时接着哪一步想。要移动请回树视图或列表视图；这两件事是刻意分开的。",
 
       /* ---- ② 数据依赖：树是记录，input 是字节 ---- */
       "input.lead": "**`parent` 是我当时接着哪一步想，`input` 是这些字节从哪来。** 多数时候是同一步；不是的时候，只有这几行说得出来——树上只挂得住一个父节点，而一条流水线可以同时吃四份产物。",

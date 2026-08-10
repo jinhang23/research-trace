@@ -349,6 +349,78 @@
     return "";
   }
 
+  /* -------------------------------------------------------- ①b 拖拽：可测的那一半
+   *
+   * 拖拽本身是 DOM 的事，在 node 里测不了。但拖拽里真正会**把记录写坏**的判断
+   * 一个都不是 DOM：落点合不合法、指针底下压着的是哪一张卡、这一拖到底带走了
+   * 哪几步。它们和 moveError 一样剥在这一层，tests/app.test.js 逐条钉住。
+   *
+   * 合法性**不在这里重判一遍**——界面层直接问 moveError，和「移动」对话框问的
+   * 是同一个函数。两套判断迟早会不一致，而不一致的那一刻用户看到的是
+   * 「能拖，拖完报错」：手势说可以，服务端说不行，人只会认为这个功能坏了。
+   */
+
+  /* 起拖阈值。没有它，每一次「点一下选中这个节点」都可能变成一次意外移动——
+     而移动不是撤销一下就没事的操作，它会往 note.md 里追加一条永久审计，
+     还会逼人当场编一句原因。5 像素是「手抖」和「我要拖」之间的那条线。 */
+  var DRAG_SLOP = 5;
+  function beyondSlop(dx, dy, slop) {
+    var s = slop === undefined ? DRAG_SLOP : slop;
+    return dx * dx + dy * dy >= s * s;
+  }
+
+  /* 这一拖带走的是哪一片（含自己）。后端的 move_step 本来就是整棵子树跟着走，
+     所以拖动时必须让人看得见那一片：看不见的话，拖一棵二十步的子树和拖一个
+     光杆节点在屏幕上长得一模一样，而两者的后果差二十倍。
+     沿 parent 反查而不是读 children：children 是服务端派生出来的，这一层
+     只依赖每条记录自己写着的那一个字段。 */
+  function subtreeIds(byId, id) {
+    if (!byId || !byId[id]) return [];
+    var kids = Object.create(null);
+    Object.keys(byId).forEach(function (k) {
+      var p = byId[k].parent || "";
+      if (p) (kids[p] || (kids[p] = [])).push(k);
+    });
+    var out = [], queue = [id], seen = Object.create(null);
+    while (queue.length) {
+      var cur = queue.shift();
+      if (seen[cur]) continue;          // 数据坏成环时也不许把这里转死
+      seen[cur] = 1;
+      out.push(cur);
+      (kids[cur] || []).forEach(function (k) { queue.push(k); });
+    }
+    return out;
+  }
+
+  /* 命中测试。刻意不用 document.elementFromPoint：拖动时指针底下悬着的是跟手的
+     小标签，问 DOM 永远只会问到那个标签自己。坐标是布局早就算好的，直接判坐标。
+     后画的盖住先画的，所以从后往前找。 */
+  function hitRect(rects, x, y) {
+    for (var i = (rects || []).length - 1; i >= 0; i--) {
+      var r = rects[i];
+      if (x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) return r.id;
+    }
+    return "";
+  }
+
+  /* 指针在不在这块**可视区域**上。
+
+     命中测试是纯坐标换算，而 #diagram / #rows 的矩形在滚动时会伸到视口外去，
+     于是「指针停在顶栏的搜索框上」「指针停在右边的详情面板上」照样能换算出
+     画布里某个屏幕上根本看不见的节点——松手就是一次挂到看不见的地方的移动，
+     而移动会写一条永久的审计记录。所以命中之前先问一句：指针真的在这块上吗。 */
+  function withinRect(r, x, y) {
+    return !!r && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+  }
+
+  /* 列表视图的命中：定高行，除一下就是第几行。越界回 -1，不回 0——
+     「拖到列表下方的空白」和「拖到第一行」是两件完全不同的事。 */
+  function rowAt(y, rowH, count) {
+    if (!(rowH > 0) || y < 0) return -1;
+    var i = Math.floor(y / rowH);
+    return i >= 0 && i < count ? i : -1;
+  }
+
   /* -------------------------------------------------------------- ⑥ 提示级
    *
    * 这三条诊断服务端发的是 warn 级，但它们**不影响 L0–L4**。混在真警告里显示，
@@ -495,6 +567,8 @@
     MEASURED_ATTRS: MEASURED_ATTRS, inheritPath: inheritPath,
     parseInsights: parseInsights, parseInsightLine: parseInsightLine,
     moveError: moveError, warnLevel: warnLevel,
+    DRAG_SLOP: DRAG_SLOP, beyondSlop: beyondSlop, subtreeIds: subtreeIds,
+    hitRect: hitRect, rowAt: rowAt, withinRect: withinRect,
     flowLayout: flowLayout, depClosure: depClosure,
   };
   global.traceUtil = U;
@@ -2516,7 +2590,10 @@
    *   2) 成环 / 挂到自己的后代下面**当场**说，不等服务端 4xx——那两条不是笔误，
    *      是想法本身有问题，等一个 400 回来时人已经点过确定了。
    */
-  function openMove(sid) {
+  /* preset：拖拽已经把新父节点挑好了，直接填进下拉框（下拉框仍然摆在那儿，
+     因为人还得看一眼「我到底挂到哪了」，而且键盘用户走的就是它）。
+     dragged：这一次是拖出来的，多说一行「只改了 parent，inputs 一个字没动」。 */
+  function openMove(sid, preset, dragged) {
     var s = IDX[sid];
     if (!s) return;
     $("#mv-title").textContent = i18n.t("move.dialog.title", { id: s.id });
@@ -2532,8 +2609,9 @@
         + "</option>");
     });
     $("#mv-parent").innerHTML = opts.join("");
-    $("#mv-parent").value = cur;
+    $("#mv-parent").value = preset === undefined || preset === null ? cur : preset;
     $("#mv-reason").value = "";
+    $("#mv-dragnote").hidden = !dragged;
     $("#dlg-move").dataset.sid = s.id;
     paintMoveErr();
     $("#dlg-move").showModal();
@@ -2577,6 +2655,231 @@
                      : i18n.t("toast.moved.root", { id: sid }));
       });
     }).catch(fail);
+  }
+
+  /* ------------------------------------------------------------ ①b 拖着改父节点
+   *
+   * 用户的原话是「所以可以自由拖动变换关系吗」——他要的是**手势**，不是表单。
+   * 一个 50 步的项目里，「在下拉框里翻 id」这件事本身就贵到让人不想改结构，
+   * 于是又绕回「把两步的正文对调」那条一点痕迹都不留的老路上去。
+   * 拖拽要省掉的正是翻下拉框的那十几秒，**不是**那句原因。
+   *
+   * 五条自觉的边界：
+   *
+   * 1) **手势只挑目标，不代替原因。** 松手之后弹的还是同一个 #dlg-move，新父节点
+   *    已经由手势填好，焦点直接落在原因框上。原因是这条审计里唯一无法自动生成的
+   *    部分：移动过的树本来就会和创建顺序对不上，半年后只有那一句话解释得了它。
+   *    取消 / Esc = 什么都没发生，树回到原样，磁盘上一个字节都没动。
+   *
+   * 2) **只改 parent，绝不动 inputs。** parent 是「我当时接着哪一步想」，
+   *    inputs 是「这些字节从哪来」。所以**数据流视图整个不参与拖拽**：那张图画的
+   *    边就是 inputs，在它上面能拖，人立刻会以为自己在改数据依赖，而数据流图
+   *    从此就会跟着树形一起骗人。在那张图上按住卡片拖，得到的是一句说明，
+   *    不是一次移动。移动对话框上也另起一行把这条界线写出来。
+   *
+   * 3) **提为根必须是有意的。** 「没落在任何卡片上就算提为根」是最容易误触发的
+   *    判定，而误触发的代价是一条永久审计加一句被逼出来的原因。所以提为根有一条
+   *    **明确的落区**：拖起来之后左上角才出现，只有落在那条上才作数；落在别的
+   *    空白处等于取消。
+   *
+   * 4) **非法落点在拖动过程中就禁掉**，判断全部转手给 U.moveError——和对话框问的
+   *    是同一个函数。自己、自己的后代、当前的父，指针经过时既不高亮也接不住，
+   *    跟手的小标签当场说明是为什么。
+   *
+   * 5) **拖拽是增强，不是唯一入口。** 详情面板上那个「⇄ 移动」按钮 + 对话框那条路
+   *    一个字都没改：只能靠拖的功能，对键盘用户等于不存在。
+   *
+   * 视觉：规格里「一个视觉通道只承载一件事」在这里是硬约束。线型已经归 status，
+   * 不透明度归祖先链/搜索命中，颜色只作线型的补强，字形标记（🖼 📎 L0 ↺✕ ⇄）
+   * 那一档也满了。所以拖拽用的是三样**此前没人用过**的东西：
+   *   · 卡片外面那一圈 outline —— 它画在 border 之外，不是 border，
+   *     所以既不改线型也不改颜色；细圈 = 跟着走的那一片，粗圈 = 接得住的新父。
+   *   · 跟着指针走的一个小标签 —— 只在拖动期间存在的浮层。
+   *   · 顶上那条落区 —— 同样只在拖动期间存在。
+   * 三样东西在松手的一刻全部消失，静止画面上一个像素都没变。
+   */
+
+  var drag = null;
+
+  function viewCards() {
+    if (view === "graph") return "#dnodes .card";
+    if (view === "list") return "#rows .row";
+    return "#fnodes .fcard";
+  }
+
+  /* 当前视图里每张卡片在**布局坐标**里的矩形。图视图的坐标是 F.tree 早算好的，
+     不去问 DOM 量尺寸：拖动中问 DOM 就得走一遍布局，几百个节点会卡手。 */
+  function dragRects() {
+    var T = F.tree || { nodes: {} };
+    var out = [];
+    F.steps.forEach(function (s) {
+      var n = T.nodes[s.id];
+      if (n) out.push({ id: s.id, x: n.x, y: n.y, w: T.node_w, h: T.node_h });
+    });
+    return out;
+  }
+
+  /* 指针位置 → 落在哪一步。图视图换算掉缩放，列表视图除以行高。
+     返回空串 = 没落在任何一步上。
+
+     **先过一道视口闸门**：\#diagram / \#rows 的矩形在滚动时会伸到视口外面去，
+     光做坐标换算的话，指针明明停在顶栏的搜索框上、或者右边的详情面板上，
+     算出来却是画布里某个**屏幕上根本看不见**的节点——松手就是一次挂到看不见的
+     地方的移动，而移动会写一条永久的审计记录。
+     所以判据不是"换算完落在哪个矩形里"，而是"指针是不是真的在这块可视区域上"。 */
+  function inScroller(cx, cy) {
+    return U.withinRect($("#scroller").getBoundingClientRect(), cx, cy);
+  }
+
+  function aimAt(cx, cy) {
+    if (!inScroller(cx, cy)) return "";
+    if (view === "graph") {
+      var box = $("#diagram").getBoundingClientRect();
+      return U.hitRect(drag.rects, (cx - box.left) / zoom, (cy - box.top) / zoom);
+    }
+    var rb = $("#rows").getBoundingClientRect();
+    if (cx < rb.left || cx > rb.right) return "";
+    var i = U.rowAt(cy - rb.top, F.row_h || 28, F.steps.length);
+    return i < 0 ? "" : F.steps[i].id;
+  }
+
+  function onDragDown(e) {
+    if (drag || $("#dlg-move").open) return;
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    var hit = e.target.closest("#dnodes .card, #rows .row, #fnodes .fcard");
+    if (!hit) return;
+    var id = hit.getAttribute("data-id");
+    if (!IDX[id]) return;
+    // 三种按下都先记下来：只读和数据流那两种也要等到人**真的拖了**才说话，
+    // 按一下就弹一句话等于把「选中一个节点」变成一次说教。
+    var kind = !canWrite() ? "ro" : (view === "flow" ? "flow" : "live");
+    drag = { id: id, kind: kind, x0: e.clientX, y0: e.clientY, on: false,
+             armed: e.pointerType !== "touch", timer: 0,
+             target: "", root: false, code: "", ok: false, moving: [], rects: [] };
+    /* 触屏上「按住不动」和「往下滑一屏」在按下的那一刻分不开，而滑动才是这一页
+       在手机上最常做的事。所以触屏要长按 400ms 才起拖，其余时候照常滚。
+       按钮 + 对话框那条路一直在，触屏用户不会因此失去移动能力。 */
+    if (!drag.armed) {
+      drag.timer = setTimeout(function () {
+        if (!drag || drag.on || drag.kind !== "live") return;
+        drag.armed = true;
+        beginDrag();
+        aimDrag(drag.x0, drag.y0);
+      }, 400);
+    }
+  }
+
+  function onDragMove(e) {
+    if (!drag) return;
+    if (!drag.on) {
+      if (!U.beyondSlop(e.clientX - drag.x0, e.clientY - drag.y0)) return;
+      clearTimeout(drag.timer);
+      // 拖不动的两种情形，到这里才说——而且说的是**为什么**，不是「不允许」。
+      if (drag.kind === "ro") { toast(i18n.t("drag.readonly")); endDrag(); return; }
+      if (drag.kind === "flow") { toast(i18n.t("drag.flow")); endDrag(); return; }
+      if (!drag.armed) { endDrag(); return; }   // 触屏没长按：这一下是滑动，让位给滚动
+      beginDrag();
+    }
+    e.preventDefault();                          // 拖动中不选中文字、不滚动
+    aimDrag(e.clientX, e.clientY);
+  }
+
+  function beginDrag() {
+    drag.on = true;
+    drag.moving = U.subtreeIds(IDX, drag.id);
+    drag.rects = dragRects();
+    var mv = Object.create(null);
+    drag.moving.forEach(function (k) { mv[k] = 1; });
+    document.body.classList.add("dragging");
+    document.querySelectorAll(viewCards()).forEach(function (el) {
+      el.classList.toggle("dsub", !!mv[el.getAttribute("data-id")]);
+    });
+    var rz = $("#droot");
+    rz.hidden = false;
+    // 本来就是根的步骤没有「提为根」可言，落区如实地不接受，而不是接了再报错
+    rz.classList.toggle("off", U.moveError(IDX, drag.id, "") !== "");
+    $("#dg-id").textContent = drag.id;
+    $("#dghost").hidden = false;
+  }
+
+  function aimDrag(cx, cy) {
+    var rz = $("#droot").getBoundingClientRect();
+    var onRoot = !$("#droot").hidden
+      && cx >= rz.left && cx <= rz.right && cy >= rz.top && cy <= rz.bottom;
+    var target = onRoot ? "" : aimAt(cx, cy);
+    // 没落在卡片上、也没落在落区上：这是「空白」，它既不是提为根也不是错误。
+    var code = (onRoot || target) ? U.moveError(IDX, drag.id, target) : "away";
+    drag.root = onRoot;
+    drag.target = target;
+    drag.code = code;
+    drag.ok = code === "";
+    $("#droot").classList.toggle("on", onRoot && drag.ok);
+    document.querySelectorAll(viewCards()).forEach(function (el) {
+      el.classList.toggle("dtarget", drag.ok && !onRoot && el.getAttribute("data-id") === target);
+    });
+    paintGhost(cx, cy);
+  }
+
+  /* 跟手的小标签。它同时回答三件事：拖的是谁、要落到哪、跟着走的有几步。
+     第三件是最容易被忽略、后果又最大的一件——拖一棵二十步的子树和拖一个光杆
+     节点在屏幕上长得一样。 */
+  function paintGhost(cx, cy) {
+    var g = $("#dghost"), carried = drag.moving.length - 1, what;
+    if (drag.ok && drag.root) what = i18n.t("drag.aim.root");
+    else if (drag.ok) what = i18n.t("drag.aim.parent", { parent: drag.target });
+    else if (drag.code === "away") what = i18n.t("drag.aim.none");
+    else if (drag.code === "self") what = i18n.t("drag.no.self");
+    else if (drag.code === "descendant") what = i18n.t("drag.no.descendant", { id: drag.id, parent: drag.target });
+    else if (drag.code === "noop") what = i18n.t("drag.no.noop");
+    else what = i18n.t("drag.no.missing");
+    $("#dg-what").textContent = what;
+    $("#dg-carry").textContent = carried > 0 ? i18n.t("drag.carry", { n: carried }) : "";
+    g.classList.toggle("bad", !drag.ok);
+    g.style.left = (cx + 14) + "px";
+    g.style.top = (cy + 18) + "px";
+  }
+
+  function onDragUp() {
+    if (!drag) return;
+    var d = drag;
+    endDrag();
+    if (!d.on) return;
+    // 起拖之后的那一次 click 不能再当成「选中」：一次移动会紧接着弹框，
+    // 而框背后的选中态跳走会让人以为自己点错了地方。
+    swallowNextClick();
+    if (!d.ok) return;        // 空白 / 非法落点：什么都没发生，树一个字没动
+    openMove(d.id, d.root ? "" : d.target, true);
+  }
+
+  function swallowNextClick() {
+    var off = function () { document.removeEventListener("click", once, true); clearTimeout(t); };
+    var once = function (ev) { ev.stopPropagation(); ev.preventDefault(); off(); };
+    var t = setTimeout(off, 400);   // 没有跟上来的 click 就自己拆掉，别吃掉下一次点击
+    document.addEventListener("click", once, true);
+  }
+
+  function endDrag() {
+    if (!drag) return;
+    clearTimeout(drag.timer);
+    if (drag.on) {
+      document.body.classList.remove("dragging");
+      document.querySelectorAll(".dsub, .dtarget").forEach(function (el) {
+        el.classList.remove("dsub", "dtarget");
+      });
+      $("#droot").hidden = true;
+      $("#droot").classList.remove("on", "off");
+      $("#dghost").hidden = true;
+    }
+    drag = null;
+  }
+
+  /* 中途取消：Esc、指针被系统收走（来电、触屏改成滚动）、窗口失焦。
+     三条出口都必须把树恢复原样——半截的高亮留在屏幕上比没有高亮更糟。 */
+  function cancelDrag(say) {
+    if (!drag) return;
+    var was = drag.on;
+    endDrag();
+    if (was && say) toast(i18n.t("drag.cancelled"));
   }
 
   /* -------------------------------------------------------------- 写入 */
@@ -3008,6 +3311,17 @@
     e.returnValue = "";
   });
 
+  /* ①b 拖着改父节点。用的是 Pointer Events，不是 HTML5 的 drag-and-drop：
+     后者在自定义的 SVG / 绝对定位画布上各浏览器表现不一，拖影没法控制，
+     触屏基本不可用，而这一页的图视图恰恰就是绝对定位的画布。
+     pointermove / pointerup 挂在 document 上而不是卡片上：指针出了卡片
+     （拖到空白、拖出窗口）之后事件仍然要收得到，否则松手时高亮会卡在屏幕上。 */
+  $("#scroller").addEventListener("pointerdown", onDragDown);
+  document.addEventListener("pointermove", onDragMove, { passive: false });
+  document.addEventListener("pointerup", onDragUp);
+  document.addEventListener("pointercancel", function () { cancelDrag(false); });
+  window.addEventListener("blur", function () { cancelDrag(false); });
+
   // Ctrl/⌘ + 滚轮缩放图视图
   $("#scroller").addEventListener("wheel", function (e) {
     if (!(e.ctrlKey || e.metaKey) || view !== "graph") return;
@@ -3016,6 +3330,10 @@
   }, { passive: false });
 
   document.addEventListener("keydown", function (e) {
+    /* 拖到一半按 Esc = 什么都没发生。它排在最前面：拖动期间屏幕上有三样临时的
+       东西（跟手标签、落区、两种 outline），任何一条别的分支先 return 掉，
+       那三样就会留在屏幕上，而树看起来像是坏了。 */
+    if (drag && drag.on && e.key === "Escape") { e.preventDefault(); cancelDrag(true); return; }
     if (!$("#lightbox").hidden && e.key === "Escape") { closeLightbox(); return; }
     if ($("#dlg-leave").open || $("#dlg-conflict").open) {
       // 这两个框问的正是「要不要丢东西」，Esc 一律理解成「先别动，我再想想」
@@ -3405,6 +3723,10 @@
   /* 「＋ 项目」以前只长在项目索引页上，而只剩一个项目时那个页面会 302 弹回项目页，
      于是网页端永远建不出第二个项目。现在它在顶栏，任何页面都够得着。 */
   $("#btn-newproj").hidden = MODE === "static";
+  /* 「这些卡片抓得动」是一条只能靠光标说的话：静态导出里它们仍然点得开、
+     仍然能读，但抓不动。所以抓手光标只在写得进去的时候给——给了却抓不动，
+     比不给更让人以为是坏了。 */
+  document.body.classList.toggle("canwrite", canWrite());
   if (MODE === "static") $("#live").className = "dot";
   $("#lb-close").addEventListener("click", closeLightbox);
 
@@ -3443,6 +3765,11 @@
         forestCache = Object.create(null);   // 别的项目也可能变了，跨项目搜索的缓存作废
         refreshProjects();
         refreshGit();
+        /* 别人刚写进来一步，树的形状可能已经变了——而拖动中的落点判定用的是
+           起拖那一刻的坐标。不掐掉的话，重画会把高亮抹掉，人手上却还举着一个
+           指向旧位置的落点，松手落到的是另一步。移动会写下永久审计，这种
+           「看着 A 落到 B」绝不能发生，所以有拖动在进行时先取消它。 */
+        if (drag && drag.on) cancelDrag(true);
         if (PROJECT && !editing) refresh();   // 正在编辑时不要把用户的输入冲掉
       }
     };

@@ -285,6 +285,84 @@ test("目标不存在时说得出来，而不是让人点了确定才知道", ()
   assert.equal(U.moveError(MOVE_TREE, "002", "999"), "missing");
 });
 
+/* ------------------------------------------------ ①b 拖拽里那些不是 DOM 的判断
+ *
+ * 手势本身测不了（node 里没有指针），但拖拽里真正会把记录写坏的三件事都不是 DOM：
+ * 多远才算「我要拖」、指针底下压着的是哪一张卡、这一拖带走了哪几步。
+ */
+
+test("起拖要过阈值 —— 没有它，每一次选中节点都可能变成一次带永久审计的移动", () => {
+  assert.equal(U.beyondSlop(0, 0), false);
+  assert.equal(U.beyondSlop(3, 3), false, "手抖三四个像素不算拖");
+  assert.equal(U.beyondSlop(5, 0), true);
+  assert.equal(U.beyondSlop(0, -5), true, "反方向同样算");
+  assert.equal(U.beyondSlop(-4, -4), true, "斜着走的是直线距离，不是某一根轴");
+  assert.ok(U.DRAG_SLOP > 0);
+  // 阈值可以由调用方指定，好让触屏那种更粗的手指有自己的一档
+  assert.equal(U.beyondSlop(6, 0, 12), false);
+});
+
+test("拖一步就是拖它整棵子树 —— 后端本来就是这个语义，屏幕上必须看得见那一片", () => {
+  assert.deepEqual(U.subtreeIds(MOVE_TREE, "001").sort(), ["001", "002", "003"]);
+  assert.deepEqual(U.subtreeIds(MOVE_TREE, "003"), ["003"], "叶子只带自己");
+  assert.deepEqual(U.subtreeIds(MOVE_TREE, "010"), ["010"]);
+  assert.equal(U.subtreeIds(MOVE_TREE, "001")[0], "001", "自己排在最前面");
+  assert.deepEqual(U.subtreeIds(MOVE_TREE, "999"), [], "不存在的步骤带不走任何东西");
+});
+
+test("子树是沿 parent 反查出来的，不读 children —— children 是服务端派生的第二份真相", () => {
+  // 故意给一份 children 和 parent 说法相反的数据：只有 parent 那一份算数
+  const lying = {
+    a: { id: "a", parent: "", children: ["zzz"] },
+    b: { id: "b", parent: "a", children: [] },
+  };
+  assert.deepEqual(U.subtreeIds(lying, "a").sort(), ["a", "b"]);
+});
+
+test("父指针成环时子树不转死 —— 磁盘上真出现过环的话，界面也得能画出来", () => {
+  const ring = { x: { id: "x", parent: "y" }, y: { id: "y", parent: "x" } };
+  assert.deepEqual(U.subtreeIds(ring, "x").sort(), ["x", "y"]);
+});
+
+test("命中测试认坐标不认 DOM —— 拖动时指针底下悬着的是跟手的标签", () => {
+  const rects = [
+    { id: "001", x: 0, y: 0, w: 100, h: 40 },
+    { id: "002", x: 120, y: 0, w: 100, h: 40 },
+  ];
+  assert.equal(U.hitRect(rects, 10, 10), "001");
+  assert.equal(U.hitRect(rects, 150, 39), "002");
+  assert.equal(U.hitRect(rects, 110, 10), "", "两张卡之间的空隙不是任何一张卡");
+  assert.equal(U.hitRect(rects, 10, 40), "", "下边界是开区间，不然相邻两行会同时命中");
+  assert.equal(U.hitRect([], 0, 0), "");
+  assert.equal(U.hitRect(undefined, 0, 0), "");
+});
+
+test("重叠时后画的那张赢 —— 屏幕上盖在上面的就是人以为自己指着的那张", () => {
+  const rects = [
+    { id: "under", x: 0, y: 0, w: 100, h: 40 },
+    { id: "over", x: 50, y: 0, w: 100, h: 40 },
+  ];
+  assert.equal(U.hitRect(rects, 60, 10), "over");
+});
+
+test("列表命中越界回 -1 而不是 0 —— 「拖到列表下方的空白」不能变成「拖到第一行」", () => {
+  assert.equal(U.rowAt(0, 28, 3), 0);
+  assert.equal(U.rowAt(27.9, 28, 3), 0);
+  assert.equal(U.rowAt(28, 28, 3), 1);
+  assert.equal(U.rowAt(83, 28, 3), 2);
+  assert.equal(U.rowAt(84, 28, 3), -1, "最后一行下面是空白，不是最后一行");
+  assert.equal(U.rowAt(-1, 28, 3), -1, "列表上方同理");
+  assert.equal(U.rowAt(10, 0, 3), -1, "行高还没算出来时不许瞎猜一行");
+});
+
+test("拖拽的合法性判断没有第二份 —— 落点问的就是对话框问的那个 moveError", () => {
+  // 这条钉的是「不许再写一套」：两套判断迟早不一致，而不一致的那一刻
+  // 用户看到的是「能拖，拖完报错」。所以 traceUtil 里只该有这一个判官。
+  const names = Object.keys(U).filter((k) => /^(drop|canDrop|dragError|dropError)/.test(k));
+  assert.deepEqual(names, [], "又出现了第二个落点判官：" + names.join(", "));
+  assert.equal(typeof U.moveError, "function");
+});
+
 /* ------------------------------------------------ ⑥ 提示级不和真警告混在一起 */
 
 test("三条新诊断是提示级 —— 它们不影响 L0–L4，混进警告栏人就不再看警告栏了", () => {
@@ -412,4 +490,27 @@ test("产物和代码的位置进搜索干草堆，校验和与日期不进", ()
   assert.ok(U.matches(step, "pocket_composition"));
   assert.ok(!U.matches(step, "7d4e1a9c"),
     "搜一串 md5 是核对不是找东西，把它拼进干草堆只会制造噪声命中");
+});
+
+/* --------------------------------- 拖拽：落点必须在屏幕上看得见 */
+
+test("指针不在可视区域上时，命中一律作废", () => {
+  // 画布/列表的矩形在滚动时会伸到视口外去，所以光换算坐标是不够的：
+  // 指针停在顶栏的搜索框上、或者右边的详情面板上，照样能换算出画布里某个
+  // **屏幕上根本看不见**的节点。松手就是一次挂到看不见的地方的移动——
+  // 而移动会写一条永久的审计记录。这条测试钉的就是那道闸门。
+  const view = { left: 0, top: 240, right: 600, bottom: 760 };
+  assert.ok(U.withinRect(view, 300, 500), "画布正中当然算");
+  assert.ok(!U.withinRect(view, 300, 20), "顶栏的搜索框在画布上方");
+  assert.ok(!U.withinRect(view, 900, 500), "详情面板在画布右边");
+  assert.ok(!U.withinRect(view, 300, 830), "图例下方也不算");
+  assert.ok(!U.withinRect(null, 300, 500), "元素还没渲染时不许当成命中");
+});
+
+test("可视区域的边界算在里面", () => {
+  // 贴着边松手是很常见的动作，差一个像素就"什么都没发生"会让人以为拖坏了。
+  const view = { left: 10, top: 10, right: 100, bottom: 100 };
+  for (const [x, y] of [[10, 10], [100, 100], [10, 100], [100, 10]])
+    assert.ok(U.withinRect(view, x, y), `角点 ${x},${y} 应当算命中`);
+  assert.ok(!U.withinRect(view, 101, 50));
 });

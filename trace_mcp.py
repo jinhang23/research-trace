@@ -1730,7 +1730,7 @@ def dispatch(backend, name: str, args: dict[str, Any]) -> str:
 # 的客户端连上来跑一遍互操作。
 
 SERVER_NAME = "trace"
-SERVER_VERSION = "1.4.0"
+SERVER_VERSION = "1.5.0"
 
 # 收到客户端要的版本就原样回它（前提是我们认识），否则回我们最新的。
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")

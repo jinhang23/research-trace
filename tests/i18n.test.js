@@ -336,6 +336,54 @@ test("① editor.hint 不再说 parent 不可改 —— P2 重新定义之后那
   assert.match(one("en", "editor.hint"), /`id` never changes/);
 });
 
+test("①b 拖拽：跟手的标签、落区、两种拖不动、取消，都有文案", () => {
+  needKeys([
+    "drag.aim.parent", "drag.aim.root", "drag.aim.none",
+    "drag.no.self", "drag.no.descendant", "drag.no.noop", "drag.no.missing",
+    "drag.carry", "drag.root.label", "drag.root.hint",
+    "drag.cancelled", "drag.readonly", "drag.flow", "move.dragged.note",
+  ], "手势不是自解释的：落到哪、为什么落不下、为什么拖不动，都得有话说");
+});
+
+test("①b 跟手的标签必须短 —— 读它的人正在拖东西，一眼一句", () => {
+  for (const lang of ["en", "zh"]) {
+    for (const k of ["drag.aim.parent", "drag.aim.root", "drag.no.self",
+                     "drag.no.descendant", "drag.no.noop", "drag.no.missing"]) {
+      assert.ok(one(lang, k).length <= 40, `${lang}.${k} 太长，贴着指针读不完：${one(lang, k)}`);
+    }
+  }
+});
+
+test("①b 「拖不动」要说为什么，不是只说不行", () => {
+  // 只读那一条要点出「这是静态导出」，否则人只会以为功能坏了
+  assert.match(one("en", "drag.readonly"), /static export/);
+  assert.match(one("zh", "drag.readonly"), /静态导出/);
+  for (const lang of ["en", "zh"]) {
+    assert.ok(one(lang, "drag.readonly").length > 40, `${lang}.drag.readonly 说不出为什么`);
+    assert.ok(one(lang, "drag.flow").length > 40, `${lang}.drag.flow 说不出为什么`);
+  }
+});
+
+test("①b 最要紧的那一句：拖拽只改 parent，inputs 一个字没动", () => {
+  // 手势最容易造成的误会就是「我把数据流也接过去了」。两种语言都必须挡住它。
+  for (const lang of ["en", "zh"]) {
+    assert.match(one(lang, "move.dragged.note"), /parent/);
+    assert.match(one(lang, "move.dragged.note"), /inputs/);
+    assert.match(one(lang, "drag.flow"), /parent/);
+    assert.match(one(lang, "drag.flow"), /inputs/);
+  }
+});
+
+test("①b 提为根的落区要说清「只有这里算」—— 不然它就是最容易误触发的那个判定", () => {
+  assert.match(one("en", "drag.root.hint"), /Only here/i);
+  assert.match(one("zh", "drag.root.hint"), /只有这里/);
+});
+
+test("②b 拖走一片时要说走的是几步 —— 拖一棵子树和拖一个光杆节点在屏幕上一模一样", () => {
+  assert.deepEqual(placeholders(one("en", "drag.carry")), ["n"]);
+  assert.deepEqual(placeholders(one("zh", "drag.carry")), ["n"]);
+});
+
 test("② 数据依赖：两个方向的清单、数据流视图、三类警告都有文案", () => {
   needKeys([
     "input.lead", "input.parent.tip",

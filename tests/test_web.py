@@ -825,6 +825,149 @@ def test_the_move_history_is_shown_and_says_who_and_why():
     assert "move.badge.title" in marks, "树上没有「这一步被移动过」的标记"
 
 
+# ---------------------------------------------------------------- ①b 拖着改父节点
+
+
+def test_dragging_uses_pointer_events_not_the_html5_drag_api():
+    """HTML5 的 drag-and-drop 在自定义 SVG / 绝对定位画布上各浏览器表现不一，
+    拖影没法控制，触屏基本不可用——而图视图恰恰就是绝对定位的画布。
+
+    页面里另外两处 dragover/drop 是**文件上传**（把截图拖进详情面板），
+    那是浏览器和操作系统之间的协议，本来就该用 HTML5 那套。所以这里只断言
+    树上的拖拽走 Pointer Events，不是「全文不许出现 dragover」。
+    """
+    for ev in ("pointerdown", "pointermove", "pointerup", "pointercancel"):
+        assert f'"{ev}"' in APP, f"树上的拖拽没有接 {ev}"
+    assert 'addEventListener("dragstart"' not in APP, "树上的拖拽退回了 HTML5 那套"
+    assert "dataTransfer.setData" not in APP
+    # pointermove / pointerup 必须挂在 document 上：指针拖出卡片之后事件还得收得到，
+    # 否则松手时高亮会永远卡在屏幕上
+    assert 'document.addEventListener("pointermove", onDragMove' in APP
+    assert 'document.addEventListener("pointerup", onDragUp' in APP
+
+
+def test_a_drag_only_starts_after_a_threshold():
+    """没有阈值的话，每一次「点一下选中这个节点」都可能变成一次移动——
+    而移动要写原因、往 note.md 里追加一条永久审计，不是撤销一下就没事的操作。"""
+    m = re.search(r"function onDragMove[\s\S]*?\n  \}\n", APP).group(0)
+    assert "U.beyondSlop" in m, "起拖没有阈值"
+    assert m.index("U.beyondSlop") < m.index("beginDrag()"), "先起拖了才判阈值"
+    assert "var DRAG_SLOP" in APP
+
+
+def test_the_drop_target_is_judged_by_the_same_function_the_dialog_uses():
+    """两套判断迟早会不一致，而不一致的那一刻用户看到的是「能拖，拖完报错」。"""
+    aim = re.search(r"function aimDrag[\s\S]*?\n  \}\n", APP).group(0)
+    assert "U.moveError" in aim, "落点合法性又写了一套"
+    # 落点非法时既不高亮也接不住，而不是松手之后弹错
+    assert "drag.ok = code === \"\"" in aim
+    assert "drag.ok &&" in aim, "非法目标也被高亮成落点了"
+    up = re.search(r"function onDragUp[\s\S]*?\n  \}\n", APP).group(0)
+    assert "if (!d.ok) return;" in up, "非法落点松手之后居然还往下走"
+
+
+def test_a_drag_carries_the_whole_subtree_and_says_how_many():
+    """后端的 move_step 本来就是整棵子树跟着走。拖一棵二十步的子树和拖一个光杆
+    节点在屏幕上长得一模一样，而后果差二十倍——所以那一片必须看得见。"""
+    begin = re.search(r"function beginDrag[\s\S]*?\n  \}\n", APP).group(0)
+    assert "U.subtreeIds" in begin
+    assert '"dsub"' in begin, "跟着走的那一片没有任何标记"
+    ghost = re.search(r"function paintGhost[\s\S]*?\n  \}\n", APP).group(0)
+    assert "drag.carry" in ghost, "没说这一拖带走了几步"
+    assert ".dsub" in CSS
+
+
+def test_dropping_a_step_still_asks_why():
+    """拖拽省掉的是「在下拉框里翻 id」的那十几秒，不是那句原因。
+
+    用户吃过的亏是：没有移动能力时他把两个节点的正文对调来骗过显示，于是 013b 的
+    创建日期和它现在装的内容对不上号，而这件事一条记录都没留下。移动过的树本来
+    就会和创建顺序对不上——那句原因是半年后唯一能解释它的东西。
+    """
+    up = re.search(r"function onDragUp[\s\S]*?\n  \}\n", APP).group(0)
+    assert "openMove(" in up, "拖完直接就写进去了，没有问原因"
+    assert "papi(" not in up, "拖完就发请求了 —— 原因框被跳过了"
+    # 目标由手势填好，焦点落在原因框上
+    om = re.search(r"function openMove[\s\S]*?\n  \}\n", APP).group(0)
+    assert "preset" in om, "拖拽挑好的父节点没有填进对话框"
+    assert '$("#mv-reason").focus()' in om
+
+
+def test_the_drag_never_touches_inputs():
+    """parent 是「我当时接着哪一步想」，inputs 是「这些字节从哪来」。挪了位置
+    就跟着改数据依赖的话，数据流图会跟着树形一起骗人。
+
+    所以数据流视图整个不参与拖拽：那张图画的边就是 inputs，在它上面能拖，人立刻
+    会以为自己在改数据依赖。在那张图上拖，得到的是一句说明，不是一次移动。
+    """
+    down = re.search(r"function onDragDown[\s\S]*?\n  \}\n", APP).group(0)
+    assert 'view === "flow" ? "flow"' in down, "数据流视图上也能拖"
+    mv = re.search(r"function onDragMove[\s\S]*?\n  \}\n", APP).group(0)
+    assert 'drag.kind === "flow"' in mv and "drag.flow" in mv, "在数据流上拖没有任何说明"
+    # 提交出去的 payload 里只有 parent + reason，没有 inputs
+    sm = re.search(r"function submitMove[\s\S]*?\n  \}\n", APP).group(0)
+    assert "inputs" not in sm, "移动的请求里混进了 inputs"
+    assert 'id="mv-dragnote"' in HTML, "对话框上没写明「只改了 parent」"
+
+
+def test_promoting_to_a_root_needs_a_deliberate_drop_zone():
+    """「没落在任何卡片上就当成提为根」是最容易误触发的判定，而误触发的代价是
+    一条永久审计外加一句被逼出来的原因。所以提为根有一条明确的落区。"""
+    assert 'id="droot"' in HTML
+    aim = re.search(r"function aimDrag[\s\S]*?\n  \}\n", APP).group(0)
+    assert "onRoot" in aim
+    # 没落在卡片上、也没落在落区上 = 空白 = 什么都不发生，不是提为根
+    assert '"away"' in aim, "空白处被当成了提为根"
+    assert "#droot { " in CSS or "#droot {" in CSS
+    assert "pointer-events: none" in CSS.split("#droot {")[1].split("}")[0], \
+        "落区会抢走点击 —— 命中与否该由坐标判"
+
+
+def test_a_cancelled_drag_leaves_the_tree_exactly_as_it_was():
+    """取消 / Esc = 什么都没发生。半截的高亮留在屏幕上比没有高亮更糟。"""
+    assert "if (drag && drag.on && e.key === \"Escape\")" in APP, "拖到一半按 Esc 没有出口"
+    end = re.search(r"function endDrag[\s\S]*?\n  \}\n", APP).group(0)
+    for cls in ("dragging", "dsub", "dtarget"):
+        assert cls in end, f"取消之后 {cls} 还留在屏幕上"
+    assert '$("#droot").hidden = true' in end
+    assert '$("#dghost").hidden = true' in end
+    # 别人刚写进来一步 = 树的形状可能变了，而落点判定用的是起拖那一刻的坐标。
+    # 不掐掉的话，人看着 A 松手，落到的是 B——而移动会写下永久审计。
+    live = APP.split("es.onmessage")[1].split("};")[0]
+    assert "cancelDrag" in live, "实时更新会把拖到一半的落点从手底下换掉"
+
+
+def test_read_only_pages_cannot_drag_and_say_why():
+    """静态导出是记录的一张照片。拖不动却不说为什么，人只会认为功能坏了。"""
+    down = re.search(r"function onDragDown[\s\S]*?\n  \}\n", APP).group(0)
+    assert "!canWrite() ? \"ro\"" in down
+    mv = re.search(r"function onDragMove[\s\S]*?\n  \}\n", APP).group(0)
+    assert 'drag.kind === "ro"' in mv and "drag.readonly" in mv
+    # 抓手光标只在写得进去的时候给：给了却抓不动比不给更像坏了
+    assert 'classList.toggle("canwrite", canWrite())' in APP
+    assert "body.canwrite" in CSS
+
+
+def test_the_button_and_dialog_path_survives_untouched():
+    """只能靠拖的功能，对键盘用户等于不存在。"""
+    assert 'if (name === "move") { openMove(selected()); return; }' in APP
+    assert 'id="dlg-move"' in HTML and 'id="mv-parent"' in HTML
+    assert '$("#mv-parent").addEventListener("change", paintMoveErr);' in APP
+
+
+def test_the_drag_highlight_does_not_steal_an_existing_visual_channel():
+    """规格里那条硬约束：一个视觉通道只承载一件事。线型=status，不透明度=祖先链
+    /搜索命中，颜色只作线型的补强，字形标记那一档也满了。所以拖拽只能用
+    outline（画在 border 之外，和 border-style 是两个属性）和两个临时浮层。
+    """
+    block = CSS.split("①b 拖着改父节点")[1].split("/* -------")[0]
+    assert "outline:" in block, "拖拽的高亮没用 outline"
+    assert "border-style:" not in block.split("#droot")[0], "拖拽动了线型 —— 那是 status 的通道"
+    assert "opacity" not in block.split("#droot.off")[0], "拖拽动了不透明度 —— 那是祖先链的通道"
+    # 两个浮层都不许抢点击：命中与否由坐标判
+    assert block.count("pointer-events: none") >= 2
+
+
 # ---------------------------------------------------------------- ② 数据依赖
 
 
@@ -975,3 +1118,38 @@ def test_the_chinese_warnings_really_do_get_translated_on_todays_messages():
     out = {x["code"]: x for x in json.loads(r.stdout)}
     assert out["dangling_input"]["ok"] and out["dangling_input"]["v"] == "404", out
     assert out["self_input"]["ok"] and out["self_input"]["v"] == "003", out
+
+
+# ---------------------------------------------------------------- 拖拽的两处几何
+
+def test_the_drop_target_must_be_somewhere_the_pointer_actually_is():
+    """命中测试之前必须先过一道视口闸门。
+
+    #diagram / #rows 的矩形在滚动时会伸到视口外面去，所以纯坐标换算会把
+    「指针停在顶栏的搜索框上」「指针停在右边的详情面板上」也算成命中——
+    浏览器里实测过：拖到详情面板上，弹出来的新父节点是屏幕上完全看不见的一步。
+    松手就是一次挂到看不见的地方的移动，而移动写的是永久审计。
+    """
+    body = APP[APP.index("function aimAt("):]
+    body = body[:body.index("\n  }") + 4]
+    assert "inScroller" in body.split("\n")[1], "闸门必须是 aimAt 的第一句，不能等换算完再补"
+    assert "withinRect" in APP, "闸门的判据要是可测的纯函数，不许在 DOM 回调里手写一遍"
+
+
+def test_the_page_is_a_column_so_a_tall_warning_bar_cannot_push_the_bottom_off_screen():
+    """main 的高度以前写死成 calc(100% - 41px)——只减了顶栏，没减警告栏。
+
+    于是一有警告，main 就比视口高出警告栏那么多，被顶出屏幕的正是 #left 底部的
+    图例、缩放条，以及拖拽时那条「提为根」的落区。浏览器里量过：警告栏到 60px
+    落区就出视口了，而它是提为根的**唯一**入口——一个只在「项目足够干净」时
+    才存在的功能，比没有更糟。
+    """
+    # 注释里会引用那个旧值来解释这次修复，所以先把注释剥掉再查活代码。
+    live = re.sub(r"/\*.*?\*/", "", CSS, flags=re.S)
+    assert "calc(100% - 41px)" not in live, "别再把顶栏的高度写死进别人的高度里"
+    main = re.search(r"^main \{[^}]*\}", live, re.M)
+    assert main, "找不到 main 的规则"
+    assert "flex: 1" in main.group(0) and "min-height: 0" in main.group(0), \
+        "min-height:0 不能省：flex 项默认不肯缩到内容以下，缺了它 main 照样撑出视口"
+    assert re.search(r"^body \{[^}]*flex-direction: column", live, re.M), \
+        "header / #warnbar / main 要由 body 自己排成一列，谁高谁矮都不用再算"
