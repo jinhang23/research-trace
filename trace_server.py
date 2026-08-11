@@ -600,6 +600,9 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             .replace("__PROJECT__", project)
             .replace("__DATA__", "")
             .replace("__PROJECTS__", "")
+            # 服务模式下那张图按需去 /pipeline/figure.svg 取（同源 fetch），
+            # 所以这里不预灌：它会随记录改变，灌进 HTML 就成了一份会过期的拷贝。
+            .replace("__PIPESVG__", "")
         )
         return Response(html, media_type="text/html; charset=utf-8")
 
@@ -811,6 +814,56 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             "version": state.version,
         })
 
+    # 定稿流程。**读，所以公开**——和 forest / forks 一致。
+    #
+    # 为什么它必须是一条**单独**的路由，而不是让客户端从 forest 里取那个键：
+    # 一个 `result:` 都没声明的项目，forest 里刻意**整个 pipeline 键都不出现**
+    # （现存项目必须完全无感，内核那侧有测试钉着）。于是空态那句「教你怎么办」
+    # 只有主动问起来的这条路上拿得到 —— 而空态恰恰是这个功能最需要说话的时候：
+    # 没有它，用户看到的是一块什么都不说的空面板。
+    #
+    # 派生一次、三个门面共用：这里、MCP 的 trace_pipeline、CLI 的 `pipeline`，
+    # 拼 payload 的是同一个 mcp.pipeline_payload。各拼一遍的话，迟早有一个字段
+    # 在某个门面上分家 —— 而分家的那一份正好是要写进论文的。
+    def _pipeline(project: str, forest: dict) -> dict:
+        # 抬头用显示名而不是目录名：三样导出是要交出去的产物，抬头写着 slug
+        # 的话，收到的人只会以为拿错了文件。
+        name = next((p.name for p in core.scan_projects(data_root) if p.slug == project),
+                    project)
+        return mcp.pipeline_payload(forest, project, core.compute_pipeline({}, []), name)
+
+    @app.get(base + "/api/p/{project}/pipeline")
+    async def api_pipeline(project: str) -> JSONResponse:
+        sd(project)
+        out = _pipeline(project, await state.forest(project))
+        out["version"] = state.version
+        return JSONResponse(out)
+
+    # 两样导出走**服务端**而不是让前端各画一遍。理由不是省事：markdown 和 SVG
+    # 各写一份 Python 一份 JS，两份迟早不一致，**而其中一份会进论文**。
+    # 生成器是纯函数、逐字节确定（P3），所以这两条路由没有缓存、也不需要缓存。
+    @app.get(base + "/api/p/{project}/pipeline/figure.svg", include_in_schema=False)
+    async def api_pipeline_svg(project: str) -> Response:
+        sd(project)
+        svg = mcp.pipeline_svg(_pipeline(project, await state.forest(project)))
+        return Response(svg, media_type="image/svg+xml; charset=utf-8")
+
+    @app.get(base + "/api/p/{project}/pipeline/methods.md", include_in_schema=False)
+    async def api_pipeline_methods(project: str) -> Response:
+        sd(project)
+        md = mcp.pipeline_methods(_pipeline(project, await state.forest(project)))
+        return PlainTextResponse(md, media_type="text/markdown; charset=utf-8")
+
+    # 第三样：能直接发给合作者的那一页（单文件、无脚本、无外部资源）。
+    # 它和上面两条是同一批字节的第三种包装，走同一个纯函数——网页上那个
+    # 「独立页面」按钮就是指到这里，前端一行渲染逻辑都不再有。
+    @app.get(base + "/api/p/{project}/pipeline/page.html", include_in_schema=False)
+    async def api_pipeline_page(project: str) -> Response:
+        sd(project)
+        forest = await state.forest(project)
+        html = mcp.pipeline_page(_pipeline(project, forest))
+        return Response(html, media_type="text/html; charset=utf-8")
+
     @app.get(base + "/api/git")
     async def api_git(request: Request) -> JSONResponse:
         """最近一次 git 自动同步的结果。
@@ -884,6 +937,10 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             # PATCH 一次才写得进去，大概率就永远空着了。
             branch=payload.get("branch", ""),
             decision=payload.get("decision", ""),
+            # 「这一步进不进最终流程」偶尔在动手之前就知道（「拿来试试看的」）。
+            # 不在这里收下，那句**必填**的理由就得等一次 PATCH，而多一道摩擦
+            # 它就永远空着——和 decision 是同一个道理。
+            pipeline=payload.get("pipeline", ""),
         )
         if created:
             await touched([f"{project}/{step.id}"])
@@ -973,6 +1030,48 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
                                    decision=str(payload.get("decision") or ""),
                                    notes=notes)
         await touched([f"{project}/{i}" for i in info["marked"]])
+        return JSONResponse(info)
+
+    # ---- 成果声明 ----------------------------------------------------
+    #
+    # 按步骤 id 增删，**没有「整组替换」这条路**。这不是遗漏：一个用打开页面那一刻
+    # 的旧列表整组提交的表单，会静默删掉这期间 agent 刚声明的那一条——和洞察那边
+    # `_merge_insights` 挡的是同一次事故。要做「编辑成果列表」的界面，请按行发增删。
+    #
+    # 为什么它值得单开一条路由，而不是塞进 PATCH /api/projects 的一个字段：
+    # 它决定的东西比它看起来重得多——重写的是整条定稿流程、论文 Methods 里出现哪几步、
+    # 导出的那张图长什么样。和「改个显示名」走同一个随手的口子，在语义上就把它降级
+    # 成了一个字段；而且它要的校验（步骤必须存在、不能是 dead）得 load 一遍步骤树，
+    # 那是 update_project 够不着的。
+
+    @app.put(base + "/api/p/{project}/results/{sid}")
+    async def api_set_result(project: str, sid: str, request: Request) -> JSONResponse:
+        """把某一步声明成成果（或就地改写它那句说明）。
+
+        悬空的 `result:` 比悬空的 `input:` 后果重得多：后者只是让一条数据边不参与
+        计算（读侧警告一声），前者让整条流程从一个不存在的起点出发，结果是空，
+        而页面上一个字都不报。所以这条校验在写入侧就是硬的（W.set_result 里）。
+        """
+        require_token(request)
+        sd(project)                         # 项目不存在就 404，别把它当成一次成功的写
+        payload = await body_json(request)
+        info = W.set_result(data_root, project, sid, str(payload.get("note") or ""))
+        await touched([f"project:{project}"])
+        return JSONResponse(info, status_code=201 if info.get("created") else 200)
+
+    @app.delete(base + "/api/p/{project}/results/{sid}")
+    async def api_drop_result(project: str, sid: str, request: Request) -> JSONResponse:
+        """撤掉一条成果声明。**不要求写原因**，也不留审计。
+
+        `result:` 不是一段历史，是一个当前指针（「论文现在报的是哪一步」）。撤掉它
+        不销毁任何事实：那一步和它的记录一个字都没动，开发路径上它还在原处。
+        对照之下 move_step 的 reason 是必填的——移动**销毁**了「原来挂在哪」，
+        那条 `moved:` 是它仅存的证据。判据是同一条。
+        """
+        require_token(request)
+        sd(project)
+        info = W.drop_result(data_root, project, sid)
+        await touched([f"project:{project}"])
         return JSONResponse(info)
 
     @app.post(base + "/api/p/{project}/steps/{sid}/paths/check")

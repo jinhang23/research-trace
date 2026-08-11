@@ -643,3 +643,163 @@ def test_mv_says_what_it_did_to_both_forks(forked, capsys):
     cli.cmd_mv(mv_args(id="002b", parent=None, reason="002b 其实是独立的一条线"))
     out = capsys.readouterr().out
     assert "原来那个岔路口 001" in out and "只有一个候选" in out
+
+
+# ------------------------------------------------------------ 定稿流程（result / pipeline）
+#
+# CLI 上两条路径的分工：`check` / `forks` 看的是**开发路径**（全部记录，含走不通的），
+# `pipeline` 看的是**定稿流程**（只有产出成果的那条链，给别人照着做、给论文用）。
+# 这一组防的是：空态说不出话、导出被谁悄悄改成非确定性的、以及诊断混成一栏。
+
+
+def result_args(**kw):
+    return type("A", (), {"project": None, "note": "", "drop": False, **kw})()
+
+
+def pipeline_args(**kw):
+    return type("A", (), {"project": None, "methods": False, "svg": None, "page": None, **kw})()
+
+
+def test_pipeline_without_a_declared_result_teaches_instead_of_scolding(graded, capsys):
+    """没声明成果是**常态**。写成缺陷，人就会随手指一步当成果换一屏干净输出。"""
+    assert cli.cmd_pipeline(pipeline_args()) == 0
+    out = capsys.readouterr().out
+    assert "不是缺陷" in out
+    assert "result -P" in out, "得给出照抄就能用的那条命令，不然这句提示落不了地"
+    assert "错误" not in out
+
+
+def test_declaring_a_result_prints_the_pipeline_it_just_created(graded, capsys):
+    """这个动作真正改变的东西（哪几步进了 Methods、整条链的等级）看不见的话，
+    用户拿到的只是一句干净的「已声明」——而那是它全部后果的零。"""
+    assert cli.cmd_result(result_args(id="002", note="主结果：加了标题字段")) == 0
+    out = capsys.readouterr().out
+    assert "result: 002 | 主结果：加了标题字段" in out
+    assert "定稿流程" in out and "001" in out and "002" in out
+
+
+def test_the_pipeline_level_is_the_weakest_step_on_that_chain(graded, capsys):
+    """一条链值多少看最弱的那一环。不点名就没法照着补。"""
+    cli.cmd_result(result_args(id="002", note="主结果"))
+    capsys.readouterr()
+    assert cli.cmd_pipeline(pipeline_args()) == 0
+    out = capsys.readouterr().out
+    assert "最弱的一步" in out and "001" in out
+
+
+def test_pipeline_diagnostics_are_split_by_consequence_not_by_level(graded, capsys):
+    """三条诊断全是同一个级别，但后果完全不同。混成一栏打，人会以为
+    「还没声明成果」和「你的结果站在一条自己判死的路上」一样严重，
+    然后开始整体略过这一段——那正是警告失效的方式。"""
+    import trace_write as W
+
+    sd = core.steps_dir_of(graded, "第一个课题")
+    # 003 是 dead，让成果的上游穿过它：这是这套推导最该说话的形状。
+    W.create_step(sd, parent="003", title="接着死路做的", status="done",
+                  body="## 为什么\n试\n## 做了什么\n跑\n## 结论\n成了\n",
+                  inputs=["003 | scores.csv"])
+    cli.cmd_result(result_args(id="004", note="主结果"))
+    capsys.readouterr()
+    cli.cmd_pipeline(pipeline_args())
+    out = capsys.readouterr().out
+    assert "影响别人能不能照着做出来" in out
+    assert "003" in out.split("影响别人能不能照着做出来")[1], "踩着的那一步 dead 要指名"
+
+
+def test_check_reports_the_final_pipeline_as_its_own_column(graded, capsys):
+    """check 原来只答得了「开发路径整体多干净」，而投稿前真正要问的是
+    「**产出成果的那条链**别人能不能照着做出来」。两者可以差很远。"""
+    cli.cmd_result(result_args(id="002", note="主结果"))
+    capsys.readouterr()
+    cli.cmd_check(check_args())
+    out = capsys.readouterr().out
+    assert "定稿流程" in out and "001 → 002" in out
+    assert "成果 002" in out
+
+
+def test_check_says_nothing_about_the_pipeline_when_no_result_is_declared(graded, capsys):
+    """现存项目一个 `result:` 都没有。每次 check 都念一遍「你还没声明成果」，
+    人就会为了让输出干净随手指一步——和拿假结论换绿色是同一件事。"""
+    cli.cmd_check(check_args())
+    assert "定稿流程" not in capsys.readouterr().out
+
+
+def test_a_weak_final_pipeline_fails_strict(graded, capsys):
+    """--strict 是给 CI 用的闸门，而「别人照着这条链做不出来」正是它该拦的东西。"""
+    cli.cmd_result(result_args(id="002", note="主结果"))
+    capsys.readouterr()
+    assert cli.cmd_check(check_args(strict=True)) == 1
+
+
+def test_methods_goes_to_stdout_with_nothing_mixed_in(graded, capsys):
+    """这条路的产物是要被 `> methods.md` 收走、粘进稿子的。往 stdout 里混一句
+    提示，就等于往 Methods 的第一段里混一句提示。"""
+    cli.cmd_result(result_args(id="002", note="主结果"))
+    capsys.readouterr()
+    assert cli.cmd_pipeline(pipeline_args(methods=True)) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("# Methods（草稿）")
+    # CLI 自己那几样（流程概览、三栏诊断、「已写出」）一样都不许混进来。
+    # 草稿**里面**那一节「生成时发现的问题」是另一回事：它是给作者看的，
+    # 而且是 markdown 的一部分，作者删掉它就等于确认自己看过了。
+    assert "定稿流程 ·" not in out and "已写出" not in out
+    assert "影响别人能不能照着做出来" not in out
+    assert out.endswith("\n") and not out.endswith("\n\n\n")
+
+
+def test_methods_plus_svg_keeps_the_receipt_off_stdout(graded, tmp_path: Path, capsys):
+    """同时要草稿和图时，文件照写，但那句「已写出」走 stderr。
+
+    两条都不能省：混进 stdout 就等于把一句提示粘进 Methods 的第一段；
+    完全不说，人就不知道自己刚在磁盘上生成了什么。
+    """
+    cli.cmd_result(result_args(id="002", note="主结果"))
+    capsys.readouterr()
+    svg = tmp_path / "fig.svg"
+    assert cli.cmd_pipeline(pipeline_args(methods=True, svg=str(svg))) == 0
+    cap = capsys.readouterr()
+    assert svg.is_file()
+    assert "已写出" not in cap.out and "已写出" in cap.err
+    assert cap.out.startswith("# Methods（草稿）")
+
+
+def test_the_exported_figure_and_page_are_written_and_deterministic(graded, tmp_path: Path, capsys):
+    """P3：同样的记录两次导出逐字节一致。不确定的话，「重新生成」会在 diff 里
+    制造假变更，而人会开始把导出存进仓库当成产物——那就是第二份真相。"""
+    cli.cmd_result(result_args(id="002", note="主结果"))
+    capsys.readouterr()
+    svg, page = tmp_path / "out" / "fig.svg", tmp_path / "out" / "p.html"
+    assert cli.cmd_pipeline(pipeline_args(svg=str(svg), page=str(page))) == 0
+    first = (svg.read_bytes(), page.read_bytes())
+    assert cli.cmd_pipeline(pipeline_args(svg=str(svg), page=str(page))) == 0
+    assert (svg.read_bytes(), page.read_bytes()) == first
+    assert first[0].startswith(b"<svg") and b"<script" not in first[1]
+    assert "逐字节确定" in capsys.readouterr().out, "不说出来，人就会把导出存进仓库"
+
+
+def test_build_ships_a_standalone_pipeline_page_only_when_there_is_one(graded, tmp_path: Path, capsys):
+    """两条路径两个出口：index.html 是开发路径（给自己查问题），
+    pipeline.html 只含定稿流程（能直接发给合作者）。没声明成果就不生成——
+    一页空白的 HTML 比没有这一页更让人困惑。"""
+    out = tmp_path / "site"
+    assert cli.cmd_build(type("A", (), {"out": str(out)})()) == 0
+    page = out / "p" / "第一个课题" / "pipeline.html"
+    assert not page.exists()
+
+    cli.cmd_result(result_args(id="002", note="主结果"))
+    assert cli.cmd_build(type("A", (), {"out": str(out)})()) == 0
+    assert page.is_file()
+    text = page.read_text(encoding="utf-8")
+    assert "<script" not in text and 'src="http' not in text, "发出去的那一页不许引外部资源"
+    assert "回译增强" not in text, "开发路径上那条 dead 不该出现在给别人照着做的那一页里"
+
+
+def test_dropping_a_result_leaves_the_record_untouched(graded, capsys):
+    """`result:` 是当前指针不是历史。撤掉它不销毁任何事实，所以不要求写原因。"""
+    cli.cmd_result(result_args(id="002", note="主结果"))
+    note = next(core.steps_dir_of(graded, "第一个课题").glob("002_*")) / core.NOTE_NAME
+    before = note.read_text(encoding="utf-8")
+    capsys.readouterr()
+    assert cli.cmd_result(result_args(id="002", drop=True)) == 0
+    assert "记录一个字都没动" in capsys.readouterr().out
+    assert note.read_text(encoding="utf-8") == before

@@ -493,8 +493,23 @@ def _readme() -> str:
     return (REPO / "README.md").read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("sub", ["projects", "new-project", "new", "rm", "mv",
-                                 "paths", "tr", "check", "build", "url"])
+def _cli_subcommands() -> list[str]:
+    """**从 argparse 自己身上问**，不再手写一份名单。
+
+    上一版这里是一个 parametrize 字面量，于是它自己就是那种会漂移的中心索引：
+    `result` / `pipeline` 两条新子命令加进来的时候没人想起改它，那道「加了子命令
+    却没人知道」的闸门对新命令**恰好是不设防的**——它只看得见名单里已经有的那些。
+    名单和真相分家，正是这个仓库到处在防的事。
+    """
+    import argparse
+
+    subs = [a for a in C.build_parser()._actions
+            if isinstance(a, argparse._SubParsersAction)]
+    assert subs, "trace_cli 的 argparse 里找不到子命令"
+    return sorted(subs[0].choices)
+
+
+@pytest.mark.parametrize("sub", _cli_subcommands())
 def test_every_cli_subcommand_is_named_somewhere_in_the_readme(sub):
     """`serve` 和 `init` 在「30 秒上手」里，别的都该出现在命令一节。"""
     assert re.search(rf"trace_cli\.py {re.escape(sub)}\b", _readme()), \

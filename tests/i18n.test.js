@@ -795,3 +795,273 @@ test("⑦ 移动一个候选之后说得出两个岔路口各剩下谁", () => {
 test("⑦ 搜索命中「当时在决定什么」时，那一档有名字", () => {
   needKeys(["search.where.fork"], "否则英文界面上原样漏出 fork 这个词");
 });
+
+/* ------------------------------------------------ ⑧ 两条路径：开发路径 / 定稿流程
+ *
+ * 这一组挡的东西和别处不同：⑦ 挡的是「一条边什么意思」，这里挡的是
+ * **「我现在在看哪一条路径」**。一个人第一次看见两个视图，全靠两个名字和各一句话
+ * 分清自己在看什么；分不清的后果不是少读一句解释，是拿开发路径去写论文，
+ * 或者以为定稿流程把自己的记录删掉了一半。
+ */
+
+test("⑧ 两条路径各有名字和一句解释 —— 这两行是全部的关键", () => {
+  needKeys([
+    "app.view.dev", "app.view.dev.title",
+    "app.view.pipeline", "app.view.pipeline.title",
+    "pipeline.name", "pipeline.lead",
+    "pipeline.dev.name", "pipeline.dev.lead",
+    "pipeline.pair.note",
+  ], "两个视图并排站着，名字和那一句话就是读者唯一的分辨依据");
+
+  // 切换器上的名字要短（贴着别的档并排放），解释要真的解释
+  for (const lang of ["en", "zh"]) {
+    for (const k of ["app.view.dev", "app.view.pipeline"]) {
+      assert.ok(one(lang, k).length <= 20, `${lang}.${k} 太长，塞不进视图切换器：${one(lang, k)}`);
+    }
+    for (const k of ["pipeline.lead", "pipeline.dev.lead"]) {
+      assert.ok(one(lang, k).length > 30, `${lang}.${k} 只是个名字，没说这条路径是干什么的`);
+    }
+  }
+});
+
+test("⑧ 两条路径的解释必须点名各自的读者 —— 「给自己查问题」对「给别人照着做」", () => {
+  // 只说「全部记录」和「一条链」的话，人分不出该看哪一个。这套文案的分辨点
+  // 从来不是内容多少，而是**读者是谁**。
+  assert.match(one("en", "app.view.dev.title"), /yourself/i);
+  assert.match(one("en", "app.view.pipeline.title"), /everyone else|someone else|others/i);
+  assert.match(one("zh", "app.view.dev.title"), /给自己/);
+  assert.match(one("zh", "app.view.pipeline.title"), /给别人/);
+});
+
+test("⑧ 「定稿流程不是开发路径的精简版」这句话不许丢", () => {
+  // 它挡的是最容易犯的那个误解：以为两个视图是同一份东西的详略两版，于是
+  // 开始找「为什么这一步被藏起来了」。两者回答的是两个不同的问题。
+  const en = one("en", "pipeline.pair.note"), zh = one("zh", "pipeline.pair.note");
+  assert.match(en, /how you got there/i, "英文里要说出「怎么走到那儿的」");
+  assert.match(en, /what to do/i, "英文里要说出「该怎么做」");
+  assert.match(zh, /怎么走到那儿的|怎么走到这儿的/);
+  assert.match(zh, /该怎么做/);
+  for (const lang of ["en", "zh"]) {
+    assert.ok(one(lang, "pipeline.pair.note").length > 80,
+      `${lang}.pipeline.pair.note 太短，说不清两者不是包含关系`);
+  }
+});
+
+test("⑧ 空状态是门面不是报错：说清是什么、为什么值得声明、怎么声明", () => {
+  // 一个 result 都没声明是绝大多数项目的初始状态，所以这几句是大多数人
+  // 第一次点进定稿流程时唯一会读到的东西。写成「暂无数据」等于这功能没做。
+  needKeys([
+    "pipeline.empty.title", "pipeline.empty.what",
+    "pipeline.empty.why", "pipeline.empty.how", "pipeline.empty.act",
+  ], "没有成果时定稿流程视图上只剩这几句话");
+
+  for (const lang of ["en", "zh"]) {
+    for (const k of ["pipeline.empty.what", "pipeline.empty.why"]) {
+      assert.ok(one(lang, k).length > 60, `${lang}.${k} 太短，回答不了「这是什么、为什么要用」`);
+    }
+    // 「怎么声明」得给出那一行的真实写法，不能只说「去声明一个成果」
+    assert.match(one(lang, "pipeline.empty.how"), /result:/,
+      `${lang}.pipeline.empty.how 没写出 result: 那一行长什么样`);
+  }
+  // 不许写成报错 / 空数据口吻——这是一句邀请，不是一次故障
+  const en = ["title", "what", "why"].map((s) => one("en", "pipeline.empty." + s)).join(" ");
+  const zh = ["title", "what", "why"].map((s) => one("zh", "pipeline.empty." + s)).join(" ");
+  assert.ok(!/\berror\b|\bfail(ed|ure)?\b|\binvalid\b|nothing to show|no data\b/i.test(en),
+    "en 的空状态用了报错口吻：" + en);
+  assert.ok(!/错误|失败|无数据|暂无/.test(zh), "zh 的空状态用了报错口吻：" + zh);
+});
+
+test("⑧ 空状态要指向那个动作 —— {act} 让按钮名和这句话不会各说各的", () => {
+  assert.deepEqual(placeholders(one("en", "pipeline.empty.how")), ["act"]);
+  assert.deepEqual(placeholders(one("zh", "pipeline.empty.how")), ["act"]);
+  needKeys(["pipeline.empty.act"], "空状态那句话里的 {act} 就是它");
+});
+
+test("⑧ 成果：标记 / 取消 / 说明 / 多个成果，都有文案", () => {
+  needKeys([
+    "pipeline.result.head", "pipeline.result.lead",
+    "pipeline.result.entry", "pipeline.result.entry.bare",
+    "pipeline.result.badge", "pipeline.result.badge.title",
+    "pipeline.result.mark", "pipeline.result.mark.title",
+    "pipeline.result.unmark", "pipeline.result.unmark.title",
+    "pipeline.result.prompt", "pipeline.result.multi",
+    "toast.result.marked", "toast.result.unmarked",
+  ], "「哪一步是成果」是唯一声明出来的事，声明它的那套界面缺一环就用不了");
+
+  assert.deepEqual(placeholders(one("en", "pipeline.result.entry")), ["link", "what"].sort());
+  assert.deepEqual(placeholders(one("zh", "pipeline.result.entry")), ["link", "what"].sort());
+  assert.deepEqual(placeholders(one("en", "toast.result.marked")), ["id"]);
+});
+
+test("⑧ 「成员清单不存」要写出来 —— 不然人会去找那个列成员的编辑框", () => {
+  // 存一份成员清单就是中心索引（P1 禁止）。界面不说这件事，人找不到清单
+  // 会以为功能缺了一半，然后自己在正文里手写一份——那正是双真相源。
+  for (const lang of ["en", "zh"]) {
+    assert.ok(one(lang, "pipeline.derived.note").length > 60,
+      `${lang}.pipeline.derived.note 说不清成员是怎么来的`);
+    assert.match(one(lang, "pipeline.derived.note"), /input/,
+      `${lang}.pipeline.derived.note 没说是沿 input 反推的`);
+    assert.match(one(lang, "pipeline.derived.note"), /parent/,
+      `${lang}.pipeline.derived.note 没说没声明输入时退回 parent`);
+    assert.match(one(lang, "pipeline.derived.note"), /dead/,
+      `${lang}.pipeline.derived.note 没说 dead 会被剔掉`);
+  }
+  assert.match(one("en", "pipeline.result.lead"), /written down|declared/i);
+  assert.match(one("zh", "pipeline.result.lead"), /只有这一条是写下来的|其余全是读出来的/);
+});
+
+test("⑧ 「这一步为什么在流程里」四种来路都说得出", () => {
+  // 闭包是算出来的，算出来的东西必须能解释自己——否则用户只能选择相信它。
+  needKeys([
+    "pipeline.why.result", "pipeline.why.input",
+    "pipeline.why.parent", "pipeline.why.include",
+  ], "成果本身 / 被谁当成输入 / 退回 parent / 人手留下的，四种来路");
+  assert.deepEqual(placeholders(one("en", "pipeline.why.input")), ["id"]);
+  assert.deepEqual(placeholders(one("zh", "pipeline.why.parent")), ["id"]);
+});
+
+test("⑧ 两个例外是写在那一步自己身上的，文案要说出这一点", () => {
+  needKeys([
+    "pipeline.include.badge", "pipeline.include.badge.title",
+    "pipeline.exclude.badge", "pipeline.exclude.badge.title",
+    "editor.pipeline.label", "editor.pipeline.auto",
+    "editor.pipeline.include", "editor.pipeline.exclude",
+    "editor.pipeline.hint", "editor.pipeline.note.label",
+    "editor.pipeline.note.placeholder",
+    "toast.pipeline.include", "toast.pipeline.exclude", "toast.pipeline.auto",
+  ], "include/exclude 是每一步自己的声明，和 branch: 同一个套路");
+
+  // 关键那半句：项目上没有清单。不写，人会去项目页找「流程成员」那一栏。
+  assert.match(one("en", "editor.pipeline.hint"), /the project never holds a list|no list/i);
+  assert.match(one("zh", "editor.pipeline.hint"), /不存成员清单|没有清单/);
+  // 默认那一档要摆在最前面并且劝人别动：手工设的是事实，事实会过期
+  for (const lang of ["en", "zh"]) {
+    assert.ok(one(lang, "editor.pipeline.hint").length > 80,
+      `${lang}.editor.pipeline.hint 太短，说不清什么时候才该动它`);
+  }
+});
+
+test("⑧ 「不算流程」不是贬义：它成功了，只是不属于这个方法", () => {
+  // 写成「被排除 / 无效 / 没用上」的话，人会不敢标——于是探索性的步骤全留在
+  // 流程里，Methods 草稿变成一份没人跑得完的清单。
+  for (const lang of ["en", "zh"]) {
+    const badge = one(lang, "pipeline.exclude.badge");
+    assert.ok(!/fail|invalid|useless|error|无效|失败|废|没用/i.test(badge),
+      `${lang}.pipeline.exclude.badge 带贬义：${badge}`);
+  }
+  assert.match(one("en", "pipeline.exclude.badge.title"), /worked/i);
+  assert.match(one("zh", "pipeline.exclude.badge.title"), /成功/);
+});
+
+test("⑧ 两条路径要能互相跳，而且 tooltip 说的是「去那边能看到什么」", () => {
+  needKeys([
+    "pipeline.badge", "pipeline.badge.title",
+    "pipeline.jump.dev", "pipeline.jump.dev.title",
+    "pipeline.jump.final", "pipeline.jump.final.title",
+  ], "「这一步当时有 3 个候选，为什么选了它」正是两条路径都留着的意义");
+
+  // 跳回开发路径的理由必须点名候选：那是这个跳转唯一非有不可的场景
+  assert.match(one("en", "pipeline.jump.dev.title"), /candidate/i);
+  assert.match(one("zh", "pipeline.jump.dev.title"), /候选/);
+  // 徽章要说清它是派生的，没人勾选过
+  assert.match(one("en", "pipeline.badge.title"), /nothing was ticked|not.*stored|worked out/i);
+  assert.match(one("zh", "pipeline.badge.title"), /没有人勾选|算出来|追到的/);
+});
+
+test("⑧ 三条诊断都有文案：没成果 / 流程里有 dead / 流程里有 L0-L1", () => {
+  needKeys([
+    "pipeline.check.head",
+    "pipeline.warn.noresult", "pipeline.warn.dead", "pipeline.warn.weak",
+  ], "这三条是声明一个成果之后白拿的全部收益，缺一条那块面板就只有半句话");
+
+  // 两条要指名道姓：说「流程里有 dead」而不说是哪一步，等于让人自己再找一遍
+  for (const lang of ["en", "zh"]) {
+    assert.deepEqual(placeholders(one(lang, "pipeline.warn.dead")), ["ids", "n"].sort(),
+      `${lang}.pipeline.warn.dead 得说出是哪几步`);
+    assert.deepEqual(placeholders(one(lang, "pipeline.warn.weak")), ["ids", "n"].sort(),
+      `${lang}.pipeline.warn.weak 得说出是哪几步`);
+  }
+});
+
+test("⑧ 「结果依赖着一条自己放弃的路」要让人当回事，但不能像在指责", () => {
+  // 这是这三条里唯一的 warn 级：它多半意味着 dead 标记过期了，也可能意味着
+  // 结果真的立在死胡同上。措辞要说清两种可能都值得现在知道——写成责备，
+  // 人的第一反应会是把那个 dead 标记删掉，那是拿一条假结论换一块绿色。
+  for (const lang of ["en", "zh"]) {
+    assert.ok(one(lang, "pipeline.warn.dead").length > 80,
+      `${lang}.pipeline.warn.dead 太短，说不清这意味着什么`);
+    assert.match(one(lang, "pipeline.warn.dead"), /dead/,
+      `${lang}.pipeline.warn.dead 没点出那一步是 dead`);
+  }
+  assert.match(one("en", "pipeline.warn.dead"), /gave up|abandon/i,
+    "英文里要说出「这是你自己放弃过的路」");
+  assert.match(one("zh", "pipeline.warn.dead"), /放弃/);
+  // 不许指责：主语是结果和记录，不是「你忘了 / 你应该」
+  assert.ok(!/\byou (should|must|forgot|failed)\b/i.test(one("en", "pipeline.warn.dead")),
+    "en.pipeline.warn.dead 像在指责用户：" + one("en", "pipeline.warn.dead"));
+  assert.ok(!/忘了|忘记|应该|必须改|错误/.test(one("zh", "pipeline.warn.dead")),
+    "zh.pipeline.warn.dead 像在指责用户：" + one("zh", "pipeline.warn.dead"));
+  // 两种可能都要摆出来，只说一种就是在替人下结论
+  assert.match(one("en", "pipeline.warn.dead"), /either/i);
+  assert.match(one("zh", "pipeline.warn.dead"), /要么/);
+});
+
+test("⑧ 「投稿前该补哪几步」要说清后果：别人跑不起来", () => {
+  assert.match(one("en", "pipeline.warn.weak"), /L0|L1/);
+  assert.match(one("zh", "pipeline.warn.weak"), /L0|L1/);
+  assert.match(one("en", "pipeline.warn.weak"), /run/i, "英文里要说出「别人跑不起来」");
+  assert.match(one("zh", "pipeline.warn.weak"), /跑不起来|跑不了/);
+});
+
+test("⑧ 流程的等级：整条链一个数、最弱的是谁、这对别人意味着什么", () => {
+  needKeys([
+    "pipeline.level.head", "pipeline.level.note", "pipeline.level.weakest",
+    "pipeline.level.means.L0", "pipeline.level.means.L1", "pipeline.level.means.L2",
+    "pipeline.level.means.L3", "pipeline.level.means.L4",
+  ], "一个数回答「别人能不能照着做出来」，还得指名是哪一步拖的后腿");
+
+  assert.deepEqual(placeholders(one("en", "pipeline.level.weakest")), ["link", "title"].sort());
+  assert.deepEqual(placeholders(one("zh", "pipeline.level.weakest")), ["link", "title"].sort());
+  // 「L2」这三个字对读者没有意义，五句话各自要把它翻成一句关于**别人**的话
+  for (const lang of ["en", "zh"]) {
+    for (const L of ["L0", "L1", "L2", "L3", "L4"]) {
+      const s = one(lang, "pipeline.level.means." + L);
+      assert.ok(s.length > 25, `${lang}.pipeline.level.means.${L} 太短，翻不出「这意味着什么」`);
+    }
+  }
+  assert.match(one("en", "pipeline.level.note"), /weakest/i);
+  assert.match(one("zh", "pipeline.level.note"), /最弱/);
+});
+
+test("⑧ 三个导出各有名字和一句说明，并且说清这是初稿", () => {
+  needKeys([
+    "export.head", "export.lead",
+    "export.figure", "export.figure.note",
+    "export.methods", "export.methods.note",
+    "export.page", "export.page.note",
+    "export.draft.note", "toast.export.ready",
+  ], "图 / Methods 草稿 / 独立页面，三样都要说得出它是什么、能拿去干什么");
+
+  // 最要紧的一句：不要让人以为可以直接投出去
+  for (const lang of ["en", "zh"]) {
+    assert.ok(one(lang, "export.draft.note").length > 60,
+      `${lang}.export.draft.note 太短，挡不住「这份可以直接交」的误会`);
+  }
+  assert.match(one("en", "export.draft.note"), /draft/i);
+  assert.match(one("zh", "export.draft.note"), /初稿/);
+  assert.match(one("en", "export.draft.note"), /read every line|before this goes/i,
+    "英文里要说出「发出去之前自己读一遍」");
+  assert.match(one("zh", "export.draft.note"), /读一遍|发出去之前/);
+  // 图那一条要点明黑白可读：这次不许只靠颜色
+  assert.match(one("en", "export.figure.note"), /black and white|greyscale|grayscale|grey|gray/i);
+  assert.match(one("zh", "export.figure.note"), /黑白|灰度/);
+});
+
+test("⑧ 导出是逐字节确定的，文案要把这件事说出来 —— 它决定了人该不该留拷贝", () => {
+  // P3：视图是文件系统的纯函数。说出来，人才会去重新生成而不是把导出结果
+  // 存进仓库——一份存下来的导出就是第二份真相。
+  assert.match(one("en", "export.lead"), /same bytes|byte-identical/i);
+  assert.match(one("zh", "export.lead"), /逐字节/);
+  assert.match(one("en", "toast.export.ready"), /same bytes|byte-identical/i);
+  assert.match(one("zh", "toast.export.ready"), /逐字节/);
+});

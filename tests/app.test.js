@@ -732,3 +732,120 @@ test("同一层的汇回不许退化成一条直线", () => {
   const slope = U.curveBetween({ x: 0, y: 100 }, { x: 120, y: 260 }, 24);
   assert.ok(/C/.test(slope.d), "不同层时仍然是曲线");
 });
+
+/* ================================================ ⑧ 定稿流程：派生与三样导出
+ *
+ * 这一整块钉的是同一件事的两半：
+ *   派生      —— 成员是算出来的；没声明成果时**什么都不算**（不许造一条空流程）；
+ *   三样导出  —— 从同一份派生长出来、逐字节确定、自包含、不靠颜色说话。
+ */
+
+const TPL = {
+  zh: "## 为什么\n\n\n## 做了什么\n\n\n## 结果\n\n\n## 结论\n\n\n## 下一步\n",
+  en: "## Why\n\n\n## What\n\n\n## Result\n\n\n## Conclusion\n\n\n## Next\n",
+};
+
+test("SECTION_ORDER 的下标就是模板里小节的顺序 —— 错一位，Methods 里就写成了「为什么」", () => {
+  // 「为什么」恰恰是定稿流程唯一不该显示的东西（那是开发路径的事）。
+  assert.deepEqual(U.SECTION_ORDER, ["why", "what", "result", "conclusion", "next"]);
+  assert.equal(U.headingList(TPL.zh)[U.SECTION_ORDER.indexOf("what")], "做了什么");
+  assert.equal(U.headingList(TPL.en)[U.SECTION_ORDER.indexOf("what")], "What");
+});
+
+test("sectionOf 取的是「做了什么」，中英两套小节名各认各的", () => {
+  const zh = "## 为什么\n想验证 X\n\n## 做了什么\n跑了 train.py\n\n## 结果\n0.91\n";
+  assert.equal(U.sectionOf(zh, TPL, "what"), "跑了 train.py");
+  assert.ok(!U.sectionOf(zh, TPL, "what").includes("想验证 X"), "把「为什么」也带进来了");
+  const en = "## Why\nbecause\n\n## What\nran train.py\n\n## Result\n0.91\n";
+  assert.equal(U.sectionOf(en, TPL, "what"), "ran train.py");
+});
+
+test("一节包含它下面更深的标题 —— `### 细节` 不许把「做了什么」切断", () => {
+  const body = "## 做了什么\n第一段\n### 细节\n参数在这里\n\n## 结果\n0.91\n";
+  const what = U.sectionOf(body, TPL, "what");
+  assert.ok(what.includes("参数在这里"), what);
+  assert.ok(!what.includes("0.91"), "同级标题必须结束这一节");
+});
+
+test("认不出小节名时 sectionOf 返回空串，绝不猜", () => {
+  // 一份记录里出现汉字不等于它该被当成中文记录。查表查不到就是查不到。
+  assert.equal(U.sectionOf("随便写的一段话，没有任何小节", TPL, "what"), "");
+});
+
+/* codeBlocks / wrapLabel / labelWidth / xesc 的测试跟着它们一起走了：那四个
+ * helper 只服务浏览器里那份 SVG 和 Methods 生成器，而那份生成器已经删掉了
+ * （三样导出只剩 Python 一份实现）。折行宽度、围栏捞命令这些判断现在长在
+ * trace_mcp 的 _clip / pipeline_methods 里，钉在 tests/test_seams_pipeline.py 上。 */
+
+/* -------------------- 派生 -------------------- */
+
+function fixture() {
+  return {
+    steps: [
+      { id: "001", title: "清洗数据", status: "done", date: "2026-03-01",
+        body: "## 做了什么\n跑了 clean.py\n\n```bash\npython clean.py\n```\n",
+        paths: [{ location: "/blue/lab/clean", role: "output", note: "去重后的训练集",
+                  attrs: { sha256: "aabbccdd" } }],
+        code: [{ kind: "git", location: "c1d2e3f", note: "", attrs: {}, from: "commit" }],
+        inputs: [], pipeline: { member: true, result: false, index: 0, rule: "", note: "" } },
+      { id: "002", title: "试了 focal loss", status: "dead", body: "## 做了什么\n没走通\n",
+        paths: [], code: [], inputs: [{ step: "001", note: "" }] },
+      { id: "003", title: "主模型", status: "done", date: "2026-03-11",
+        body: "## 为什么\n上一步有近重复\n\n## 做了什么\n重训\n\n```bash\npython train.py\n```\n",
+        paths: [{ location: "/orange/lab/best.pt", role: "output", note: "权重", attrs: {} }],
+        code: [{ kind: "snapshot", location: "/orange/lab/snap", note: "",
+                 attrs: { manifest: "MANIFEST.md5" } }],
+        inputs: [{ step: "001", note: "clean.jsonl" }],
+        pipeline: { member: true, result: true, index: 1, rule: "", note: "" } },
+    ],
+    pipeline: {
+      declared: true,
+      results: [{ step: "003", note: "主结果：AUC 0.91", members: ["001", "003"] }],
+      order: ["001", "003"],
+      edges: [{ from: "001", to: "003", kind: "input", via: ["002"], notes: ["clean.jsonl"] }],
+      why: { "001": { kind: "input", id: "003" }, "003": { kind: "result", id: "" } },
+      levels: { "001": "L2", "003": "L1" },
+      level: "L1", weakest: "003", weak: ["003"], dead: ["002"],
+      excluded: [{ step: "002", why: "dead" }], included: [],
+      diagnostics: [],
+    },
+  };
+}
+const OPTS = {
+  title: (s) => s.title || "",
+  what: (s) => U.sectionOf(s.body || "", TPL, "what"),
+  whyText: (w) => (w.kind === "result" ? "声明的成果" : "被 " + w.id + " 当成输入"),
+};
+
+test("一个 result 都没声明时不许凭空造一条流程出来", () => {
+  // 空态是绝大多数项目打开这一档时的第一眼，它必须是「还没声明」，不是
+  // 「这里有一条空流程」——后者会让人以为算错了，转头去找那个列成员的编辑框。
+  const m = U.pipelineModel({ steps: [{ id: "001", title: "x" }] }, OPTS);
+  assert.equal(m.declared, false);
+  assert.deepEqual(m.order, []);
+  assert.deepEqual(m.steps, []);
+});
+
+test("模型只收 core 算出来的成员，dead 的那一步一个字都不进去", () => {
+  const m = U.pipelineModel(fixture(), OPTS);
+  assert.deepEqual(m.order, ["001", "003"]);
+  assert.deepEqual(m.steps.map((s) => s.n), [1, 2]);
+  assert.equal(m.steps[1].result, true);
+  assert.equal(m.steps[1].resultNote, "主结果：AUC 0.91");
+  assert.equal(m.steps[0].level, "L2");
+  assert.equal(m.steps[0].what, "跑了 clean.py\n\n```bash\npython clean.py\n```");
+  assert.ok(!m.order.includes("002"), "被剔掉的 dead 步进了流程");
+});
+
+/* -------------------- 三样导出 --------------------
+ *
+ * 这里曾经有十条测试，钉的是 web/app.js 里那份 SVG / Methods / 独立页面生成器。
+ * 那份生成器**没了**：三样导出只剩 Python 一份实现（trace_mcp 的 pipeline_svg /
+ * pipeline_methods / pipeline_page），CLI、REST、MCP、静态导出和这一页全走它。
+ *
+ * 那十条断言一个都没丢，只是搬了家 —— 自包含、无脚本、黑白打印可读（一个有色相
+ * 的颜色都没有）、虚线要标出路过了谁、Methods 里必须有命令和校验和、不许出现
+ * 论文腔、逐字节确定 —— 现在钉在 tests/test_seams_pipeline.py 上，钉的是真正会
+ * 被发出去的那批字节。留在这里等于对着一个已经不存在的实现做保证。
+ */
+

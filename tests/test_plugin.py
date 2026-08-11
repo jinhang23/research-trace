@@ -240,10 +240,18 @@ MCP_PREFIX = "mcp__plugin_research-trace_trace__"
 # trace_check_paths 归**写**，尽管它读起来像查证：它把 checked= / missing= 写进 note.md。
 # 这一条值得单说——「路径还在不在」正是 auditor 该干的活，但按现在的工具集它够不着，
 # 只能报告给人再由人写回（见报告里的接缝）。
-READ_TOOLS = {"trace_projects", "trace_read", "trace_search", "trace_untranslated", "trace_flow"}
+# trace_pipeline 归读：它把定稿流程算出来（成员清单一个字都不存），一个字节不写。
+# 它对 auditor 尤其要紧——「这个结果别人能不能照着做出来」问的正是**这条链**的
+# 等级，而不是整棵开发路径的等级；只给它开发路径，它会把一堆探索性步骤的缺失
+# 算进结论里，把一条其实很干净的流程报成 L0。
+# trace_result 归**写**，而且是这张表上最重的一个写：它落进 project.md 的那一行
+# 决定整条定稿流程长什么样、论文附录里出现哪几步。auditor 够不着它是对的——
+# 「论文报的是哪一步」不该由一个查证 agent 顺手改掉。
+READ_TOOLS = {"trace_projects", "trace_read", "trace_search", "trace_untranslated",
+              "trace_flow", "trace_pipeline"}
 WRITE_TOOLS = {"trace_new_project", "trace_insight", "trace_delete_step",
                "trace_new_step", "trace_update_step", "trace_move_step",
-               "trace_check_paths", "trace_attach", "trace_translate"}
+               "trace_check_paths", "trace_attach", "trace_translate", "trace_result"}
 
 
 def _split_tools(value) -> list:

@@ -6,12 +6,14 @@ description: "记录与查询科研步骤树（trace 系统，支持多项目）
 # trace — 科研步骤树
 
 **如果 `trace_*` 这组 MCP 工具可用，优先用它们**——参数有 schema、不用自己拼请求、
-中文不会撞终端编码。十四个工具：
+中文不会撞终端编码。十六个工具：
 
 | 工具 | 什么时候用 |
 |---|---|
 | `trace_projects` | 不确定该记到哪个项目时，先调它 |
-| `trace_read` | **动手之前**先读。给 `step` 就读那一步全文 + 溯源链 + L0–L4。缩进树上还会标出互斥候选和**还没做决定的岔路口** |
+| `trace_read` | **动手之前**先读**开发路径**（这棵树的全部）。给 `step` 就读那一步全文 + 溯源链 + L0–L4。缩进树上还会标出互斥候选和**还没做决定的岔路口** |
+| `trace_pipeline` | 读**定稿流程**：产出成果的那条链 + 整链等级 + 最弱的一步 + 诊断。**要复现、要总结、要写 Methods 时用它，不要照着 `trace_read` 那棵树走**（`methods=true` 直接给 Methods 草稿） |
+| `trace_result` | 把某一步声明成**成果**（`drop=true` 撤销）。定稿流程唯一写下来的那件事，其余全是算出来的 |
 | `trace_search` | 「之前是不是试过 X」「为什么放弃了 Y」「`best.pt` 是哪一步产出的」。搜标题/正文/标签/`path:` 与 `code:` 的位置/各语言译文；不给 `project` 就搜全部项目 |
 | `trace_flow` | 顺**数据依赖**看上下游：这个数字是从哪几步算出来的、改了它谁会跟着错 |
 | `trace_new_project` | 建项目。同一个课题的不同尝试是**分叉的步骤**，不是新项目 |
@@ -62,6 +64,7 @@ description: "记录与查询科研步骤树（trace 系统，支持多项目）
 | `code` | 代码在哪：`kind \| 位置 \| k=v`，kind ∈ `git` / `snapshot` / `container`。整组替换；`add_code` 是追加 |
 | `branch` | 这一步和它 parent 之间那条边**什么意思**：`extends`（默认）/ `alternative`（互斥候选）。可带说明：`alternative \| 先试最便宜的那条`。见「岔路口和支线」一节 |
 | `decision` | 这一步**底下那个岔路口在决定什么**。自由文本，写在分叉点身上，不是写在候选身上 |
+| `pipeline` | 这一步**算不算定稿流程的一环**：`include` / `exclude`，用来推翻算出来的结论。**理由必填**（`exclude \| 为什么`）。见「开发路径和定稿流程」一节 |
 | `repro` | 复现记录，**只能追加**。见「复现记录」一节 |
 | `moved` | 只读。这一步被挪过位置的审计，顺序即历史。只有 `trace_move_step` 写得了它 |
 | `digest` | `sha256(note.md 原始字节)[:12]`。用来做冲突检测，见「别覆盖掉别人的写入」 |
@@ -194,6 +197,88 @@ MCP 那边一样：`trace_new_step(..., branch="alternative | 先试最便宜的
 是「其实它不是候选」，`decision: ""` 是撤回那句话，标错了都能改回来。
 完整格式见 `FORMAT.md` 第 15 节。
 
+## 开发路径和定稿流程（**要总结、要复现、要写 Methods 时先看这一节**）
+
+你最容易犯的错是**把开发路径当成唯一真相**：拿整棵树去复现、去总结、去写方法。
+那棵树里有 `dead`（作者判定走不通的路）、有还没决定的岔路口（结论根本还没定），
+照着它写出去的「方法」里混着作者已经放弃的步骤，而且看不出来。
+
+同一个项目有两条路径：
+
+| | **开发路径** | **定稿流程** |
+|---|---|---|
+| 是什么 | 这棵树的**全部**，含 `dead`、含未决的岔路口 | 真正产出成果的那**一条链** |
+| 回答 | 我当初是怎么走到那儿的 | **别人该怎么做** |
+| 什么时候看 | 查问题、「为什么放弃了 X」、追一个数字的来龙去脉 | 复现、总结、写 Methods、给合作者 |
+
+**两条都要留，别去「清理」开发路径。**只留定稿流程的话，「当初为什么排除了另一条路」
+就没人答得上来了——那句话只写在被剔掉的那几步的「结论」里。
+
+### 它是怎么算出来的（别自己再算一遍）
+
+全项目**只有一行**要人写，在 `project.md` 的 front-matter 里，可以重复：
+
+```
+result: 023 | 亲和力预测：AUC 0.91（论文图 3）
+```
+
+其余全部派生：从每个成果沿 `input:` 反向做闭包，**一步没写 `input:` 时退回它的
+`parent`**，剔掉 `dead`，再应用每一步自己的 `pipeline:` 例外。所以：
+
+- **成员清单一个字都不存**，项目上没有、父节点上也没有。别去找那个「编辑流程成员」
+  的字段，也别在正文里自己维护一份「最终流程是 001→013→023」——那就是双真相源，
+  移动一步或补一条 `input:` 之后它立刻过期，而且不会有人发现
+- 谁在流程里、整条流程的等级、哪一步最弱，都由服务端算好给你，**照抄它的结论**
+- **一个 `result:` 都没声明是常态。**这时候推不出定稿流程，`trace_pipeline` 会
+  告诉你怎么办。正确的动作是**问用户哪一步是成果、得到答复之后再调
+  `trace_result`**，不是自己挑一步——那一行是全项目唯一推导不出来的事实，
+  猜错了整份 Methods 就是错的
+
+### 要动流程成员时
+
+先问：**这一步的产物真的进了下游吗？**
+
+- 进了 → 给下游那一步补一条 `add_inputs`（首选，顺带把数据流图也修对了）
+- 没进、但闭包沿 parent 把它拉进来了 → 在**那一步自己**身上写一行
+  `pipeline: exclude | 为什么`
+- 闭包够不到、但它确实是流程的一环（比如一个独立跑的消融） → 那一步身上写
+  `pipeline: include | 为什么`
+
+**理由必填**，只给取值会被拒绝。`exclude` **不带贬义**——探索性的一步成功了、
+有价值、只是没进最终那条链。
+
+### 三条一定要在总结里说出来的
+
+1. **整条流程的等级**（= 成员里最弱的一步）和**是哪一步拖的后腿**。
+   报单步等级答不了「别人能不能重做出这个结果」
+2. **流程里有 `dead` 的一步** —— 必须**点名**。它意味着结果依赖着一条作者自己
+   已经放弃的路：要么那个 `dead` 下错了，要么那条 `input:` 该换一步。
+   注意流程看着仍然是完整的（被剔掉的步骤上游照样接了过来），正因为看着完整，
+   不点名就没人会发现
+3. **流程里 L0/L1 的那几步** —— 别人跑不起来，投稿前该补的就是它们
+
+### 怎么调
+
+```
+trace_pipeline(project="我的课题")                  # 那条链 + 整链等级 + 诊断
+trace_pipeline(project="我的课题", methods=True)    # Methods 草稿（初稿，不是成品）
+
+trace_result(project="我的课题", step="023", note="亲和力预测 AUC 0.91")
+trace_result(project="我的课题", step="023", drop=True)     # 撤销，不需要理由
+
+trace_update_step(project="我的课题", step="018",
+                  pipeline="exclude | 只是看一眼分布，没有产物进下游")
+```
+
+- `trace_result` 会当场拒绝两种写法：指向**不存在**的步骤（悬空的成果让整条流程
+  静默变空，而页面上一个字都不报），以及把 **`dead`** 的一步定成成果。
+  反过来允许——已声明的成果后来被标 `dead` 不拦（那是真会发生的事），
+  由 `trace_pipeline` warn 级点名
+- REST 那边：`GET /api/p/{项目}/pipeline` 读，`PUT` / `DELETE
+  /api/p/{项目}/results/{id}` 写成果声明，`pipeline` 走建步骤和 PATCH 的普通字段
+
+完整格式见 `FORMAT.md` 第 16 节。
+
 ## 产物路径写细一点（`paths`）
 
 最简写法 `位置 | 说明` 一直有效。要让机器读得到就再分段：
@@ -292,6 +377,11 @@ MCP 那边是 `trace_update_step(project=…, step="004", repro="verified | … 
 **等级受依赖制约，而依赖 = `parent` ∪ `inputs`**：001 没记数据在哪，004 写得再全，
 整条链也追不到底；数据依赖同样算数，最弱的那一环可能根本不在 `lineage` 里。
 所以被问到"要不要补记录"时，**从 `weakest` 指的那一步补起**，不是从最新那一步补起。
+
+**还有第三个等级：整条定稿流程的等级**（见「开发路径和定稿流程」）。被问到
+「这个结果别人能不能重做出来」时该报的是它——同样是最弱的一步，但范围是流程的成员，
+而且取每个成员**自己**的等级（整链会把被剔掉的 `dead` 祖先算进来，那些按定义
+不是方法的一部分）。
 
 ## 正文模板
 
@@ -428,12 +518,16 @@ trace_translate(project="我的课题", lang="en",          # 省略 step = 翻�
 
 ### 绝不要往翻译文件里写结构字段
 
-`id` · `parent` · `status` · `date` · `commit` · `author` · `tags` · `path` · `repro` · `key` · `input` · `code` · `moved` · `branch` · `decision`
+`id` · `parent` · `status` · `date` · `commit` · `author` · `tags` · `path` · `repro` · `key` · `input` · `code` · `moved` · `branch` · `decision` · `result` · `pipeline`
 
-这十五个键写进译文会被**一律忽略**，并产出一条警告。最后两个是分叉语义
+这十七个键写进译文会被**一律忽略**，并产出一条警告。`branch` / `decision` 是分叉语义
 （见「岔路口和支线」一节）：`branch` 说的是「这条边什么意思」、`decision` 说的是
 「这个岔路口在问什么」，两者都是结构。`decision` 那句话读起来很像该翻译的东西，
 但它现在没有译文通道——写在 `note.md` 里。
+
+最后两个后果更重：`result` / `pipeline` 决定**哪些步骤进定稿流程**（见
+「开发路径和定稿流程」一节）。译文里各写一份，中文页面和英文页面会导出两条不同的
+Methods，而两边看着都像对的。
 
 **理由不是洁癖。**上一代系统就是死在双真相源上：同一个事实存在两个地方，
 写一处漏一处，页面上永远有一半是错的。要改状态、改 commit、加 `repro`，
@@ -482,12 +576,16 @@ Base = `TRACE_URL`（形如 `https://你的域名/t/<space>`）。
 | GET | `/api/p/{项目}/steps/{id}` — 含 `lineage` `files` `backlinks` `trace` `digest` | — |
 | GET | `/api/search` — 跨项目搜索，`?q=` 或 `?query=` | — |
 | GET | `/api/p/{项目}/untranslated` — 还欠哪些译文，`?lang=en` | — |
+| GET | `/api/p/{项目}/pipeline` — **定稿流程**：那条链、整链等级、最弱的一步、诊断 | — |
+| GET | `/api/p/{项目}/pipeline/figure.svg`、`…/methods.md`、`…/page.html` — 三样导出。**只有这一份实现**，网页和 CLI 拿到的是同一批字节 | — |
+| PUT | `/api/p/{项目}/results/{id}` — 声明成果 `{note}`；新建回 201，就地改写回 200 | Bearer |
+| DELETE | `/api/p/{项目}/results/{id}` — 撤销一条成果声明，不要求写原因 | Bearer |
 | GET | `/api/status` — 版本、项目数、步骤数、git 同步状态、`write_protected` | — |
 | GET | `/api/git` — 自动 git 同步的状态（`ok` / `summary` / `hint`） | — |
 | POST | `/api/projects` — `{name}` | Bearer |
 | PATCH | `/api/projects/{项目}` — `{name}` / `{insights}` / `{add_insight:{kind,text,supersedes?}}` 追加并回 id / `{add_insight:{id,text?}}` 就地改 | Bearer |
-| POST | `/api/p/{项目}/steps` — `{parent, title, status, body, date, commit, author, key, tags, paths, inputs, code, lang}` | Bearer |
-| PATCH | `/api/p/{项目}/steps/{id}` — `status` `title` `body` `date` `commit` `author` `tags` `lang` `paths` `inputs` `code` `add_paths` `add_repro` `add_inputs` `add_code`；可带 `expect` | Bearer |
+| POST | `/api/p/{项目}/steps` — `{parent, title, status, body, date, commit, author, key, tags, paths, inputs, code, lang, branch, decision, pipeline}` | Bearer |
+| PATCH | `/api/p/{项目}/steps/{id}` — `status` `title` `body` `date` `commit` `author` `tags` `lang` `paths` `inputs` `code` `branch` `decision` `pipeline` `add_paths` `add_repro` `add_inputs` `add_code`；可带 `expect` | Bearer |
 | PATCH | `/api/p/{项目}/steps/{id}` — **移动**：`{parent, reason}`，`reason` 必填且这一次请求里不能夹带别的字段 | Bearer |
 | POST | `/api/p/{项目}/steps/{id}/paths/check` — `{loc, exists, date?, size?, n?}`，`exists` 必须显式 true/false | Bearer |
 | DELETE | `/api/p/{项目}/steps/{id}` — `{reason}` 必填 | Bearer |
@@ -561,6 +659,12 @@ call("PATCH", p(f"/steps/{step['id']}"), {"status": "done", "expect": step["dige
 - 不要在父节点上写一份候选清单，也不要另存一个「选中了谁」的字段——
   「这一组有谁」是扫出来的，「选了哪个」是其余候选标 `dead` 派生出来的。
   也不要把「C 的产物后来汇回 A 线」标成 `branch`：那是一条 `inputs`
+- **不要拿整棵树当方法。**要复现、要总结、要写 Methods 时看的是**定稿流程**
+  （见「开发路径和定稿流程」）——开发路径里有 `dead`、有还没决定的岔路口。
+  也不要在正文或洞察里自己维护一份「最终流程是 001→013→023」：成员是算出来的，
+  手抄一份就是双真相源，补一条 `input:` 之后它立刻过期
+- **没有 `result:` 时不要自己挑一步当成果。**问用户。那一行是全项目唯一
+  推导不出来的事实，挑错了整份 Methods 都是错的
 - 不要手写 `path` 的 `checked=` / `missing=`：那两个日期的意思是「**真去看过**」。
   去核对用 `trace_check_paths`，够不着的时候什么都别写
 - 不要因为一条洞察说得不准就再写一条相似的：给 id 就地改，或者带 `supersedes` 取代它

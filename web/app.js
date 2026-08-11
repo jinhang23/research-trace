@@ -780,6 +780,131 @@
     return got;
   }
 
+  /* ================================================ ⑧ 定稿流程：第二样东西
+   *
+   * 开发路径 = 现在这棵树的**全部**（含走不通的、含还悬着的岔路口），给自己查问题用。
+   * 定稿流程 = 真正把成果做出来的**那条链**，给别人照着做、给论文 Methods 用。
+   *
+   * 它**不是第四种画法**。图 / 列表 / 数据流是同一批步骤的三张图；定稿流程画的是
+   * 另一批步骤（trace_core 从 `result:` 沿 `input:` 反向做闭包算出来的子图）。
+   * 把它塞进同一排按钮，等于对读者说「这是同一件事的另一种排版」——而那正是
+   * i18n 的 pipeline.pair.note 专门写来挡的那个误解。
+   *
+   * 这一层做两件事，一件都不碰 DOM：
+   *   1) 把 forest.pipeline 整理成一份模型（pipelineModel），供这一屏渲染；
+   *   2) 从正文里取出「做了什么」（sectionOf）。
+   *
+   * **三样导出（SVG 图 / Methods 草稿 / 独立页面）在这里一份都没有，这是有意的。**
+   * 它们只有**一份**实现，在 Python 那一侧（trace_mcp 的 pipeline_svg /
+   * pipeline_methods / pipeline_page），CLI、REST、MCP、静态导出全走它。
+   * 这一页拿到的是那份实现的产物：服务模式下 fetch `/api/p/{项目}/pipeline/*`，
+   * 静态模式下读 `build` 灌进来的同一批字节。
+   *
+   * 曾经这里有第二份（JS 各画一遍 SVG 和 markdown）。两份实现看起来都对，
+   * 输出却是两份不同的文件：屏幕上讨论的是一张图，投出去的是另一张，
+   * 而**其中一份会进论文**。谁的排版更好看不是这条规矩要解决的问题——
+   * 「只有一份」本身才是。
+   */
+
+  /* 正文那五个小节的**语义键**，顺序逐字对着 trace_core.SECTION_NAMES。
+     这里存的是英文键名（why/what/…），不是小节标题——标题是封闭词表里的中文/英文，
+     由 i18n 的 template.body 提供（和 langByHeadings 走同一张表）。
+     tests/test_web.py 拿 trace_core 逐字核过这个顺序：错一位，Methods 草稿里
+     「做了什么」就会变成「为什么」，而那正是定稿流程唯一不该说的东西。 */
+  var SECTION_ORDER = ["why", "what", "result", "conclusion", "next"];
+
+  function headingList(body) {
+    var out = [];
+    String(body == null ? "" : body).split("\n").forEach(function (line) {
+      var m = HEADING_RE.exec(line);
+      if (m) out.push(m[1]);
+    });
+    return out;
+  }
+
+  /* 取出正文里某一节的内容。**只查表，不猜语种**：先用 langByHeadings 认出这份
+     正文用的是哪一套小节名，再按 SECTION_ORDER 的下标去那一套里取标题。
+     一节的内容包含它下面所有更深的标题（和 trace_core.sections() 同一套层级语义），
+     所以 `### 细节` 不会把「做了什么」切断。 */
+  function sectionOf(body, templates, key) {
+    var at = SECTION_ORDER.indexOf(key);
+    if (at < 0) return "";
+    var l = langByHeadings(body, templates);
+    if (!l) return "";
+    var want = headingList((templates || {})[l] || "")[at];
+    if (!want) return "";
+    var lines = String(body == null ? "" : body).split("\n");
+    var out = [], on = false, lv = 0;
+    for (var i = 0; i < lines.length; i++) {
+      var m = HEADING_RE.exec(lines[i]);
+      if (m) {
+        var d = (/^\s*(#{1,6})/.exec(lines[i]))[1].length;
+        if (on && d <= lv) break;
+        if (!on && m[1].trim() === want) { on = true; lv = d; continue; }
+      }
+      if (on) out.push(lines[i]);
+    }
+    return out.join("\n").replace(/^\n+|\n+$/g, "");
+  }
+
+  /* forest.pipeline → 三个出口共用的一份模型。
+   *
+   * `forest.pipeline` **只在项目声明了 `result:` 时才存在**（现存项目必须完全无感），
+   * 所以第一件事是老实返回 declared:false，让界面走空态——而不是造一个空流程
+   * 假装什么都算过了。
+   *
+   * opts 里那三个函数把「语言」挡在这一层之外：标题要跟界面语言走、「做了什么」
+   * 要按内容语言取、「凭什么在流程里」是一句 i18n 文案。纯函数层持有界面文案，
+   * 就等于让它替界面决定说哪种语言（和文件头那条规矩同一条）。 */
+  function pipelineModel(forest, opts) {
+    opts = opts || {};
+    var title = opts.title || function (s) { return (s && s.title) || ""; };
+    var what = opts.what || function () { return ""; };
+    var whyText = opts.whyText || function () { return ""; };
+    var P = (forest && forest.pipeline) || null;
+    var byId = Object.create(null);
+    ((forest && forest.steps) || []).forEach(function (s) { byId[s.id] = s; });
+    var empty = {
+      declared: false, order: [], steps: [], edges: [], results: [], why: {},
+      levels: {}, level: "", weakest: "", weak: [], dead: [], included: [], excluded: [],
+      diagnostics: (P && P.diagnostics) || [],
+    };
+    if (!P || !P.declared) return empty;
+    var noteOf = Object.create(null);
+    (P.results || []).forEach(function (r) { noteOf[r.step] = r.note || ""; });
+    var levels = P.levels || {}, why = P.why || {};
+    var steps = (P.order || []).map(function (id, i) {
+      var s = byId[id] || { id: id };
+      var w = why[id] || { kind: "", id: "" };
+      return {
+        id: id, index: i, n: i + 1, step: s,
+        title: title(s),
+        level: levels[id] || "",
+        why: w, whyText: whyText(w),
+        result: id in noteOf,
+        resultNote: noteOf[id] || "",
+        what: what(s),
+      };
+    });
+    return {
+      declared: true,
+      order: (P.order || []).slice(),
+      steps: steps,
+      edges: (P.edges || []).map(function (e) {
+        return { from: e.from, to: e.to, kind: e.kind || "",
+                 via: (e.via || []).slice(), notes: (e.notes || []).slice() };
+      }),
+      results: (P.results || []).map(function (r) {
+        return { step: r.step, note: r.note || "", members: (r.members || []).slice() };
+      }),
+      why: why, levels: levels,
+      level: P.level || "", weakest: P.weakest || "",
+      weak: (P.weak || []).slice(), dead: (P.dead || []).slice(),
+      included: (P.included || []).slice(), excluded: (P.excluded || []).slice(),
+      diagnostics: P.diagnostics || [],
+    };
+  }
+
   var U = {
     LEVELS: LEVELS, REPRO_STATES: REPRO_STATES, INSIGHT_HEADINGS: INSIGHT_HEADINGS,
     INSIGHT_KIND_BY_HEADING: INSIGHT_KIND_BY_HEADING, SUPERSEDE_WORDS: SUPERSEDE_WORDS,
@@ -800,6 +925,8 @@
     forkBracket: forkBracket, forkLabel: forkLabel, curveBetween: curveBetween,
     rejoinCurve: rejoinCurve, railRejoin: railRejoin,
     rejoinRelated: rejoinRelated, groupOf: groupOf,
+    SECTION_ORDER: SECTION_ORDER, headingList: headingList, sectionOf: sectionOf,
+    pipelineModel: pipelineModel,
   };
   global.traceUtil = U;
   if (typeof module !== "undefined" && module.exports) module.exports = U;
@@ -846,6 +973,11 @@
   var F = { steps: [], order: [], lanes: {}, lane_count: 0, warnings: [], row_h: 28, lane_w: 14,
             tree: { nodes: {}, w: 0, h: 0, node_w: 176, node_h: 58 } };
   var IDX = {};
+  /* 编译了第几次。定稿流程那张图是**服务端画的**，取回来之后得知道手上这份对不对
+     得上当前的记录 —— 一张过期的方法图会被当成现在的方法图，那比没有图糟。
+     用它而不是 forest 里的版本号：`/forest` 的响应里没有版本这一项，拿 undefined
+     当版本会让缓存永远命中，于是改完一步图再也不更新。 */
+  var FOREST_SEQ = 0;
   var PROJECTS = [];
   var query = "";
   var editing = false;
@@ -860,6 +992,13 @@
   var VIEWS = ["graph", "list", "flow"];
   var view = VIEWS.indexOf(savedView) >= 0 ? savedView
     : (window.innerWidth && window.innerWidth < NARROW ? "list" : "graph");
+  /* 看的是**哪一份东西**：开发路径（这棵树的全部）还是定稿流程（产出成果的那条链）。
+     它和 view 是两级，不是四选一——理由写在 index.html 的 #modeswitch 那段注释里。
+     默认永远是开发路径：绝大多数项目一个 `result:` 都没声明，把人直接丢进一个
+     空态页面，等于让这个功能的第一印象是「这里什么都没有」。 */
+  var MODES = ["dev", "pipeline"];
+  var savedMode = localStorage.getItem("trace.mode");
+  var mode = MODES.indexOf(savedMode) >= 0 ? savedMode : "dev";
   var zoom = 1;
 
   var IMG = /\.(png|jpe?g|gif|webp|svg|bmp|avif)$/i;
@@ -1111,6 +1250,7 @@
 
   function apply(data) {
     F = data;
+    FOREST_SEQ++;                       // 记录变了 —— 那张图得重新去取，缓存的那份已经过期（见 fetchFigure）
     IDX = Object.create(null);
     F.steps.forEach(function (s) { IDX[s.id] = s; });
     document.documentElement.style.setProperty("--row-h", (F.row_h || 28) + "px");
@@ -1121,6 +1261,7 @@
     renderWarnings();
     renderMissingPaths();
     renderForks();
+    renderPipeline();
     applyView();
     onHash();
   }
@@ -1130,6 +1271,9 @@
       PROJECTS = d.projects || [];
       renderProjects();
       if (!PROJECT) { renderHome(); return; }
+      // 这一屏里也用得上项目名（面包屑、空态），而项目名在 PROJECTS 里、比 forest
+      // 晚到。图本身的抬头不再受这个影响——它由服务端画，服务端手上一直有显示名。
+      if (!editing) renderPipeline();
       // 洞察面板是从 PROJECTS 里读的，而它比 forest 晚到。
       // 不在这里重画一次的话，第一次打开项目看到的就是个空框。
       if (!selected() && !editing) renderDetail();
@@ -1537,6 +1681,18 @@
       out += '<span class="cmk gone" title="' + esc(i18n.t("path.summary.missing", { n: gone }))
         + '">⊘' + (gone > 1 ? gone : "") + "</span>";
     }
+    /* 开发路径上的回指：这一步也在定稿流程里，而且是第几步。
+       仍然是**字形**这个第四通道——线型归 status、不透明度归祖先链/搜索命中、
+       颜色归三种关系，一个都没借。方括号里的数字和那张图上、Methods 草稿里的
+       编号是同一个，于是两条路径互相指得回去。
+       `s.pipeline` 只在项目声明了成果时才存在（现存项目完全无感）。 */
+    var pl = s.pipeline;
+    if (pl && pl.member) {
+      var num = (pl.index === null || pl.index === undefined) ? "" : String(pl.index + 1);
+      out += '<span class="cmk pipe" title="'
+        + esc(i18n.t(pl.result ? "pipeline.result.badge.title" : "pipeline.badge.title"))
+        + '">[' + esc(num) + "]</span>";
+    }
     return out;
   }
 
@@ -1567,6 +1723,24 @@
     /* `branch:` 拼错时 core 报的降级提醒。没有这一条的时候它会退回 esc(w.message)，
        也就是在英文界面上原样漏出一整句中文——而这条恰恰是给写错字的人看的。 */
     bad_branch: { key: "lint.branch.unknown", take: ["branch"] },
+    /* 定稿流程那三条判断。它们走的是 forest.pipeline.diagnostics，**不进警告栏**
+       （见 pipeChecks），但换文案用的是同一张表——同一个 code 在两处说两句不同的
+       话，比漏翻还糟。带变量的一律 take（core 已经把 ids 拼成了一个字符串、
+       n 是数字），绝不从中文句子里抠。 */
+    pipeline_no_result: { key: "pipeline.warn.noresult" },
+    pipeline_dead_step: { key: "pipeline.warn.dead", take: ["n", "ids"] },
+    pipeline_weak_step: { key: "pipeline.warn.weak", take: ["n", "ids"] },
+    /* core 发的是**七**条，上面只有三条时剩下四条在英文界面上原样漏出中文——
+       退回 esc(w.message) 那条兜底是对的（绝不吞警告），但漏出来的恰好是四条
+       「记录里两句话打架」，也就是最需要人读懂的那几条。 */
+    pipeline_excluded_consumed: { key: "pipeline.warn.excluded.consumed", take: ["n", "id", "ids"] },
+    pipeline_excluded_result: { key: "pipeline.warn.excluded.result", take: ["id"] },
+    pipeline_cycle: { key: "pipeline.warn.cycle", take: ["n", "ids"] },
+    dangling_result: { key: "pipeline.warn.dangling", take: ["id"] },
+    /* `pipeline:` 写错取值时 core 的降级提醒。走的是 forest.warnings（不是
+       pipeline.diagnostics），和 bad_branch 并排——它只在有人真写了这一行时才出现，
+       而那个人正是最需要读懂这句话的人。 */
+    bad_pipeline: { key: "lint.pipeline.unknown", take: ["pipeline"] },
   };
   /* w.vars 里那个值，取成字符串。**不许只认 string**：core 的
      validate_branches 发的是 {"n": len(options)}，那是个**数字**，
@@ -1577,32 +1751,40 @@
     if (v === undefined || v === null || v === "") return "";
     return String(v);
   }
-  /* 出的是 HTML：这些文案里有 `行内代码` 和 **粗体**，走 t() 的话反引号会原样
-     显示给用户看。认不出来时退回服务端那句中文，那一条要 esc——它是别处来的字节。 */
-  function warnText(w) {
+  /* 选出这一条警告该用哪条文案、带哪些变量。认不出来返回 null（调用方退回
+     服务端原句）。抽出来是因为同一条判断现在有两个出口：屏幕上那条走 tHtml
+     （文案里有 `行内代码` 和 **粗体**），Methods 草稿和独立页面走 t()。
+     两处各写一遍的话，同一条诊断在页面上和在导出里会说成两句不同的话。 */
+  function warnPick(w) {
     var m = WARN_MAP[w.code];
-    if (!m || !i18n.has(m.key)) return esc(w.message);
+    if (!m || !i18n.has(m.key)) return null;
     if (m.take) {
       var got = {}, ok = true;
       m.take.forEach(function (k) {
         var v = warnVar(w, k);
         if (!v) ok = false; else got[k] = v;
       });
-      return ok ? i18n.tHtml(m.key, got) : esc(w.message);
+      return ok ? { key: m.key, vars: got } : null;
     }
-    if (!m.pick) return i18n.tHtml(m.key);
+    if (!m.pick) return { key: m.key, vars: {} };
     var vars = {};
     var direct = warnVar(w, m.as);
     if (direct) {
       vars[m.as] = direct;
     } else {
       var hit = m.pick.exec(w.message || "");
-      if (!hit) return esc(w.message);
+      if (!hit) return null;
       vars[m.as] = hit[1].trim();
     }
-    return i18n.tHtml(m.key, vars);
+    return { key: m.key, vars: vars };
   }
-
+  /* 出的是 HTML：这些文案里有 `行内代码` 和 **粗体**，走 t() 的话反引号会原样
+     显示给用户看。认不出来时退回服务端那句中文，那一条要 esc——它是别处来的字节。 */
+  function warnText(w) {
+    var got = warnPick(w);
+    if (!got) return esc(w.message);
+    return i18n.tHtml(got.key, got.vars);
+  }
   function renderWarnings() {
     var bar = $("#warnbar"), ws = F.warnings || [];
     bar.hidden = !ws.length;
@@ -1664,16 +1846,291 @@
         }).join(" ·");
   }
 
+  /* ======================================================== ⑧ 定稿流程视图
+   *
+   * 这一档画的是**另一批步骤**：trace_core 从 project.md 的 `result:` 出发、沿
+   * `input:` 反向做闭包算出来的那条链（够不着输入时退回 parent，dead 剔掉）。
+   * 成员清单一个字都不存，所以移动一步、补一条 input、把某支标 dead，它自己就变。
+   *
+   * 它要**看起来像一张方法图，不像一棵树**：没有岔路口、没有 dead、没有「我当时
+   * 为什么试这个」。每一步显示的东西全部按「别人照着做」来挑——做了什么、命令、
+   * 代码位置、产物和校验和、这一步的等级。「为什么试这个」是开发路径的事，
+   * 那条路径一步都没删，一个按钮就跳得回去。
+   *
+   * 屏幕上那张图和导出的 SVG 是**同一个出口的同一份字节**（exportURL("figure")）：
+   * 让屏幕一张、发出去另一张，等于对着一张图讨论、拿另一张去投稿。
+   */
+  var PIPE = { declared: false, order: [], steps: [], results: [], diagnostics: [] };
+
+  /* 「这一步凭什么在流程里」。四选一的枚举由 core 给（result / include / input /
+     parent），这里只负责说成话；认不出来的取值就不说——编一句比不说更糟。 */
+  function pipeWhy(w) {
+    var key = "pipeline.why." + ((w && w.kind) || "");
+    return i18n.has(key) ? i18n.t(key, { id: (w && w.id) || "" }) : "";
+  }
+
+  /* 把 forest.pipeline 整理成这一屏和三样导出**共用**的那一份模型。
+     标题跟界面语言走、「做了什么」按内容语言从正文里取——两件事都在这里做完，
+     纯函数层（U.pipelineModel）一个字的界面文案都不持有。 */
+  function buildPipeline() {
+    PIPE = U.pipelineModel(F, {
+      title: stepTitle,
+      what: function (s) { return U.sectionOf(stepBody(s), templates(), "what"); },
+      whyText: pipeWhy,
+    });
+    return PIPE;
+  }
+
+  function pipeLevelLine() {
+    var m = PIPE;
+    return m.level ? m.level + " " + levelName(m.level) : "";
+  }
+  function pipeMeans() {
+    var key = "pipeline.level.means." + PIPE.level;
+    return PIPE.level && i18n.has(key) ? i18n.t(key) : "";
+  }
+  function pipeWeakestLine() {
+    var w = PIPE.weakest && IDX[PIPE.weakest];
+    return w ? i18n.t("pipeline.level.weakest", { link: w.id, title: stepTitle(w) }) : "";
+  }
+
+  /* 空态。绝大多数项目打开定稿流程看到的就是这一屏，所以它按「是什么 / 为什么
+     值得声明 / 怎么声明 / 去声明」四段写，而且第三段里就是那一行 `result:` 的
+     真实写法——按钮这条路要服务端配合（见接口说明），而在项目笔记里手写一行
+     永远有效，那一条不能只藏在文档里。 */
+  function pipeEmpty() {
+    return '<div class="pdoc pempty">'
+      + '<h2 class="viewtitle">' + esc(i18n.t("pipeline.empty.title")) + "</h2>"
+      + '<p class="viewlead">' + i18n.tHtml("pipeline.empty.what") + "</p>"
+      + '<p class="viewlead">' + i18n.tHtml("pipeline.empty.why") + "</p>"
+      + '<p class="viewlead">'
+      + i18n.tHtml("pipeline.empty.how", { act: i18n.t("pipeline.empty.act") }) + "</p>"
+      + (canWrite()
+          ? '<p class="pacts"><button class="primary" data-act="result-mark" title="'
+            + esc(i18n.t("pipeline.result.mark.title")) + '">'
+            + esc(i18n.t("pipeline.empty.act")) + "</button></p>"
+          : "")
+      + '<p class="viewlead quiet">' + i18n.tHtml("pipeline.pair.note") + "</p>"
+      + "</div>";
+  }
+
+  function pipeResults() {
+    var m = PIPE;
+    if (!m.results.length) return "";
+    return '<div class="sec presults"><h3>'
+      + esc(i18n.t("pipeline.result.head", { n: m.results.length })) + "</h3>"
+      + '<p class="dropnote deplead">' + i18n.tHtml("pipeline.result.lead") + "</p>"
+      + '<ul class="deplist">' + m.results.map(function (r) {
+          var link = '<a href="#' + esc(r.step) + '" data-pgoto="' + esc(r.step) + '">'
+            + esc(r.step) + "</a>";
+          return "<li>" + (r.note
+            ? i18n.tHtml("pipeline.result.entry", { link: { html: link }, what: r.note })
+            : i18n.tHtml("pipeline.result.entry.bare", { link: { html: link } })) + "</li>";
+        }).join("") + "</ul>"
+      + (m.results.length > 1
+          ? '<p class="dropnote">' + esc(i18n.t("pipeline.result.multi")) + "</p>" : "")
+      + "</div>";
+  }
+
+  /* 整条流程的可溯源等级 —— 一个数回答「别人能不能照着做出来」，并**指名**
+     是哪一步拖的后腿（可点，跳到这一屏里那一步的卡片）。 */
+  function pipeLevel() {
+    var m = PIPE;
+    if (!m.level) return "";
+    var w = m.weakest && IDX[m.weakest];
+    var weak = w
+      ? '<p class="lvcap">' + i18n.tHtml("pipeline.level.weakest", {
+          link: { html: '<a href="#' + esc(w.id) + '" data-pgoto="' + esc(w.id) + '">'
+            + esc(w.id) + "</a>" },
+          title: stepTitle(w),
+        }) + "</p>"
+      : "";
+    return '<div class="sec plevel"><h3>' + esc(i18n.t("pipeline.level.head")) + "</h3>"
+      + '<div class="lvrow">' + lvChip(m.level) + "</div>"
+      + '<p class="lvmean">' + esc(pipeMeans()) + "</p>"
+      + weak
+      + '<p class="dropnote">' + esc(i18n.t("pipeline.level.note")) + "</p></div>";
+  }
+
+  /* 三条判断，写论文前最想知道的那几件事。它们**只在这里**说，绝不进顶栏的
+     警告栏（forest.pipeline.diagnostics 和 forest.warnings 是两份东西）：
+     定稿流程的事让每个项目每次打开都多一条顶栏提示，人很快连真警告一起不看了。 */
+  function pipeChecks() {
+    var ds = PIPE.diagnostics || [];
+    if (!ds.length) return "";
+    return '<div class="sec pchecks"><h3>' + esc(i18n.t("pipeline.check.head")) + "</h3>"
+      + ds.map(function (w) {
+          var lv = w.level === "info" ? "info" : U.warnLevel(w);
+          return '<div class="wrow w-' + esc(lv) + '">'
+            + (lv === "info" ? "· " : "⚠ ")
+            + "<b>" + esc(w.where || w.code) + "</b> — " + warnText(w) + "</div>";
+        }).join("") + "</div>";
+  }
+
+  /* 三样导出的地址。**它们是同一份生成器的三个出口**，这一页一笔都不画。
+     服务模式走那三条只读路由；静态导出没有服务端，走 `build` 写在同目录的三个
+     文件（figure 那一份还被灌进了页面本身，见 PIPE_SVG）。
+     两条路拿到的都是 trace_mcp 里 pipeline_svg / pipeline_methods / pipeline_page
+     的输出——**屏幕上看到的就是发出去的那批字节**。 */
+  var EXPORT_FILE = { figure: "pipeline.svg", methods: "pipeline.md", page: "pipeline.html" };
+  var EXPORT_ROUTE = { figure: "figure.svg", methods: "methods.md", page: "page.html" };
+  function exportURL(kind) {
+    if (!EXPORT_FILE[kind]) return "";
+    if (MODE === "static") return EXPORT_FILE[kind];
+    return BASE + "/api/p/" + encodeURIComponent(PROJECT) + "/pipeline/" + EXPORT_ROUTE[kind];
+  }
+
+  /* 那张图的字节。静态导出里 `build` 已经灌进页面（file:// 下 fetch 一个相对
+     路径会被当成跨源，取不到），服务模式下按需取一次并按 forest 版本缓存。
+     取不到时**留空**、不画一张自己拼的图：一张来路不明的图比没有图糟得多。 */
+  var PIPE_SVG = "";
+  var PIPE_SVG_AT = -1;      // 手上这份图对应第几次 apply()（见 FOREST_SEQ）
+  var PIPE_SVG_WANT = -1;    // 正在取的是第几次的（同一版不重复发请求）
+  (function () {
+    var el = document.getElementById("pipeline-svg");
+    var raw = el && el.textContent.trim();
+    if (raw) { try { PIPE_SVG = JSON.parse(raw) || ""; } catch (e) { PIPE_SVG = ""; } }
+  })();
+
+  function pipeFigure() {
+    // 屏幕上就是那张要进论文的图：纸上的墨、黑白可读、不跟主题走。
+    // 换一套「屏幕好看版」的代价是人对着一张图讨论、发出去另一张。
+    return '<div class="pfig" id="pfig">' + PIPE_SVG + "</div>";
+  }
+
+  /* 服务模式下把那张图取回来填进去。**不重画**：如果这次没取到，上一次那张
+     （版本可能已经旧了）也不留在屏幕上——一张过期的图会被当成现在的方法图。 */
+  function fetchFigure() {
+    if (MODE === "static" || !PIPE.declared) return;
+    var want = FOREST_SEQ;
+    // 已经取到这一版、或这一版正在取的路上，就不再发第二次：renderPipeline
+    // 一次 apply 里会被调两遍（apply 一遍、项目名到了再一遍）。
+    if (PIPE_SVG_AT === want || PIPE_SVG_WANT === want) return;
+    PIPE_SVG_WANT = want;
+    fetch(exportURL("figure")).then(function (r) {
+      return r.ok ? r.text() : "";
+    }).catch(function () { return ""; }).then(function (svg) {
+      if (PIPE_SVG_WANT !== want) return;      // 这期间又变了，别用旧的盖掉新的
+      PIPE_SVG = svg || "";
+      PIPE_SVG_AT = svg ? want : -1;
+      var box = $("#pfig");
+      if (box) box.innerHTML = PIPE_SVG;
+    });
+  }
+
+  function pipeSteps() {
+    return PIPE.steps.map(function (it) {
+      var s = it.step || {};
+      var badges = "";
+      if (it.result) {
+        badges += '<span class="pipechip result" title="'
+          + esc(i18n.t("pipeline.result.badge.title")) + '">'
+          + esc(i18n.t("pipeline.result.badge")) + "</span>";
+      }
+      if ((s.pipeline || {}).rule === "include") {
+        badges += '<span class="pipechip" title="' + esc(i18n.t("pipeline.include.badge.title"))
+          + '">' + esc(i18n.t("pipeline.include.badge")) + "</span>";
+      }
+      var what = it.what
+        ? '<div class="prose">' + window.md.render(it.what, { resolve: resolverFor(s) }) + "</div>"
+        : '<p class="dropnote pmiss">' + esc(i18n.t("trace.missing.what")) + "</p>";
+      return '<section class="pstep" data-pstep="' + esc(it.id) + '">'
+        + '<div class="phead"><span class="pnum mono">' + it.n + "</span>"
+        + '<span class="pid mono">' + esc(it.id) + "</span>"
+        + '<h3 class="ptitle">' + esc(it.title || i18n.t("common.untitled")) + "</h3>"
+        + lvChip(it.level, "mini") + badges
+        + '<span class="sp"></span>'
+        // 这就是「两条路径都留着」的全部意义：这一步当时有几个候选、为什么选了它，
+        // 全在开发路径那边，而这里一个按钮就过去。
+        + '<button data-devgoto="' + esc(it.id) + '" title="'
+        + esc(i18n.t("pipeline.jump.dev.title")) + '">'
+        + esc(i18n.t("pipeline.jump.dev")) + "</button></div>"
+        + (it.whyText ? '<p class="pwhy quiet">' + esc(it.whyText) + "</p>" : "")
+        + what
+        + renderCode(s) + renderPaths(s)
+        + "</section>";
+    }).join("");
+  }
+
+  /* 三个导出。**它们不在这里生成**——三样都指到那唯一一份实现的产物上
+     （服务模式是三条只读路由，静态导出是 build 写在同目录的三个文件）。
+     都是纯函数的产物：同一份记录导两次逐字节一致，所以正确的做法是要用的时候
+     重新生成，不是把导出存进仓库。文案里的 export.lead 把这句话说给用户听。
+
+     做成 <a download> 而不是「取回来再 Blob 一下」：file:// 下 fetch 一个相对
+     路径会被当成跨源，静态导出里那三个按钮会一按什么都不发生。 */
+  function pipeExport() {
+    var stem = (PROJECT || "trace") + "-";
+    var one = function (kind, key) {
+      return '<div class="pexp"><a class="btn" data-export="' + kind + '" href="'
+        + esc(exportURL(kind)) + '" download="' + esc(stem + EXPORT_FILE[kind]) + '" title="'
+        + esc(i18n.t(key + ".note")) + '">' + esc(i18n.t(key)) + "</a>"
+        + '<span class="dropnote">' + esc(i18n.t(key + ".note")) + "</span></div>";
+    };
+    return '<div class="sec pexport"><h3>' + esc(i18n.t("export.head")) + "</h3>"
+      + '<p class="dropnote deplead">' + i18n.tHtml("export.lead") + "</p>"
+      + '<div class="pexps">' + one("figure", "export.figure")
+      + one("methods", "export.methods") + one("page", "export.page") + "</div>"
+      + '<p class="dropnote">' + i18n.tHtml("export.draft.note") + "</p></div>";
+  }
+
+  function renderPipeline() {
+    var box = $("#pwrap");
+    if (!box) return;
+    buildPipeline();
+    if (!PIPE.declared) { box.innerHTML = pipeEmpty(); return; }
+    box.innerHTML = '<div class="pdoc">'
+      + '<h2 class="viewtitle">' + esc(i18n.t("pipeline.head", { n: PIPE.order.length })) + "</h2>"
+      + '<p class="viewlead">' + i18n.tHtml("pipeline.lead") + "</p>"
+      + '<p class="viewlead quiet">' + i18n.tHtml("pipeline.pair.note") + "</p>"
+      + pipeLevel() + pipeResults() + pipeChecks()
+      + pipeFigure()
+      + '<p class="dropnote">' + esc(i18n.t("pipeline.order.note")) + "</p>"
+      + pipeSteps()
+      + pipeExport()
+      + '<p class="dropnote pfoot">' + i18n.tHtml("pipeline.derived.note") + "</p>"
+      + "</div>";
+    enhanceProse(box);
+    fetchFigure();
+  }
+
+  /* 按下三个导出之一。真正的下载由 <a download> 自己完成（这个处理器**不**
+     preventDefault），这里只负责说一声——那句话里带着「逐字节确定」这件事，
+     人知道了才会去重新生成，而不是把导出存进仓库当第二份真相。 */
+  function doExport(kind) {
+    var name = { figure: "export.figure", methods: "export.methods", page: "export.page" }[kind];
+    // 认不出的取值什么都不说：一次拼错的按钮名不该冒充成一次成功的导出。
+    if (!name || !PIPE.declared) return;
+    toast(i18n.t("toast.export.ready", { name: i18n.t(name) }));
+  }
+
+  /* 在这一屏里跳到某一步的卡片。和跳回开发路径是两个动作：这个不换模式。 */
+  function pipeScrollTo(id) {
+    var el = document.querySelector('#pwrap [data-pstep="' + id + '"]');
+    if (el) el.scrollIntoView({ block: "start", inline: "nearest" });
+  }
+
+  function setMode(next, keep) {
+    if (MODES.indexOf(next) < 0 || next === mode) return;
+    mode = next;
+    localStorage.setItem("trace.mode", mode);
+    applyView();
+    renderSelection();
+    if (!keep) scrollToSelected();
+  }
+
   function applyView() {
     // 窄屏切到图视图时先自动适应宽度，否则第一眼是画布左上角那一小块
     if (view === "graph" && window.innerWidth < NARROW && F.tree && F.tree.w > $("#scroller").clientWidth) {
       fitZoom();
     }
-    $("#dwrap").hidden = view !== "graph";
-    $("#track").hidden = view !== "list";
-    $("#fwrap").hidden = view !== "flow";
-    $("#empty").hidden = F.steps.length > 0;
-    $("#zoombar").hidden = view !== "graph";
+    var dev = mode === "dev";
+    $("#dwrap").hidden = !dev || view !== "graph";
+    $("#track").hidden = !dev || view !== "list";
+    $("#fwrap").hidden = !dev || view !== "flow";
+    $("#pwrap").hidden = dev;
+    $("#empty").hidden = !dev || F.steps.length > 0;
+    $("#zoombar").hidden = !dev || view !== "graph";
     // 图例跟着视图换：数据流那三条说的是边的意思，和 status 那三条不是一回事，
     // 同时摆出来只会让人以为「实线 = 树边」。
     $("#treelegend").hidden = view === "flow";
@@ -1681,7 +2138,16 @@
     document.querySelectorAll("#viewtoggle button").forEach(function (b) {
       b.classList.toggle("on", b.getAttribute("data-view") === view);
     });
-    $("#legend").hidden = !F.steps.length;
+    document.querySelectorAll("#modetoggle button").forEach(function (b) {
+      b.classList.toggle("on", b.getAttribute("data-mode") === mode);
+    });
+    /* 定稿流程是一份从头读到尾的**文档**，不是一棵可以戳的树，所以它占满整块
+       工作区、并且不带右边那个详情面板——详情面板里装的正是这一档不该显示的东西
+       （为什么试这个、几个候选、移动史）。想看那些就按「回开发路径上看它」。
+       第二级的画法切换和图例也一起收起来：这一档只有一种画法。 */
+    document.body.classList.toggle("pipeline-mode", !dev);
+    $("#viewtoggle").hidden = !dev;
+    $("#legend").hidden = !dev || !F.steps.length;
   }
 
   /* -------------------------------------------------------------- 选中态 */
@@ -2166,6 +2632,41 @@
         }).join("") + "</div>";
   }
 
+  /* ⑧ 这一步和定稿流程的关系 —— 开发路径这一侧的那半个入口。
+   *
+   * 整块只在项目**真的声明了成果**时才出现（`s.pipeline` 是 compile_forest 在
+   * 有 `result:` 时才加的键）。没声明的项目一个字都不多出来。
+   *
+   * 三件事：它在不在流程里、凭什么在（core 给的四选一枚举）、以及跳到流程里去看。
+   * 「这一步当时有 3 个候选」留在这一侧（上面那几块），「该怎么做」在那一侧——
+   * 两条路径各说各的那一半，谁也不复述谁。
+   */
+  function renderPipelineOf(s) {
+    var pl = s.pipeline;
+    if (!pl) return "";
+    if (!pl.member && !pl.rule) return "";
+    var body = "";
+    if (pl.member) {
+      var w = (F.pipeline && F.pipeline.why && F.pipeline.why[s.id]) || null;
+      var why = pipeWhy(w);
+      body += '<p class="decq"><b>' + esc(i18n.t("pipeline.badge")) + "</b>"
+        + '<span title="' + esc(i18n.t("pipeline.badge.title")) + '">'
+        + esc(pl.index === null || pl.index === undefined ? "" : "[" + (pl.index + 1) + "] ")
+        + esc(why) + "</span></p>"
+        + '<p class="pacts"><button data-pipego="' + esc(s.id) + '" title="'
+        + esc(i18n.t("pipeline.jump.final.title")) + '">'
+        + esc(i18n.t("pipeline.jump.final")) + "</button></p>";
+    }
+    // 这一步自己写的那行 `pipeline:`。说明是必写的（写入侧拦着），所以它一定有话说。
+    if (pl.rule) {
+      body += '<p class="dropnote">'
+        + esc(i18n.t("pipeline." + pl.rule + ".badge.title"))
+        + (pl.note ? " — " + esc(pl.note) : "") + "</p>";
+    }
+    return '<div class="sec pipebox"><h3>' + esc(i18n.t("pipeline.name")) + "</h3>"
+      + '<p class="dropnote deplead">' + i18n.tHtml("pipeline.lead") + "</p>" + body + "</div>";
+  }
+
   /* ---------------------------------------------------------- 可溯源性 */
 
   function levelName(l) { return i18n.t("trace.level." + l); }
@@ -2547,6 +3048,25 @@
       meta.push('<span class="joinchip" title="' + esc(i18n.t("rejoin.badge.title")) + '">'
         + esc(i18n.t("rejoin.badge")) + "</span>");
     }
+    /* 「它在定稿流程里」得在第一眼看得见：这一步的记录写成什么样，从此不只是
+       自己的事——它会跟着成果被别人照着做一遍。 */
+    var pl0 = s.pipeline;
+    if (pl0 && pl0.result) {
+      meta.push('<span class="pipechip result" title="'
+        + esc(i18n.t("pipeline.result.badge.title")) + '">'
+        + esc(i18n.t("pipeline.result.badge")) + "</span>");
+    } else if (pl0 && pl0.member) {
+      meta.push('<span class="pipechip" title="' + esc(i18n.t("pipeline.badge.title")) + '">'
+        + esc(i18n.t("pipeline.badge")) + "</span>");
+    }
+    if (pl0 && pl0.rule === "include") {
+      meta.push('<span class="pipechip" title="' + esc(i18n.t("pipeline.include.badge.title"))
+        + '">' + esc(i18n.t("pipeline.include.badge")) + "</span>");
+    }
+    if (pl0 && pl0.rule === "exclude") {
+      meta.push('<span class="pipechip out" title="' + esc(i18n.t("pipeline.exclude.badge.title"))
+        + '">' + esc(i18n.t("pipeline.exclude.badge")) + "</span>");
+    }
     if ((s.children || []).length) meta.push(esc(i18n.t("count.children", { n: s.children.length })));
     (s.tags || []).forEach(function (tag) { meta.push('<span class="tag">' + esc(tag) + "</span>"); });
 
@@ -2567,6 +3087,14 @@
         + esc(i18n.t(s.branch === U.BRANCH_ALT ? "decision.unmark.act.title" : "decision.mark.act.title"))
         + '">' + esc(i18n.t(s.branch === U.BRANCH_ALT ? "decision.unmark.act" : "decision.mark.act"))
         + "</button>"
+        /* 标成成果 / 撤回。这是整条定稿流程里**唯一**写下来的一件事，其余
+           （谁在流程里、什么顺序、能追到多远）全是从它反推出来的，所以这里
+           永远不会有一个「编辑流程成员」的按钮——那就是第二份真相。 */
+        + '<button data-act="result" title="'
+        + esc(i18n.t((s.pipeline && s.pipeline.result)
+              ? "pipeline.result.unmark.title" : "pipeline.result.mark.title"))
+        + '">' + esc(i18n.t((s.pipeline && s.pipeline.result)
+              ? "pipeline.result.unmark" : "pipeline.result.mark")) + "</button>"
         // 「在决定什么」写在**分叉点**上，所以只有底下真有支的步骤才给这个入口
         + ((s.children || []).length || s.decision
             ? '<button data-act="decision" title="' + esc(i18n.t("decision.write.act.title")) + '">'
@@ -2615,7 +3143,7 @@
       + '<div class="meta">' + meta.join("") + "</div>" + acts + paths + renderCode(s)
       + trNotice(s)
       + '<div class="prose">' + body + "</div>"
-      + renderFork(s) + renderDeps(s) + renderRejoin(s) + back
+      + renderFork(s) + renderDeps(s) + renderRejoin(s) + renderPipelineOf(s) + back
       + renderMoved(s) + renderTrace(s) + files;
     enhanceProse(el);
     el.scrollTop = 0;
@@ -2659,20 +3187,25 @@
              // 和 paths/inputs/code 同一档：结构信息，只写进 note.md，译文里一行都没有
              branch: ($("#ed-branch") || {}).value || "extends",
              bnote: ($("#ed-bnote") || {}).value || "",
-             decision: ($("#ed-decision") || {}).value || "", lang: edLang };
+             decision: ($("#ed-decision") || {}).value || "",
+             // 这一步在定稿流程上的例外。控件只在项目真的有流程时才画出来
+             // （见 pipelineField），画不出来时这两项恒为空、也不会被发出去。
+             pipe: ($("#ed-pipe") || {}).value || "",
+             pnote: ($("#ed-pnote") || {}).value || "", lang: edLang };
   }
   /* 编辑器此刻对着的那一份磁盘内容。译文只有标题和正文——path / input / code
      都是结构信息，翻译文件里一行都不许有（写两份就是双真相源，而且 core 会
      把它们读都不读地丢掉并报一条 translation_structural_key）。 */
   var EMPTY_TARGET = { title: "", body: "", paths: "", inputs: "", code: "",
-                       branch: "extends", bnote: "", decision: "" };
+                       branch: "extends", bnote: "", decision: "", pipe: "", pnote: "" };
   function editTarget(s, l) {
     if (!s) return Object.assign({}, EMPTY_TARGET);
     if (!l) {
       return { title: s.title || "", body: s.body || "", paths: pathsToText(s),
                inputs: inputsToText(s), code: codeToText(s),
                branch: s.branch || "extends", bnote: s.branch_note || "",
-               decision: s.decision || "" };
+               decision: s.decision || "",
+               pipe: (s.pipeline || {}).rule || "", pnote: (s.pipeline || {}).note || "" };
     }
     var e = (s.tr || {})[l] || {};
     return Object.assign({}, EMPTY_TARGET, { title: e.title || "", body: e.body || "" });
@@ -2685,7 +3218,8 @@
     return st.title === base.title && st.body === base.body && st.paths === base.paths
       && (st.inputs || "") === base.inputs && (st.code || "") === base.code
       && (st.branch || "extends") === base.branch && (st.bnote || "") === base.bnote
-      && (st.decision || "") === base.decision;
+      && (st.decision || "") === base.decision
+      && (st.pipe || "") === base.pipe && (st.pnote || "") === base.pnote;
   }
   function isDirty() {
     if (!editing) return false;
@@ -2947,6 +3481,33 @@
       + "</div>";
   }
 
+  /* 这一步在定稿流程上的例外（`pipeline: include / exclude`）。三选一，默认那一档
+     就是「别动它」——成员是从成果反推出来的，它自己会保持正确。
+     **只在项目真的声明了成果时才画这个控件**，而且没画出来时 saveEditor 连这个键
+     都不发。理由是数据安全，不是洁癖：forest 里没有 pipeline 这个键时，我们根本
+     不知道磁盘上那一行写着什么（`pipeline: exclude` 完全可以先于 `result:` 写下），
+     照空值发回去就是替人把他写的那一行删掉，而他不会收到任何提示。 */
+  function pipelineField(base) {
+    if (!F.pipeline) return "";
+    var opt = function (v, key) {
+      return '<option value="' + v + '"' + (base.pipe === v ? " selected" : "") + ">"
+        + esc(i18n.t(key)) + "</option>";
+    };
+    return '<div class="edrel">'
+      + '<label class="edpaths"><span>' + esc(i18n.t("editor.pipeline.label")) + "</span>"
+      + '<select id="ed-pipe">'
+      + opt("", "editor.pipeline.auto")
+      + opt("include", "editor.pipeline.include")
+      + opt("exclude", "editor.pipeline.exclude")
+      + "</select></label>"
+      + '<label class="edpaths"><span>' + esc(i18n.t("editor.pipeline.note.label")) + "</span>"
+      + '<input id="ed-pnote" maxlength="200" value="' + esc(base.pnote) + '" placeholder="'
+      + esc(i18n.t("editor.pipeline.note.placeholder")) + '"></label>'
+      + "</div>"
+      + '<span class="edtip">' + i18n.tHtml("editor.pipeline.hint") + "</span>"
+      + '<span class="edtip">' + i18n.tHtml("editor.pipeline.note.required") + "</span>";
+  }
+
   function renderEditor(s) {
     var base = editTarget(s, edLang);
     $("#detail").innerHTML =
@@ -2991,7 +3552,8 @@
             + '<label class="edpaths"><span>' + esc(i18n.t("editor.decision.label")) + "</span>"
             + '<input id="ed-decision" maxlength="300" value="' + esc(base.decision) + '" placeholder="'
             + esc(i18n.t("editor.decision.placeholder")) + '">'
-            + '<span class="edtip">' + i18n.tHtml("editor.decision.hint") + "</span></label>")
+            + '<span class="edtip">' + i18n.tHtml("editor.decision.hint") + "</span></label>"
+            + pipelineField(base))
       + '<div class="edtools">' + TOOLS.map(function (x) {
           return '<button type="button" data-md="' + x.k + '" title="'
             + esc(i18n.t("editor.tool." + x.k)) + '">' + x.html + "</button>";
@@ -3129,10 +3691,14 @@
   function bindEditor(ta, s) {
     ta.addEventListener("input", function () { schedulePreview(s); scheduleDraft(); });
     // 标题、外部路径、数据依赖、代码位置同样是人敲进去的，一起进草稿
-    ["#ed-title", "#ed-paths", "#ed-inputs", "#ed-code"].forEach(function (sel) {
+    ["#ed-title", "#ed-paths", "#ed-inputs", "#ed-code", "#ed-pnote"].forEach(function (sel) {
       var el = $(sel);
       if (el) el.addEventListener("input", scheduleDraft);
     });
+    // 三选一那个下拉不发 input 事件，只发 change。漏了它的话，只改了取值
+    // 没改说明的那次编辑不会进草稿，刷新一下就没了。
+    var pipeSel = $("#ed-pipe");
+    if (pipeSel) pipeSel.addEventListener("change", scheduleDraft);
 
     ta.addEventListener("paste", function (e) {
       var dt = e.clipboardData;
@@ -3202,6 +3768,16 @@
     var note = String(st.bnote || "").trim();
     return note ? U.BRANCH_ALT + " | " + note : U.BRANCH_ALT;
   }
+  /* 同上，`pipeline: <取值> | <理由>`。理由是**必填**的（写入侧会 400）：
+     候选组在树上看得见，而这一行除了改变一份导出之外不留任何痕迹，
+     没有那半句话就分不清它是想清楚的决定还是一次误点。撤销时说明一起丢掉——
+     一行没有取值的 pipeline 读回来什么都不是。 */
+  function pipelineFieldValue(st) {
+    var rule = String((st && st.pipe) || "").trim();
+    if (!rule) return "";
+    var note = String((st && st.pnote) || "").trim();
+    return note ? rule + " | " + note : rule;
+  }
 
   function saveEditor() {
     var s = IDX[selected()];
@@ -3211,29 +3787,47 @@
     saveDraftNow();                       // 先钉住：网络失败、409、页面被关都不该让这段字消失
     /* 两条写入路径。译文那条只发 title 和 body：补翻译的工具碰不到原文，
        所以它连 paths / status 都不该有能力发出去。 */
+    var payload = {
+      title: st.title,
+      body: st.body,
+      paths: textToPaths(st.paths),
+      // 三块结构化文本一起回写。整组替换是对的：框里显示的就是磁盘上的
+      // 全部内容（`commit:` 派生出来的那条除外，见 codeToText），
+      // 删掉一行的意思就该是删掉那一行。
+      inputs: textToPaths(st.inputs),
+      code: textToPaths(st.code),
+      /* 说明必须跟着 branch 一起发（写入侧没有单独的 branch_note 字段）：
+         只改说明、不改 kind 的话，那句说明会挂在一个不存在的候选身份上。
+         改回 extends 就发空串——「标错了要能改回来」，和 lang 同一条。 */
+      branch: branchField(st),
+      decision: (st.decision || "").trim(),
+      // 乐观并发控制：expect 是我打开这一步时读到的摘要。这期间别人改过就 409，
+      // 由人来判怎么合，而不是谁最后按保存谁赢。
+      expect: s.digest || "",
+    };
+    /* `pipeline` 只在控件真的画出来时才发。控件画不出来（项目还没声明成果）
+       就意味着我们不知道磁盘上那一行是什么，而 update_step 只在键**在**的时候
+       才动它——不发这个键，别人先写好的 `pipeline: exclude | …` 就不会被
+       一次无关的正文编辑悄悄抹掉。 */
+    if (F.pipeline && !st.lang) {
+      /* 理由必填，**当场拦住**而不是让人走一趟服务端。写入侧确实会 400，但那条
+         报错是中文的、而且要等一次往返——人看到的是「保存失败」加一句读不懂的话，
+         最可能的反应是再按一次保存。这里问的和写入侧问的是同一件事，所以两处
+         判据必须一致：有取值就必须有理由。 */
+      if (String(st.pipe || "").trim() && !String(st.pnote || "").trim()) {
+        toast(i18n.t("editor.pipeline.note.required"), true);
+        var pn = $("#ed-pnote");
+        if (pn) pn.focus();
+        return;
+      }
+      payload.pipeline = pipelineFieldValue(st);
+    }
     var go = st.lang
       ? putTranslation(s.id, st.lang, {
           title: st.title, body: st.body,
           expect: trDigest[trKey(s.id, st.lang)] || "",
         }).then(refresh)
-      : patch(s.id, {
-          title: st.title,
-          body: st.body,
-          paths: textToPaths(st.paths),
-          // 三块结构化文本一起回写。整组替换是对的：框里显示的就是磁盘上的
-          // 全部内容（`commit:` 派生出来的那条除外，见 codeToText），
-          // 删掉一行的意思就该是删掉那一行。
-          inputs: textToPaths(st.inputs),
-          code: textToPaths(st.code),
-          /* 说明必须跟着 branch 一起发（写入侧没有单独的 branch_note 字段）：
-             只改说明、不改 kind 的话，那句说明会挂在一个不存在的候选身份上。
-             改回 extends 就发空串——「标错了要能改回来」，和 lang 同一条。 */
-          branch: branchField(st),
-          decision: (st.decision || "").trim(),
-          // 乐观并发控制：expect 是我打开这一步时读到的摘要。这期间别人改过就 409，
-          // 由人来判怎么合，而不是谁最后按保存谁赢。
-          expect: s.digest || "",
-        });
+      : patch(s.id, payload);
     return go
       .then(function () {
         dropDraft(s.id, st.lang);
@@ -3780,6 +4374,8 @@
         if ($("#ed-branch")) $("#ed-branch").value = dd.branch || "extends";
         if ($("#ed-bnote")) $("#ed-bnote").value = dd.bnote || "";
         if ($("#ed-decision")) $("#ed-decision").value = dd.decision || "";
+        if ($("#ed-pipe")) $("#ed-pipe").value = dd.pipe || "";
+        if ($("#ed-pnote")) $("#ed-pnote").value = dd.pnote || "";
         updatePreview(ds);
         toast(i18n.t("toast.draft.restored"));
       } else {
@@ -3806,6 +4402,34 @@
     var gh = e.target.closest("#hitlist a");
     if (gh) { hideHits(); return; }   // 让链接照常跳走，只把面板收起来
 
+    /* 定稿流程 → 开发路径。这是「两条路径都留着」的全部意义：这一步当时有几个
+       候选、为什么选了它，只有那一侧答得出。所以它换模式、选中、滚过去，
+       三件事一起做完——只跳不选的话，人到了那边还得自己在树上找。 */
+    var dg = e.target.closest("[data-devgoto]");
+    if (dg) {
+      e.preventDefault();
+      setMode("dev", true);
+      select(dg.getAttribute("data-devgoto"));
+      scrollToSelected();
+      return;
+    }
+    // 反方向：开发路径 → 定稿流程里的那一步。
+    var pg = e.target.closest("[data-pipego]");
+    if (pg) {
+      e.preventDefault();
+      setMode("pipeline", true);
+      pipeScrollTo(pg.getAttribute("data-pipego"));
+      return;
+    }
+    // 定稿流程内部的跳转（成果清单、最弱的那一环）：不换模式，只滚过去。
+    var pj = e.target.closest("[data-pgoto]");
+    if (pj) { e.preventDefault(); pipeScrollTo(pj.getAttribute("data-pgoto")); return; }
+
+    /* 导出。**故意不 preventDefault**：下载是那个 <a download> 自己的事，
+       拦下来就得在这一页里再造一份字节，而「只有一份实现」正是这一档的规矩。 */
+    var ex = e.target.closest("[data-export]");
+    if (ex) { doExport(ex.getAttribute("data-export")); return; }
+
     var goto = e.target.closest("[data-goto]");
     if (goto) { e.preventDefault(); select(goto.getAttribute("data-goto")); scrollToSelected(); return; }
 
@@ -3814,7 +4438,12 @@
 
     // 点图上的空白处 = 取消选中 = 所有节点回到全亮。
     // 不透明度这个通道只承载"是否在选中的祖先链上"，没有选中时就不该有任何东西是淡的。
-    if (e.target.closest("#scroller") && selected()) { select(""); return; }
+    // 定稿流程那一档不参与选中（它是一份文档，不是一棵可以戳的树），在它上面
+    // 点一下不该把开发路径那边选好的步骤悄悄清掉——切回去时人会以为选择丢了。
+    if (mode === "dev" && e.target.closest("#scroller") && selected()) { select(""); return; }
+
+    var mt = e.target.closest("#modetoggle button");
+    if (mt) { setMode(mt.getAttribute("data-mode")); return; }
 
     var vt = e.target.closest("#viewtoggle button");
     if (vt) {
@@ -3908,6 +4537,33 @@
     var act = e.target.closest("[data-act]");
     if (!act) return;
     var name = act.getAttribute("data-act");
+    /* 声明 / 撤回一个成果。这是**唯一**写下来的那件事，所以它有自己的入口，
+       不混进「改个标题」那条随手的路：它重写的是整条定稿流程、Methods 里出现
+       哪几步、导出的那张图长什么样。撤回不问原因——它不销毁任何事实，
+       那一步和它的记录一个字都没动，开发路径上它还在原处。 */
+    if (name === "result" || name === "result-mark") {
+      var rs = IDX[selected()];
+      if (!rs) { toast(i18n.t("toast.select.step"), true); return; }
+      if (name === "result" && rs.pipeline && rs.pipeline.result) {
+        papi("/results/" + encodeURIComponent(rs.id), { method: "DELETE" })
+          .then(refresh)
+          .then(function () { toast(i18n.t("toast.result.unmarked", { id: rs.id })); })
+          .catch(fail);
+        return;
+      }
+      var note = prompt(i18n.t("pipeline.result.prompt"), stepTitle(rs));
+      if (note === null) return;
+      /* 按 **id 发增删**（PUT /results/{id}），不是「整组提交成果列表」：用打开
+         页面那一刻的旧列表整组提交，会静默删掉这期间 agent 刚声明的那一条。
+         写入侧刻意没有整组替换那条路，服务端也只开了按 id 的 PUT / DELETE。 */
+      papi("/results/" + encodeURIComponent(rs.id), {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ note: note.trim() }),
+      }).then(refresh)
+        .then(function () { toast(i18n.t("toast.result.marked", { id: rs.id })); })
+        .catch(fail);
+      return;
+    }
     if (name === "edit-insights") { openInsightEditor(); return; }
     if (name === "save-insights") { saveInsights(); return; }
     if (name === "move") { openMove(selected()); return; }
@@ -3975,13 +4631,24 @@
         Object.keys(d.tr || {}).forEach(function (l) { dropDraft(d.id, l); });
         forceSelect("");
         return refresh().then(refreshProjects).then(function () {
-          // 指空的 input 排在孤儿前面：孤儿会被降级为根、在图上仍然看得见，
-          // 而一条指空的 input 在界面上只是一行小字，最容易就这么留在那里。
-          toast(info.dangling_inputs && info.dangling_inputs.length
-            ? i18n.t("toast.deleted.inputs", { id: info.id, ids: info.dangling_inputs.join(" · ") })
-            : (info.orphaned.length
-              ? i18n.t("toast.deleted.orphaned", { id: info.id, ids: info.orphaned.join(" · ") })
-              : i18n.t("toast.deleted", { id: info.id })));
+          /* 三条后果，按**严重程度**排，只说最重的那一条：
+             ① 被删的这一步是声明出来的**成果** —— 整条定稿流程从它长出来，
+                它一没，流程静默变空，而 id 会被重用，下一个拿到该号的步骤会
+                无声地变成论文报的那个结果；
+             ② 指空的 `input:` —— 可溯源链断在这里，而它在界面上只是一行小字；
+             ③ 孤儿 —— 会被降级为根，在图上仍然看得见，最不容易被忽略。
+             说三条等于一条都没说：toast 只有几秒，人只读得进第一句。 */
+          var lostResult = !!(info.dangling_results && info.dangling_results.length);
+          toast(lostResult
+            ? i18n.t("toast.deleted.result", { id: info.id })
+            : (info.dangling_inputs && info.dangling_inputs.length
+              ? i18n.t("toast.deleted.inputs", { id: info.id, ids: info.dangling_inputs.join(" · ") })
+              : (info.orphaned.length
+                ? i18n.t("toast.deleted.orphaned", { id: info.id, ids: info.orphaned.join(" · ") })
+                : i18n.t("toast.deleted", { id: info.id }))),
+            // 成果那一条按「要人动手」的样式显示（多停几秒）：它是三条里唯一
+            // 会让一份要交出去的产物变空的。
+            lostResult);
         });
       }).catch(fail);
     }
@@ -4125,11 +4792,19 @@
     } else if (e.key === "ArrowUp" || e.key === "k") {
       e.preventDefault(); select(F.steps[Math.max(0, i <= 0 ? 0 : i - 1)].id); scrollToSelected();
     } else if (e.key === "g") {
-      // 三个视图轮着来。数据流也进这个循环——它不是一个附属面板，而是同一份
-      // 文件的第三种读法，和图/列表平级。
+      /* 三个视图轮着来。数据流也进这个循环——它不是一个附属面板，而是同一份
+         文件的第三种读法，和图/列表平级。
+         定稿流程**不**进这个循环：它不是第四种读法，是另一批步骤。在那一档上
+         按 g 的意思只能是「回去看开发路径」，把它排进循环等于用同一个键说两件事。 */
+      if (mode !== "dev") { setMode("dev"); return; }
       view = VIEWS[(VIEWS.indexOf(view) + 1) % VIEWS.length];
       localStorage.setItem("trace.view", view);
       applyView(); renderSelection(); scrollToSelected();
+    } else if (e.key === "p") {
+      // 两条路径来回切。和 g 分开是因为它们不是同一层的选择（见 index.html 的
+      // #modeswitch 那段）：g 换画法，p 换看的是哪一份东西。
+      e.preventDefault();
+      setMode(mode === "dev" ? "pipeline" : "dev");
     } else if (e.key === "n" && canWrite()) { e.preventDefault(); openNew(selected()); }
     else if (e.key === "e" && canWrite() && selected()) { e.preventDefault(); startEditing(); }
     else if (e.key === "Escape") {
@@ -4454,6 +5129,8 @@
     renderFlow();
     renderWarnings();        // 警告栏和缺失横幅现在都是本语言的说法，切换要跟上
     renderMissingPaths();
+    // 定稿流程整块（含那张图上的字）都是本语言的，而且导出就是屏幕上这一份
+    renderPipeline();
     applyView();
     if (keepEditor) { renderSelection(); return; }
     onHash();

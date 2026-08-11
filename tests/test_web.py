@@ -998,7 +998,9 @@ def test_the_flow_view_is_a_third_view_not_a_panel():
         assert f".fedge.{kind}" in CSS or f"fedge.{kind}," in CSS, f"边的三档少了 {kind}"
     assert "flowempty" in m, "一条 input 都没有时不说明，人会以为功能坏了"
     ap = re.search(r"function applyView[\s\S]*?\n  \}\n", APP).group(0)
-    assert '$("#fwrap").hidden = view !== "flow"' in ap
+    # `!dev ||` 是⑧加的：数据流仍然是**开发路径**下的第三种画法，切到定稿流程时
+    # 它跟另外两种一起收起来。判据没变（还是 view），只是多了一层「哪一份东西」。
+    assert '$("#fwrap").hidden = !dev || view !== "flow"' in ap
 
 
 def test_the_flow_layout_is_deterministic_and_not_force_directed():
@@ -1111,9 +1113,18 @@ def test_hint_codes_are_exactly_the_ones_core_emits_without_changing_the_level()
 def test_server_side_chinese_warnings_are_translated_where_we_know_how():
     """服务端的 warning 是中文的。认得的换成本语言的说法，认不出的原样显示——
     老老实实给中文，好过悄悄吞掉一条待办。"""
+    # ⑧ 之后「选哪条文案」被抽进 warnPick（Methods 草稿要同一条判断的纯文本版），
+    # warnText 只剩「认得就 tHtml、认不出就退回服务端原句并转义」这两条出口。
     m = re.search(r"function warnText[\s\S]*?\n  \}\n", APP).group(0)
     assert "return esc(w.message)" in m, "认不出来时把整条吞了（而且服务端那句话必须转义）"
-    assert "i18n.tHtml(m.key" in m, "文案里的 `行内代码` 会原样显示成反引号"
+    assert "i18n.tHtml(got.key" in m, "文案里的 `行内代码` 会原样显示成反引号"
+    pick = re.search(r"function warnPick[\s\S]*?\n  \}\n", APP).group(0)
+    assert "return null" in pick, "认不出来时必须说不认得，而不是编一条空文案出来"
+    # 曾经还有第二个出口 warnPlain（纯文本版），服务的是浏览器里自己生成的那份
+    # Methods 草稿。那份草稿连同整个 JS 生成器一起没了——三样导出只剩 Python
+    # 那一份实现——所以这里不再有第二个出口要对齐，反过来它的**回归**才是信号。
+    assert "function warnPlain" not in APP, \
+        "warnPlain 回来了 —— 那说明网页又开始自己生成导出了，两份实现迟早不一致"
     table = re.search(r"var WARN_MAP = \{[\s\S]*?\n  \};", APP).group(0)
     for code in ("dangling_input", "self_input", "input_cycle",
                  "section_without_prose", "table_without_explanation", "code_without_explanation"):
@@ -1449,3 +1460,208 @@ def test_the_three_relationship_legend_items_survive_the_phone_breakpoint():
     assert re.search(r"#legend \.lgrels \.lgm \{[^}]*display:\s*inline-flex", phone), \
         "三种关系那一组要显式留下"
     assert 'class="lgset lgrels"' in HTML, "那一组要有自己的钩子，不能只靠位置"
+
+
+# ------------------------------------------------------------ ⑧ 定稿流程
+
+
+def test_the_final_pipeline_is_a_second_thing_not_a_fourth_drawing():
+    """切换器必须是两级的。
+
+    图 / 列表 / 数据流画的是**同一批步骤**；定稿流程画的是另一批（从 `result:`
+    沿 `input:` 反推出来的闭包）。把它做成第四个并排的按钮，等于对读者说
+    「这是同一件事的另一种排版」——而 i18n 的 pipeline.pair.note 正是写来挡
+    这个误解的。所以一级选「看哪一份东西」，二级选「怎么画」。
+    """
+    assert 'id="modetoggle"' in HTML and 'data-mode="pipeline"' in HTML
+    assert 'data-view="pipeline"' not in HTML, "定稿流程被塞进了画法那一排"
+    # 二级只在开发路径下出现：定稿流程只有一种画法，它就是一张方法图
+    ap = re.search(r"function applyView[\s\S]*?\n  \}\n", APP).group(0)
+    assert '$("#viewtoggle").hidden = !dev' in ap
+    assert '$("#pwrap").hidden = dev' in ap
+    # 两级在视觉上必须分得出来，否则「分了级」只存在于 DOM 里
+    assert ".seg.mode button" in CSS and ".seg.sub button" in CSS
+
+
+def test_the_pipeline_view_is_a_document_not_a_tree_to_poke_at():
+    """它占满整块工作区并收起详情面板。
+
+    详情面板里装的正是这一档不该显示的东西：为什么试这个、当时有几个候选、
+    被移动过几次。要看那些就按「回开发路径上看它」——那个按钮必须在。
+    """
+    assert "body.pipeline-mode #detail { display: none; }" in CSS
+    assert re.search(r"body\.pipeline-mode #left \{[^}]*flex:", CSS)
+    steps = re.search(r"function pipeSteps[\s\S]*?\n  \}\n", APP).group(0)
+    assert "data-devgoto=" in steps, "流程里的每一步都要有一个跳回开发路径的入口"
+    assert "pipeline.jump.dev" in steps
+    # 按「别人照着做」挑内容：做了什么、命令（它就在那一节的原文里）、代码、产物、等级
+    assert "it.what" in steps and "renderCode(s)" in steps and "renderPaths(s)" in steps
+    assert "lvChip(it.level" in steps
+    # 「为什么试这个」不许出现在这一档：sectionOf 只取 what 那一节
+    build = re.search(r"function buildPipeline[\s\S]*?\n  \}\n", APP).group(0)
+    assert '"what"' in build and '"why"' not in build
+
+
+def test_the_two_paths_point_at_each_other():
+    """两条路径都留着的全部意义就是这一对入口，缺一个就只剩一条路。"""
+    assert "[data-devgoto]" in APP and "[data-pipego]" in APP
+    dev = APP[APP.index('e.target.closest("[data-devgoto]")'):]
+    dev = dev[:dev.index("return;") + 7]
+    assert 'setMode("dev"' in dev and "select(" in dev, "跳回去还得选中它，否则人到了那边要自己找"
+    # 开发路径这一侧的回指：标记 + 详情面板里那个反向入口
+    marks = re.search(r"function nodeMarks[\s\S]*?\n  \}\n", APP).group(0)
+    assert "pl.member" in marks and "cmk pipe" in marks
+    detail = re.search(r"function renderPipelineOf[\s\S]*?\n  \}\n", APP).group(0)
+    assert "data-pipego=" in detail
+
+
+def test_the_pipeline_marker_does_not_steal_an_existing_visual_channel():
+    """线型只归 status、不透明度只归祖先链/搜索命中、颜色已经归了三种关系。
+
+    所以「这一步在定稿流程里」只能走字形这个第四通道（和 L0 · ↺✕ · ⇢ · Y ·
+    ~> · ⇄ · ⊘ 同一档）。
+    """
+    marks = re.search(r"function nodeMarks[\s\S]*?\n  \}\n", APP).group(0)
+    pipe = marks[marks.index("var pl = s.pipeline"):]
+    for stolen in ("opacity", "faded", "border-style", "stroke-dasharray", 's-" +'):
+        assert stolen not in pipe, f"回指标记动了已经被占用的通道：{stolen}"
+    live = re.sub(r"/\*.*?\*/", "", CSS, flags=re.S)
+    m = re.search(r"\.cmk\.pipe \{([^}]*)\}", live)
+    assert m, "回指标记没有样式"
+    for stolen in ("opacity: .", "stroke", "font-style"):
+        assert stolen not in m.group(1), f".cmk.pipe 借了别的通道：{stolen}"
+    assert 'class="cmk pipe"' in HTML, "图例里没有它，那个 [3] 就是个谜"
+
+
+def test_the_empty_state_teaches_the_line_you_can_always_write_by_hand():
+    """绝大多数项目打开这一档看到的就是空态，它是这个功能的门面。
+
+    按钮那条路要服务端配合（见 seams），而在 project.md 里手写一行 `result:`
+    永远有效——所以那一行的真实写法必须印在空态上，不能只藏在文档里。
+    """
+    empty = re.search(r"function pipeEmpty[\s\S]*?\n  \}\n", APP).group(0)
+    for key in ("pipeline.empty.title", "pipeline.empty.what", "pipeline.empty.why",
+                "pipeline.empty.how", "pipeline.empty.act"):
+        assert key in empty, f"空态少了 {key}"
+    assert 'act: i18n.t("pipeline.empty.act")' in empty, \
+        "{act} 硬编码了按钮名，切语言时那句话和按钮会各说各的"
+    # 「两条路径不是详略两版」这句必须在空态上就说清楚
+    assert "pipeline.pair.note" in empty
+
+
+def test_the_pipeline_diagnostics_never_reach_the_top_warning_bar():
+    """顶栏不许因为定稿流程多出提示。
+
+    现存项目一个 `result:` 都没声明，把这些挂进全局警告栏等于每个项目每次打开
+    都被念一遍，而那正是让人从此不看警告的做法。
+    """
+    checks = re.search(r"function pipeChecks[\s\S]*?\n  \}\n", APP).group(0)
+    assert "PIPE.diagnostics" in checks
+    warn = re.search(r"function renderWarnings[\s\S]*?\n  \}\n", APP).group(0)
+    assert "pipeline" not in warn, "定稿流程的诊断混进了顶栏那条警告栏"
+    # 但换文案用的是同一张表：同一个 code 在两处说两句不同的话，比漏翻还糟
+    table = re.search(r"var WARN_MAP = \{[\s\S]*?\n  \};", APP).group(0)
+    for code in ("pipeline_dead_step", "pipeline_weak_step", "pipeline_no_result"):
+        assert code in table, f"{code} 在英文界面上会原样漏出中文"
+
+
+def test_the_pipeline_codes_the_ui_maps_are_really_the_ones_core_sends():
+    """表里写着而 core 不发的 code 是一句空话，反过来是英文界面上漏中文。"""
+    src = (ROOT / "trace_core.py").read_text(encoding="utf-8")
+    table = re.search(r"var WARN_MAP = \{[\s\S]*?\n  \};", APP).group(0)
+    for code in ("pipeline_dead_step", "pipeline_weak_step", "pipeline_no_result"):
+        assert f'"{code}"' in src, f"core 不发 {code} 了，这张表就该跟着改"
+    assert "bad_pipeline" in src, "core 侧 `pipeline:` 写错值的降级提醒不见了"
+    # 反向：core 现在发的每一条 pipeline_* 诊断，界面认不出的会退回中文原句。
+    # 这一条不当成失败（退回原句是有意的兜底），但把缺口显式列出来，
+    # 免得「反正会退回」变成再也没人补文案的理由。
+    sent = set(re.findall(r'warn\(\s*"(?:warn|info)",\s*"(pipeline_\w+)"', src))
+    assert {"pipeline_dead_step", "pipeline_weak_step"} <= sent, sent
+
+
+# 抠一个顶层函数的源码。写成模板是因为反斜杠密集的正则重复写六遍，
+# 抄错一处只会让断言静默地什么都不查。
+RE = r"function %s[\s\S]*?\n  \}\n"
+
+
+def test_the_three_exports_have_no_second_implementation_in_the_browser():
+    """图 / Methods 草稿 / 独立页面在网页里**一份都不生成**。
+
+    曾经这里有第二份实现（JS 各画一遍 SVG 和 markdown），于是同一个项目在屏幕上
+    和在 `trace_cli.py pipeline --svg` 里是两张不同的图、两份不同的草稿。两份都
+    看着对，而**其中一份会进论文**。现在三样只有 Python 那一份实现，网页拿到的
+    是它的产物：服务模式 fetch 三条只读路由，静态导出读 build 写在同目录的三个
+    文件。
+    """
+    for gone in ("pipelineSVG", "pipelineMarkdown", "pipelinePage", "pipelineLayout",
+                 "PIPELINE_SVG_CSS", "PIPELINE_PAGE_CSS"):
+        assert gone not in APP, f"{gone} 回来了 —— 网页又在自己生成导出"
+    # 三个按钮指到的是那一份实现的三个出口，不是就地拼出来的 Blob
+    exp = re.search(RE % "pipeExport", APP).group(0)
+    for key in ("export.figure", "export.methods", "export.page", "export.draft.note"):
+        assert key in exp, f"导出那一块少了 {key}"
+    assert "download=" in exp and "exportURL(" in exp, "导出按钮不再是 <a download>"
+    assert "createObjectURL" not in APP, "Blob 下载意味着那批字节是这一页自己拼的"
+    url = re.search(RE % "exportURL", APP).group(0)
+    assert "/pipeline/" in url and 'MODE === "static"' in url, \
+        "两种模式都得指到同一份实现的产物上"
+    # 屏幕上那张图就是导出的那一份，一个字节都不差：它们出自同一个出口
+    screen = re.search(RE % r"pipeFigure\(\)", APP).group(0)
+    assert "PIPE_SVG" in screen, "屏幕上画的是另一张图，人会对着一张、发出去另一张"
+    fetcher = re.search(RE % "fetchFigure", APP).group(0)
+    assert 'exportURL("figure")' in fetcher, "屏幕上那张图和导出的那张不是同一个出口"
+
+
+def test_the_exports_never_ask_what_time_it_is():
+    """逐字节确定是 P3。混进一个时间戳，「重新生成永远比留一份拷贝划算」就成了
+    一句假话，人就会把导出结果存进仓库。
+
+    生成器现在只在 Python 那一侧，所以这一条也跟过去查那边的源码 —— 留在这里查
+    JS 等于对着一个已经不存在的实现做保证。"""
+    src = (ROOT / "trace_mcp.py").read_text(encoding="utf-8")
+    gen = src[src.index("def fmt_pipeline"):src.index("def _section(")]
+    for banned in ("datetime.now", "time.time", "random.", "date.today", "utcnow"):
+        assert banned not in gen, f"导出生成器里出现了 {banned}"
+
+
+def test_the_section_order_matches_the_core_side():
+    """Methods 草稿取的是「做了什么」那一节。下标错一位就写成了「为什么」——
+    而「为什么」恰恰是定稿流程唯一不该显示的东西。"""
+    import trace_core as core  # noqa: PLC0415
+
+    got = re.search(r"var SECTION_ORDER = \[([^\]]*)\];", APP).group(1)
+    keys = [x.strip().strip('"') for x in got.split(",") if x.strip()]
+    assert keys == list(core.SECTION_NAMES), "小节顺序和 trace_core 对不上"
+
+
+def test_the_editor_never_erases_a_pipeline_line_it_cannot_see():
+    """`pipeline: exclude` 完全可以先于任何 `result:` 写下来。
+
+    那时 forest 里根本没有 pipeline 这个键（现存项目必须完全无感），界面也就
+    不知道磁盘上那一行写着什么。照空值发回去 = 一次无关的正文编辑悄悄把它删了，
+    而人不会收到任何提示。所以：控件不画、键不发。
+    """
+    field = re.search(r"function pipelineField[\s\S]*?\n  \}\n", APP).group(0)
+    assert "if (!F.pipeline) return \"\";" in field
+    save = re.search(r"function saveEditor[\s\S]*?\n  \}\n", APP).group(0)
+    assert "if (F.pipeline && !st.lang) {" in save and "payload.pipeline =" in save
+    # 理由必填是写入侧的硬规矩（不写就 400）。界面得在这里拦住，而不是让人走一趟
+    # 服务端再收到一句读不懂的中文报错——上一版界面还印着「可不写」。
+    assert "editor.pipeline.note.required" in save, "选了取值不填理由时没人当场拦住"
+    # 译文里一行结构键都不许有（和 paths / inputs / code 同一条）
+    assert "!st.lang" in save
+    # 草稿也要跟上，否则改了取值刷新一下就没了
+    st = re.search(r"function editorState[\s\S]*?\n  \}\n", APP).group(0)
+    assert "ed-pipe" in st and "ed-pnote" in st
+    same = re.search(r"function sameAsStep[\s\S]*?\n  \}\n", APP).group(0)
+    assert "st.pipe" in same and "st.pnote" in same
+
+
+def test_declaring_a_result_has_its_own_entry_and_no_member_list_editor():
+    """「哪一步是成果」是整条流程里唯一写下来的事，所以它有自己的入口；
+    而「谁在流程里」是算出来的，界面上永远不会有一个编辑成员清单的地方——
+    那就是第二份真相。"""
+    assert 'data-act="result"' in APP and "pipeline.result.mark" in APP
+    assert "/results" in APP, "声明成果没有写入路径"
+    for forbidden in ("pipeline.members", "editMembers", "data-act=\"pipeline-members\""):
+        assert forbidden not in APP, f"界面上出现了成员清单编辑口：{forbidden}"

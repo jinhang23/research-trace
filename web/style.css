@@ -190,9 +190,18 @@ main { display: flex; flex: 1; min-height: 0; align-items: stretch; }
   display: flex; gap: 14px; padding: 6px 14px; font-size: 11px;
   color: var(--muted); border-top: 1px solid var(--rule); background: var(--panel);
 }
+/* `display: flex` 会盖过 hidden 属性自带的 display:none —— 一棵空树的时候
+   这条图例从来就没真的藏起来过，只是那时它下面什么都没有所以没人发现。
+   定稿流程那一档必须真的收掉它：那三组说的是树上的线型、关系和字形，
+   而这一档一条树边都没有。 */
+#legend[hidden] { display: none; }
 #legend .sp { flex: 1; }
 #legend i { display: inline-block; width: 18px; border-top-width: 2px; vertical-align: middle; margin-right: 5px; }
 #zoombar { display: flex; gap: 3px; align-items: center; }
+/* `display: flex` 会盖过 hidden 属性，于是 applyView 里那句
+   `$("#zoombar").hidden = view !== "graph"` 从来没生效过——列表和数据流视图上
+   缩放条一直在。#legend 上面那一行修的是同一个坑。 */
+#zoombar[hidden] { display: none; }
 #zoombar button { padding: 1px 7px; font-size: 11px; line-height: 16px; min-width: 24px; }
 #zoomval { font-family: var(--mono); font-size: 10.5px; }
 #legend .done { border-top-style: solid; border-color: var(--done); }
@@ -1236,6 +1245,112 @@ button.danger:hover { background: color-mix(in srgb, var(--dead) 12%, transparen
 .edtip { display: block; margin-top: 3px; font-size: 11px; line-height: 1.65; color: var(--muted); }
 .edtip code { font-family: var(--mono); font-size: 10.5px; background: var(--hi); padding: 0 3px; border-radius: 3px; }
 
+/* ------------------------------------------------------------ ⑧ 定稿流程
+ *
+ * 这一块的全部设计意图只有一句：**让人看得出这是另一样东西，不是第四种排版。**
+ *   顶栏  切换器分两级——一级选「看哪一份」（开发路径 / 定稿流程），
+ *         二级选「怎么画」（图 / 列表 / 数据流），二级只在开发路径下出现。
+ *   工作区 定稿流程占满整块并收起右边的详情面板：它是一份从头读到尾的文档，
+ *         而详情面板里装的正是这一档不该显示的东西（为什么试这个、几个候选）。
+ *   开发路径上的回指 只用**字形**（[3]）。线型仍然只归 status、不透明度仍然只归
+ *         祖先链/搜索命中、颜色已经归了三种关系——一个通道都没借。
+ */
+
+/* 两级切换器。一级用实心底（它决定你在看什么），二级压小、去掉外框，
+   视觉上"挂"在一级下面——两级长得一样，就等于没分级。 */
+.modeswitch { display: flex; align-items: center; gap: 7px; flex: 0 0 auto; }
+.seg.mode button { padding: 5px 12px; font-weight: 600; }
+.seg.sub button { padding: 4px 9px; font-size: 11.5px; }
+.seg.sub { border-color: color-mix(in srgb, var(--rule) 70%, transparent); }
+.seg.sub button.on { background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--ink); }
+#viewtoggle[hidden] { display: none; }
+
+body.pipeline-mode #left { flex: 1 1 auto; border-right: 0; }
+body.pipeline-mode #detail { display: none; }
+/* 「还有几个岔路口没决定」是开发路径那一侧的待办：这一档上它只是噪声。
+   #warnbar 和 #missbar 留着——记录本身的缺陷和「位置已经没了」对一条要发给
+   别人的流程更要紧，不是更不要紧。 */
+body.pipeline-mode #forkbar { display: none; }
+
+#pwrap { padding: 14px 20px 60px; }
+#pwrap[hidden] { display: none; }
+.pdoc { max-width: 84ch; }
+.pdoc .viewtitle { font-size: 15px; margin-bottom: 6px; }
+.pdoc .sec { margin-top: 22px; padding-top: 12px; }
+.pempty .viewlead { font-size: 12.5px; }
+.pacts { margin: 14px 0 0; }
+
+/* 整条流程的等级：一个数 + 它对别人意味着什么 + 是谁拖的后腿（可点）。 */
+.plevel .lvrow { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.plevel .lvmean { margin: 0 0 6px; font-size: 13px; line-height: 1.75; }
+.plevel .lvcap { display: block; margin: 0 0 6px; font-size: 12.5px; color: var(--muted); }
+.plevel .lvcap a { color: var(--accent); font-family: var(--mono); }
+
+/* 三条判断。它们**只长在这一屏**，不进顶栏——理由见 app.js 的 pipeChecks。 */
+.pchecks .wrow { font-size: 12.5px; line-height: 1.8; padding: 3px 0; }
+.pchecks .wrow b { font-family: var(--mono); font-size: 11.5px; }
+.pchecks .w-warn { color: var(--ink); }
+.pchecks .w-info { color: var(--muted); }
+
+/* 那张图。它是**纸上的墨**（白底黑字），屏幕上也照这个样子画：让屏幕一张、
+   发出去另一张，等于对着一张图讨论、拿另一张去投稿。深色主题下它就是一张
+   摆在桌上的白纸，边框和圆角负责说明"这是一份产物，不是界面的一部分"。 */
+.pfig {
+  margin: 14px 0 6px; padding: 8px; overflow-x: auto;
+  border: 1px solid var(--rule); border-radius: 7px; background: #ffffff;
+}
+.pfig svg { display: block; }
+
+/* 逐步的做法。按"别人照着做"挑内容：做了什么、命令、代码位置、产物和校验和、
+   这一步的等级。「为什么试这个」不在这里——那是开发路径的事，一个按钮就过去。 */
+.pstep { border-top: 1px solid var(--rule); padding-top: 12px; margin-top: 26px; }
+.pstep .phead { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; }
+.pstep .phead .sp { flex: 1; }
+.pstep .pnum {
+  font-size: 12px; font-weight: 700; color: var(--muted);
+  border: 1px solid var(--rule); border-radius: 3px; padding: 0 6px;
+}
+.pstep .pid { font-size: 12px; color: var(--muted); }
+.pstep .ptitle { font-family: var(--serif); font-size: 16px; margin: 0; font-weight: 600; }
+.pstep .pwhy { margin: 6px 0 0; font-size: 11.5px; color: var(--muted); }
+.pstep .prose { font-size: 14.5px; margin-top: 8px; }
+.pstep .pmiss { color: var(--wip); }
+.pstep .pathbox, .pstep .codebox { margin-top: 12px; }
+.pstep .codebox { border-top: 0; padding-top: 0; }
+
+/* 三个导出。说明摆在按钮旁边而不是塞进 title：这三样产物各自的用途不一样，
+   而"点了会得到什么"是按下去之前就该知道的事。 */
+.pexps { display: flex; flex-wrap: wrap; gap: 14px; margin: 8px 0 4px; }
+.pexp { flex: 1 1 220px; min-width: 0; }
+/* 三个导出是 <a download> 而不是 <button>：那三份字节由服务端（或 build 写下的
+   同名文件）给，这一页不生成任何东西。所以这里要让链接长成按钮的样子——
+   它做的确实是按钮的事，只是**不由这一页动手**。 */
+.pexp .btn {
+  display: block; width: 100%; box-sizing: border-box; text-align: left; font-weight: 600;
+  padding: 5px 10px; border: 1px solid var(--rule); border-radius: 5px;
+  background: var(--bg); color: var(--ink); text-decoration: none; cursor: pointer;
+}
+.pexp .btn:hover { background: var(--hi); }
+.pexp .dropnote { margin-top: 5px; }
+.pfoot { margin-top: 22px; }
+
+/* 详情面板 / 卡片上的回指。字形通道，和 L0 · ↺✕ · ⇢ · Y · ~> · ⇄ · ⊘ 同一档。 */
+.cmk.pipe {
+  font-family: var(--mono); font-size: 9px; line-height: 13px; padding: 0 2px;
+  border-radius: 2px; border: 1px solid var(--rule); color: var(--muted); opacity: 1;
+}
+.row .cmk.pipe { flex: 0 0 auto; }
+.pipechip { padding: 0 5px; border-radius: 3px; border: 1px solid var(--rule); color: var(--muted); }
+/* 成果那一枚给一点重量：它是整条流程里唯一写下来的事实。
+   `exclude` 那一枚刻意**不**变暗、不划线——「不算流程」是一个决定，不是一个缺陷。 */
+.pipechip.result { border-color: var(--ink); color: var(--ink); font-weight: 600; }
+.pipechip.out { border-style: dashed; }
+.pipebox .decq { margin: 0 0 8px; font-size: 12.5px; line-height: 1.8; }
+.pipebox .decq b {
+  font-size: 10px; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--muted); margin-right: 8px;
+}
+
 /* ---------------------------------------------------------------- 窄屏 */
 
 /* 图视图在窄屏上的说法：不删、不改布局算法（那是纯函数，改了图和列表就对不上），
@@ -1270,6 +1385,16 @@ button.danger:hover { background: color-mix(in srgb, var(--dead) 12%, transparen
   .cfbody { max-height: 26vh; }
   .dlgbody menu { justify-content: stretch; }
   .dlgbody menu button { flex: 1 1 auto; }
+  /* 两级切换器在窄屏上叠成两行而不是被挤扁：一级那两个词（开发路径 / 定稿流程）
+     是这一版最需要读清楚的东西，压成六个像素宽的格子等于没做。 */
+  .modeswitch { flex-wrap: wrap; gap: 4px; }
+  .seg.mode button { padding: 5px 8px; }
+  .seg.sub button { padding: 4px 7px; }
+  /* 定稿流程本来就占满整块（详情面板收起来了），窄屏上再限高就只剩一条缝 */
+  body.pipeline-mode #scroller { max-height: none; }
+  #pwrap { padding: 12px 12px 48px; }
+  .pexps { gap: 10px; }
+  .pexp { flex: 1 1 100%; }
   #legend { flex-wrap: wrap; gap: 8px 12px; }
   /* 窄屏上先保住那三个词（互斥候选 / 汇回 / 延伸），后半句让位 */
   #legend .lgtext { max-width: 15ch; }

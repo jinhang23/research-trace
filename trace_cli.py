@@ -8,6 +8,8 @@
     python trace_cli.py fork 012 012b --decision "…"     把几步标成互斥候选（只能选一条）
     python trace_cli.py forks                            还有几个岔路口没做决定
     python trace_cli.py paths --check                    逐条核对外部路径还在不在
+    python trace_cli.py result 023 --note "主结果…"       声明「这一步是成果」
+    python trace_cli.py pipeline [--methods|--svg 图.svg] 定稿流程 / Methods 草稿 / 那张图
     python trace_cli.py check [-P <项目>]                 校验不变量
     python trace_cli.py tr [-P <项目>] [--lang en]        还缺哪些语言版本 / 补一份译文
     python trace_cli.py build [--out dist]               静态导出，file:// 可直接打开
@@ -374,6 +376,15 @@ def cmd_rm(args) -> int:
         # 可溯源性沿着它上溯；再加上 id 会被重用，这些边会无声地改指到别的步骤上。
         print("⚠ 这些步骤声明了 input: " + info["id"] + "（数据依赖，可溯源链会断在这里）："
               + "、".join(info["dangling_inputs"]))
+    if info.get("dangling_results"):
+        # 三条里最重的一条。删掉的这一步被 project.md 声明成了**成果**，整条定稿
+        # 流程就是从它长出来的——它一没，流程静默变空，而页面上只有一行小字。
+        # 写入侧刻意**不**替人撤那一行（撤了就没人看得见流程曾经指向一步被删的
+        # 记录），所以这里必须说出来；而 id 会被重用，下一个拿到该号的步骤会
+        # 无声地变成论文的主结果。
+        print("⚠ project.md 里这几行成果声明现在指空了（定稿流程从它们长出来）："
+              + "、".join(info["dangling_results"]))
+        print("   去 project.md 里改掉或删掉它们，或者用 result 子命令重新指一步。")
     print(f"⚠ id {info['id']} 可能被下一个新建的步骤重用。")
     return 0
 
@@ -600,6 +611,154 @@ def cmd_tr(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- 定稿流程
+#
+# 两条路径，两个出口：`check` / `forks` / 三个视图看的是**开发路径**（全部记录），
+# 这一段看的是**定稿流程**（只有产出成果的那条链）。推导和渲染一个字都不在这里——
+# 判据在 core.compute_pipeline，渲染在 trace_mcp（那三样导出**只有那一份实现**，
+# 网页拿的也是它的产物，理由见那一段的注释）。CLI 只负责读盘、挑格式、写文件。
+
+
+def _pipeline_of(root: Path, slug: str) -> dict:
+    """一个项目的定稿流程 payload。和 REST / MCP 走的是同一个 pipeline_payload。
+
+    `compute_pipeline({}, [])` 那个 fallback 不是形式：一个 `result:` 都没声明的
+    项目，forest 里**整个 pipeline 键都不出现**（现存项目必须完全无感），
+    空态那句「教你怎么办」只有主动问起来的这条路上拿得到。
+    """
+    f = core.compile_forest(core.steps_dir_of(root, slug))
+    # 抬头用显示名而不是目录名：导出的图和草稿是要交出去的，抬头写着 slug
+    # （`my-project-2`）的话，收到的人只会以为拿错了文件。
+    name = next((p.name for p in core.scan_projects(root) if p.slug == slug), slug)
+    return mcp.pipeline_payload(f, slug, core.compute_pipeline({}, []), name)
+
+
+# 诊断按**后果**分栏，不按 level 字段分——和上面 HINT_CODES 那一段是同一条道理。
+# 混成一栏打，人会以为「还没声明成果」和「你的主结果站在一条自己判死的路上」
+# 一样严重，然后开始整体略过这一段。
+#
+#   这两条直接决定「别人能不能照着做出来」：一条压着整条流程的等级，
+#   另一条说的是结果依赖着一条已经放弃的路。
+PIPE_BLOCKING_CODES = ("pipeline_weak_step", "pipeline_dead_step")
+#   这几条是**记录里两句话打架**，程序不替人裁决：排除了却仍被消费、
+#   成果指向不存在的步骤、数据依赖成环。改记录才消得掉。
+PIPE_CONFLICT_CODES = ("pipeline_excluded_consumed", "pipeline_excluded_result",
+                       "dangling_result", "pipeline_cycle")
+
+
+def _pipeline_diag_lines(payload: dict) -> tuple[list[str], list[str], list[str]]:
+    """(影响能不能复现, 记录自相矛盾, 纯提示)。三栏都可能是空的。"""
+    hard: list[str] = []
+    conflict: list[str] = []
+    hint: list[str] = []
+    for d in payload["pipeline"].get("diagnostics") or []:
+        row = f"[{d.get('where') or d.get('code')}] {d.get('message', '')}"
+        if d.get("code") in PIPE_BLOCKING_CODES:
+            hard.append(row)
+        elif d.get("code") in PIPE_CONFLICT_CODES:
+            conflict.append(row)
+        else:
+            hint.append(row)
+    return hard, conflict, hint
+
+
+def _print_pipeline_diags(payload: dict, indent: str = "  ") -> int:
+    """打三栏诊断，返回「该让 --strict 失败的」条数。"""
+    hard, conflict, hint = _pipeline_diag_lines(payload)
+    if hard:
+        print(f"{indent}⚠ 影响别人能不能照着做出来（**这几条直接决定整条流程的等级**）：")
+        for r in hard:
+            print(f"{indent}    {r}")
+    if conflict:
+        print(f"{indent}⚠ 记录里两句话打架，程序不替你裁决：")
+        for r in conflict:
+            print(f"{indent}    {r}")
+    if hint:
+        print(f"{indent}ⓘ 提示（**不影响等级，也不影响退出码**）：")
+        for r in hint:
+            print(f"{indent}    {r}")
+    return len(hard) + len(conflict)
+
+
+def cmd_result(args) -> int:
+    """声明「这一步是成果」，或撤销一条声明。
+
+    单开一个子命令而不是给 `new` / 一个通用的 project 命令加参数：这个动作决定
+    **整条定稿流程长什么样**——论文 Methods 和附录里出现哪几步、导出的那张图上
+    画着谁。和「改个标题」走同一个随手的口子，在语义上就把它降级成了一个字段。
+    """
+    cfg = load_config()
+    root = data_root(cfg)
+    slug = pick_project(root, args.project)
+    if args.drop:
+        info = W.drop_result(root, slug, args.id)
+        left = info["results"]
+        print(f"已撤销 {slug}/{args.id} 的成果声明。记录一个字都没动——"
+              "它只是不再是定稿流程的终点，开发路径上还在原处。")
+        print("现在声明的成果：" + ("、".join(r["step"] for r in left) if left
+                                    else "（一个都没有，定稿流程也就推不出来了）"))
+        return 0
+    info = W.set_result(root, slug, args.id, args.note or "")
+    print(("已声明" if info["created"] else "已改写") + f" {slug}/{info['step']} 为成果：{info['line']}")
+    print("定稿流程会从它沿 `input:` 反向算出来（一步没写 input: 时退回 parent，剔掉 dead）。"
+          "成员清单一个字都不存，所以你不用维护它。")
+    # 声明完当场把算出来的流程摆出来。不摆的话，用户拿到的是一句干净的「已声明」，
+    # 而这个动作真正改变的东西（哪几步进了 Methods、整条链的等级、有没有踩着 dead）
+    # 一样都看不见——它们恰恰是这一次调用的全部后果。
+    print()
+    payload = _pipeline_of(root, slug)
+    print(mcp.fmt_pipeline(payload, with_diagnostics=False))
+    if payload["pipeline"].get("diagnostics"):
+        print()
+        _print_pipeline_diags(payload, indent="")
+    return 0
+
+
+def cmd_pipeline(args) -> int:
+    """打印定稿流程，或把它导出成 Methods 草稿 / 一张图 / 一页独立的 HTML。
+
+    三样导出**从同一份派生来**，而且是同一份代码生成的——CLI 和网页各写一遍的话，
+    两份迟早不一致，**而其中一份会进论文**。所以这里一行渲染逻辑都没有，
+    全部调 trace_mcp 里那三个纯函数（网页那侧走 REST 的
+    `/pipeline/figure.svg` 与 `/pipeline/methods.md`，拿到的是同一批字节）。
+    """
+    cfg = load_config()
+    root = data_root(cfg)
+    slug = pick_project(root, args.project)
+    payload = _pipeline_of(root, slug)
+
+    wrote = []
+    for target, render in ((args.svg, mcp.pipeline_svg), (args.page, mcp.pipeline_page)):
+        if not target:
+            continue
+        p = Path(target)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(render(payload), encoding="utf-8", newline="\n")
+        wrote.append(p)
+
+    # `--methods` 那条路的 **stdout 是文档本身**（`> methods.md` 收走、直接粘进稿子），
+    # 所以流程概览、三栏诊断、「已写出」一样都不许混进去 —— 混进去就等于往 Methods
+    # 的第一段里塞一句提示。同时给了 --svg 的话文件照写，只是那句回执改走 stderr：
+    # 静默写文件同样不行（人不知道自己刚生成了什么），而 stderr 正是为这种话准备的。
+    out = sys.stderr if args.methods else sys.stdout
+    if args.methods:
+        print(mcp.pipeline_methods(payload), end="")
+    else:
+        # 诊断在这里**按后果分三栏**打（fmt_pipeline 那份关掉），因为「还没声明成果」
+        # 和「你的主结果站在一条自己判死的路上」不该长得一样。空态时一栏都不打：
+        # 那一条和 fmt_pipeline 里那段话说的是同一件事，打两遍只会让人以为犯了两个错。
+        print(mcp.fmt_pipeline(payload, with_diagnostics=False))
+        if payload["declared"] and payload["pipeline"].get("diagnostics"):
+            print()
+            _print_pipeline_diags(payload, indent="")
+    for p in wrote:
+        print(f"\n已写出 {p}（**逐字节确定**：同样的记录重新生成一次一模一样，"
+              "所以别把它存进仓库当第二份真相，要用就重新生成）", file=out)
+    if not payload["declared"] and not args.methods:
+        print(f"\n标一个成果：trace_cli.py result -P {slug} <步骤id> --note \"这是什么成果\"")
+    return 0
+
+
 def _histogram(levels: list[str]) -> str:
     c = {k: 0 for k in LEVELS}
     for x in levels:
@@ -691,6 +850,29 @@ def cmd_check(args) -> int:
                       + (f"  —— {g['decision']}" if g.get("decision") else "  —— 还没写在决定什么"))
             print("      逐个看：forks ／ 结掉一个：把没走通的候选标 dead 并写清为什么放弃")
 
+        # 定稿流程。**只在这个项目真的声明了成果时才出现一个字**——没声明是常态
+        # 不是缺陷，每次 check 都念一遍「你还没声明成果」只会让人为了让输出干净
+        # 随手指一步当成果，那和拿假结论换绿色是同一件事。
+        #
+        # 它回答的是 check 原来答不了的那个问题：上面那几栏说的是**开发路径**
+        # （全部记录，含走不通的），而投稿前真正要问的是「**产出成果的那条链**
+        # 别人能不能照着做出来」。两者的等级可以差很远：一堆没记全的探索性步骤
+        # 把整体分布压得很难看，而定稿流程上的那七步其实条条 L3。
+        pipe = mcp.pipeline_payload(
+            f, slug, core.compute_pipeline({}, []),
+            next((x.name for x in core.scan_projects(root) if x.slug == slug), slug))
+        if pipe["declared"]:
+            p = pipe["pipeline"]
+            print(f"  ⇉ 定稿流程 {len(p['order'])} 步 · 整链 {p['level']} "
+                  f"{LEVEL_LABEL.get(p['level'], '')}"
+                  + (f" · 最弱一环 {p['weakest']}" if p.get("weakest") else "")
+                  + f" · 成果 {'、'.join(r['step'] for r in p['results'])}")
+            print("      " + " → ".join(p["order"]))
+            # 这几条**算进 --strict**：它们说的是「别人照着这条链做不出来」，
+            # 而那正是 --strict 存在的理由。纯提示（info 级）不算，理由同上。
+            warns += _print_pipeline_diags(pipe, indent="      ")
+            print(f"      逐步看 / 导出：pipeline -P {slug} [--methods | --svg 图.svg]")
+
         # 已确认不存在的外部位置。**不是警告，也不进退出码**：路径没了是溯源
         # 结论（P4），不是这份记录写错了。但 check 是三个出口里唯一一个人会
         # 天天跑的，而它以前对此一个字都不说——网页顶上有横幅、`paths` 有汇总、
@@ -734,7 +916,7 @@ def cmd_build(args) -> int:
     for child in out.iterdir():
         shutil.rmtree(child) if child.is_dir() else child.unlink()
 
-    def render(asset_prefix: str, project: str, forest, plist) -> str:
+    def render(asset_prefix: str, project: str, forest, plist, pipe_svg: str = "") -> str:
         return (
             tpl.replace("__ASSET__", asset_prefix)
             .replace("__BASE__", "")
@@ -743,6 +925,11 @@ def cmd_build(args) -> int:
             .replace("__PROJECT__", project)
             .replace("__DATA__", inline(forest) if forest is not None else "")
             .replace("__PROJECTS__", inline(plist))
+            # 静态导出里那张图**灌进页面**而不是让页面去 fetch：file:// 下取一个
+            # 相对路径会被当成跨源，断网双击打开时页面上会是一块空白。灌进来的
+            # 字节和同目录 pipeline.svg、和服务端 /pipeline/figure.svg 完全一样
+            # ——它们是同一个纯函数的同一份输出。
+            .replace("__PIPESVG__", inline(pipe_svg) if pipe_svg else "")
         )
 
     # 静态产物必须是确定性的：不写入任何时间戳或版本号，否则
@@ -768,8 +955,30 @@ def cmd_build(args) -> int:
     for p in projects:
         pd = out / "p" / p.slug
         pd.mkdir(parents=True)
-        (pd / "index.html").write_text(render("../../", p.slug, forests[p.slug], plist),
-                                       encoding="utf-8", newline="\n")
+        # 定稿流程那**三样导出**：**只在这个项目声明了成果时才生成**（没声明就没有
+        # 流程，三个空文件比没有这三个文件更让人困惑）。它们和 index.html 是两条
+        # 路径的两个出口——index 是开发路径（全部记录，给自己查问题），这三样只有
+        # 产出成果的那条链，是**能直接发给合作者**的那一份。
+        # 无脚本、无外部资源，双击就能开，断网也行；逐字节确定（P3）。
+        #
+        # 三样都出自 trace_mcp 里那**一份**生成器，也就是服务端 /pipeline/*
+        # 和 `trace_cli.py pipeline --svg/--methods/--page` 用的同一个纯函数。
+        # 网页上那三个按钮指到这三个文件（静态）或那三条路由（服务），所以
+        # 「屏幕上看到的」和「发出去的」永远是同一批字节。
+        pipe = mcp.pipeline_payload(forests[p.slug], p.slug,
+                                    core.compute_pipeline({}, []), p.name)
+        pipe_svg = ""
+        if pipe["declared"]:
+            pipe_svg = mcp.pipeline_svg(pipe)
+            (pd / "pipeline.svg").write_text(pipe_svg, encoding="utf-8", newline="\n")
+            (pd / "pipeline.md").write_text(mcp.pipeline_methods(pipe),
+                                            encoding="utf-8", newline="\n")
+            (pd / "pipeline.html").write_text(
+                mcp.pipeline_page(pipe, title=f"{p.name} · 定稿流程"),
+                encoding="utf-8", newline="\n")
+        (pd / "index.html").write_text(
+            render("../../", p.slug, forests[p.slug], plist, pipe_svg),
+            encoding="utf-8", newline="\n")
         src = core.steps_dir_of(root, p.slug)
         if src.is_dir():
             shutil.copytree(src, pd / "steps", ignore=shutil.ignore_patterns(".*"))
@@ -799,14 +1008,13 @@ def cmd_serve(args) -> int:
 # ---------------------------------------------------------------- main
 
 
-def main(argv: list[str] | None = None) -> int:
-    # Windows 控制台默认 cp936，中文提示会乱码
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8")
-        except (AttributeError, OSError):
-            pass
+def build_parser() -> argparse.ArgumentParser:
+    """整棵 argparse。**单独一个函数，是为了让「有哪些子命令」可以被问出来。**
 
+    上一版这张表只存在于 main() 内部的局部变量里，于是「CLI 真有的子命令」这件事
+    在程序外面读不到，测试只好手抄一份名单——而手抄的那份漏掉了后来加的 result /
+    pipeline，那道闸门对新命令恰好是不设防的。派生的东西要能被派生出来（P1）。
+    """
     ap = argparse.ArgumentParser(prog="trace", description="科研记录与溯源")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -924,6 +1132,34 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--drop", action="store_true", help="删掉这一步的该语言版本。原文不受影响")
     p.set_defaults(fn=cmd_tr)
 
+    p = sub.add_parser("result",
+                       help="声明「这一步是成果」——**定稿流程唯一写下来的那件事**，其余全是算出来的")
+    p.add_argument("id", metavar="步骤id")
+    p.add_argument("-P", "--project", default=None)
+    p.add_argument("--note", default="", metavar="这是什么成果",
+                   help='一句话，如 --note "主结果：亲和力预测 AUC 0.91"。'
+                        "会显示在流程和 Methods 草稿的开头")
+    p.add_argument("--drop", action="store_true",
+                   help="撤销这一条声明。不删任何记录，也不要求写原因——"
+                        "`result:` 不是一段历史，是一个当前指针（论文现在报的是哪一步）")
+    p.set_defaults(fn=cmd_result)
+
+    p = sub.add_parser("pipeline",
+                       help="定稿流程：真正产出成果的那一条链（给别人照着做、给论文用）。"
+                            "开发路径——全部记录，含走不通的——看 check / 网页")
+    p.add_argument("-P", "--project", default=None)
+    p.add_argument("--methods", action="store_true",
+                   help="输出 **Methods 草稿**（markdown）到 stdout：按流程顺序，每一步的"
+                        "「做了什么」原文、完整命令、代码位置、产物路径与校验和。"
+                        "**写论文时最顺手的入口**（`> methods.md` 收走即可）。"
+                        "它是初稿不是成品——里面只有记录里已有的事实，没有替你编的论文腔句子")
+    p.add_argument("--svg", default=None, metavar="文件",
+                   help="导出那张图：自包含 SVG，不引任何外部资源、没有脚本，黑白打印可读")
+    p.add_argument("--page", default=None, metavar="文件",
+                   help="导出一页能发给合作者的独立 HTML（图 + Methods 草稿，只含定稿流程）。"
+                        "`build` 也会给每个声明了成果的项目生成一份 p/<项目>/pipeline.html")
+    p.set_defaults(fn=cmd_pipeline)
+
     p = sub.add_parser("check", help="校验不变量，并按 FORMAT.md 给出 L0–L4 可溯源性等级")
     p.add_argument("-P", "--project", default=None)
     p.add_argument("--strict", action="store_true",
@@ -942,8 +1178,18 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("url", help="打印访问地址与令牌")
     p.set_defaults(fn=cmd_url)
+    return ap
 
-    args = ap.parse_args(argv)
+
+def main(argv: list[str] | None = None) -> int:
+    # Windows 控制台默认 cp936，中文提示会乱码
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except (AttributeError, OSError):
+            pass
+
+    args = build_parser().parse_args(argv)
     try:
         return args.fn(args)
     except W.WriteError as exc:

@@ -82,6 +82,13 @@
       "app.view.list.title": "List view",
       "app.view.flow": "Flow",
       "app.view.flow.title": "Data-flow view — edges are declared inputs, not the tree",
+      /* ⑧ 两条路径。它们在切换器里并排站着，所以这两个名字必须互相解释：一个回答
+         「我是怎么走到这儿的」，一个回答「该怎么做」。第一次看见两个视图的人，
+         能不能分清自己在看什么，全靠这两行和下面 pipeline.*.lead 那两句。 */
+      "app.view.dev": "Development path",
+      "app.view.dev.title": "Everything that was recorded, dead ends and undecided forks included. The view for yourself: it answers how you ended up here.",
+      "app.view.pipeline": "Final pipeline",
+      "app.view.pipeline.title": "Only the chain that produced the results, traced back through the declared inputs. The view for everyone else: it answers what to do.",
       "app.new": "＋ New step",
       "app.new.title": "Branch a new step off the selected one (n)",
       "app.newproj": "＋ Project",
@@ -324,6 +331,117 @@
       "rejoin.badge": "rejoins",
       "rejoin.badge.title": "Something produced on another road was read here, or something produced here was read over there. The curved edges on the graph are these.",
 
+      /* ---- ⑧ 两条路径：记录与方法的分家 ----
+         磁盘上只多了一行 `result:`（写在 project.md 的 front-matter 上，可重复）。
+         「哪些步在流程里」「什么顺序」「整条链多可靠」全是从成果沿 `input:` 反向
+         闭包算出来的，一个字都不存——存了就是一份会漂移的中心索引（P1 禁止）。
+         文案必须把这件事说出来，否则人会去找一个「流程成员清单」的编辑框，
+         找不到就以为功能缺了一半——而那个清单正是双真相源本身。 */
+      "pipeline.name": "Final pipeline",
+      "pipeline.lead": "The chain that actually produced the results, and nothing else. It is what someone else follows to get the same numbers, and what a Methods section is made of.",
+      "pipeline.dev.name": "Development path",
+      "pipeline.dev.lead": "Every step there is, including the roads that went nowhere and the forks you are still carrying. It is what you read when something looks wrong and you need to know how it got that way.",
+      /* 这一句是两条路径全部的关键。不写它，人会把定稿流程理解成「开发路径的
+         精简版」，然后开始问「为什么这一步被藏起来了」——而它们回答的根本是
+         两个不同的问题。 */
+      "pipeline.pair.note": "Neither view is a tidier version of the other. The development path is **how you got there** — what was tried, what died, the moment a choice got made. The final pipeline is **what to do** — the shortest honest account of how the result came about. A step can matter enormously to the first and belong nowhere in the second.",
+      "pipeline.head": { one: "Final pipeline · {n} step", other: "Final pipeline · {n} steps" },
+      "pipeline.order.note": "In the order the work has to happen: a step comes after everything it reads. Where two steps depend on nothing of each other's, the id decides — so the same record always compiles to the same order, and two exports can be diffed.",
+      "pipeline.derived.note": "No list of members is stored anywhere. From each result the chain is followed backwards along `input:`; a step that declares none falls back to its `parent`, which is the step it in fact came after. Anything marked `dead` drops out. Keep a stored list instead and it starts lying the first time you move a step.",
+
+      /* 一个 `result:` 都没声明是绝大多数项目的常态，所以这四句是这个功能的门面。
+         它要说清「定稿流程是什么」「为什么值得声明」「怎么声明」——不是报错，
+         也不是空荡荡一句「暂无数据」。 */
+      "pipeline.empty.title": "Nothing has been declared a result yet",
+      "pipeline.empty.what": "A final pipeline is the chain of steps that actually produced a result — traced backwards from that result through what each step declared as its `input:`, with the dead ends dropped. It is not a second copy of anything: every member is worked out on the spot, so it follows along as you move a step, add an input, or mark a road dead.",
+      "pipeline.empty.why": "Declaring one is worth the thirty seconds, because it is the only part of this nothing can work out for you — which of two hundred steps is the one you would put in a paper. Once it is declared, the pipeline, its weakest step and a Methods draft all come for free.",
+      "pipeline.empty.how": "One line in the project's front matter: `result: 023 | affinity prediction, AUC 0.91`. Several are fine — one per figure, one per claim. Or open a step and hit **{act}**.",
+      "pipeline.empty.act": "Mark a step as a result",
+
+      "pipeline.result.head": { one: "Declared result · {n}", other: "Declared results · {n}" },
+      "pipeline.result.lead": "This is the one thing about the pipeline that is written down rather than read off the notes. Which steps are in it, in what order, and how far it can be followed are all worked out again every time.",
+      "pipeline.result.entry": "{link} — {what}",
+      "pipeline.result.entry.bare": "{link}",
+      "pipeline.result.badge": "result",
+      "pipeline.result.badge.title": "A declared result: one of the things this project set out to produce. Whatever it took to get here is the pipeline.",
+      "pipeline.result.mark": "Mark as a result",
+      "pipeline.result.mark.title": "Say that this step is one of the project's results. The pipeline behind it is then read off the inputs — no member is listed by hand, so nothing here can go stale.",
+      "pipeline.result.unmark": "Not a result after all",
+      "pipeline.result.unmark.title": "Takes that line back out of the project note. The step, its inputs and everything downstream stay exactly as they are; what changes is where the pipeline gets traced back from.",
+      "pipeline.result.prompt": "What is this the result of? One line — it travels with the result wherever the pipeline is shown, including the figure and the Methods draft:",
+      "pipeline.result.multi": "Several results, one pipeline: it holds whatever any of them needed. Each step also says which results reach it, so a single figure can still be traced on its own.",
+
+      /* 「这一步为什么在流程里」。闭包是算出来的，算出来的东西必须能解释自己，
+         否则人只能相信它——而相信一个看不见的推导，正是上一代系统的死法。 */
+      "pipeline.why.result": "the declared result",
+      "pipeline.why.input": "{id} declares this step's output as an input",
+      "pipeline.why.parent": "{id} declares no inputs, so the step it came after stands in",
+      "pipeline.why.include": "kept in by hand",
+
+      /* 个别步骤上的例外。和 `branch:` 同一个套路：写在**那一步自己**的 note.md 上，
+         不是在项目上列一张清单。文案要点出这一点，不然人会去项目页找清单。 */
+      "pipeline.include.badge": "kept in",
+      "pipeline.include.badge.title": "This step says it belongs to the pipeline even though tracing the inputs never reaches it. It declares that about itself, the same way a candidate does — the project never holds a list.",
+      "pipeline.exclude.badge": "left out",
+      "pipeline.exclude.badge.title": "This step says it is not part of the pipeline. The trace reaches it and it worked; it is still not part of how the result is made. Exploratory work usually isn't.",
+      "pipeline.badge": "in the pipeline",
+      "pipeline.badge.title": "This step is part of how a declared result came about. Nothing was ticked to say so — it is where following the inputs back from the result arrives.",
+      /* 两条路径必须能互相跳。「这一步当时有 3 个候选，为什么选了它」正是
+         两条都留着的意义，所以这两句 tooltip 说的是**去那边能看到什么**，
+         不是「切换视图」。 */
+      "pipeline.jump.dev": "Show it on the development path",
+      "pipeline.jump.dev.title": "The pipeline shows the road that was taken; the development path shows the ones that weren't. If this step was one of three candidates, that is where the other two are, and why this one carried on.",
+      "pipeline.jump.final": "Show it in the final pipeline",
+      "pipeline.jump.final.title": "Where this step sits in the chain that produced the result, and what runs on either side of it.",
+
+      /* 三条白拿的判断。第二条是最严重的发现，措辞要让人当回事而不像在指责：
+         「结果依赖着一条自己已经放弃的路」多半是标记过期了，也可能真是那样，
+         两种都该在投稿前自己发现，而不是从审稿人嘴里听到。 */
+      "pipeline.check.head": "Worth knowing before anyone else follows this",
+      "pipeline.warn.noresult": "No step is declared a result, so there is nothing to compile a pipeline from yet. One line in the project note is the whole of it.",
+      "pipeline.warn.dead": { one: "The pipeline runs through a step marked dead: {ids}. The result rests on a road you gave up on yourself. Either the mark is out of date and the road did carry on, or the dependency is real and the result stands on a dead end — either way, better found here than by a reviewer.",
+                              other: "The pipeline runs through {n} steps marked dead: {ids}. The result rests on roads you gave up on yourself. Either those marks are out of date and the roads did carry on, or the dependencies are real and the result stands on dead ends — either way, better found here than by a reviewer." },
+      "pipeline.warn.weak": { one: "{ids} is in the pipeline and sits at L0 or L1, which means nobody outside this project can run it. The pipeline can be no stronger than that step, so it is the one to mend before this goes out.",
+                              other: "{n} steps in the pipeline sit at L0 or L1 — {ids}. Nobody outside this project can run those, and the pipeline can be no stronger than its weakest one, so they are what to mend before this goes out." },
+      /* trace_core 发的是**七**条 pipeline 诊断，上面只有三条。少一条的后果不是
+         「没翻译」而是**英文界面上原样漏出一整句中文**——warnText 认不出 code 就
+         退回服务端原句（那条退路是对的：绝不吞掉警告），于是缺的那几条恰好是最
+         需要人读懂的四条自相矛盾。所以这四条和上面那三条是同一批东西，不是补充。 */
+      "pipeline.warn.excluded.consumed": { one: "{id} says `pipeline: exclude`, yet {ids} — which is in the pipeline — reads what it produced. Both cannot be true: either that exclude line is stale and the step is part of the method after all, or the `input:` on {ids} points at the wrong step.",
+                                           other: "{id} says `pipeline: exclude`, yet {n} steps in the pipeline read what it produced — {ids}. Both cannot be true: either that exclude line is stale and the step is part of the method after all, or those `input:` lines point at the wrong step." },
+      "pipeline.warn.excluded.result": "{id} is declared a result in the project note and also carries `pipeline: exclude` on itself. It is kept in — a pipeline without its endpoint is not a pipeline — but one of those two lines is out of date, and only you know which.",
+      "pipeline.warn.cycle": { one: "{ids} depends on its own output, so there is no first step to put in a Methods section. The pipeline is still shown, with the cycle placed last by id.",
+                               other: "The data dependencies among {ids} form a cycle, so no order of {n} steps can be right. The pipeline is still shown, with the cycle placed last by id — but the question \"which of these comes first\" has no answer in the notes yet, and it needs one before this is written up." },
+      "pipeline.warn.dangling": "`result: {id}` points at a step that does not exist, so nothing can be traced back from it. Usually a mistyped id, or the step was deleted — deletions are recorded under the project note's own section.",
+      /* `pipeline:` 写错值时 core 的降级提醒（当没写、继续建树）。和 bad_branch
+         同一条路，缺了它同样是英文界面漏中文。 */
+      "lint.pipeline.unknown": "`pipeline: {pipeline}` is not a value this understands, so the line is being ignored. It takes `include` or `exclude`, and a reason after the pipe.",
+
+      /* 整条流程的等级 = 其中最弱的一步。一个数回答「别人能不能照着做出来」，
+         所以每一级都要把那个数翻译成一句关于**别人**的话。 */
+      "pipeline.level.head": "How far this pipeline can be followed",
+      "pipeline.level.note": "A chain is worth what its weakest step is worth: one step nobody can locate stops the whole thing, however carefully the rest was written.",
+      "pipeline.level.weakest": "{link} {title} is what holds the whole pipeline at this level",
+      "pipeline.level.means.L0": "As it stands a reader cannot even follow what was done — somewhere along the chain the judgement itself was never written down.",
+      "pipeline.level.means.L1": "A reader can follow the reasoning but could not repeat the work: somewhere in the chain the code or the artifacts have no recorded location.",
+      "pipeline.level.means.L2": "Everything the chain used can be found again, code and artifacts both. Whether it still runs is untested.",
+      "pipeline.level.means.L3": "Someone has confirmed that the commands, the environment and the seeds are all there, end to end. A reader has what they need to try.",
+      "pipeline.level.means.L4": "Every step has been re-run and the numbers came back. This is as good as a record gets.",
+
+      /* 导出。三样都从同一份派生来，所以它们不可能互相矛盾；逐字节确定意味着
+         「重新生成」永远比「留一份拷贝」便宜——这一点值得在界面上说出来。
+         最后那句「这是初稿」是硬要说的：Methods 草稿是给人改的骨架，
+         把记录里已有的事实排好而已，它不会替你写一句论文腔的话。 */
+      "export.head": "Hand this to someone",
+      "export.lead": "All three are compiled from the same derivation, so they cannot contradict each other; and the same record compiles to the same bytes every time, so regenerating always beats keeping a copy around.",
+      "export.figure": "Figure",
+      "export.figure.note": "One self-contained SVG of the pipeline — nothing to fetch, no script to run, and readable in black and white. Journals print in grey far more often than anyone plans for.",
+      "export.methods": "Methods draft",
+      "export.methods.note": "The steps in order: what was done, the command as it ran, where the code is, and each artifact with its checksum. The facts you already recorded, arranged in the shape of a Methods section.",
+      "export.page": "Standalone page",
+      "export.page.note": "The pipeline as one page a collaborator can open with the network off. It holds the final pipeline only — the dead ends stay at home.",
+      "export.draft.note": "A draft, deliberately. It sets down what the record actually says and leaves the prose to you: nothing here invents a sentence for a fact nobody wrote down, so read every line before this goes anywhere.",
+
       /* ---- 可溯源性 · L0–L4 ---- */
       "trace.title": "Traceability · L0–L4",
       "trace.self": "this step",
@@ -425,6 +543,20 @@
       "editor.decision.label": "The question this step opens · optional",
       "editor.decision.placeholder": "How should the class imbalance be handled? Only one of these roads gets taken",
       "editor.decision.hint": "This goes on the step the roads leave from, not on the roads. Two children prove there were two roads; only this line says what the choice was between — and like \"Why\", it is a line nothing can generate for you.",
+      /* ⑧ 编辑侧只有一个三选一，而且默认那一档就是「别管它」：流程成员是算出来的，
+         手工设的那两档是**事实**，会过期，所以 hint 要先劝人不要用，再说清什么时候
+         非用不可。 */
+      "editor.pipeline.label": "This step and the final pipeline",
+      "editor.pipeline.auto": "work it out — follow the inputs back from the results",
+      "editor.pipeline.include": "keep it in — the trace misses it, but it is part of the method",
+      "editor.pipeline.exclude": "leave it out — it worked, it just isn't part of the method",
+      "editor.pipeline.hint": "Almost always leave this alone: membership is traced back from the results, so it keeps itself right. The two overrides are for the cases the trace genuinely gets wrong — a step whose output was copied across by hand and never declared as an input, or a side experiment that came off but that nobody should have to re-run. Both are declared here, on the step itself; the project never holds a list of members.",
+      "editor.pipeline.note.label": "Why, in one line",
+      "editor.pipeline.note.placeholder": "exploratory — it worked, but nothing downstream reads it",
+      /* 它**不是**可选的，写入侧不写就 400。上一版这里印着「optional」，于是人选了
+         exclude、跳过这一栏、按保存，收到的是服务端一句中文报错——界面亲口许了一个
+         它管不着的诺。理由必填是这个键和 `branch:` 唯一的分歧，原因就写在下面。 */
+      "editor.pipeline.note.required": "This one is required. Unlike a candidate group, which is visible on the tree the moment it exists, this line leaves no trace anywhere except in what gets exported — without the half-sentence there is no telling a thought-through decision from a mis-click.",
       "editor.hint": "Paste a screenshot with **Ctrl+V** and it uploads and inserts itself; anything copied out of Excel or a web table turns into a markdown table; files can be dropped straight into the box. `id` never changes and is never handed out twice — a `[[003b]]` written down anywhere has to keep working forever. `parent` can be moved, but only with a reason, and the move gets written into the note.",
       "editor.status.uploading": "Uploading…",
       "editor.status.inserted": { one: "Inserted {n} file", other: "Inserted {n} files" },
@@ -578,6 +710,10 @@
       "toast.deleted": "Deleted {id}",
       "toast.deleted.orphaned": "Deleted {id}; {ids} are orphans now",
       "toast.deleted.inputs": "Deleted {id}; {ids} still declare `input: {id}` and now point at nothing — go fix those lines",
+      /* 三条里最重的一条：被删的这一步是 project.md 声明的**成果**，整条定稿流程
+         从它长出来。放着不管的后果不是「少一条流程」，是 id 被重用之后，下一个拿到
+         这个号的步骤无声地变成论文报的那个结果。 */
+      "toast.deleted.result": "Deleted {id}, which the project note declares a result — the pipeline was traced back from it and now has nothing to start from. Fix or drop that line before the id gets reused.",
       "toast.insights.saved": "Saved — only the four insight sections were replaced",
       "toast.insight.added": "Filed under \"{label}\"",
       "toast.insight.updated": "Rewrote {id} — same id, so anything pointing at it still points at it",
@@ -594,6 +730,14 @@
       "toast.branch.extends": "{id} reads as an ordinary continuation again",
       "toast.decision.saved": "The question is written on {id}",
       "toast.decision.cleared": "The question line is gone from {id}; the candidates under it are untouched",
+      /* ⑧ 声明成果的直接后果看不见：流程是算出来的，界面上只会「多出一条链」。
+         所以这几条 toast 要顺手说出那条链是怎么来的。 */
+      "toast.result.marked": "{id} is a declared result now — the pipeline behind it is traced back from the inputs",
+      "toast.result.unmarked": "{id} is no longer a declared result; nothing about the step itself changed",
+      "toast.pipeline.include": "{id} is kept in the pipeline by hand — the note says so, the project holds no list",
+      "toast.pipeline.exclude": "{id} is out of the pipeline; on the development path it stays exactly where it was",
+      "toast.pipeline.auto": "{id} is back to being worked out from the inputs",
+      "toast.export.ready": "{name} is built — the same record always compiles to the same bytes",
       "toast.copied.path": "Path copied",
       "toast.copy.failed": "Copy failed",
       "toast.draft.restored": "Draft restored",
@@ -680,6 +824,13 @@
       "app.view.list.title": "列表视图",
       "app.view.flow": "数据流",
       "app.view.flow.title": "数据流视图——边是声明出来的输入，不是树",
+      /* ⑧ 两条路径。它们在切换器里并排站着，所以这两个名字必须互相解释：一个回答
+         「我是怎么走到这儿的」，一个回答「该怎么做」。第一次看见两个视图的人，
+         能不能分清自己在看什么，全靠这两行和下面 pipeline.*.lead 那两句。 */
+      "app.view.dev": "开发路径",
+      "app.view.dev.title": "全部记录，含走不通的那些和还没决定的岔路口。这是给自己看的一档：它回答「我是怎么走到这儿的」。",
+      "app.view.pipeline": "定稿流程",
+      "app.view.pipeline.title": "只有真正产出成果的那条链，顺着声明的输入反推出来。这是给别人看的一档：它回答「该怎么做」。",
       "app.new": "＋ 新步骤",
       "app.new.title": "从选中节点派生新步骤（n）",
       "app.newproj": "＋ 项目",
@@ -908,6 +1059,113 @@
       "rejoin.badge": "有汇回",
       "rejoin.badge.title": "别的路上产出的东西被这里读了，或者这里产出的东西被别的路读了。图上那些弯曲的边就是它们。",
 
+      /* ---- ⑧ 两条路径：记录与方法的分家 ----
+         磁盘上只多了一行 `result:`（写在 project.md 的 front-matter 上，可重复）。
+         「哪些步在流程里」「什么顺序」「整条链多可靠」全是从成果沿 `input:` 反向
+         闭包算出来的，一个字都不存——存了就是一份会漂移的中心索引（P1 禁止）。
+         文案必须把这件事说出来，否则人会去找一个「流程成员清单」的编辑框，
+         找不到就以为功能缺了一半——而那个清单正是双真相源本身。 */
+      "pipeline.name": "定稿流程",
+      "pipeline.lead": "真正把成果做出来的那条链，别的都不在里面。别人照着它才能拿到同样的数字，论文的 Methods 也是从它长出来的。",
+      "pipeline.dev.name": "开发路径",
+      "pipeline.dev.lead": "所有步骤都在，包括走不通的那些、还有你现在背着的那几个岔路口。哪里看着不对、想查清它是怎么变成这样的，看这一条。",
+      /* 这一句是两条路径全部的关键。不写它，人会把定稿流程理解成「开发路径的
+         精简版」，然后开始问「为什么这一步被藏起来了」——而它们回答的根本是
+         两个不同的问题。 */
+      "pipeline.pair.note": "两条路径不是同一件事的详略两版。开发路径说的是**当时怎么走到那儿的**——试过什么、哪条断了、哪一刻做了选择；定稿流程说的是**该怎么做**——把这个结果做出来的、最短而且诚实的一份说明。一步完全可以在前者里极其重要，同时在后者里根本不该出现。",
+      "pipeline.head": "定稿流程 · {n} 步",
+      "pipeline.order.note": "按工作必须发生的顺序排：一步排在它读过的所有东西后面。互不依赖的两步之间按 id 定序，于是同一份记录每次编出来的顺序都一样，两份导出可以直接 diff。",
+      "pipeline.derived.note": "成员清单一个字都没存。从每个成果出发沿 `input:` 反着走，某一步没声明输入就退回它的 `parent`（那就是它事实上接着的前一步），`dead` 的剔掉。真存一份清单的话，你第一次移动步骤它就开始说假话。",
+
+      /* 一个 `result:` 都没声明是绝大多数项目的常态，所以这四句是这个功能的门面。
+         它要说清「定稿流程是什么」「为什么值得声明」「怎么声明」——不是报错，
+         也不是空荡荡一句「暂无数据」。 */
+      "pipeline.empty.title": "还没有哪一步被声明成成果",
+      "pipeline.empty.what": "定稿流程就是真正把某个成果做出来的那条链——从成果出发，顺着每一步声明的 `input:` 往回追，把走不通的剔掉。它不是任何东西的第二份拷贝：成员全是现算的，所以你移动一步、补一条输入、把某条支标成 dead，它自己就跟着变了。",
+      "pipeline.empty.why": "声明它值那三十秒，因为这是这里唯一没人能替你算出来的事——两百步里，哪一步是你会写进论文的那一个。声明完，流程本身、它最弱的那一环、还有一份 Methods 草稿都是白拿的。",
+      "pipeline.empty.how": "在项目的 front-matter 里加一行：`result: 023 | 亲和力预测 AUC 0.91`。可以写多条——一张图一条、一个论断一条。或者打开某一步，点**{act}**。",
+      "pipeline.empty.act": "把某一步标成成果",
+
+      "pipeline.result.head": "已声明的成果 · {n}",
+      "pipeline.result.lead": "整个流程里只有这一条是写下来的，其余全是读出来的：哪些步在里面、什么顺序、整条链能追到多远，每次都现算。",
+      "pipeline.result.entry": "{link} —— {what}",
+      "pipeline.result.entry.bare": "{link}",
+      "pipeline.result.badge": "成果",
+      "pipeline.result.badge.title": "一个声明出来的成果：这个项目要做出来的东西之一。为了走到这里所需要的一切，就是它的流程。",
+      "pipeline.result.mark": "标成成果",
+      "pipeline.result.mark.title": "声明这一步是本项目的一个成果。它背后的流程随即从各步的输入反推出来——不用手工列任何成员，也就没有什么东西会过期。",
+      "pipeline.result.unmark": "其实不是成果",
+      "pipeline.result.unmark.title": "把那一行从项目笔记里撤掉。这一步、它的输入、它下游的一切全都原样不动，变的只是流程从哪里开始往回追。",
+      "pipeline.result.prompt": "这是什么的成果？一行字——它会跟着这个成果出现在流程的每个出口，包括那张图和 Methods 草稿：",
+      "pipeline.result.multi": "多个成果共用一条流程：任何一个成果用到的步都在里面。每一步还会标出它被哪几个成果追到，所以单独一张图也照样追得清。",
+
+      /* 「这一步为什么在流程里」。闭包是算出来的，算出来的东西必须能解释自己，
+         否则人只能选择相信它——而相信一个看不见的推导，正是上一代系统的死法。 */
+      "pipeline.why.result": "它就是声明的那个成果",
+      "pipeline.why.input": "{id} 把本步的产物声明成了输入",
+      "pipeline.why.parent": "{id} 没声明输入，于是退回它接着的前一步",
+      "pipeline.why.include": "人手留下的",
+
+      /* 个别步骤上的例外。和 `branch:` 同一个套路：写在**那一步自己**的 note.md 上，
+         不是在项目上列一张清单。文案要点出这一点，不然人会去项目页找那张清单。 */
+      "pipeline.include.badge": "留在流程里",
+      "pipeline.include.badge.title": "顺着输入反推追不到这一步，而它自己声明它属于这条流程。这句话写在它自己身上，和候选声明自己是候选是同一个套路——项目那一侧永远没有清单。",
+      "pipeline.exclude.badge": "不算流程",
+      "pipeline.exclude.badge.title": "反推追得到这一步，它当时也成功了，可它仍然不是「这个结果是怎么做出来的」的一部分。探索性的工作多半都是这样。",
+      "pipeline.badge": "在定稿流程里",
+      "pipeline.badge.title": "这一步是某个声明成果做出来的过程的一环。没有人勾选过它——顺着输入从成果往回追，追到的就是它。",
+      /* 两条路径必须能互相跳。「这一步当时有 3 个候选，为什么选了它」正是
+         两条都留着的意义，所以这两句 tooltip 说的是**去那边能看到什么**，
+         不是「切换视图」。 */
+      "pipeline.jump.dev": "回开发路径上看它",
+      "pipeline.jump.dev.title": "流程画的是走了的那条路，开发路径画的是没走的那些。这一步当时要是三个候选之一，另外两个就在那边，选它的理由也在那边。",
+      "pipeline.jump.final": "到定稿流程里看它",
+      "pipeline.jump.final.title": "看它在产出成果的那条链上排在哪，前后各是哪一步。",
+
+      /* 三条白拿的判断。第二条是最严重的发现，措辞要让人当回事而不像在指责：
+         「结果依赖着一条自己已经放弃的路」多半是标记过期了，也可能真就是那样，
+         两种都该在投稿前自己发现，而不是从审稿人嘴里听到。 */
+      "pipeline.check.head": "让别人照着做之前，这几件事得先知道",
+      "pipeline.warn.noresult": "还没有哪一步被声明成成果，所以暂时没有可以编出来的流程。项目笔记里加一行就是全部工作。",
+      "pipeline.warn.dead": "流程里有 {n} 步是 dead：{ids}。也就是说这个结果压在你自己已经放弃的路上。要么是那个标记过期了、这条路后来其实走通了，要么这条依赖是真的、结果确实立在一条死胡同上——哪一种，都该在这里发现，而不是从审稿人那里。",
+      "pipeline.warn.weak": "流程里有 {n} 步停在 L0/L1：{ids}。这个项目之外的人跑不起来它们，而整条流程不会强过其中最弱的一步——投稿前要补的就是这几步。",
+      /* trace_core 发的是**七**条 pipeline 诊断，上面只有三条。少一条的后果不是
+         「没翻译」而是**英文界面上原样漏出一整句中文**——warnText 认不出 code 就
+         退回服务端原句（那条退路是对的：绝不吞掉警告），于是缺的那几条恰好是最
+         需要人读懂的四条自相矛盾。所以这四条和上面那三条是同一批东西，不是补充。 */
+      "pipeline.warn.excluded.consumed": "{id} 自己写着 `pipeline: exclude`（不进流程），可流程里有 {n} 步正吃着它的产物：{ids}。这两句话不能同时成立：要么那行 exclude 已经过期、它其实是流程的一环，要么那几行 `input:` 指错了步骤。",
+      "pipeline.warn.excluded.result": "{id} 既被项目笔记声明成成果，自己又写着 `pipeline: exclude`。按「成果永远在流程里」处理了（否则这条流程连终点都没有），但那两行字里一定有一行是旧的，只有你知道是哪一行。",
+      "pipeline.warn.cycle": "{ids} 这 {n} 步的数据依赖成环，排不出先后。流程照样给出来（环上的按 id 序排在最后），但「先做哪一步」这个问题在记录里本身就还没有答案，写进 Methods 之前得先把环拆掉。",
+      "pipeline.warn.dangling": "`result: {id}` 指向一个不存在的步骤，从它追不出任何东西。多半是 id 写错了，或者那一步被删了——删除记录在项目笔记自己那一节里。",
+      /* `pipeline:` 写错值时 core 的降级提醒（当没写、继续建树）。和 bad_branch
+         同一条路，缺了它同样是英文界面漏中文。 */
+      "lint.pipeline.unknown": "`pipeline: {pipeline}` 不是认得的取值，这一行按没写处理。它只收 `include` 或 `exclude`，竖线后面再写一句为什么。",
+
+      /* 整条流程的等级 = 其中最弱的一步。一个数回答「别人能不能照着做出来」，
+         所以每一级都要把那个数翻译成一句关于**别人**的话。 */
+      "pipeline.level.head": "这条流程能被追到多远",
+      "pipeline.level.note": "一条链值多少，看它最弱的那一步值多少：只要有一步谁都定位不到，其余写得再细也停在那里。",
+      "pipeline.level.weakest": "把整条流程压在这一级上的是 {link} {title}",
+      "pipeline.level.means.L0": "照现在这样，读者连当时做了什么都跟不下来——链上某处，那个判断本身就没写下来。",
+      "pipeline.level.means.L1": "读者看得懂当时的判断，但重做不了：链上某处的代码或者产物没有记下位置。",
+      "pipeline.level.means.L2": "这条链用到的东西都找得回来，代码和产物都在。至于现在还跑不跑得起来，没人验过。",
+      "pipeline.level.means.L3": "有人从头到尾确认过命令、环境、随机种子都齐了。读者手上的东西够他去试一次。",
+      "pipeline.level.means.L4": "每一步都有人真跑过，数字对上了。记录能做到的就是这样了。",
+
+      /* 导出。三样都从同一份派生来，所以它们不可能互相矛盾；逐字节确定意味着
+         「重新生成」永远比「留一份拷贝」便宜——这一点值得在界面上说出来。
+         最后那句「这是初稿」是硬要说的：Methods 草稿是给人改的骨架，
+         把记录里已有的事实排好而已，它不会替你写一句论文腔的话。 */
+      "export.head": "拿去给别人",
+      "export.lead": "三样都是从同一份派生编出来的，所以它们不可能互相矛盾；同一份记录每次编出来逐字节一致，于是「重新生成」永远比「留一份拷贝」划算。",
+      "export.figure": "图",
+      "export.figure.note": "一张自包含的流程 SVG——不取任何外部资源、不跑脚本，黑白打印也读得出来。期刊印成灰的次数，比谁预想的都多。",
+      "export.methods": "Methods 草稿",
+      "export.methods.note": "按流程顺序：每一步做了什么、当时跑的完整命令、代码在哪、产物路径和校验和。都是你已经记下来的事实，只是排成了 Methods 的骨架。",
+      "export.page": "独立页面",
+      "export.page.note": "把流程做成一页，合作者断网也打得开。里面只有定稿流程——走不通的那些留在家里。",
+      "export.draft.note": "它是初稿，而且是故意做成初稿的。它只把记录里确实写着的东西摆出来，句子留给你写：这里不会为一件没人记过的事凭空造一句话，所以发出去之前请把每一行都读一遍。",
+
       /* ---- 可溯源性 · L0–L4 ---- */
       "trace.title": "可溯源性 · L0–L4",
       "trace.self": "这一步自己",
@@ -1009,6 +1267,20 @@
       "editor.decision.label": "这一步开出的那个问题 · 可不写",
       "editor.decision.placeholder": "类别不平衡怎么处理？只能选一条走下去",
       "editor.decision.hint": "写在分叉的那一步上，不是写在分出去的路上。两个孩子只能证明当时有两条路；只有这一行说得出这两条路是在选什么——和「为什么」一样，它是机器替你生成不了的那种句子。",
+      /* ⑧ 编辑侧只有一个三选一，而且默认那一档就是「别管它」：流程成员是算出来的，
+         手工设的那两档是**事实**，会过期，所以 hint 要先劝人别用，再说清什么时候
+         非用不可。 */
+      "editor.pipeline.label": "这一步和定稿流程的关系",
+      "editor.pipeline.auto": "算出来 —— 从成果顺着输入往回追",
+      "editor.pipeline.include": "留在流程里 —— 反推追不到它，但它确实是流程的一环",
+      "editor.pipeline.exclude": "不算流程 —— 它成功了，只是不属于这个方法",
+      "editor.pipeline.hint": "绝大多数时候别动这里：成员是从成果反推出来的，它自己会保持正确。这两个手工挡是留给反推真的判错的那些情况——比如产物是手工拷过去的、从来没写成 `input:`，又比如一个成功了但不该让别人重跑的旁支试验。两者都声明在这一步自己身上；项目那一侧永远不存成员清单。",
+      "editor.pipeline.note.label": "一句话说清为什么",
+      "editor.pipeline.note.placeholder": "探索性的，成功了，但下游没有任何一步读它",
+      /* 它**不是**可选的，写入侧不写就 400。上一版这里印着「可不写」，于是人选了
+         exclude、跳过这一栏、按保存，收到的是服务端一句中文报错——界面亲口许了一个
+         它管不着的诺。理由必填是这个键和 `branch:` 唯一的分歧，原因就写在下面。 */
+      "editor.pipeline.note.required": "这一栏必须写。候选组在树上一出现就看得见，而这一行除了改变一份导出之外不留任何痕迹——没有那半句话，分不清它是想清楚的决定还是一次误点。",
       "editor.hint": "截图 **Ctrl+V** 直接粘贴会自动上传并插入；从 Excel / 网页表格复制的内容粘贴会自动转成 markdown 表格；文件也可以拖进编辑框。`id` 不可改、也不会重发——任何地方写下的 `[[003b]]` 都必须永远有效。`parent` 可以移动，但必须写原因，而且这次移动会被记进笔记。",
       "editor.status.uploading": "上传中…",
       "editor.status.inserted": "已插入 {n} 个文件",
@@ -1157,6 +1429,8 @@
       "toast.deleted": "已删除 {id}",
       "toast.deleted.orphaned": "已删除 {id}；{ids} 已变成孤儿",
       "toast.deleted.inputs": "已删除 {id}；{ids} 还声明着 `input: {id}`，现在指空了——请去改掉那几行",
+      /* 三条里最重的一条，理由同上。 */
+      "toast.deleted.result": "已删除 {id}，而项目笔记把它声明成了成果——定稿流程正是从它反推出来的，现在没有起点了。趁 id 还没被重用，去改掉或撤掉那一行。",
       "toast.insights.saved": "已保存（只替换了四个洞察小节）",
       "toast.insight.added": "已记入「{label}」",
       "toast.insight.updated": "已重写 {id}——id 没变，指向它的引用照样有效",
@@ -1169,6 +1443,14 @@
       "toast.branch.extends": "{id} 又读作普通的延伸了",
       "toast.decision.saved": "「在决定什么」已写在 {id} 上",
       "toast.decision.cleared": "{id} 上那行决策问题已删掉；下面的候选一个没动",
+      /* ⑧ 声明成果的直接后果是看不见的：流程是算出来的，界面上只会「多出一条链」。
+         所以这几条 toast 要顺手说出那条链是怎么来的。 */
+      "toast.result.marked": "{id} 现在是声明出来的成果了——它背后的流程从各步的输入反推出来",
+      "toast.result.unmarked": "{id} 不再是声明的成果了；这一步本身一个字没变",
+      "toast.pipeline.include": "{id} 被人手留在流程里——这句话写在它自己的笔记里，项目那边不存清单",
+      "toast.pipeline.exclude": "{id} 不算在流程里了；开发路径上它还在原来的位置，一点没动",
+      "toast.pipeline.auto": "{id} 改回按输入算了",
+      "toast.export.ready": "{name} 已生成——同一份记录每次编出来逐字节一致",
       "toast.copied.path": "已复制路径",
       "toast.copy.failed": "复制失败",
       "toast.draft.restored": "已恢复草稿",

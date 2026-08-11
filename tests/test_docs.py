@@ -593,6 +593,11 @@ def test_the_front_matter_key_order_in_format_md_is_the_order_render_note_emits(
                      date="2026-01-01", commit="c", author="a", key="k", tags=["x"],
                      branch="alternative", branch_note="先试最便宜的那条",
                      decision="类别不平衡怎么处理？",
+                     # `pipeline` 和 branch / decision 同一个理由要在这里填上：
+                     # 断言是**相等**不是包含，漏填哪个键，这条测试就对那个键的
+                     # 位置一言不发，而它恰好夹在 decision 和 lang 之间——排错了
+                     # 文件仍然合法，只是「人的判断」和「机器记录」两区混在一起。
+                     pipeline="exclude", pipeline_note="探索性的，没进最终流程",
                      moved=[{"date": "2026-01-02", "from": "000", "to": "001b",
                              "by": "human", "reason": "r"}],
                      inputs=[{"step": "000", "note": "a.csv"}],
@@ -1336,6 +1341,303 @@ def test_the_untranslated_fields_named_in_the_readme_exist():
     for field in ("missing", "translated", "native", "project_note"):
         assert field in report, f"README 说 /untranslated 回 {field}，实际没有"
         assert f"`{field}" in text(README) or field in text(README)
+
+
+# ------------------------------------------------- 两条路径（FORMAT.md 第 16 节）
+# 这一节讲的是「记录」和「方法」的分家，而它整节的价值压在一句承诺上：**成员一个字
+# 都不存，全是算出来的**。所以这里不校对散文，只做两件事：把文档里那张「在脑子里
+# 算一遍」的表整块喂给 compute_pipeline（读者信不信那张图，取决于他照着算出来的
+# 和程序算出来的是不是同一份），以及把两个键的取值、七条诊断的 code 逐字对上代码。
+
+
+def pipeline_section() -> str:
+    return format_numbered_section("两条路径")
+
+
+def worked_example_rows() -> list[dict[str, str]]:
+    """第 16.2 节那张「在脑子里算一遍」的表，每行一个步骤。
+
+    按表头定位而不是按行号：这张表是读者唯一能自己验算的东西，它和代码一旦
+    分家，整节就变成一段听起来很有道理的散文。
+    """
+    sec = pipeline_section()
+    head = "| 步骤 | `parent` | `input` | `status` | `pipeline` | 在定稿流程里吗 |"
+    start = sec.find(head)
+    assert start != -1, "FORMAT.md 第 16 节里找不到那张「在脑子里算一遍」的表"
+    out: list[dict[str, str]] = []
+    for line in sec[start:].split("\n")[2:]:            # 跳过表头和分隔行
+        if not line.startswith("|"):
+            break
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        assert len(cells) == 6, f"表格这一行不是六列: {line}"
+        ids = re.findall(r"`([0-9a-z]+)`", cells[0])
+        assert ids, f"表格这一行第一列没有步骤 id: {line}"
+        out.append({
+            "id": ids[0],
+            "parent": (re.findall(r"`([0-9a-z]+)`", cells[1]) or [""])[0],
+            "input": (re.findall(r"`([0-9a-z]+)`", cells[2]) or [""])[0],
+            "status": (re.findall(r"`([a-z]+)`", cells[3]) or [""])[0],
+            "pipeline": (re.findall(r"`([a-z]+)`", cells[4]) or [""])[0],
+            "member": cells[5].startswith("✓"),
+            "why": cells[5],
+        })
+    assert len(out) >= 5, f"那张表只扫到 {len(out)} 行，扫描器可疑"
+    return out
+
+
+def test_the_pipeline_rules_in_format_md_are_exactly_the_ones_the_parser_knows():
+    """`pipeline:` 是闭词表（core.PIPELINE_RULES）。文档多写一个取值，照着写的人拿到的
+    是一条 `bad_pipeline` 加一次**静默无效**——那一行什么都不做，而记录看着一切正常。
+    少写一个则相反：有效的写法没人知道。顺序也要对上，那张表就是照着常量列的。"""
+    listed = table_first_column(pipeline_section(), "| 取值 |")
+    assert tuple(listed) == core.PIPELINE_RULES, \
+        f"FORMAT.md 第 16 节的取值表是 {listed}，core.PIPELINE_RULES 是 {list(core.PIPELINE_RULES)}"
+
+
+def test_every_pipeline_example_in_the_docs_carries_a_known_rule_and_a_reason():
+    """`pipeline:` 的示例必须：取值认得出、**写了理由**、并且回写后逐字不变。
+
+    理由那一条是写入侧的硬校验（`norm_pipeline` 不给理由直接拒绝），所以文档里
+    出现一条没理由的示例，等于在教一种服务端会 400 的写法。而它偏偏是这个键
+    最容易被省掉的一半——`pipeline:` 除了改变一份导出之外不留任何痕迹，
+    没有那半句话，半年后分不清是想清楚的决定还是一次误点。
+    """
+    seen = 0
+    for doc, raw in front_matter_lines("pipeline"):
+        got = core.parse_pipeline(raw)
+        assert got["rule"] in core.PIPELINE_RULES, \
+            f"{where(doc)} 的 `pipeline: {raw}` 取值 {got['rule']!r} 不在 {list(core.PIPELINE_RULES)} 里"
+        assert got["note"], f"{where(doc)} 的 `pipeline: {raw}` 没写理由，而写入侧要求必填"
+        assert core.format_pipeline(got) == raw, \
+            f"{where(doc)} 的 pipeline 回写后变了样: {raw!r} → {core.format_pipeline(got)!r}"
+        W.norm_pipeline(raw)                        # 写入侧的校验器：不合法直接抛
+        seen += 1
+    assert seen >= 2, f"只扫到 {seen} 条 pipeline 示例，include / exclude 至少各要有一条"
+
+
+def test_every_result_example_in_the_docs_names_a_step_and_says_what_it_is():
+    """`result:` 是全项目**唯一**要人写的一行，右半边（这是什么成果）是它一半的价值：
+    导出的 Methods 里每一节的标题就是它。示例只写 `result: 023` 的话，照着写的人
+    得到的是一条自己半年后也看不懂的声明。
+
+    判据走真解析器 `core.parse_results`（它自己扫 front-matter 的原始行），
+    不是照着「和 input 语法一样」抄一份——两处各写一遍迟早在「说明里再有竖线
+    怎么办」上分家。
+    """
+    seen = 0
+    for doc, raw in front_matter_lines("result"):
+        got = core.parse_results(f"---\nname: x\nresult: {raw}\n---\n")
+        assert got, f"{where(doc)} 的 `result: {raw}` 解析不出任何东西"
+        assert got[0]["step"], f"{where(doc)} 的 `result: {raw}` 没解析出步骤 id"
+        assert got[0]["note"], \
+            f"{where(doc)} 的 `result: {raw}` 没写清这是什么成果，示例不该这么教"
+        assert core.format_result(got[0]) == raw
+        seen += 1
+    assert seen >= 3, f"只扫到 {seen} 条 result 示例，扫描器可疑"
+
+
+def test_the_worked_example_in_format_md_derives_exactly_the_flow_it_prints():
+    """第 16.2 节把一个六步的项目和它算出来的流程**都印了出来**，读者会照着验算。
+
+    所以直接把那张表喂给 `compute_pipeline`：算出来的顺序必须和文档印的那一行
+    逐字一致，✓ / ✗ 那一列也必须和真实的成员判定逐个对上。这一节的全部说服力
+    都压在这件事上——表和代码一旦分家，读者会先信文档，然后照着一条不存在的
+    流程去写 Methods。
+
+    顺带钉住三件这一节明确承诺过的事：被剔掉的步骤上游**接过去**（`via` 非空）、
+    「凭什么在流程里」是四选一的枚举、以及**磁盘上没有任何成员清单**。
+    """
+    rows = worked_example_rows()
+    metas = {}
+    for r in rows:
+        meta: dict[str, str] = {"status": r["status"], "title": "t"}
+        if r["parent"]:
+            meta["parent"] = r["parent"]
+        if r["input"]:
+            # 表格里只写了来源步骤（竖线在 markdown 表格里要转义，写进去只会
+            # 让这张表更难读）。竖线右边那半句在表格下面那句话里，是真示例。
+            meta["input"] = f"{r['input']} | pairs.csv"
+        if r["pipeline"]:
+            meta["pipeline"] = f"{r['pipeline']} | 文档第 16.3 节那两个示例块里的理由"
+        metas[r["id"]] = meta
+    by_id, _children, _order = build_forest(metas)
+
+    # 成果不从表里猜：那一节明说了「`project.md` 里只有一行 `result: …`」，
+    # 就用那一行本身（它也被上面那条 result 示例测试逐字校验过）。
+    decl = re.search(r"只有一行 `result:\s*([^`]+)`", pipeline_section())
+    assert decl, "第 16.2 节没写清这个例子声明的是哪一个成果"
+    declared = core.parse_results(f"---\nname: x\nresult: {decl.group(1)}\n---\n")
+    assert declared and declared[0]["step"] in by_id, \
+        f"第 16.2 节声明的成果 {declared} 不在那张表里"
+    assert declared[0]["step"] == next(r["id"] for r in rows if "成果" in r["why"]), \
+        "表格里标成「就是那个成果」的那一行和上面声明的 result 对不上"
+    p = core.compute_pipeline(by_id, declared)
+
+    printed = re.search(r"^顺序((?:\s*`[0-9a-z]+`)+)", pipeline_section(), re.M)
+    assert printed, "第 16.2 节没有印出算完之后的顺序"
+    assert re.findall(r"`([0-9a-z]+)`", printed.group(1)) == p["order"], \
+        f"文档印的顺序和 compute_pipeline 算出来的 {p['order']} 对不上"
+    assert [r["id"] for r in rows if r["member"]] == p["order"], \
+        "表格 ✓ / ✗ 那一列和真实的成员判定对不上"
+
+    # 被剔掉的两步各是一种理由，而且上游被接了过去（不留断口）。
+    assert {d["step"]: d["why"] for d in p["excluded"]} == {"018": "declared", "020": "dead"}
+    assert any(e["via"] for e in p["edges"]), \
+        "剔掉中间那两步之后没有一条边带 via —— 「上游接过去」这条承诺没兑现"
+
+    # 「凭什么在流程里」四选一，文档把四种都点了名。
+    assert {w["kind"] for w in p["why"].values()} == {"result", "include", "input", "parent"}
+
+    # 磁盘上没有任何成员清单：front-matter 里不许出现这类键。
+    for meta in metas.values():
+        for banned in ("pipeline_members", "members", "flow", "steps"):
+            assert banned not in meta
+
+
+def test_the_pipeline_diagnostics_in_the_docs_are_the_real_codes():
+    """七条诊断的 `code` 是精确匹配的字符串（人要拿它 grep、前端要拿它选文案）。
+
+    两个方向都盯着：文档列的必须是 `compute_pipeline` 真报得出来的，
+    报得出来的也必须都被列上——界面上冒出来一句文档里查不到的提示，
+    读的人只能当它是 bug。
+
+    另外钉住这一节的两条边界：这些诊断**不进 `forest["warnings"]`**（现存项目
+    一个 result 都没声明，挂进全局警告栏等于每次打开都被念一遍），
+    以及它们**一条都不改 L0–L4**（和第 3 / 6 / 15 节那些提示同一档）。
+    """
+    sec = pipeline_section()
+    documented = set(re.findall(r"^\|\s*`([a-z]+_[a-z_]+)`\s*\|", sec, re.M))
+
+    emitted: set[str] = set()
+    # ① 一个 result 都没声明 → 只有那条 info。
+    emitted |= {d["code"] for d in core.compute_pipeline({}, [])["diagnostics"]}
+    # ② 悬空的 result。
+    lone, _w = core.build_step("001_x", {"id": "001", "status": "done"}, "")
+    emitted |= {d["code"] for d in
+                core.compute_pipeline({"001": lone}, [{"step": "099", "note": "n"}])["diagnostics"]}
+    # ③ 一次造齐其余五条：dead 在闭包里、L0 的成员、exclude 却被吃、
+    #    成果自己写着 exclude、以及一个数据依赖的环。
+    by_id, _c, _o = build_forest({
+        "001": {"status": "done"},
+        "002": {"parent": "001", "status": "dead"},
+        "003": {"parent": "002", "status": "done", "pipeline": "exclude | 不算流程"},
+        "004": {"parent": "001", "status": "done", "input": "003 | a.csv"},
+        "005": {"status": "done", "input": "006 | b.csv", "pipeline": "exclude | 我也不算"},
+        "006": {"status": "done", "input": "005 | c.csv"},
+    })
+    p = core.compute_pipeline(by_id, [{"step": "004", "note": "主结果"},
+                                      {"step": "005", "note": "自己写了 exclude 的成果"}])
+    emitted |= {d["code"] for d in p["diagnostics"]}
+
+    assert emitted == {"pipeline_no_result", "dangling_result", "pipeline_dead_step",
+                       "pipeline_weak_step", "pipeline_excluded_consumed",
+                       "pipeline_excluded_result", "pipeline_cycle"}, \
+        f"compute_pipeline 报出来的是 {sorted(emitted)} —— 造用例的场景该更新了"
+    assert emitted == documented, (
+        f"第 16 节没列全: {sorted(emitted - documented)}；"
+        f"列了报不出来的: {sorted(documented - emitted)}")
+    assert "bad_pipeline" in sec, "第 16 节没提 `bad_pipeline`（取值拼错时的静默无效）"
+
+    # 同一份记录，加不加 pipeline 语义，等级必须一模一样。
+    body = "## 为什么\n因为。\n\n## 做了什么\n跑了 `a.py`。\n\n## 结论\n成立。\n"
+    kw = dict(id="002", status="done", title="t", commit="c1d2e3f", body=body,
+              paths=[{"location": "/blue/x", "note": "n", "kind": "hpc"}], dirname="002_t")
+    plain = core.Step(**kw)
+    marked = core.Step(pipeline="exclude", pipeline_note="不算流程", **kw)
+    assert core.traceability(marked)["level"] == core.traceability(plain)["level"] == "L2", \
+        "`pipeline:` 把等级动了 —— 第 16 节说这七条一条都不降级"
+
+
+def test_a_project_that_declares_no_result_notices_nothing(tmp_path):
+    """第 16.1 节承诺「一个 `result:` 都没声明是常态，不是缺陷」，README 也照这句话写。
+
+    这句话是有代价的承诺：现存的每一个项目都是这个状态，所以 `compile_forest`
+    的输出里**不能因此多出任何东西**——多一个键，前端要多一条判空；多一条警告，
+    每个项目每次打开都被念一遍，而那正是让人从此不看警告的做法。
+    """
+    p = W.create_project(tmp_path, "还没声明成果的项目")
+    sd = core.steps_dir_of(tmp_path, p.slug)
+    W.create_step(sd, title="第一步", body="## 为什么\n因为。\n")
+    forest = core.compile_forest(sd)
+    assert "pipeline" not in forest, "没声明成果的项目也长出了 pipeline 键"
+    assert "pipeline" not in forest["steps"][0], "没声明成果的项目在步骤上多了字段"
+    assert not [w for w in forest["warnings"] if "pipeline" in w["code"]
+                or "result" in w["code"]], "没声明成果却多出了警告"
+
+    # 那句「教怎么办」的话只在**主动问起**时才说，而且是 info 级不是 warn。
+    alone = core.compute_pipeline({}, [])["diagnostics"]
+    assert [d["level"] for d in alone] == ["info"], \
+        f"空态那条诊断不是 info 级: {alone}"
+
+
+def test_the_pipeline_level_is_the_weakest_member_not_the_weakest_chain():
+    """第 10 / 16.4 节都写着：流程的等级取成员**自己**的等级，不是它的整链等级。
+
+    差别是实打实的：被剔掉的 `dead` / `exclude` 祖先会把整链等级压下去，而那些
+    步骤按定义就不是方法的一部分。照整链算的话，一条方法齐全的流程会因为它
+    路过了一段已经放弃的路而被报成 L1——那个数会让人去补一份根本不该写进
+    Methods 的记录。
+    """
+    full = ("## 为什么\n因为。\n\n## 做了什么\n跑了 `a.py`。\n\n"
+            "## 结果\n0.9。\n\n## 结论\n成立。\n")
+    by_id = {
+        # 001 什么都没写 ⇒ L0，但它是 dead，按第 16.2 节的规则会被剔出流程。
+        "001": core.Step(id="001", status="dead", title="走不通的那条", body="",
+                         dirname="001_x"),
+        "002": core.Step(id="002", parent="001", status="done", title="主结果",
+                         commit="c1d2e3f", body=full,
+                         paths=[{"location": "/blue/x", "note": "n", "kind": "hpc"}],
+                         dirname="002_x"),
+    }
+    assert core.traceability(by_id["002"])["level"] == "L2"
+    assert core.traceability(by_id["001"])["level"] == "L0"
+    p = core.compute_pipeline(by_id, [{"step": "002", "note": "主结果"}])
+    assert p["order"] == ["002"] and p["level"] == "L2", \
+        f"流程等级被剔掉的那一步压下去了: {p['level']}（成员 {p['order']}）"
+
+
+def test_both_docs_name_the_two_paths_the_same_way():
+    """「开发路径」和「定稿流程」是这一版新造的一对术语，没有别处可查。
+
+    README 叫「开发路径」而 SKILL 叫「完整树」、agent 叫「全量视图」的话，
+    读的人不会意识到说的是同一件事，只会以为漏了一种东西。而这一对术语的
+    全部作用就是让人在「我现在该看哪一条」上不用犹豫。
+    """
+    docs = [README, FORMAT, SKILL,
+            ROOT / "agents" / "trace-auditor.md",
+            ROOT / "agents" / "trace-reproducer.md"]
+    for doc in docs:
+        body = text(doc)
+        for name in ("开发路径", "定稿流程"):
+            assert name in body, f"{where(doc)} 里没有「{name}」这个说法"
+    # 最容易被读错的一句：两者不是详略两版。README 和 FORMAT 都要挡住它。
+    for doc in (README, FORMAT):
+        assert "不是**开发路径的精简版**" in text(doc) or "**不是**开发路径的精简版" in text(doc), \
+            f"{where(doc)} 没挡住「定稿流程 = 开发路径的精简版」这个误解"
+
+
+def test_the_docs_are_honest_about_which_front_doors_carry_the_pipeline_fields():
+    """和 inputs/code、branch/decision 那两条同一个理由：**静默丢字段是最坏的一类缺陷**。
+
+    `pipeline` 已经在 `W.MUTABLE` 里，REST 的 PATCH 把请求体整个透传，所以那条路
+    现在就能用；但 MCP 的 `t_update_step` 是白名单转发的，`POST …/steps` 也不读它。
+    在门面补齐之前 SKILL.md 必须明说；补齐之后那段注意事项必须删掉，
+    否则 agent 会一直多发一个 PATCH。两个方向都盯着。
+    """
+    mcp_src = (ROOT / "trace_mcp.py").read_text(encoding="utf-8")
+    m = re.search(r"def t_update_step\(.*?\n\ndef ", mcp_src, re.S)
+    assert m, "trace_mcp.py 里找不到 t_update_step 了（函数名变了？）"
+    server_src = (ROOT / "trace_server.py").read_text(encoding="utf-8")
+    c = re.search(r"async def api_create\(.*?\n\n", server_src, re.S)
+    assert c, "trace_server.py 里找不到建步骤那条路由了（函数名变了？）"
+
+    wired = '"pipeline"' in m.group(0) and 'payload.get("pipeline"' in c.group(0)
+    warned = "还没透传" in text(SKILL)
+    assert wired != warned, (
+        "两个门面都收 pipeline 了，请删掉 SKILL.md 里那段「还没透传」的注意事项"
+        if wired else
+        "MCP 的 trace_update_step / POST …/steps 仍然丢掉 pipeline，"
+        "SKILL.md 必须明说这件事（agent 会以为记上了）")
 
 
 # ---------------------------------------------------------------- 前端资源

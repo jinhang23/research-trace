@@ -37,10 +37,23 @@
     <button id="btn-scope" type="button"></button>
     <span id="hits" class="mono"></span>
   </div>
-  <!-- 三个视图。数据流是第三个而不是一个附属面板：森林是单父树、数据流是 DAG，
-       同一份文件的两种读法平级，谁也不是谁的注脚。 -->
-  <div class="seg" id="viewtoggle">
-    <button data-view="graph" data-i18n="app.view.graph" data-i18n-title="app.view.graph.title"></button><button data-view="list" data-i18n="app.view.list" data-i18n-title="app.view.list.title"></button><button data-view="flow" data-i18n="app.view.flow" data-i18n-title="app.view.flow.title"></button>
+  <!-- 切换器是**两级**的，这不是排版偏好，是这两样东西本来的层次。
+       第一级「开发路径 / 定稿流程」选的是**看哪一份东西**：开发路径是这棵树的
+       全部（含走不通的、含还悬着的岔路口），定稿流程是从 `result:` 沿 `input:`
+       反推出来的那条链——两者的步骤集合根本不一样。
+       第二级「图 / 列表 / 数据流」选的是**同一份东西怎么画**。
+       把定稿流程做成第四个并排的按钮，等于对读者说「这是同一件事的另一种排版」，
+       而那正是 i18n 的 pipeline.pair.note 专门写来挡的那个误解；反过来，把三种
+       画法提到第一级，又会让人以为数据流和定稿流程是一回事（一个是 input 的
+       全图，一个是成果的闭包）。所以一级选东西、二级选画法。
+       第二级只在开发路径下出现：定稿流程只有一种画法（它就是一张方法图）。 -->
+  <div class="modeswitch" id="modeswitch">
+    <div class="seg mode" id="modetoggle">
+      <button type="button" data-mode="dev" data-i18n="app.view.dev" data-i18n-title="app.view.dev.title"></button><button type="button" data-mode="pipeline" data-i18n="app.view.pipeline" data-i18n-title="app.view.pipeline.title"></button>
+    </div>
+    <div class="seg sub" id="viewtoggle">
+      <button data-view="graph" data-i18n="app.view.graph" data-i18n-title="app.view.graph.title"></button><button data-view="list" data-i18n="app.view.list" data-i18n-title="app.view.list.title"></button><button data-view="flow" data-i18n="app.view.flow" data-i18n-title="app.view.flow.title"></button>
+    </div>
   </div>
   <button id="btn-new" data-i18n="app.new" data-i18n-title="app.new.title"></button>
   <!-- 新建项目必须在顶栏：只剩一个项目时项目索引页会 302 弹回项目页，
@@ -116,6 +129,11 @@
           <div id="fnodes"></div>
         </div>
       </div>
+      <!-- 定稿流程。它**不在**上面那三个之列：那三个画的是同一批步骤，这一个
+           画的是另一批。整块内容由 app.js 的 renderPipeline() 生成——它不是一张
+           静态骨架，而是一份随成果声明一起变的文档（空态、成果清单、等级、
+           那张图、逐步的做法、三个导出），写死在 HTML 里的只有这个容器。 -->
+      <div id="pwrap" hidden></div>
       <p id="empty" hidden data-i18n-html="list.empty"></p>
     </div>
     <!-- 「提为根」的落区。只在拖动期间出现，而且**只有落在它上面才算**：
@@ -158,6 +176,11 @@
           <span class="lgm"><i class="cmk join">~&gt;</i><span data-i18n="rejoin.kind" data-i18n-title="rejoin.kind.title"></span></span>
           <span class="lgm"><i class="cmk moved">⇄</i><span data-i18n="move.badge"></span></span>
           <span class="lgm"><i class="cmk gone">⊘</i><span data-i18n="path.missing.badge"></span></span>
+          <!-- 开发路径上「这一步在定稿流程里」的回指。用的是**字形**这个第四通道：
+               线型仍然只归 status，不透明度仍然只归祖先链/搜索命中，颜色已经归了
+               三种关系。方括号里的数字就是它在流程里的第几步——和那张图上、
+               Methods 草稿里的编号是同一个，于是两条路径互相指得回去。 -->
+          <span class="lgm"><i class="cmk pipe">[1]</i><span data-i18n="pipeline.badge" data-i18n-title="pipeline.badge.title"></span></span>
         </span>
         <!-- 「颜色负责一眼扫到，形状负责说得准」那句话。压成一行加省略号、整句在
              title 里：图例是常驻的，让它长到三行就是永久吃掉一块画布。 -->
@@ -335,6 +358,13 @@
 
 <script id="forest-data" type="application/json">__DATA__</script>
 <script id="projects-data" type="application/json">__PROJECTS__</script>
+<!-- 定稿流程那张图的**字节**。它由服务端那份唯一的生成器画出来（Python 侧的
+     pipeline_svg），页面自己一笔都不画：图上五步、Methods 里六步，收到的人只会
+     认为这份记录不可信。
+     服务模式下这里是空的，页面按需去 /api/p/{项目}/pipeline/figure.svg 取；
+     静态导出没有服务端，`build` 把同一份字节直接灌进来（file:// 下 fetch 一个
+     相对路径会被当成跨源，取不到）。两条路拿到的是同一个函数的同一份输出。 -->
+<script id="pipeline-svg" type="application/json">__PIPESVG__</script>
 <script>window.TRACE_BASE = "__BASE__"; window.TRACE_MODE = "__MODE__"; window.TRACE_PROJECT = "__PROJECT__";</script>
 <!-- i18n.js 必须排在 app.js 之前：app.js 第一次 paintChrome() 就要 window.i18n。
      它和 md.js 互不依赖，谁前谁后都行。 -->

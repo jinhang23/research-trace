@@ -88,6 +88,12 @@ WRITES = [
     # 任何人都能把一条正常的延伸说成「这两条只能选一个」，而读的人会照着它去
     # 判断哪条路已经被放弃了。
     ("POST", "/api/p/课题/forks", {"ids": ["001", "002"], "decision": "谁都能写这句话"}),
+    # 成果声明写的是 project.md 里的 `result:`。它比这张表上任何一条都更值得设防：
+    # 定稿流程、论文 Methods 里出现哪几步、导出的那张图，**全部**是从它算出来的。
+    # 一个不设防的 PUT 足够让任何人把主结果改指到另一步上，而页面上一个字都不会报——
+    # 记录一个字节没变，变的是「从哪儿开始往回追」。
+    ("PUT", "/api/p/课题/results/001", {"note": "谁都能改论文报的是哪一步"}),
+    ("DELETE", "/api/p/课题/results/001", {}),
 ]
 
 
@@ -1183,3 +1189,137 @@ def test_marking_a_group_refuses_steps_that_do_not_share_a_parent(client):
     assert r.status_code == 400 and "同一个父节点" in r.json()["error"]
     assert "branch:" not in note_of(client, "002").read_text(encoding="utf-8"), \
         "校验全部前置：不许留下「两个候选只标了一个」的半成品"
+
+
+# ------------------------------------------------------- 定稿流程
+#
+# 两条路径在 HTTP 上的两个出口：`/forest` 是**开发路径**（全部记录），
+# `/pipeline` 是**定稿流程**（只有产出成果的那条链）。这一组防的是三件事：
+# 空态说不出话、两个门面对同一条流程给出不同答案、导出被谁悄悄改成非确定性的。
+
+BODY = "## 为什么\n要试\n\n## 做了什么\n跑了 `python train.py`\n\n## 结果\nAUC\n\n## 结论\n成了\n"
+
+
+def _chain(client):
+    """001 清洗 → 002 死路 → 003 主实验（吃 002 的产物）。"""
+    mkstep(client, title="清洗数据", body=BODY, status="done", commit="c1d2e3f",
+           paths=["/blue/lab/clean | output | 训练集 | size=12884901888 sha256=aabbccdd"])
+    mkstep(client, parent="001", title="试了 focal loss", body=BODY, status="dead")
+    mkstep(client, parent="002", title="主实验", body=BODY, status="done",
+           inputs=["002 | scores.csv"])
+
+
+def test_the_pipeline_endpoint_is_a_public_read_like_the_forest(client):
+    _chain(client)
+    assert client.get("/api/p/课题/pipeline").status_code == 200
+    assert client.get("/api/p/课题/pipeline/figure.svg").status_code == 200
+    assert client.get("/api/p/课题/pipeline/methods.md").status_code == 200
+
+
+def test_the_empty_state_hint_only_exists_on_this_endpoint(client):
+    """forest 里**刻意**不带 pipeline 键（现存项目必须完全无感），所以「你还没
+    声明成果，该怎么办」那句话只有主动问起来的这条路上拿得到。
+
+    没有这条端点，一个还没声明成果的项目在界面上就是一块什么都不说的空面板——
+    而那是绝大多数项目的常态。
+    """
+    _chain(client)
+    assert "pipeline" not in client.get("/api/p/课题/forest").json(), \
+        "没声明成果的项目，forest 上不许多出一个键"
+    body = client.get("/api/p/课题/pipeline").json()
+    assert body["declared"] is False
+    codes = [d["code"] for d in body["pipeline"]["diagnostics"]]
+    assert codes == ["pipeline_no_result"]
+    assert body["pipeline"]["diagnostics"][0]["level"] == "info", \
+        "「还没声明成果」是邀请不是缺陷——报成 warn 会让人随手指一步换个干净界面"
+
+
+def test_declaring_a_result_makes_the_pipeline_appear(client):
+    _chain(client)
+    r = client.put("/api/p/课题/results/003", json={"note": "主结果 AUC 0.91"}, headers=AUTH)
+    assert r.status_code == 201 and r.json()["line"] == "result: 003 | 主结果 AUC 0.91"
+    p = client.get("/api/p/课题/pipeline").json()
+    assert p["declared"] is True
+    assert p["pipeline"]["order"] == ["001", "003"], "dead 的 002 不进流程"
+    assert p["pipeline"]["dead"] == ["002"], "但「结果踩着一条废路」必须指名"
+    assert [s["id"] for s in p["steps"]] == ["001", "003"]
+    # 再写一次是**就地改写**，不是追加：同一步两条声明，说明不同的那两句话没人
+    # 知道该信哪句。
+    again = client.put("/api/p/课题/results/003", json={"note": "改一句"}, headers=AUTH)
+    assert again.status_code == 200 and again.json()["created"] is False
+    assert len(again.json()["results"]) == 1
+
+
+def test_a_result_pointing_nowhere_is_refused_at_the_door(client):
+    """悬空的 `result:` 比悬空的 `input:` 重得多：后者只让一条边不参与计算，
+    前者让整条流程从一个不存在的起点出发，结果是空，而页面上一个字都不报。"""
+    _chain(client)
+    r = client.put("/api/p/课题/results/099", json={}, headers=AUTH)
+    assert r.status_code == 404
+    assert client.get("/api/p/课题/pipeline").json()["declared"] is False
+
+
+def test_a_dead_step_cannot_be_declared_the_result(client):
+    """「我的主结果是一条我自己判了此路不通的线」不是任何人想打出来的话。"""
+    _chain(client)
+    r = client.put("/api/p/课题/results/002", json={"note": "主结果"}, headers=AUTH)
+    assert r.status_code == 400 and "dead" in r.json()["error"]
+
+
+def test_dropping_a_result_touches_no_record(client):
+    """撤销一个**当前指针**不销毁任何事实，所以它不要求写原因、也不留审计。"""
+    _chain(client)
+    client.put("/api/p/课题/results/003", json={"note": "主结果"}, headers=AUTH)
+    before = note_of(client, "003").read_text(encoding="utf-8")
+    r = client.delete("/api/p/课题/results/003", headers=AUTH)
+    assert r.status_code == 200 and r.json()["results"] == []
+    assert note_of(client, "003").read_text(encoding="utf-8") == before, \
+        "撤销成果声明碰了那一步的记录 —— 它只是不再是终点，记录一个字都不该动"
+    assert client.get("/api/p/课题/pipeline").json()["declared"] is False
+
+
+def test_creating_a_step_can_declare_the_pipeline_exception(client):
+    """「这一步是拿来试试看的，不进最终流程」有时动手之前就知道。收不下的话，
+    那句**必填**的理由就得等一次 PATCH，而多一道摩擦它就永远空着。"""
+    r = client.post("/api/p/课题/steps", headers=AUTH,
+                    json={"title": "探索", "body": BODY,
+                          "pipeline": "exclude | 探索性的，成功了但没进最终流程"})
+    assert r.status_code == 201, r.text
+    assert "pipeline: exclude | 探索性的，成功了但没进最终流程" in \
+        note_of(client, "001").read_text(encoding="utf-8")
+
+
+def test_the_two_exports_are_byte_identical_across_requests(client):
+    """P3：导出是文件系统的纯函数。两次请求不一致，「重新生成」就会在 diff 里
+    制造假变更，而人会开始把导出当成要保存的产物——那就是第二份真相。"""
+    _chain(client)
+    client.put("/api/p/课题/results/003", json={"note": "主结果"}, headers=AUTH)
+    for path in ("/api/p/课题/pipeline/figure.svg", "/api/p/课题/pipeline/methods.md"):
+        a = client.get(path).content
+        b = client.get(path).content
+        assert a == b and a, path
+
+
+def test_the_exported_figure_over_http_is_still_self_contained(client):
+    """网页那侧要能直接把这张图存下来投出去，所以外链和脚本在这条路上也不许有。"""
+    _chain(client)
+    client.put("/api/p/课题/results/003", json={"note": "主结果"}, headers=AUTH)
+    svg = client.get("/api/p/课题/pipeline/figure.svg").text
+    assert svg.lstrip().startswith("<svg") and "<script" not in svg
+    assert "http" not in svg.replace("http://www.w3.org/2000/svg", "")
+
+
+def test_both_front_doors_derive_the_very_same_pipeline(client):
+    """REST 和 MCP 的本地后端必须给出**同一条**流程。
+
+    各拼一遍的话，迟早有一个字段在某个门面上分家 —— 而分家的那一份正好是
+    要写进论文的那一份。所以两边走的是同一个 mcp.pipeline_payload。
+    """
+    import trace_mcp as M  # noqa: PLC0415
+
+    _chain(client)
+    client.put("/api/p/课题/results/003", json={"note": "主结果"}, headers=AUTH)
+    over_http = client.get("/api/p/课题/pipeline").json()
+    over_http.pop("version")
+    local = M.LocalBackend(client.root).pipeline("课题")
+    assert over_http == local

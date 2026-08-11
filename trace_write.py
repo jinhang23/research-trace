@@ -32,6 +32,19 @@ CLI、网页表单、agent API 全部调这里，不允许任何一方绕过去�
 双语（note.<lang>.md）同样只有一条写入路径：write_translation /
 write_project_translation / drop_translation。它们碰不到原文，也写不出结构键——
 见文件下半部分「翻译」那一节的长注释。
+
+「开发路径」和「定稿流程」这一版分了家（记录 vs 方法），而落盘的**只有一件推导
+不出来的事**：哪一步是成果。它写在 project.md 的 front-matter 里，可重复：
+
+    result: 023 | 主结果：亲和力预测 AUC 0.91
+
+其余全部派生：从每个 result 沿 `input:` 反向做闭包（没写 input: 的退回 parent），
+剔掉 dead，剩下的就是定稿流程。**成员清单一个字都不存**——存了它，移动一步、
+补一条 input:、把某支标 dead，那份清单当场就过期，而它看起来仍然完全正常。
+这正是上一代系统的死法，也是 P1 禁止中心索引的原因。
+
+单步上的例外（`pipeline: include|exclude | 理由`）同样只写在**那一步自己**身上，
+和 `branch:` 一个套路：项目上绝不列「哪些步骤要排除」的清单。
 """
 
 from __future__ import annotations
@@ -66,6 +79,7 @@ from trace_core import (
     DEFAULT_BRANCH,
     NOTE_NAME,
     PATH_ROLES,
+    PIPELINE_RULES,
     PROJECT_NOTE,
     STATUSES,
     DEFAULT_STATUS,
@@ -83,6 +97,8 @@ from trace_core import (
     format_insight,
     format_moved,
     format_path,
+    format_pipeline,
+    format_result,
     id_key,
     next_insight_id,
     parse_branch,
@@ -92,6 +108,8 @@ from trace_core import (
     parse_moved,
     parse_note,
     parse_paths,
+    parse_pipeline,
+    parse_results,
     path_kind,
     project_dir,
     projects_root,
@@ -495,24 +513,51 @@ def _merge_insights(old_body: str, submitted: str, lang: str = "zh") -> str:
     return "\n\n".join(chunks)
 
 
-def _read_project_note(d: Path) -> tuple[dict[str, str], str]:
-    """读 project.md。非 UTF-8 就拒绝——继续写下去会把原文替换成一串问号。"""
+def _load_project_note(d: Path) -> tuple[dict[str, str], str, list[dict[str, str]]]:
+    """读 project.md：front-matter、正文、以及成果声明（`result:`，可重复）。
+
+    成果声明**不能**从 parse_note 给的 meta 里拿：那边只有 MULTI_KEYS 里的键会累积，
+    而 `result:` 刻意不在那张表里（那是 note.md 的可重复键表，FORMAT.md 第 2 节逐字
+    钉着它）。按 meta 读的话只留得下最后一行，于是第二条成果声明会在下一次改项目名
+    的时候被静默删掉——一条 diff 都不像是删除，人只看到自己刚改的名字。
+    所以走 core 的 parse_results，它自己扫 front-matter 的原始行。
+
+    非 UTF-8 就拒绝——继续写下去会把原文替换成一串问号。
+    """
     note = d / PROJECT_NOTE
     if not note.is_file():
-        return {}, ""
-    meta, body, _w = parse_note(read_text_strict(note, "项目笔记"))
+        return {}, "", []
+    text = read_text_strict(note, "项目笔记")
+    meta, body, _w = parse_note(text)
+    return meta, body, parse_results(text)
+
+
+def _read_project_note(d: Path) -> tuple[dict[str, str], str]:
+    """读 project.md 的 front-matter 和正文。成果声明由 _write_project_note 自己保留。"""
+    meta, body, _results = _load_project_note(d)
     return meta, body
 
 
-def _write_project_note(d: Path, name: str, body: str, lang: str = "") -> None:
-    """回写 project.md。
+def _write_project_note(d: Path, name: str, body: str, lang: str = "",
+                        results: list[dict[str, str]] | None = None) -> None:
+    """回写 project.md。键顺序固定（name → lang → result…），保证逐字节确定（P3）。
 
     `lang` 要**原样带回去**：它是这份笔记自己声明的主语言，翻译文件靠它判断
     「哪个语言不需要翻译」。这个函数是全量重写 front-matter 的，不显式带上就等于
     每次改一条洞察都把用户手写的 `lang:` 悄悄删掉一次。
+
+    `results` 默认是 None，意思是**从磁盘上原样读回来**，不是「一条都没有」。
+    默认值选「保留」而不是「清空」，是因为这个函数有五个调用方（改名、改洞察、
+    整体替换、记删除、标注删除未完成），它们没有一个关心成果声明——默认清空的话，
+    漏掉一处的表现是「改了个项目名，论文的定稿流程整个没了」，而且不报错。
+    lang 当年就是这么漏的（见上一段），这一次让「忘记传」等于「保留」。
     """
     body = body.strip()
-    head = f"---\nname: {name}\n" + (f"lang: {lang}\n" if lang else "") + "---\n\n"
+    if results is None:
+        _m, _b, results = _load_project_note(d)
+    head = f"---\nname: {name}\n" + (f"lang: {lang}\n" if lang else "")
+    head += "".join(f"result: {format_result(r)}\n" for r in results)
+    head += "---\n\n"
     write_atomic(d / PROJECT_NOTE, _utf8_bytes(head + (f"{body}\n" if body else ""), "项目笔记"))
 
 
@@ -798,6 +843,134 @@ def rename_project(root: Path, slug: str, name: str) -> Project:
     return Project(slug=slug, name=name, body=body)
 
 
+# ---------------------------------------------------------------- 成果声明
+#
+# 「开发路径」是整棵树（含走不通的、含岔路口），「定稿流程」是真正产出成果的那条
+# 链。两者之间**只有一件事推导不出来**：哪一步是成果。所以磁盘上也只多这一行：
+#
+#     result: 023 | 主结果：亲和力预测 AUC 0.91
+#     result: 031 | 图 4 的消融
+#
+# 流程的成员清单绝不落盘（P1）。它是从每个 result 沿 `input:` 反向做闭包算出来的，
+# 于是移动一步、补一条 `input:`、把某支标 dead，流程自己就跟着变了。存一份清单的
+# 代价不是「多一个文件」，是那份清单**看起来永远是对的**——它只在你改完结构之后
+# 才开始说谎，而那正是你最信它的时候。
+#
+# 为什么单开一个写入口，而不是给 update_project 加一个参数（三条，各对应一种
+# 「加个参数」拦不住的坏结果）：
+#
+#   1. **它决定的东西比它看起来重得多。**「把 023 定为主结果」重写的是整条定稿
+#      流程、论文 Methods 里出现哪几步、导出的那张图长什么样。和「改个标题」走
+#      同一个随手的口子，语义上就把它降级成了一个字段。
+#   2. **它要校验的东西 update_project 够不着。**成果必须指向一个**真实存在**的
+#      步骤：`input:` 指向不存在的 id 是宽容的（读侧报一条警告，那条数据边不参与
+#      计算），而悬空的 `result:` 会让整条定稿流程**静默变空**——闭包从一个不存在
+#      的起点出发，什么都够不着，页面上不报错，只是那一栏空了。所以这里要 load 一遍
+#      步骤，而 update_project 只拿得到项目目录。
+#   3. **参数组合会爆炸。**update_project 已经有 name / insights / add / insight_id /
+#      supersedes / lang 六个参数和一组互斥规则。再塞三个，最可能的失败是「传了但
+#      被忽略」——写入侧最难查的一类 bug。
+#
+# 明确**不**要的：一句 reason。move_step 的 reason 存在是因为移动**销毁**了一个
+# 事实（原来挂在哪），那条审计是它仅存的证据；而声明成果什么都不销毁，它不是一段
+# 历史，是一个**当前指针**（「论文现在报的是这一步」）。给指针强制配一句理由，
+# 收上来的会是「因为这是主结果」这种仪式性文字，而仪式性文字会训练人连 move_step
+# 那句真正要紧的理由一起敷衍过去。更实在的是：「为什么这一步是成果」已经写在那一步
+# 自己的 `## 结论` 里了，再写一份就是第二份真相。
+
+
+def _result_row(sid: str, note: str) -> dict[str, str]:
+    """校验并规整一条成果声明，然后**按它将来在磁盘上的样子读回来对一遍**。
+
+    和 _path_row 同一个做法：拼出那一行 → 交给读侧的解析器 → 比对。多花一次解析，
+    换「写进去的和读出来的一模一样」。这条边角很窄（id 的形状已经查过、说明里的
+    竖线本来就该原样留着），但读写两侧一旦哪天分家，症状是**成果声明写得进去、
+    读不回来**，而磁盘上那一行看着完全正常，页面只是安静地少一条流程。
+    """
+    sid = _clean_line(sid)
+    if not sid:
+        raise WriteError("要把哪一步定为成果？step 不能为空。")
+    if not _STEP_ID_RE.match(sid):
+        raise WriteError(
+            f"成果指向的步骤 id 形状不对: {sid!r}（应该是 023 / 023b 这样的三位数字加可选字母）。")
+    row = {"step": sid, "note": _clean_line(note)}
+    line = f"result: {format_result(row)}"
+    if parse_results(f"---\n{line}\n---\n") != [row]:
+        raise WriteError(f"这条成果声明读回来和写进去的不一样: {line!r}。")
+    return row
+
+
+def set_result(root: Path, slug: str, step: str, note: str = "") -> dict[str, Any]:
+    """声明「这一步是成果」，或就地改写它那一行的说明。定稿流程从这里长出来。
+
+    同一个步骤只会有一行：成果声明的身份**就是**那个步骤 id，同一步写两条只会
+    产出两个一模一样的闭包，而说明不同的那两句话没人知道该信哪句。所以再写一次
+    就是改写那一行，位置不动（顺序是人声明的顺序，也是导出里的顺序）。
+
+    两条硬校验，各挡一种静默失败：
+
+      * **步骤必须存在。**悬空的 result 不像悬空的 input（读侧警告一声、那条边
+        不参与计算），它让整条定稿流程从一个不存在的起点出发，结果是空——页面上
+        什么都不报，只是那一栏没了。
+      * **不能把 dead 的一步定为成果。**「我的主结果是一条我自己判了此路不通的
+        线」不是任何人想打出来的话。注意反过来是**允许**的：已经声明成成果的一步
+        后来被标 dead 不拦（P4：结论不是错误，而且那多半是真发生的事），它由读侧
+        以 warn 级说出来并点名。写入侧挡住新犯的错，读侧说清已经发生的事——
+        和 branch 的笔误校验是同一条分工。
+    """
+    steps_dir = resolve_project(root, slug)
+    d = steps_dir.parent
+    row = _result_row(step, note)
+    with project_lock(d):
+        by_id = load(steps_dir)
+        target = by_id.get(row["step"])
+        if target is None:
+            raise NotFound(
+                f"步骤 {row['step']} 在这个项目里不存在。成果声明不接受悬空引用："
+                "定稿流程是从它反向做闭包算出来的，起点不存在的话整条流程会静默变空，"
+                "而页面上一个字都不会报。")
+        if target.status == "dead":
+            raise WriteError(
+                f"{row['step']} 是 dead —— 那是一句结论（此路不通），不该同时是成果。"
+                "如果这条路其实走通了，先把它的 status 改掉；如果成果在别的步骤上，"
+                "换那一步。（已经声明过的成果后来被标 dead 是允许的，那是真会发生的事，"
+                "由读侧点名报出来。）")
+        meta, body, results = _load_project_note(d)
+        idx = next((i for i, r in enumerate(results) if r["step"] == row["step"]), None)
+        created = idx is None
+        if created:
+            results = results + [row]
+        else:
+            results = [row if i == idx else r for i, r in enumerate(results)]
+        _write_project_note(d, (meta.get("name") or slug).strip(), body,
+                            (meta.get("lang") or "").strip(), results)
+    return {"slug": slug, "step": row["step"], "note": row["note"], "created": created,
+            "line": f"result: {format_result(row)}", "results": results}
+
+
+def drop_result(root: Path, slug: str, step: str) -> dict[str, Any]:
+    """撤掉一条成果声明。
+
+    这不是 P2 的例外：`result:` 不是一段历史，是一个当前指针（「论文现在报的是
+    哪一步」）。指针改了就是改了，被撤掉的那一步和它的记录一个字都没动，
+    它只是不再是定稿流程的终点——开发路径上它还在原处。
+    """
+    sid = _clean_line(step)
+    d = project_dir(root, slug)
+    if not d.is_dir():
+        raise NotFound(f"项目 {slug} 不存在")
+    with project_lock(d):
+        meta, body, results = _load_project_note(d)
+        left = [r for r in results if r["step"] != sid]
+        if len(left) == len(results):
+            raise NotFound(
+                f"项目 {slug} 没有把 {sid or '（空）'} 声明成成果。"
+                f"现在声明的是: {'、'.join(r['step'] for r in results) or '（一个都没有）'}。")
+        _write_project_note(d, (meta.get("name") or slug).strip(), body,
+                            (meta.get("lang") or "").strip(), left)
+    return {"slug": slug, "step": sid, "removed": True, "results": left}
+
+
 # ---------------------------------------------------------------- 步骤
 
 
@@ -887,6 +1060,17 @@ def _branch_of(step: Step) -> dict[str, str]:
             "note": _clean_line(getattr(step, "branch_note", ""))}
 
 
+def _pipeline_of(step: Step) -> dict[str, str]:
+    """这一步对定稿流程的例外声明，取成 core 那对 parse/format 用的 {rule, note}。
+
+    没声明就是空 rule —— 进不进流程由闭包说了算，那是绝大多数步骤的状态。
+    getattr 兜底的理由和 branch 那一条一样：纯手工造出来的 Step（测试、演算）
+    可能连这两个字段都没有。
+    """
+    return {"rule": _clean_line(getattr(step, "pipeline", "")).lower(),
+            "note": _clean_line(getattr(step, "pipeline_note", ""))}
+
+
 def render_note(step: Step) -> str:
     """序列化成 note.md。键顺序固定，保证同样的数据永远产出同样的字节。"""
     lines = ["---", f"id: {step.id}"]
@@ -915,6 +1099,13 @@ def render_note(step: Step) -> str:
     decision = _clean_line(getattr(step, "decision", ""))
     if decision:
         lines.append(f"decision: {decision}")
+    # pipeline 挨着 decision 放：两行都是**人对结构的判断**（decision 说这个岔路口
+    # 在决定什么，pipeline 说这一步进不进最终流程），都推翻不了也推导不出来，
+    # 而下面从 lang 开始是机器记录区。没声明就不写这一行——「没写」和
+    # 「由闭包说了算」是同一个意思，把默认值存进文件就是把派生写成数据。
+    pl = _pipeline_of(step)
+    if pl["rule"]:
+        lines.append("pipeline: " + format_pipeline(pl))
     # lang 也要写回去。它是这份 note.md 自己声明的主语言，翻译文件靠它判断
     # 「这个语言不用翻」。render_note 是全量重写 front-matter 的，漏掉一个键
     # 就等于每次在网页上点一下 done 都把用户手写的那一行悄悄删掉。
@@ -1141,6 +1332,52 @@ def norm_branch(raw: Any) -> dict[str, str]:
     return {"kind": kind, "note": note}
 
 
+def norm_pipeline(raw: Any) -> dict[str, str]:
+    """把外部传来的 pipeline 声明规整成 core 那对 parse/format 用的 {rule, note}。
+
+    这一行是**对派生结果的手工推翻**：定稿流程本来是从 `result:` 沿 `input:` 反向
+    做闭包算出来的，`pipeline: exclude` 说「闭包够得到它，但它不该在流程里」，
+    `pipeline: include` 说「闭包够不到它，但它确实是流程的一环」。所以：
+
+      * **写空 = 撤销声明**（回到「由闭包说了算」），不是非法值——标错了要能改回来，
+        否则一次手滑就永久留在那儿。撤销时说明一起丢掉：一行没有取值的 pipeline
+        什么都没说，读侧看不见它，人却以为自己声明过了。
+      * **只写说明不写取值直接拒绝**，而不是悄悄当成撤销。那句说明是人写的字，
+        默默吃掉它比报错糟得多。
+      * **必须写理由。**这是它和 `branch:` 的唯一分歧（那边说明是可选的）：
+        候选组在树上看得见，一个 `branch: alternative` 写没写理由，图上都摆着；
+        而 pipeline 除了改变一份导出之外**不留任何痕迹**。没有那半句话，半年后
+        没人分辨得出这是想清楚的决定还是一次误点，而受害的是论文的 Methods。
+        它和 move_step 的 reason 是同一类：推翻推导的动作，必须留下推翻的理由。
+    """
+    if isinstance(raw, dict):
+        # `kind` 也接住：branch 那一侧用的是这个词，调用方（和写代码的人）会串。
+        rule = _clean_line(raw.get("rule") if raw.get("rule") is not None
+                           else raw.get("kind")).lower()
+        note = _clean_line(raw.get("note") if raw.get("note") is not None else raw.get("desc"))
+    else:
+        got = parse_pipeline(_clean_line(raw))
+        rule, note = got["rule"], got["note"]
+    if not rule:
+        if note:
+            raise WriteError(
+                f"pipeline 要先说清是 {' 还是 '.join(PIPELINE_RULES)}，只写说明的话这一行没有取值，"
+                f"读侧看不见它（收到的说明是 {note!r}）。要撤销声明请传空串。")
+        return {"rule": "", "note": ""}
+    if rule not in PIPELINE_RULES:
+        raise WriteError(
+            f"pipeline 只能是 {'/'.join(PIPELINE_RULES)} 之一，收到 {rule!r}。"
+            "exclude 的意思是「这一步成功了，但它是探索性的，没进最终流程」，"
+            "include 的意思是「闭包够不到它，但它确实是流程的一环」。"
+            "不写这一行才是常态——进不进流程默认由闭包算出来。")
+    if not note:
+        raise WriteError(
+            f"pipeline: {rule} 必须写清理由，写成 `{rule} | 为什么`。"
+            "这一行推翻的是算出来的结果，而它除了改变导出之外不留任何痕迹——"
+            "没有理由的话，半年后没人分得清这是想清楚的决定还是一次误点。")
+    return {"rule": rule, "note": note}
+
+
 def _branch_groups(by_id: dict[str, Step]) -> dict[str, dict[str, Any]]:
     """按分叉点 id 索引的候选组（根之间那一组的键是空串）。
 
@@ -1174,6 +1411,12 @@ def _hydrate(step: Step, text: str) -> Step:
     step.branch = b["kind"]                                # type: ignore[attr-defined]
     step.branch_note = b["note"]                           # type: ignore[attr-defined]
     step.decision = _clean_line(meta.get("decision", ""))  # type: ignore[attr-defined]
+    # pipeline 同理**原样读回**，不过 norm_pipeline 的校验：文件里写着
+    # `pipeline: exclud | 打错了` 的时候，照校验过的值写回去等于替人把那一行删掉，
+    # 而人还以为自己声明过。校验只管这次新传进来的值（见 norm_pipeline 的说明）。
+    pl = parse_pipeline(meta.get("pipeline", ""))
+    step.pipeline = pl["rule"]                             # type: ignore[attr-defined]
+    step.pipeline_note = pl["note"]                        # type: ignore[attr-defined]
     return step
 
 
@@ -1198,6 +1441,7 @@ def create_step(
     lang: str = "",
     branch: Any = "",
     decision: str = "",
+    pipeline: Any = "",
 ) -> tuple[Step, bool]:
     """新建一步。返回 (step, created)；created=False 表示命中幂等键返回了既有步骤。
 
@@ -1234,6 +1478,11 @@ def create_step(
         # 目录都不该留下。
         branch_row = norm_branch(branch)
         decision = _clean_line(decision)
+        # 建的时候就能声明进不进流程。主要用法仍然是回头再补（update_step），
+        # 但「这一步是拿来试试看的，不进最终流程」有时候动手之前就知道，
+        # 而逼人建完再 PATCH 一次，那句理由大概率就永远空着了。
+        # 校验同样放在 mkdir 之前：非法值一个目录都不该留下。
+        pipeline_row = norm_pipeline(pipeline)
 
         sid = alloc_id(by_id, parent)
         step = Step(
@@ -1268,6 +1517,8 @@ def create_step(
         step.branch = branch_row["kind"]        # type: ignore[attr-defined]
         step.branch_note = branch_row["note"]   # type: ignore[attr-defined]
         step.decision = decision                # type: ignore[attr-defined]
+        step.pipeline = pipeline_row["rule"]         # type: ignore[attr-defined]
+        step.pipeline_note = pipeline_row["note"]    # type: ignore[attr-defined]
 
         text = _utf8_bytes(render_note(step), "正文")
         d = steps_dir / step.dirname
@@ -1289,7 +1540,10 @@ MUTABLE = ("status", "title", "body", "date", "commit", "author", "tags",
            # 分叉语义必须可变，而且这才是**主要**用法：两步先各自建出来，过几天
            # 回头才想明白「当时这两条是互斥的，只能选一条」。只在 create 时给，
            # 等于要求人在还没纠结完的时候就说清自己在纠结什么。
-           "branch", "decision")
+           "branch", "decision",
+           # 「这一步到底进不进最终流程」天然是回头才定的：先跑完、先看见结果，
+           # 才知道它是主线还是一次探索。只能在 create 时给等于要求人预判。
+           "pipeline")
 
 
 def norm_repro(raw: Any) -> list[dict[str, str]]:
@@ -1443,6 +1697,12 @@ def _update_step_locked(steps_dir: Path, sid: str, patch: dict[str, Any], expect
     if "decision" in patch:
         # 分叉点上那句「在决定什么」。空串是撤回（这儿不再是个岔路口了）。
         step.decision = _clean_line(patch["decision"])        # type: ignore[attr-defined]
+    if "pipeline" in patch:
+        # 对定稿流程的例外声明。空串是撤回（进不进流程重新交给闭包算），
+        # 撤回之后 render_note 不写这一行——不留一行空的（见 norm_pipeline）。
+        row = norm_pipeline(patch["pipeline"])
+        step.pipeline = row["rule"]                           # type: ignore[attr-defined]
+        step.pipeline_note = row["note"]                      # type: ignore[attr-defined]
 
     # 目录名不跟着 title 改：目录名里的 id 是给 shell 补全用的，
     # 改名会让所有已经发出去的相对链接失效。
@@ -1781,7 +2041,13 @@ def delete_step(steps_dir: Path, sid: str, reason: str, by: str = "", date: str 
        **静悄悄地**接手这些边——那时它指向的是一个完全不相干的实验，而没有
        任何一处会报错。所以它必须和孤儿一样，删的时候当场报出来。
 
-    所以返回值里明确告诉调用方这三件事各自发生了多少，让人能当场看见后果。
+    4. **project.md 里的 `result:` 会指空。** 后果比第 3 条更重：定稿流程是从成果
+       反向做闭包算出来的，起点没了，整条流程**静默变空**（页面上不报错，只是那一栏
+       没了）；再叠上第 1 条，下一个拿到这个号的步骤会无声地变成论文的主结果。
+       这里**不替人撤掉那一行**——声明是人写的，机器代撤之后「定稿流程曾经指向一步
+       被删的记录」就再也没人看得见了。报出来，让人自己决定改指哪一步。
+
+    所以返回值里明确告诉调用方这四件事各自发生了多少，让人能当场看见后果。
     """
     reason = _clean_line(reason)
     if not reason:
@@ -1801,6 +2067,9 @@ def delete_step(steps_dir: Path, sid: str, reason: str, by: str = "", date: str 
         # 谁声明过「我读了这一步的产物」。这条边一样会被删除打断，见上面第 3 条。
         eaters = sorted((k for k, s in by_id.items()
                          if k != sid and any(i["step"] == sid for i in s.inputs)), key=id_key)
+        # 这一步被声明成成果了没有。报的是那一行的原文，人一眼看得出要去改什么。
+        declared = [f"result: {format_result(r)}"
+                    for r in _load_project_note(steps_dir.parent)[2] if r["step"] == sid]
 
         d = steps_dir / target.dirname
         # rglob 数的是目录里所有文件，所以 note.md、每一份 note.<lang>.md 和全部
@@ -1830,7 +2099,7 @@ def delete_step(steps_dir: Path, sid: str, reason: str, by: str = "", date: str 
 
     return {"id": sid, "title": target.title, "reason": reason,
             "files_removed": files, "orphaned": children, "dangling_refs": refs,
-            "dangling_inputs": eaters}
+            "dangling_inputs": eaters, "dangling_results": declared}
 
 
 def _on_rm_error(func, path, _exc) -> None:

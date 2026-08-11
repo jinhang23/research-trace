@@ -10,11 +10,17 @@
 
 布局算法（order / lanes）是最容易写错的部分，因此被写成不碰 IO 的纯函数，
 可以直接对着期望结果写断言，不需要跑渲染。
+
+定稿流程的**派生**（compute_pipeline）在这里；它的三个**导出**
+（Methods 草稿 / SVG 图 / 独立页面）**不在这里**，在 trace_mcp.py 的「三个导出」
+那一节，理由写在那儿。要改导出请去那一份——CLI、服务端、静态导出都调它，
+在这里再写一份就等于让论文里那张图和网页上那张图各活各的。
 """
 
 from __future__ import annotations
 
 import hashlib
+import heapq
 import os
 import re
 from dataclasses import dataclass, field
@@ -45,6 +51,15 @@ DEFAULT_BRANCH = "extends"
 #   abandoned  一个不剩 —— 整条路都走不通，这**是结论不是错误**（P4）
 #   open       还有两个以上活着 —— 这个岔路口还没做决定
 BRANCH_STATES = ("open", "decided", "abandoned")
+
+# 定稿流程上，**某一步自己**的例外声明（`pipeline:` 写在 note.md 里）：
+#   include  闭包够不到它，但它确实是流程的一环
+#   exclude  探索性的、成功了但没进最终流程
+#
+# 和 `branch:` 同一个套路：声明写在**这一步自己**身上，绝不在项目上列一份成员清单。
+# 清单一旦落盘就是一份会漂移的中心索引（P1 禁止）——移动一步、补一条 `input:`、
+# 把某支标 dead，那份清单立刻过期，而且没有任何机制会告诉你它过期了。
+PIPELINE_RULES = ("include", "exclude")
 
 # 列表视图：行高与轨道宽。前端要用同一组数字，这里是唯一来源。
 # 行高必须固定——轨道 SVG 和行文本是两套坐标系，只靠它对齐。
@@ -144,7 +159,11 @@ TR_STRUCT_KEYS = ("id", "parent", "status", "date", "commit", "author",
                   "tags", "path", "repro", "key", "input", "code", "moved",
                   # branch / decision 是**结构**（这条边什么意思、这个岔路口在问什么），
                   # 不是正文。译文里写一份，页面就会按不同的边画同一棵树的两个版本。
-                  "branch", "decision")
+                  "branch", "decision",
+                  # result / pipeline 同理，而且后果更重：它们决定**哪些步骤进定稿流程**。
+                  # 译文里写一份，中文页面和英文页面会导出两条不同的 Methods，
+                  # 而两边看着都像对的——正是双真相源最难查的那一种。
+                  "result", "pipeline")
 
 _HPC_RE = re.compile(r"^(/blue/|/orange/|/red/|/scratch/|/gpfs/|/lustre/|/work/)", re.I)
 _WIN_RE = re.compile(r"^[a-z]:[\\/]", re.I)
@@ -517,6 +536,61 @@ def format_branch(b: dict[str, str]) -> str:
     return f"{kind} | {note}" if note else kind
 
 
+def parse_pipeline(raw: str) -> dict[str, str]:
+    """`pipeline: exclude | 探索性的，成功了但没进最终流程` → `{"rule", "note"}`。
+
+    和 `branch:` 逐字同一个套路（竖线左边给机器、右边给人），因为它们回答的是同一类
+    问题：**这一步自己**声明一件只有它说得清的事。区别只在于问的是哪件事——
+    `branch:` 说「我和兄弟只能选一条」，`pipeline:` 说「我进不进最终那条流程」。
+
+    **不判合法性**：未知取值要报出是哪个步骤写的（这里拿不到 dirname），
+    留给 build_step，和 `status:` / `branch:` 同一条路。
+    """
+    rule, _, note = str(raw or "").partition("|")
+    return {"rule": rule.strip().lower(), "note": note.strip()}
+
+
+def format_pipeline(p: dict[str, str]) -> str:
+    """还原成 note.md 里的一行（不含 `pipeline: ` 前缀）。"""
+    rule = str(p.get("rule") or "").strip()
+    note = str(p.get("note") or "").strip()
+    return f"{rule} | {note}" if note else rule
+
+
+def parse_results(text: str) -> list[dict[str, str]]:
+    """从 **project.md 全文**里取出每一行 `result: <步骤 id> | <这是什么成果>`。
+
+    「哪一步是成果」是整个定稿流程里唯一推导不出来的事，所以它是全项目唯一要人写
+    的一行；成员清单一个字都不存（存了就是会漂移的中心索引，P1 禁止）。
+
+    为什么不走 `parse_note` 拿 `meta["result"]`：那边只有 MULTI_KEYS 里的键会累积，
+    而 MULTI_KEYS 是 **note.md** 的「可以重复的键」那张表（FORMAT.md 第 2 节逐字钉着
+    它）。`result:` 是 project.md 的键，混进那张表会让文档和实现说两件不同的事。
+    所以这里自己扫 front-matter 的原始行——切法和 parse_note 共用 `_split_front_matter`，
+    不会在「BOM 算不算」这种细节上和它分家。
+    """
+    out: list[dict[str, str]] = []
+    for raw in _split_front_matter(text)[0]:
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        k, sep, v = s.partition(":")
+        if not sep or k.strip().lower() != "result":
+            continue
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1]
+        # `id | 说明` 的语法和 `input:` 逐字相同，所以直接借它的解析器：
+        # 两处各写一遍，迟早会在「说明里再有竖线怎么办」上分家。
+        out.extend(parse_inputs(v))
+    return out
+
+
+def format_result(r: dict[str, str]) -> str:
+    """还原成 project.md 里的一行（不含 `result: ` 前缀）。"""
+    return format_input(r)
+
+
 def parse_code(raw: str) -> list[dict[str, Any]]:
     """每行一条 `<kind> | <位置> | <k=v …>`，kind ∈ CODE_KINDS。
 
@@ -717,6 +791,16 @@ class Step:
     # 少数无法自动生成的字段之一：候选有哪些、选中了谁都算得出来，唯独「当时在纠结
     # 什么」推导不出来。半年后看到两条并排的支线，没有这句话就只剩猜。
     decision: str = ""
+    # 这一步在**定稿流程**上的例外（`pipeline:`）：include 拉进来 / exclude 剔出去 /
+    # 空串就是不声明（绝大多数）。默认那条路是算出来的（从 `result:` 沿 input 反向做
+    # 闭包），这两个值只在算错的时候才写——所以它和 `branch:` 一样声明在自己身上，
+    # 项目那边永远不出现一份成员清单。
+    #
+    # **刻意不进 to_dict()**：一个 result 都没声明的项目（现存全部如此）
+    # 不该因为这一轮改动多出一个字段值。要看这一步在不在流程里，读
+    # compile_forest 给出的 step["pipeline"]（只在项目声明了成果时才有）。
+    pipeline: str = ""
+    pipeline_note: str = ""
     body: str = ""
     dirname: str = ""
     # note.md 自己声明的语言（front-matter 的 `lang:`）。**没声明就是空串**，
@@ -1007,6 +1091,24 @@ def scan_projects(root: Path) -> list[Project]:
 # ---------------------------------------------------------------- parse
 
 
+def _split_front_matter(text: str) -> tuple[list[str], str, str]:
+    """切出 (front-matter 的原始行, 正文, 切不干净时的原因码)。原因码为空即切好了。
+
+    单独抽出来是因为有**两个**读者：`parse_note` 要的是「键 → 值」，而 `parse_results`
+    要的是「所有 `result:` 行」（同一个键可以重复，折成一个值就丢了一半）。两处各写
+    一遍切法，迟早会在「BOM 算不算」「\\r\\n 算不算」上分家——而分家之后是
+    **某些文件里的 `result:` 读不出来**，静默少几步，比报错难查得多。
+    """
+    text = text.lstrip("﻿").replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return [], text.strip("\n"), ("no_front_matter" if text.strip() else "")
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            return lines[1:i], "\n".join(lines[i + 1:]).strip("\n"), ""
+    return [], text.strip("\n"), "unclosed_front_matter"
+
+
 def parse_note(text: str) -> tuple[dict[str, str], str, list[dict[str, str]]]:
     """拆 front-matter 和正文。
 
@@ -1015,25 +1117,16 @@ def parse_note(text: str) -> tuple[dict[str, str], str, list[dict[str, str]]]:
     对本用途更健壮，且零依赖。
     """
     warnings: list[dict[str, str]] = []
-    text = text.lstrip("﻿").replace("\r\n", "\n").replace("\r", "\n")
-    lines = text.split("\n")
-
-    if not lines or lines[0].strip() != "---":
-        if text.strip():
-            warnings.append(warn("warn", "no_front_matter", "缺少 front-matter，全部内容当作正文"))
-        return {}, text.strip("\n"), warnings
-
-    close = None
-    for i in range(1, len(lines)):
-        if lines[i].strip() == "---":
-            close = i
-            break
-    if close is None:
+    raw_lines, body, bad = _split_front_matter(text)
+    if bad == "no_front_matter":
+        warnings.append(warn("warn", "no_front_matter", "缺少 front-matter，全部内容当作正文"))
+        return {}, body, warnings
+    if bad == "unclosed_front_matter":
         warnings.append(warn("warn", "unclosed_front_matter", "front-matter 没有闭合的 ---，全部内容当作正文"))
-        return {}, text.strip("\n"), warnings
+        return {}, body, warnings
 
     meta: dict[str, str] = {}
-    for raw in lines[1:close]:
+    for raw in raw_lines:
         s = raw.strip()
         if not s or s.startswith("#"):
             continue
@@ -1052,7 +1145,6 @@ def parse_note(text: str) -> tuple[dict[str, str], str, list[dict[str, str]]]:
         else:
             meta[k] = v
 
-    body = "\n".join(lines[close + 1 :]).strip("\n")
     return meta, body, warnings
 
 
@@ -1134,6 +1226,19 @@ def build_step(dirname: str, meta: dict[str, str], body: str) -> tuple[Step, lis
                              dirname, {"branch": branch}))
         branch = DEFAULT_BRANCH
 
+    # `pipeline:` 同样走「报一声、当没写、继续建树」那条路。当没写的后果是这一步
+    # 按默认规则参与流程（在闭包里就进、是 dead 就剔），而不是从流程里消失——
+    # 一个拼错的词不该悄悄改掉论文 Methods 里有哪几步。
+    # 说明（竖线右边）**留着**：那是人写的字，取值拼错了也不该跟着丢。
+    pl = parse_pipeline(meta.get("pipeline", ""))
+    pipeline, pipeline_note = pl["rule"], pl["note"]
+    if pipeline and pipeline not in PIPELINE_RULES:
+        warnings.append(warn("warn", "bad_pipeline",
+                             f"未知 pipeline {pipeline!r}，当没写（可用取值："
+                             + " / ".join(PIPELINE_RULES) + "）",
+                             dirname, {"pipeline": pipeline}))
+        pipeline = ""
+
     step = Step(
         id=sid,
         parent=parent,
@@ -1153,6 +1258,8 @@ def build_step(dirname: str, meta: dict[str, str], body: str) -> tuple[Step, lis
         branch_note=branch_note,
         # 自由文本，不做任何词表约束：「在决定什么」是人话，不是枚举。
         decision=(meta.get("decision") or "").strip(),
+        pipeline=pipeline,
+        pipeline_note=pipeline_note,
         body=body,
         dirname=dirname,
         # 没写就是空串。**不做任何猜测**：字符集探测能把一段引用了中文论文标题的
@@ -2356,6 +2463,369 @@ def lineage(by_id: dict[str, Step], sid: str) -> list[str]:
     return chain
 
 
+# -------------------------------------------------------------- 定稿流程
+#
+# 同一批文件上的**两条路径**：
+#
+#   开发路径  现在这棵树的全部——含走不通的、含岔路口。给自己和查问题用。
+#   定稿流程  真正产出成果的那一条链。给别人照着做、给论文 Methods 用。
+#
+# 全项目只声明**一件推导不出来的事**：哪一步是成果（project.md 的 `result:`）。
+# 其余全部派生：从成果沿 `input:` 反向做闭包，剔掉 dead，应用每一步自己的
+# `pipeline: include / exclude`。**成员清单一个字都不存**——存了就是一份会漂移的
+# 中心索引（P1 禁止）：移动一步、补一条 `input:`、把某支标 dead，流程要自己跟着变，
+# 而一份落盘的清单只会理直气壮地列着已经不对的东西。
+
+# 一个 result 都没声明时说的话。**教怎么办，不责备**：大多数项目一开始就是这个状态，
+# 「你还没声明成果」写成缺陷只会让人为了让界面干净随手指一步当成果，那是拿假结论换绿色。
+PIPELINE_EMPTY_HINT = (
+    "这个项目还没声明成果，所以推不出定稿流程——这是常态，不是缺陷。"
+    "想要一条能给别人照着做、能直接写进论文 Methods 的流程，"
+    "在 project.md 的 front-matter 里写一行 "
+    "`result: <步骤 id> | <这是什么成果>`（可以写好几行，一个成果一行）。"
+    "剩下的全是算出来的：从成果沿 `input:` 反向做闭包（一步没写 `input:` 时"
+    "退回它的 parent），剔掉 dead。哪些步骤算流程的一员，永远不用你维护。"
+)
+
+
+def pipeline_deps(by_id: dict[str, Step], sid: str) -> list[str]:
+    """定稿流程的闭包沿哪条边上溯：有 `input:` 就**只**沿 input，一条都没有才退回 parent。
+
+    **为什么这个退路是对的。**`input:` 回答的正是「这些字节从哪来」，所以它当然是
+    首选。但绝大多数步骤不写 `input:`——不是因为没有输入，而是因为输入就是上一步，
+    写出来是废话。真按「没写 input 就没有上游」算，现存每一个项目的定稿流程都只剩
+    成果那一步，这个功能等于不存在。退回 parent 就是把「我接着上一步做」读成
+    「我吃了上一步的产物」，在一条直链上这两句话说的是同一件事。
+
+    **它什么时候会把不该来的拉进来。**parent 是「我当时接着哪一步**想**」，不保证
+    有字节流过来。016 挂在 013b 底下只是因为想法承接自那个判定，数据却是从磁盘上
+    另拿的——此时闭包会把 013b 连同它整条祖先链拖进 Methods，而其中一个字节都没参与
+    这个结果。两条出路，都在记录里说清楚而不是靠程序猜：给 016 补一行真正的 `input:`
+    （首选，顺带把数据流图也修对了），或者在 013b 上写一行 `pipeline: exclude`。
+
+    还有一种更隐蔽的情况：`input:` 全都指向不存在的步骤（悬空）。此时这一步**算是
+    声明过**输入，不退回 parent，闭包就在这里断掉。这是有意的——悬空的 `input:`
+    已经由 `dangling_input` 报出来了，再拿 parent 顶上等于替人猜一个来源。
+    """
+    s = by_id.get(sid)
+    if s is None:
+        return []
+    if s.inputs:
+        out: list[str] = []
+        for i in s.inputs:
+            t = (i.get("step") or "").strip()
+            if t and t != sid and t in by_id and t not in out:
+                out.append(t)
+        return out
+    p = s.parent
+    return [p] if p and p in by_id else []
+
+
+def _pipeline_members(by_id: dict[str, Step], closure: Iterable[str],
+                      result_ids: set[str]) -> tuple[list[str], list[dict[str, str]]]:
+    """闭包 → 成员清单，外加「被剔掉的是谁、为什么」。
+
+    优先级只有三条，从具体到一般：
+
+      1. 声明成果的那一步**永远在流程里**——`result:` 说的就是「这是产出」，
+         比任何一般规则都具体。（它同时写了 exclude 时另报一条诊断，见 compute_pipeline。）
+      2. 这一步自己的 `pipeline: include / exclude` 赢过默认规则——那是人当场写下的判断。
+      3. 默认：`dead` 剔掉。dead 是**结论**（P4），不是错误，但一条被放弃的路
+         本来就不该出现在「照着做」的说明书里。
+    """
+    members: list[str] = []
+    dropped: list[dict[str, str]] = []
+    for sid in sorted(closure, key=id_key):
+        rule = by_id[sid].pipeline
+        if sid in result_ids or rule == "include":
+            members.append(sid)
+        elif rule == "exclude":
+            dropped.append({"step": sid, "why": "declared"})
+        elif by_id[sid].status == "dead":
+            dropped.append({"step": sid, "why": "dead"})
+        else:
+            members.append(sid)
+    return members, dropped
+
+
+def _pipeline_edges(by_id: dict[str, Step], members: list[str]) -> list[dict[str, Any]]:
+    """成员之间的边。被剔掉的那些步骤**接过去**，不留断口。
+
+    020 是 dead、023 吃了 020 的产物、020 又吃了 015 的：剔掉 020 之后如果连边一起
+    丢掉，015 就成了一个和成果毫无关系的孤点，读的人只会以为它是多出来的。
+    015 的字节确实流进了 023（只是路上经过一段已经放弃的路），所以边照接，
+    并在 `via` 里记下路过了谁——诊断②会点名 020，`via` 让人一眼看出它卡在哪两步之间，
+    也是「从流程跳回开发路径」的锚点。
+
+    `kind` 是**第一跳**的来路（input / parent），因为那是这条边在文件里的依据；
+    `notes` 只在直连（没有 via）且来自 `input:` 时才有——那一行说明写的是
+    「我消费了谁的哪份产物」，接过一段之后它描述的就不再是这条边了。
+    """
+    member_set = set(members)
+    index: dict[tuple[str, str], dict[str, Any]] = {}
+    out: list[dict[str, Any]] = []
+    for m in members:                       # members 按 id 序 ⇒ 输出顺序确定（P3）
+        kind = "input" if by_id[m].inputs else "parent"
+        for first in pipeline_deps(by_id, m):
+            # 宽度优先：同一个成员被好几条路径够到时，`via` 取最短的那条。
+            # seen 同时是环的刹车——数据依赖成环时这里必须能停下来。
+            queue: list[tuple[str, list[str]]] = [(first, [])]
+            seen: set[str] = set()
+            while queue:
+                node, via = queue.pop(0)
+                if node in seen:
+                    continue
+                seen.add(node)
+                if node not in member_set:
+                    for nxt in pipeline_deps(by_id, node):
+                        queue.append((nxt, via + [node]))
+                    continue
+                if node == m:
+                    continue                # 绕一圈回到自己：不画自环
+                key = (node, m)
+                edge = index.get(key)
+                if edge is None:
+                    edge = {"from": node, "to": m, "kind": kind,
+                            "via": list(via), "notes": []}
+                    index[key] = edge
+                    out.append(edge)
+                if not via and kind == "input":
+                    for i in by_id[m].inputs:
+                        n = (i.get("note") or "").strip()
+                        if (i.get("step") or "").strip() == node and n and n not in edge["notes"]:
+                            edge["notes"].append(n)
+    return out
+
+
+def _pipeline_order(members: list[str], edges: list[dict[str, Any]]
+                    ) -> tuple[list[str], list[str]]:
+    """按数据依赖拓扑排序，平局按 id 序。返回 (顺序, 排不进去的那些)。
+
+    平局必须有个说法，否则同一份文件在两台机器上能排出两种顺序，而 Methods 的
+    段落顺序会跟着变——P3 要求逐字节确定，所以就近取 id 序（也正是人写记录的顺序）。
+    """
+    indeg = {m: 0 for m in members}
+    adj: dict[str, list[str]] = {m: [] for m in members}
+    for e in edges:
+        adj[e["from"]].append(e["to"])
+        indeg[e["to"]] += 1
+    # 小根堆而不是「每轮重排一遍队列」：入度归零的先后不该影响结果，而重排在
+    # 长流程上是 n² log n。堆里放 (id_key, id)，取出来的永远是 id 最小的那个。
+    ready = [(id_key(m), m) for m in members if indeg[m] == 0]
+    heapq.heapify(ready)
+    out: list[str] = []
+    while ready:
+        cur = heapq.heappop(ready)[1]
+        out.append(cur)
+        for nxt in adj[cur]:
+            indeg[nxt] -= 1
+            if indeg[nxt] == 0:
+                heapq.heappush(ready, (id_key(nxt), nxt))
+    done = set(out)
+    return out, [m for m in members if m not in done]
+
+
+def compute_pipeline(by_id: dict[str, Step],
+                     results: list[dict[str, str]]) -> dict[str, Any]:
+    """派生定稿流程。**派生字段，绝不存储**（P1）。
+
+    `results` 是 project.md 里那几行 `result:`（parse_results 的产物）。
+
+    **多个成果合成一张 DAG，不是几条独立的链。** 两个成果的闭包几乎一定相交
+    （同一份清洗好的数据集喂了主结果和消融），拆成几条链就会把同一步在图上和
+    Methods 里各画一遍，读的人得自己对着 id 去重——而「同一个事实只有一份」正是
+    这套系统的地基。所以 `order` / `edges` 是合并后的一张图；同时每个成果各自带一份
+    `members`（它在这张图上的祖先集合，仍按全局拓扑序），于是「Methods 里一个成果
+    写一节」和「一张总图」都不用再算第二遍。
+    """
+    diags: list[dict[str, Any]] = []
+    empty: dict[str, Any] = {
+        "declared": False, "results": [], "order": [], "edges": [], "why": {},
+        "levels": {}, "level": "", "weakest": "", "weak": [], "dead": [],
+        "excluded": [], "included": [], "diagnostics": [],
+    }
+    declared = [r for r in results if (r.get("step") or "").strip()]
+    if not declared:
+        # 只在**有人主动问起**定稿流程时才说这句话。它绝不进 forest["warnings"]：
+        # 现存项目一个 result 都没声明，把它挂进全局警告栏等于每个项目每次打开
+        # 都被念一遍，而那正是让人从此不看警告的做法。
+        out = dict(empty)
+        out["diagnostics"] = [warn("info", "pipeline_no_result", PIPELINE_EMPTY_HINT)]
+        return out
+
+    # 成果：按声明顺序，重复声明同一步只算一次（第二行没有新信息）。
+    seeds: list[dict[str, str]] = []
+    seen_seed: set[str] = set()
+    for r in declared:
+        sid = r["step"].strip()
+        if sid not in by_id:
+            diags.append(warn(
+                "warn", "dangling_result",
+                f"`result: {sid}` 指向不存在的步骤，这个成果推不出流程。"
+                "多半是 id 写错了，或者那一步被删了（删除记录在 project.md 的「已删除」里）",
+                PROJECT_NOTE, {"id": sid}))
+            continue
+        if sid in seen_seed:
+            continue
+        seen_seed.add(sid)
+        seeds.append({"step": sid, "note": (r.get("note") or "").strip()})
+
+    included = [sid for sid in sorted(by_id, key=id_key) if by_id[sid].pipeline == "include"]
+
+    # 闭包：从成果和每个 `pipeline: include` 的步骤一起反向走。include 的步骤也当种子，
+    # 是因为「它确实是流程的一环」这句话必然连带它的上游——一个输入不在流程里的
+    # 成员，写进 Methods 就是一句断了的话。
+    closure: set[str] = set()
+    stack = [s["step"] for s in seeds] + list(included)
+    while stack:
+        cur = stack.pop()
+        if cur in closure:
+            continue
+        closure.add(cur)
+        stack.extend(pipeline_deps(by_id, cur))
+
+    result_ids = {s["step"] for s in seeds}
+    members, dropped = _pipeline_members(by_id, closure, result_ids)
+    edges = _pipeline_edges(by_id, members)
+    order, stuck = _pipeline_order(members, edges)
+    if stuck:
+        chain = " / ".join(sorted(stuck, key=id_key))
+        diags.append(warn(
+            "warn", "pipeline_cycle",
+            f"这几步的数据依赖成环，排不出先后：{chain}。"
+            "流程照样给出来（环上的按 id 序排在最后），但「先做哪一步」这个问题"
+            "在记录里本身就没有答案，写进 Methods 之前得先把环拆掉",
+            PROJECT_NOTE, {"ids": chain, "n": len(stuck)}))
+        order = order + sorted(stuck, key=id_key)
+
+    # 等级复用 traceability()，不另起一套判据。取**成员自己**的等级而不是整链等级：
+    # chain 会把非成员的祖先（正是被剔掉的 dead / exclude）算进来，而流程说的就是
+    # 「那些不算方法的一部分」。
+    levels = {sid: traceability(by_id[sid])["level"] for sid in order}
+    weakest = ""
+    for sid in order:
+        if not weakest or LEVELS.index(levels[sid]) < LEVELS.index(levels[weakest]):
+            weakest = sid
+    level = levels[weakest] if weakest else ""
+
+    dead = [sid for sid in sorted(closure, key=id_key) if by_id[sid].status == "dead"]
+    if dead:
+        names = " / ".join(dead)
+        diags.append(warn(
+            "warn", "pipeline_dead_step",
+            f"成果依赖着已经放弃的路：{names} 标着 dead，却在成果的上游。"
+            "dead 的默认不进定稿流程（被剔掉的那几步，上游照样接进来了），"
+            "但「我的结果建立在一条我自己判定走不通的路上」是必须说出来的事——"
+            "要么那个 dead 下错了，要么这个依赖该换一步",
+            PROJECT_NOTE, {"ids": names, "n": len(dead)}))
+
+    weak = [sid for sid in order if levels[sid] in ("L0", "L1")]
+    if weak:
+        names = " / ".join(weak)
+        diags.append(warn(
+            "warn", "pipeline_weak_step",
+            f"流程里有 {len(weak)} 步别人跑不起来：{names} 还停在 L0/L1"
+            f"（整条流程的等级 = 最弱的一步 = {level}，卡在 {weakest}）。"
+            "补记录要从这几步补起，不是从最新那一步补起——投稿前该补的就是它们",
+            PROJECT_NOTE, {"ids": names, "n": len(weak), "level": level, "id": weakest}))
+
+    # `pipeline: exclude` 却被流程里的步骤吃着产物：两句话互相矛盾，程序不替人裁决。
+    member_set = set(members)
+    consumed: dict[str, list[str]] = {}
+    for m in members:
+        for d in pipeline_deps(by_id, m):
+            if d not in member_set and by_id[d].pipeline == "exclude":
+                consumed.setdefault(d, []).append(m)
+    for sid in sorted(consumed, key=id_key):
+        eaters = " / ".join(consumed[sid])
+        diags.append(warn(
+            "warn", "pipeline_excluded_consumed",
+            f"{sid} 写着 `pipeline: exclude`（不进流程），"
+            f"可流程里的 {eaters} 正吃着它的产物。这两句话不能同时成立："
+            "要么那行 exclude 该删掉（它其实是流程的一环），"
+            f"要么 {eaters} 的 `input:` 指错了步骤",
+            by_id[sid].dirname, {"id": sid, "ids": eaters, "n": len(consumed[sid])}))
+
+    for sid in sorted(result_ids, key=id_key):
+        if by_id[sid].pipeline == "exclude":
+            diags.append(warn(
+                "warn", "pipeline_excluded_result",
+                f"{sid} 既被 project.md 声明成成果，自己又写着 `pipeline: exclude`。"
+                "按「成果永远在流程里」处理（否则这条流程连终点都没有），"
+                "但两行字里一定有一行是旧的，删掉那一行",
+                by_id[sid].dirname, {"id": sid}))
+
+    # 每一步**凭什么在流程里**。派生自上面那几样，但单独给出来，是因为它是读者
+    # 第一个会问的问题（「这一步凭什么算进 Methods」），而从 edges 里反查一遍
+    # 要挑「哪个下游算数」——那个挑法必须确定，放在这里挑一次胜过每个出口各挑一次。
+    # 优先级和 _pipeline_members 一致：声明的成果 > 人手 include > 被谁吃了。
+    first_eater: dict[str, tuple[str, str]] = {}
+    for e in edges:                                   # edges 按消费者 id 序 ⇒ 取到的是最小的那个
+        first_eater.setdefault(e["from"], (e["kind"], e["to"]))
+    why: dict[str, dict[str, str]] = {}
+    for sid in order:
+        if sid in result_ids:
+            why[sid] = {"kind": "result", "id": ""}
+        elif by_id[sid].pipeline == "include":
+            why[sid] = {"kind": "include", "id": ""}
+        else:
+            kind, eater = first_eater.get(sid, ("", ""))
+            why[sid] = {"kind": kind, "id": eater}
+
+    # 每个成果各自的成员：在合并图上从它反向可达的那些，仍按全局拓扑序输出。
+    parents_of: dict[str, list[str]] = {}
+    for e in edges:
+        parents_of.setdefault(e["to"], []).append(e["from"])
+
+    def _upstream(start: str) -> list[str]:
+        seen: set[str] = set()
+        st = [start]
+        while st:
+            cur = st.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            st.extend(parents_of.get(cur, []))
+        return [sid for sid in order if sid in seen]
+
+    return {
+        "declared": True,
+        "results": [{"step": s["step"], "note": s["note"], "members": _upstream(s["step"])}
+                    for s in seeds],
+        "order": order,
+        "edges": edges,
+        "why": why,
+        "levels": levels,
+        "level": level,
+        "weakest": weakest,
+        "weak": weak,
+        "dead": dead,
+        "excluded": dropped,
+        "included": included,
+        "diagnostics": diags,
+    }
+
+
+def scan_results(steps_dir: Path) -> list[dict[str, str]]:
+    """读 steps/ 同级的 project.md，取出全部 `result:`。读不到就当没声明。
+
+    为什么在这里读盘、而不是让调用方传进来：`compile_forest` 的入参只有 steps 目录，
+    而「哪一步是成果」是**项目级**的事实，写在 project.md 里（steps/ 的上一级）。
+    `signature()` 早就把 project.md 算进目录指纹了，所以改一行 `result:` 会照常
+    涨版本、推 SSE、触发重编译，不需要再加一条通知路径。
+
+    编码坏掉时这里不报警：同一个文件的 `not_utf8` 由 scan_projects 那条路报过一次了，
+    同一件事说两遍只会让人开始略过警告。
+    """
+    note = steps_dir.parent / PROJECT_NOTE
+    try:
+        raw = note.read_bytes()
+    except OSError:
+        return []
+    text, _w = decode_note(raw, PROJECT_NOTE)
+    return parse_results(text)
+
+
 # ---------------------------------------------------------------- compile
 
 
@@ -2382,6 +2852,14 @@ def compile_forest(steps_dir: Path, with_files: bool = True) -> dict[str, Any]:
     w_branch = validate_branches(by_id, groups)
 
     traces = compute_traces(by_id, order)             # 派生，不存储
+
+    # 定稿流程。**只在项目声明了成果时才存在**：现存项目一个 `result:` 都没有，
+    # 它们的 forest 必须和这一轮改动之前逐字节一样——不多一个键、不多一条警告。
+    # 所以这里不是「算出一个空流程挂上去」，而是整个键都不出现。
+    results = scan_results(steps_dir)
+    pipeline = compute_pipeline(by_id, results) if results else None
+    pipe_pos = {sid: i for i, sid in enumerate(pipeline["order"])} if pipeline else {}
+    pipe_results = {r["step"] for r in pipeline["results"]} if pipeline else set()
 
     w_lint: list[dict[str, str]] = []
     steps_out = []
@@ -2412,9 +2890,20 @@ def compile_forest(steps_dir: Path, with_files: bool = True) -> dict[str, Any]:
         d["lane"] = lane[sid]
         d["row"] = len(steps_out)
         d["trace"] = traces[sid]
+        # 「我在不在定稿流程里」。开发路径上的这个标记和流程那边跳回开发路径的链接
+        # 是同一件事的两头——两条路径都留着，才答得出「这一步当时有 3 个候选，
+        # 为什么选了它」。`rule` / `note` 是这一步自己写的那行 `pipeline:`（多数是空的）。
+        if pipeline is not None:
+            d["pipeline"] = {
+                "member": sid in pipe_pos,
+                "result": sid in pipe_results,
+                "index": pipe_pos.get(sid),
+                "rule": step.pipeline,
+                "note": step.pipeline_note,
+            }
         steps_out.append(d)
 
-    return {
+    out: dict[str, Any] = {
         "steps": steps_out,
         "order": order,
         "lanes": {sid: lane[sid] for sid in order},
@@ -2424,7 +2913,12 @@ def compile_forest(steps_dir: Path, with_files: bool = True) -> dict[str, Any]:
         # 语义**，不是几何：布局（order / lanes / tree）一个数都不因为它们而变。
         "branch_groups": [_copy_group(g) for g in groups],
         "merges": merges,
-        "warnings": w_scan + w_val + w_inputs + w_branch + w_lint,
-        "row_h": ROW_H,
-        "lane_w": LANE_W,
     }
+    # 键的位置固定在 merges 之后、warnings 之前（静态导出要逐字节一致，
+    # 而 dict 的插入顺序就是 JSON 里的顺序）。没有成果时整个键不出现。
+    if pipeline is not None:
+        out["pipeline"] = pipeline
+    out["warnings"] = w_scan + w_val + w_inputs + w_branch + w_lint
+    out["row_h"] = ROW_H
+    out["lane_w"] = LANE_W
+    return out

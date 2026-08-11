@@ -89,6 +89,21 @@ DECISION_DESC = (
     "半年后看到两条并排的支线，没有它就只剩猜。和「为什么」是同一类字段。\n"
     "别写在候选自己身上：候选身上写的是 `branch`，分叉点身上写的是 `decision`。"
 )
+PIPELINE_DESC = (
+    "**这一步和定稿流程的关系**。三选一，而且**默认那一档就是别动它**：\n"
+    "  （不写）  —— 默认。算出来：从声明的成果沿 `input:` 反向做闭包"
+    "（一步没写 input: 时退回它的 parent），剔掉 dead。**先试着让推导对**。\n"
+    "  exclude —— 「成功了，但它不是最终流程的一环」。典型是一次探索性的旁支："
+    "它的产物确实被下游读了，可写进 Methods 只会让别人以为非做不可。\n"
+    "  include —— 「闭包够不到它，但它确实是流程的一环」。够不到多半说明"
+    "**记录本身缺了一条边**，所以先想想是不是该给下游补一行 `input:`——"
+    "补了 input 连数据流图也一起修对了，写 include 只修了这一份导出。\n"
+    "**必须带一句理由**，写成 \"exclude | 探索性的，成功了但没进最终流程\"。"
+    "这是它和 branch 唯一的分歧：候选组在树上看得见，而 pipeline 除了改变一份导出"
+    "之外不留任何痕迹——没有那半句话，半年后分不清这是想清楚的决定还是一次误点。\n"
+    "**它推翻的是算出来的结果，所以是例外不是常规**：一个项目里写满 include/exclude，"
+    "等于把「成员清单」一行行手抄回了记录里，而那正是这套推导要避免的东西。"
+)
 CODE_DESC = (
     "跑这一步的代码在哪，一条一行，写成 \"kind | 位置 | k=v …\"。kind 三选一：\n"
     "  git       —— 位置是仓库/树的 URL 或本地仓库路径（`commit:` 字段等价于这一种，"
@@ -124,7 +139,12 @@ TR_STRUCT_KEYS = ("id", "parent", "status", "date", "commit", "author",
                   # branch / decision 是**结构**（这条边什么意思、这个岔路口在问什么），
                   # 不是正文。译文里写一句 `branch: alternative` 就等于让「谁和谁互斥」
                   # 这件事在两个文件里各有一份答案，而它们只有在改了其中一份时才会打架。
-                  "branch", "decision")
+                  "branch", "decision",
+                  # result / pipeline 同理，而且后果更重：这两个键决定**定稿流程长什么样**
+                  # ——论文附录里出现哪几步。译文里写一句 `pipeline: exclude` 会被读侧
+                  # 一个字不看地丢掉，于是「我明明把它排除了」和「它还在 Methods 里」
+                  # 同时成立，而人只会去怀疑推导错了。
+                  "result", "pipeline")
 
 # 小节名的中英对照。agent 手上**没有别的地方**能知道这张表：FORMAT.md 在 pip 装的
 # 机器上根本不存在，而小节名是精确匹配的——写成 `## Why not`，评级和 check 就都
@@ -375,6 +395,19 @@ class HttpBackend:
         return self._call("GET", f"/api/p/{urllib.parse.quote(project)}/untranslated"
                                  f"?lang={urllib.parse.quote(lang)}")
 
+    def pipeline(self, project):
+        # 读，所以不要令牌（和 forest / forks 一致）。服务端已经把 pipeline_payload
+        # 拼好了，这里一个字段都不重算——远端和本地必须给出同一条流程。
+        return self._call("GET", f"/api/p/{urllib.parse.quote(project)}/pipeline")
+
+    def set_result(self, project, step, note):
+        return self._call("PUT", f"/api/p/{urllib.parse.quote(project)}/results/"
+                                 f"{urllib.parse.quote(step)}", {"note": note})
+
+    def drop_result(self, project, step):
+        return self._call("DELETE", f"/api/p/{urllib.parse.quote(project)}/results/"
+                                    f"{urllib.parse.quote(step)}")
+
 
 class LocalBackend:
     """直接读写文件。agent 和数据在同一台机器上时用这个，不需要起服务。"""
@@ -482,6 +515,9 @@ class LocalBackend:
             # 不在建的时候收下 branch/decision，就得建完再 PATCH 一次，而
             # decision 那句话是整件事里唯一推导不出来的信息，多一道摩擦就永远空着。
             branch=payload.get("branch", ""), decision=payload.get("decision", ""),
+            # 「这一步进不进最终流程」偶尔动手之前就知道（「拿来试试看的」）。
+            # 收不下的话那句必填的理由就得等一次 PATCH，而多一道摩擦它就永远空着。
+            pipeline=payload.get("pipeline", ""),
         )
         d = step.to_dict()
         d["created"] = created
@@ -529,6 +565,28 @@ class LocalBackend:
         lang = self._guard(self.W.norm_lang, lang)
         p = next((x.to_dict() for x in self.core.scan_projects(self.root) if x.slug == project), None)
         return untranslated_report(self.forest(project), p, lang)
+
+    def pipeline(self, project):
+        """定稿流程。**和 REST 的 /pipeline 走同一个 pipeline_payload**。
+
+        `compute_pipeline({}, [])` 那个 fallback 不是形式：一个 `result:` 都没声明
+        的项目，forest 里刻意**整个 pipeline 键都不出现**（现存项目必须完全无感），
+        于是那条「教你怎么办」的 info 级诊断只有主动问起来的这条路上拿得到。
+        """
+        f = self.forest(project)
+        # 显示名和目录名可以不一样（改显示名不动目录名，已发出去的链接才不会失效）。
+        # 导出的抬头要的是显示名——那是一份要进论文的产物。
+        name = next((x.name for x in self.core.scan_projects(self.root)
+                     if x.slug == project), project)
+        return pipeline_payload(f, project, self.core.compute_pipeline({}, []), name)
+
+    def set_result(self, project, step, note):
+        self._sd(project)          # 项目不存在时给和别的工具一样的报错
+        return self._guard(self.W.set_result, self.root, project, step, note)
+
+    def drop_result(self, project, step):
+        self._sd(project)
+        return self._guard(self.W.drop_result, self.root, project, step)
 
 
 # 配置文件的查找顺序。有它才能让插件的 .mcp.json 保持静态——
@@ -1076,6 +1134,542 @@ def _fmt_step(project: str, s: dict) -> str:
     return "\n".join(head) + "\n\n" + (s.get("body") or "（正文为空）")
 
 
+# ---------------------------------------------------------------- 定稿流程
+#
+# 一个项目有**两条路径**，这一段全部服务于把它们分开：
+#
+#   · **开发路径** ＝ 现在这棵树的全部（含走不通的、含还没决定的岔路口）。给自己查问题。
+#   · **定稿流程** ＝ 真正产出成果的那一条链。给别人照着做、给论文 Methods 用。
+#
+# 推导全在 core.compute_pipeline 里（成员清单一个字都不存，P1）。这里只做两件事：
+# 把两个门面要的那份 payload 组装成**同一个形状**，以及把它渲染成人/agent/论文
+# 各自要的样子。一条判据都不重写——重写就等于 agent 看到的流程和网页上的不是一条。
+#
+# ═══ 三样导出的**唯一一份实现**就在下面（fmt_pipeline / pipeline_methods /
+# pipeline_svg / pipeline_page）。CLI 的 `pipeline`、REST 的 `/pipeline/*`、
+# MCP 的 `trace_pipeline`、`build` 的静态产物、以及网页上那三个按钮和那张图，
+# 全部拿的是这几个函数的输出。
+#
+# **它们绝不允许有第二份实现。** 曾经有过：web/app.js 里另有一套 JS 的 SVG 和
+# markdown 生成器。两份都能跑、都通过了各自的测试，输出却是两份不同的文件——
+# 屏幕上讨论的是一张图，`trace_cli.py pipeline --svg` 出的是另一张，
+# **而其中一份会进论文**。那一份已经删掉，网页改成取这一份的产物
+# （同源 GET；静态导出没有服务端，`build` 把同一批字节灌进页面）。
+#
+# 上一轮这里标着「⚠ 待搬到 trace_core.py」。**这一轮判定：不搬，它就住在这。**
+# 理由是那条最容易被忘掉的部署路径：`trace_mcp.py` 对 trace_core 一律**软 import**，
+# 于是「只把这一个文件拷到一台只有 TRACE_URL 的机器上」今天是通的（有测试拿
+# MetaPathFinder 真的挡掉 trace_core 验过）。搬进 core 之后那条路会断在 Methods
+# 草稿上——而那台机器（超算上的 agent）恰恰是最需要 Methods 草稿的一台。
+# 「按分工该住 core」是个整洁性论据；「远端后端拿不到草稿」是个功能损失。
+# 何况 core 是**内核**（scan/parse/validate/order/lanes/tree），而这几个是**排版**：
+# 它们只用到 LEVELS / ROLE_LABEL / CODE_KIND_LABEL / _fmt_attrs / _fmt_bytes
+# 这几张显示用的表，一条判据都不持有——判据全在 core.compute_pipeline 里，
+# 这里一个字都没重写。
+
+def empty_pipeline() -> dict[str, Any]:
+    """forest 里没有 `pipeline` 键时（＝这个项目一个 `result:` 都没声明）的兜底形状。
+
+    键要齐，渲染侧才不必到处 `.get(..., [])`；`declared: False` 是唯一的判据。
+    做成函数而不是模块常量：常量的浅拷贝会共享里面那几个空列表，一次误改就污染
+    进程里所有后来的空态。
+
+    调用方**应当**传 `core.compute_pipeline({}, [])` 当 fallback —— 只有那一份带着
+    「教你怎么办」的 info 级诊断，而空态最需要的恰恰是那句话。这个函数是那条路
+    走不通时（远端后端、拿不到 core）的退路。
+    """
+    return {
+        "declared": False, "results": [], "order": [], "edges": [], "why": {},
+        "levels": {}, "level": "", "weakest": "", "weak": [], "dead": [],
+        "excluded": [], "included": [], "diagnostics": [],
+    }
+
+# 空态那句话的 agent 版。**刻意不镜像 core.PIPELINE_EMPTY_HINT 的原文**：那一句是
+# 说给人听的（「在 project.md 里写一行」），agent 手上有工具，该被告知的是调哪个。
+# 两句话说的是同一件事，但收信人不同——照抄一份反而会让 agent 去手写文件。
+PIPELINE_EMPTY_TIP = (
+    "这个项目还没声明成果，所以推不出定稿流程。**这是常态，不是缺陷**——\n"
+    "多数项目在拿到结果之前本来就没有「哪一步是产出」这回事。\n"
+    "真的有结果了，用 trace_result 把那一步标成成果，流程会自己长出来："
+    "从成果沿 `input:` 反向做闭包（一步没写 input: 时退回它的 parent），剔掉 dead。\n"
+    "**成员清单一个字都不存**，所以你永远不用维护它：移动一步、补一条 input:、"
+    "把某支标 dead，流程下一次读就跟着变了。"
+)
+
+WHY_LABEL = {
+    "result": "它就是声明出来的那个成果",
+    "include": "人手写了 `pipeline: include`（闭包够不到它，但它确实是流程的一环）",
+    "input": "{id} 把它的产物声明成了输入（`input:`）",
+    "parent": "{id} 一条 `input:` 都没写，于是退回它接着的前一步",
+}
+
+
+def pipeline_payload(forest: dict[str, Any], project: str,
+                     fallback: dict[str, Any] | None = None,
+                     name: str = "") -> dict[str, Any]:
+    """两个门面（REST 的 /pipeline、MCP 的 LocalBackend.pipeline）共用的那份数据。
+
+    和 step_context 同一个理由：各拼一遍的话，远端后端（照着 REST 拿数据）和本地
+    后端渲染出来的流程会在某个字段上分家，而分家的那一份正好是要写进论文的。
+
+    `steps` 是**成员的完整步骤字典**，按 `pipeline.order` 排好。带全量而不是只带
+    id，是为了让 Methods 草稿和那张图在远端模式下也生成得出来——它们要正文、要
+    `code:`、要 `path:` 上的校验和，缺一样就只能退回「请自己去翻记录」。
+
+    `project` 是**目录名**（slug，用来拼路由），`name` 是**显示名**。三样导出的
+    抬头一律用 `name`：那是一份要进论文的产物，抬头写成 `pipeline-demo` 而不是
+    课题名，收到的人只会以为拿错了文件。没给 `name` 就退回 slug。
+    """
+    pipe = forest.get("pipeline")
+    if pipe is None:
+        pipe = dict(fallback) if fallback is not None else empty_pipeline()
+    at = {sid: i for i, sid in enumerate(pipe.get("order") or [])}
+    steps = sorted((s for s in (forest.get("steps") or []) if s.get("id") in at),
+                   key=lambda s: at[s["id"]])
+    return {
+        "project": project,
+        "name": name or project,
+        "declared": bool(pipe.get("declared")),
+        "pipeline": pipe,
+        "steps": steps,
+        # 全部步骤的标题，不只是成员的：诊断里点名的那些（悬空的 result、被排除
+        # 却仍被消费的那一步）多半**不在**流程里，只给成员标题的话，最该说清楚
+        # 是哪一步的地方只剩一个光秃秃的 id。
+        "titles": {s.get("id", ""): s.get("title", "") for s in (forest.get("steps") or [])},
+    }
+
+
+def _why_line(payload: dict[str, Any], sid: str) -> str:
+    """「这一步凭什么在流程里」——读者第一个会问的问题。"""
+    w = (payload["pipeline"].get("why") or {}).get(sid) or {}
+    tpl = WHY_LABEL.get(w.get("kind") or "")
+    if not tpl:
+        return "闭包里够到了它"
+    return tpl.format(id=w.get("id") or "?")
+
+
+def _pipe_diag_lines(payload: dict[str, Any]) -> list[str]:
+    """诊断，**按后果分栏**而不是按 level 字段分。
+
+    `pipeline_no_result` 是一句邀请（info），`pipeline_weak_step` 是投稿前的待办，
+    而「你的结果依赖着一条自己已经放弃的路」是必须当场说出来的事。三种混成一栏打，
+    人会以为它们一样严重，然后开始整体略过这一段——那正是警告失效的方式。
+    """
+    out: list[str] = []
+    for d in payload["pipeline"].get("diagnostics") or []:
+        mark = "ⓘ " if d.get("level") == "info" else "⚠ "
+        out.append(mark + str(d.get("message", "")))
+    return out
+
+
+def fmt_pipeline(payload: dict[str, Any], *, with_diagnostics: bool = True) -> str:
+    """定稿流程的文本视图。MCP 的 trace_pipeline 和 CLI 的 `pipeline` 共用。
+
+    `with_diagnostics=False` 是给 CLI 的：那一侧要把诊断**按后果**分成三栏
+    （影响能不能复现 / 记录自相矛盾 / 纯提示），自己打一遍。这里再打一遍就是
+    同一批话说两次，而说两次的直接后果是人开始整段略过。
+    """
+    p = payload["pipeline"]
+    project = payload.get("name") or payload["project"]
+    if not payload["declared"]:
+        # 这里**不**打 diagnostics：空态时那一条（pipeline_no_result）和上面这段话
+        # 说的是同一件事，只是一个说给人听、一个说给 agent 听。两句都打出来，
+        # 读者会以为自己犯了两个错。
+        return f"{project} · 定稿流程：还没有。\n\n" + PIPELINE_EMPTY_TIP
+
+    order = p.get("order") or []
+    levels = p.get("levels") or {}
+    titles = payload["titles"]
+    by_id = {s["id"]: s for s in payload["steps"]}
+    lines = [
+        f"{project} · 定稿流程 · {len(order)} 步",
+        "（这是**给别人照着做**的那一条路：只有真正产出成果的步骤。"
+        "全部记录——含走不通的、含还没决定的岔路口——在**开发路径**上，用 trace_read 看。）",
+        "",
+        "已声明的成果（**唯一写下来的事，其余全是算出来的**）：",
+    ]
+    for r in p.get("results") or []:
+        lines.append(f"  ★ {r['step']}  {titles.get(r['step'], '')}"
+                     + (f"  —— {r['note']}" if r.get("note") else "")
+                     + f"   （追到 {len(r.get('members') or [])} 步）")
+    lines += ["", "流程（按数据依赖拓扑排序，平局按 id 序 —— 于是两次导出可以直接 diff）："]
+
+    # 边按「被谁吃了」索引，好在每一步下面说清它的上游从哪来。`via` 非空表示
+    # 中间那几步被剔掉了（dead / pipeline: exclude），上游是**接过去**的——
+    # 不说的话，读的人会以为 013 直接喂给了 023，而事实是中间隔着一条废掉的路。
+    incoming: dict[str, list[dict[str, Any]]] = {}
+    for e in p.get("edges") or []:
+        incoming.setdefault(e["to"], []).append(e)
+
+    for i, sid in enumerate(order, 1):
+        s = by_id.get(sid) or {}
+        lv = levels.get(sid, "")
+        badge = []
+        if sid in {r["step"] for r in (p.get("results") or [])}:
+            badge.append("★成果")
+        if sid == p.get("weakest"):
+            badge.append("◆最弱一环")
+        if s.get("status") == "dead":
+            badge.append("▣dead")
+        if (s.get("pipeline") or {}).get("rule") == "include":
+            badge.append("人手保留")
+        lines.append(f"  {i:>2}. {sid:<6} [{lv} {LEVELS.get(lv, '')}] {s.get('title', '')}"
+                     + ("   " + " ".join(badge) if badge else ""))
+        lines.append(f"        凭什么在流程里: {_why_line(payload, sid)}")
+        for e in incoming.get(sid, []):
+            via = e.get("via") or []
+            note = "，".join(e.get("notes") or [])
+            lines.append(f"        ← {e['from']}"
+                         + (f"  {note}" if note else "")
+                         + (f"   [中间经过 {' / '.join(via)}，那几步不算流程的一部分]" if via else ""))
+
+    lines += ["", f"整条流程的可溯源等级 = 最弱的一步 = {p.get('level')} "
+                  f"{LEVELS.get(p.get('level') or '', '')}"
+                  + (f"，卡在 {p.get('weakest')}（{titles.get(p.get('weakest') or '', '')}）"
+                     if p.get("weakest") else ""),
+              "（一条链值多少看最弱的那一环——别人能不能照着做出来，由它决定。）"]
+    if p.get("excluded"):
+        lines.append("")
+        lines.append("闭包里被剔掉的（上游已经接过去了，图上不留断口）：")
+        for x in p["excluded"]:
+            why = "status=dead（走不通的路不进说明书）" if x["why"] == "dead" \
+                else "这一步自己写着 `pipeline: exclude`"
+            lines.append(f"  ✕ {x['step']}  {titles.get(x['step'], '')}  —— {why}")
+    diags = _pipe_diag_lines(payload) if with_diagnostics else []
+    if diags:
+        lines += ["", "诊断："] + ["  " + d for d in diags]
+    return "\n".join(lines)
+
+
+# ================================================================ 三个导出
+#
+# **这三样只有这一份实现。** CLI（trace pipeline --svg/--methods/--page）、
+# 服务端（GET .../pipeline/figure.svg 等）、静态导出（build 时写进 dist/）
+# 全部调下面这三个函数；网页那侧是去服务端取，不自己生成。
+#
+# 为什么这件事要专门说：其中一份产物**会进论文**。CLI 一份、网页一份的话，
+# 两份迟早不一致，而不一致的那天你不会知道自己投出去的是哪一份。
+#
+# 为什么住在 trace_mcp.py 而不是 trace_core.py：
+#   * 它们不属于内核那条 scan→parse→compile 的流水线——渲染一张图不是"编译";
+#   * 但 CLI 和服务端都得够得着，而 pyproject 只打包三个模块
+#     （trace_mcp / trace_core / trace_write），新开一个模块就得改打包清单，
+#     pip 装的那条路上还会多一个能装漏的东西。
+# 它们仍然是**纯函数**：只吃 payload、不碰磁盘、同样的输入逐字节相同（P3）。
+# trace_core.py 顶部留了一行指路，免得下一个人在内核里再写一份。
+
+# ------------------------------------------------ 导出①：Methods 草稿（markdown）
+
+METHODS_PREFACE = (
+    "> **这是初稿，不是成品。** 下面只把记录里**已有的事实**按 Methods 的骨架排了一遍，"
+    "一句论文腔的句子都没有替你写——编出来的那种句子读着像成品，"
+    "而它描述的是一次没人核对过的实验。发出去之前请逐段自己读一遍。\n"
+    ">\n"
+    "> 它是**派生**的：改一行 `input:`、把某一步标 dead、补一条 `result:`，"
+    "重新生成就跟着变。所以别把这份文件存进仓库当第二份真相——"
+    "同样的记录重新生成一次逐字节一致。"
+)
+
+
+def _methods_step(payload: dict[str, Any], sid: str, n: int) -> list[str]:
+    s = {x["id"]: x for x in payload["steps"]}.get(sid) or {}
+    p = payload["pipeline"]
+    out = [f"### {n}. `{sid}` — {s.get('title', '')}", ""]
+    meta = [f"凭什么在流程里：{_why_line(payload, sid)}"]
+    if s.get("date"):
+        meta.append(f"日期：{s['date']}")
+    if s.get("author"):
+        meta.append(f"记录者：{s['author']}")
+    if s.get("status") == "dead":
+        meta.append("**status: dead** —— 这一步在记录里是「此路不通」，"
+                    "却出现在成果的上游。写进论文之前必须解释清楚。")
+    out += [f"- {m}" for m in meta] + [""]
+
+    what = _section(s.get("body") or "", "what")
+    out += ["**做了什么**（记录原文，未改写）", ""]
+    out += [what.strip() if what.strip() else "_记录里这一节是空的——别人照着做不出来，补它。_", ""]
+
+    code = s.get("code") or []
+    out += ["**代码在哪**", ""]
+    if code:
+        for c in code:
+            # `commit:` 在文件里就是一行 `commit: c1d2e3f`；core 把它折算成一条
+            # **派生**的 `code: git`，位置那一段是空的。照 code 的格式印出来是
+            # 「git commit=c1d2e3f」——收到草稿的人 grep 的是 `commit:`，
+            # 而 G4 说的就是「删掉全部程序，grep 还能把人带回 note.md」。
+            if c.get("from") == "commit":
+                sha = (c.get("attrs") or {}).get("commit") or c.get("location") or ""
+                out.append(f"- `commit:` {sha}"
+                           + (f" — {c['note']}" if c.get("note") else ""))
+                continue
+            attrs = " ".join(f"{k}={v}" for k, v in (c.get("attrs") or {}).items())
+            out.append(f"- {CODE_KIND_LABEL.get(c.get('kind'), c.get('kind'))}"
+                       + (f" `{c['location']}`" if c.get("location") else "")
+                       + (f" {attrs}" if attrs else "")
+                       + (f" — {c['note']}" if c.get("note") else ""))
+    else:
+        out.append("- _没记_ —— 「用的是哪一版代码」答不出来，这一步就重跑不了。")
+    out.append("")
+
+    if s.get("inputs"):
+        out += ["**输入（数据依赖）**", ""]
+        out += [f"- `{i['step']}`" + (f" — {i['note']}" if i.get("note") else "")
+                for i in s["inputs"]]
+        out.append("")
+
+    paths = s.get("paths") or []
+    out += ["**产物与位置**", ""]
+    if paths:
+        for x in paths:
+            attrs = _fmt_attrs(x)
+            out.append("- " + (f"[{ROLE_LABEL[x['role']]}] " if x.get("role") in ROLE_LABEL else "")
+                       + f"`{x['location']}`"
+                       + (f" — {x['note']}" if x.get("note") else "")
+                       + (f" {attrs}" if attrs else ""))
+    else:
+        out.append("- _没记_")
+    out.append("")
+
+    t = s.get("trace") or {}
+    lv = (p.get("levels") or {}).get(sid, "")
+    out.append(f"**可溯源**：{lv} {LEVELS.get(lv, '')}"
+               + ("（**这一步是整条流程的最弱一环**）" if sid == p.get("weakest") else ""))
+    for m in t.get("missing") or []:
+        out.append(f"- 缺：{m}")
+    out.append("")
+    return out
+
+
+def pipeline_methods(payload: dict[str, Any]) -> str:
+    """Methods 草稿。**逐字节确定**（P3）：同样的记录永远得到同样的文本。"""
+    p = payload["pipeline"]
+    project = payload.get("name") or payload["project"]
+    if not payload["declared"]:
+        return (f"# Methods（草稿）\n\n{project} 还没有声明成果，推不出定稿流程。\n\n"
+                + PIPELINE_EMPTY_TIP + "\n")
+    titles = payload["titles"]
+    order = p.get("order") or []
+    out = [f"# Methods（草稿） — {project}", "", METHODS_PREFACE, "",
+           "## 0. 这条流程能被追到多远", ""]
+    out.append(f"- 整条流程：**{p.get('level')} {LEVELS.get(p.get('level') or '', '')}** "
+               f"= 其中最弱的一步"
+               + (f"，也就是 `{p['weakest']}`（{titles.get(p['weakest'], '')}）"
+                  if p.get("weakest") else "")
+               + "。别人能不能照着做出来，由它决定。")
+    if p.get("weak"):
+        out.append(f"- 别人跑不起来的步骤（L0/L1）：{'、'.join('`%s`' % x for x in p['weak'])}"
+                   "。补记录要从这几步补起，不是从最新那一步补起。")
+    if p.get("dead"):
+        out.append(f"- **流程里有已经放弃的步骤**：{'、'.join('`%s`' % x for x in p['dead'])}"
+                   "。结果依赖着一条自己判定走不通的路——要么那个 dead 下错了，"
+                   "要么这个依赖该换一步。这件事必须在投稿前解决。")
+    out += ["", "## 0.1 声明出来的成果", "",
+            "（这是整份流程里**唯一写下来的事**，其余每一步都是从它沿 `input:` "
+            "反向算出来的，没有任何地方存着一份成员清单。）", ""]
+    for r in p.get("results") or []:
+        out.append(f"- `{r['step']}` {titles.get(r['step'], '')}"
+                   + (f" — {r['note']}" if r.get("note") else "")
+                   + f"（追到 {len(r.get('members') or [])} 步）")
+    diags = _pipe_diag_lines(payload)
+    if diags:
+        out += ["", "## 0.2 生成时发现的问题", ""] + [f"- {d}" for d in diags]
+    out += ["", f"## 1. 流程（{len(order)} 步，按数据依赖拓扑序）", ""]
+    for i, sid in enumerate(order, 1):
+        out += _methods_step(payload, sid, i)
+    if p.get("excluded"):
+        out += ["## 2. 闭包里被剔掉的步骤（不属于方法的一部分）", "",
+                "上游已经接过去了，所以流程上没有断口；列在这里是因为"
+                "「这条路试过、没走通」正是别人最想知道、而论文里最常缺的一段。", ""]
+        for x in p["excluded"]:
+            why = "status: dead" if x["why"] == "dead" else "`pipeline: exclude`"
+            out.append(f"- `{x['step']}` {titles.get(x['step'], '')} — {why}")
+        out.append("")
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+# ------------------------------------------------ 导出②：一张能放进论文的图（SVG）
+#
+# 硬约束三条，一条都不许为了好看让步：
+#   1. **自包含**——不引外部字体、图片、样式，也没有任何脚本。审稿系统会把带脚本的
+#      SVG 直接拒掉，而引了外部字体的图在别人机器上会换一套字宽、排版全乱。
+#   2. **黑白打印可读**——这次不许只靠颜色。全图只有黑白灰，关系靠**线型**
+#      （实线/虚线）和**文字标注**表达，色觉障碍和影印件上读到的是同一张图。
+#   3. **逐字节确定**（P3）——不写时间戳、不写版本号，几何全部由数据算出来。
+
+_SVG_W = 900
+_SVG_BOX_X = 48
+_SVG_BOX_W = 596
+_SVG_BOX_H = 52
+_SVG_GAP = 44
+_SVG_HEAD = 78
+
+
+def _x(s: Any) -> str:
+    """SVG / HTML 文本转义。`&` 必须第一个换，否则会把后面换出来的实体再转一遍。"""
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;"))
+
+
+def _clip(s: str, n: int) -> str:
+    """按字符数截断。CJK 比 ASCII 宽，所以这里按 2 记宽度，估宽只用来防溢出。"""
+    w = 0
+    out: list[str] = []
+    for ch in str(s):
+        w += 2 if ord(ch) > 0x2E80 else 1
+        if w > n:
+            out.append("…")
+            break
+        out.append(ch)
+    return "".join(out)
+
+
+def pipeline_svg(payload: dict[str, Any]) -> str:
+    """定稿流程的一张图。自包含 SVG，无外部资源、无脚本，黑白打印可读。"""
+    p = payload["pipeline"]
+    order = p.get("order") or []
+    if not payload["declared"] or not order:
+        h = 120
+        return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {_SVG_W} {h}" '
+                f'width="{_SVG_W}" height="{h}" font-family="ui-monospace, Menlo, Consolas, '
+                f'monospace" font-size="13">\n'
+                f'<rect width="{_SVG_W}" height="{h}" fill="#ffffff"/>\n'
+                f'<text x="24" y="44" font-size="16">{_x(payload.get("name") or payload["project"])} · 定稿流程</text>\n'
+                f'<text x="24" y="72" fill="#333333">还没有哪一步被声明成成果，'
+                f'所以推不出流程（这是常态，不是缺陷）。</text>\n</svg>\n')
+
+    levels = p.get("levels") or {}
+    results = {r["step"] for r in (p.get("results") or [])}
+    by_id = {s["id"]: s for s in payload["steps"]}
+    top = {sid: _SVG_HEAD + i * (_SVG_BOX_H + _SVG_GAP) for i, sid in enumerate(order)}
+    at = {sid: i for i, sid in enumerate(order)}
+    height = _SVG_HEAD + len(order) * (_SVG_BOX_H + _SVG_GAP) + 74
+
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {_SVG_W} {height}" '
+           f'width="{_SVG_W}" height="{height}" font-family="ui-monospace, Menlo, Consolas, '
+           f'monospace" font-size="13">',
+           f'<rect width="{_SVG_W}" height="{height}" fill="#ffffff"/>',
+           '<defs><marker id="tip" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" '
+           'markerHeight="7" orient="auto-start-reverse">'
+           '<path d="M 0 0 L 10 5 L 0 10 z" fill="#000000"/></marker></defs>',
+           f'<text x="24" y="32" font-size="17">{_x(payload.get("name") or payload["project"])} · 定稿流程 · '
+           f'{len(order)} 步</text>',
+           f'<text x="24" y="54" fill="#333333">整条流程 {_x(p.get("level"))} '
+           f'{_x(LEVELS.get(p.get("level") or "", ""))}'
+           + (f'，最弱的一步是 {_x(p.get("weakest"))}' if p.get("weakest") else "")
+           + '　·　★＝声明的成果　◆＝最弱一环</text>']
+
+    # 边：相邻两步之间走正中的直箭头；跨步的绕到右边走一条折线，各占一条道，
+    # 免得两条边叠在一起分不清谁连谁。虚线**只**表示「中间经过了被剔掉的步骤」。
+    lane = 0
+    for e in p.get("edges") or []:
+        a, b = e.get("from"), e.get("to")
+        if a not in at or b not in at:
+            continue
+        dashed = ' stroke-dasharray="6 4"' if e.get("via") else ""
+        y1 = top[a] + _SVG_BOX_H
+        y2 = top[b]
+        if at[b] - at[a] == 1:
+            mx = _SVG_BOX_X + _SVG_BOX_W // 2
+            out.append(f'<path d="M {mx} {y1} L {mx} {y2 - 8}" stroke="#000000" fill="none"'
+                       f'{dashed} marker-end="url(#tip)"/>')
+            label_x, label_y = mx + 8, (y1 + y2) // 2 + 4
+        else:
+            rx = _SVG_BOX_X + _SVG_BOX_W + 16 + (lane % 5) * 16
+            lane += 1
+            out.append(f'<path d="M {_SVG_BOX_X + _SVG_BOX_W} {y1 - 16} L {rx} {y1 - 16} '
+                       f'L {rx} {y2 + 16} L {_SVG_BOX_X + _SVG_BOX_W + 8} {y2 + 16}" '
+                       f'stroke="#000000" fill="none"{dashed} marker-end="url(#tip)"/>')
+            label_x, label_y = rx + 6, (y1 + y2) // 2
+        if e.get("via"):
+            out.append(f'<text x="{label_x}" y="{label_y}" font-size="11" fill="#444444">'
+                       f'经 {_x(" ".join(e["via"]))}（已剔除）</text>')
+
+    for i, sid in enumerate(order, 1):
+        s = by_id.get(sid) or {}
+        y = top[sid]
+        # 成果用**双线框**而不是换个颜色：影印件上颜色全没了，框还在。
+        width = "2.5" if sid in results else "1"
+        out.append(f'<rect x="{_SVG_BOX_X}" y="{y}" width="{_SVG_BOX_W}" height="{_SVG_BOX_H}" '
+                   f'rx="4" fill="#ffffff" stroke="#000000" stroke-width="{width}"/>')
+        badge = ""
+        if sid in results:
+            badge += " ★成果"
+        if sid == p.get("weakest"):
+            badge += " ◆最弱一环"
+        if s.get("status") == "dead":
+            badge += " ▣dead"
+        out.append(f'<text x="{_SVG_BOX_X + 12}" y="{y + 21}" font-size="13">'
+                   f'{i}. {_x(sid)}　[{_x(levels.get(sid, ""))} '
+                   f'{_x(LEVELS.get(levels.get(sid, ""), ""))}]{_x(badge)}</text>')
+        out.append(f'<text x="{_SVG_BOX_X + 12}" y="{y + 41}" font-size="13" fill="#222222">'
+                   f'{_x(_clip(s.get("title", ""), 64))}</text>')
+
+    ly = _SVG_HEAD + len(order) * (_SVG_BOX_H + _SVG_GAP) + 8
+    out.append(f'<line x1="24" y1="{ly}" x2="{_SVG_W - 24}" y2="{ly}" stroke="#888888"/>')
+    out.append(f'<text x="24" y="{ly + 22}" font-size="11" fill="#333333">'
+               '实线＝上一步的产物直接喂给下一步　虚线＝中间经过了不算流程的步骤'
+               '（dead 或 pipeline: exclude），标注写着是哪几步</text>')
+    out.append(f'<text x="24" y="{ly + 40}" font-size="11" fill="#333333">'
+               '顺序＝数据依赖的拓扑序（平局按 id）。这张图是从记录算出来的，'
+               '不是画出来的：改一行 input: 重新生成即可。</text>')
+    out.append("</svg>")
+    return "\n".join(out) + "\n"
+
+
+# ------------------------------------------------ 导出③：能发给合作者的独立页面
+
+def pipeline_page(payload: dict[str, Any], title: str = "") -> str:
+    """一页 HTML：那张图 + Methods 草稿。**只含定稿流程**，不含开发路径。
+
+    没有脚本、没有外部资源、没有构建步骤——发过去就能双击打开，断网也行。
+    正文用 `<pre>` 原样摆着那份 markdown 而不是再渲染一遍：多一个渲染器就多一份
+    会和 Methods 草稿分家的实现，而分家的那一份正好是合作者读到的那一份。
+    """
+    head = title or f"{payload.get('name') or payload['project']} · 定稿流程"
+    return (
+        '<!doctype html>\n<html lang="zh"><head><meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        f"<title>{_x(head)}</title>\n<style>\n"
+        "body{margin:0;padding:32px;font:15px/1.7 system-ui,-apple-system,'Segoe UI',sans-serif;"
+        "color:#111;background:#fff;max-width:960px}\n"
+        "h1{font-size:22px;margin:0 0 4px}\n"
+        "p.lead{color:#555;margin:0 0 24px}\n"
+        "svg{max-width:100%;height:auto;border:1px solid #ddd;border-radius:6px}\n"
+        "pre{white-space:pre-wrap;word-break:break-word;background:#f7f7f7;border:1px solid #e5e5e5;"
+        "border-radius:6px;padding:16px;font:13px/1.6 ui-monospace,Menlo,Consolas,monospace;"
+        "overflow-x:auto}\n"
+        "@media print{body{padding:0}svg,pre{border:none;background:#fff}}\n"
+        "</style></head><body>\n"
+        f"<h1>{_x(head)}</h1>\n"
+        '<p class="lead">这一页只有<strong>产出成果的那条链</strong>——给别人照着做用。'
+        "走不通的路、还没决定的岔路口都在开发路径上，不在这里。</p>\n"
+        + pipeline_svg(payload)
+        + f"\n<pre>{_x(pipeline_methods(payload))}</pre>\n</body></html>\n"
+    )
+
+
+def _section(body: str, key: str) -> str:
+    """按语义键取正文的一节（中英标题都认）。
+
+    走 core.section_text 而不是写死中文标题，理由和 _why_is_blank 一字不差：
+    一份 `lang: en` 的记录会被中文正则整篇判成空，于是 Methods 草稿里
+    「做了什么」全是「记录里这一节是空的」——而记录明明写满了。
+    """
+    try:
+        import trace_core as _core  # noqa: PLC0415
+        return _core.section_text(body, key)
+    except Exception:
+        zh = {"why": "为什么", "what": "做了什么", "result": "结果",
+              "conclusion": "结论", "next": "下一步"}.get(key, key)
+        en = {"why": "Why", "what": "What", "result": "Result",
+              "conclusion": "Conclusion", "next": "Next"}.get(key, key)
+        for name in (zh, en):
+            m = re.search(r"##\s*%s\s*\n(.*?)(?=\n##\s|\Z)" % re.escape(name), body, re.S)
+            if m and m.group(1).strip():
+                return m.group(1)
+        return ""
+
+
 # ---------------------------------------------------------------- 工具
 
 TOOLS: list[dict[str, Any]] = [
@@ -1245,6 +1839,7 @@ TOOLS: list[dict[str, Any]] = [
                 "lang": {"type": "string", "description": "这份记录用什么语言写的（en / zh / ja …）。**声明**出来，别让读的一侧去猜——没有它，界面对没翻译的记录只能说「这是原文」，说不出是哪种语言的原文。"},
                 "branch": {"type": "string", "description": BRANCH_DESC},
                 "decision": {"type": "string", "description": DECISION_DESC},
+                "pipeline": {"type": "string", "description": PIPELINE_DESC},
             },
             "required": ["project", "title"],
         },
@@ -1292,6 +1887,8 @@ TOOLS: list[dict[str, Any]] = [
                                           + BRANCH_DESC},
                 "decision": {"type": "string",
                              "description": "空串＝撤回这句话。" + DECISION_DESC},
+                "pipeline": {"type": "string",
+                             "description": "空串＝撤销这个例外，回到算出来的结论。" + PIPELINE_DESC},
                 "repro": {
                     "type": "string",
                     "description": (
@@ -1454,6 +2051,80 @@ TOOLS: list[dict[str, Any]] = [
                                           "不给就是不检查"},
             },
             "required": ["project", "lang"],
+        },
+    },
+    {
+        "name": "trace_pipeline",
+        "description": (
+            "读**定稿流程**：真正产出成果的那一条链，按数据依赖排好序，"
+            "外加整条链的可溯源等级、最弱的是哪一步、以及必须说出来的几条诊断。\n"
+            "**一个项目有两条路径，别把它们当成同一件事的详略两版**：\n"
+            "  · **开发路径**（trace_read 看到的那棵树）＝**全部**记录，含走不通的 dead、"
+            "含还没决定的岔路口。它回答「当时是怎么走到那儿的」，给自己和查问题用。\n"
+            "  · **定稿流程**（这个工具）＝只有产出成果的那条链。它回答「该怎么做」，"
+            "给别人照着做、给论文 Methods 用。\n"
+            "**要复现一个结果、要写 Methods、要告诉别人「照着这个做」时，用这个工具，"
+            "不要照着开发路径那棵树走**——那棵树上有 dead 的步骤，照着它复现，"
+            "你会去重跑一条作者自己已经判定走不通的路。\n"
+            "反过来，「这一步当时有 3 个候选，为什么选了它」只有开发路径答得出来，"
+            "那正是两条路径都留着的意义。\n"
+            "成员清单**一个字都不存**（没有任何地方维护它）：从每个 `result:` 沿 "
+            "`input:` 反向做闭包，一步没写 `input:` 时退回它的 parent，剔掉 dead 与 "
+            "`pipeline: exclude`。所以移动一步、补一条 input:、把某支标 dead，"
+            "流程下一次读就跟着变了。\n"
+            "一个成果都没声明时它会说明怎么办（用 trace_result 标）。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string"},
+                "methods": {
+                    "type": "boolean", "default": False,
+                    "description": "输出 **Methods 草稿**（markdown）而不是流程概览："
+                                   "按流程顺序，每一步的「做了什么」原文、代码位置"
+                                   "（commit / 快照 + manifest）、产物路径与校验和、"
+                                   "可溯源等级。**写论文时用这个。**\n"
+                                   "它是初稿不是成品：里面只有记录里已经有的事实，"
+                                   "**不要**替用户把它改写成论文腔的句子再交出去——"
+                                   "编出来的句子读着像成品，而它描述的是一次没人核对过的实验。",
+                },
+            },
+            "required": ["project"],
+        },
+    },
+    {
+        "name": "trace_result",
+        "description": (
+            "把某一步声明成**成果**（写进 project.md 的一行 `result: <id> | <这是什么>`），"
+            "或撤销一条这样的声明（drop=true）。\n"
+            "**这个动作比它看起来重得多。** 它是整件事里**唯一写下来的**信息，"
+            "定稿流程的每一步都是从它算出来的：它决定那条流程长什么样、"
+            "决定论文 Methods 和附录里出现哪几步、决定那张导出的图上画着谁。"
+            "改一次成果声明，整份方法学描述跟着变——所以它不是「顺手改个字段」，"
+            "调用之前先确认这一步真的就是要报的那个结果。\n"
+            "什么时候调：一条线跑通、拿到了要写进论文的那个数字时。"
+            "可以声明**好几个**（主结果一条、每张消融图一条），一步一行；"
+            "同一步再写一次是就地改写那句说明，不会多出一条。\n"
+            "两条会被当场拒绝的写法：指向**不存在**的步骤（悬空的成果会让整条流程"
+            "静默变空，而页面上一个字都不报）；把 **dead** 的一步定成成果"
+            "（那是一句结论：此路不通）。反过来是允许的——已经声明的成果后来被标 dead "
+            "不会被拦住（那是真会发生的事），但 trace_pipeline 会 warn 级点名。\n"
+            "撤销不需要理由，也不留审计：`result:` 不是一段历史，是一个**当前指针**"
+            "（「论文现在报的是哪一步」）。撤掉它，那一步和它的记录一个字都没动，"
+            "开发路径上它还在原处。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string"},
+                "step": {"type": "string", "description": "哪一步是成果，如 023"},
+                "note": {"type": "string",
+                         "description": "这是什么成果，一句话。会显示在流程和 Methods 草稿的"
+                                        "开头，例：\"主结果：亲和力预测 AUC 0.91\"、\"图 4 的消融\""},
+                "drop": {"type": "boolean", "default": False,
+                         "description": "撤销这一条成果声明（不删任何记录，只是这一步不再是终点）"},
+            },
+            "required": ["project", "step"],
         },
     },
     {
@@ -1648,6 +2319,16 @@ def t_delete_step(be, args) -> str:
                    + f" 声明了 `input: {info['id']}`（数据依赖），现在指不到东西了。"
                      "这些步骤的可溯源链会断在这里；等 id 被重用之后，它们会无声地"
                      "指向一个不相干的步骤。请去把那几行 input 改掉或删掉。")
+    if info.get("dangling_results"):
+        # 三条里最重的一条：这一步被声明成了**成果**，整条定稿流程从它长出来。
+        # 它一没，流程静默变空（trace_pipeline 会报 dangling_result），而 id 会被
+        # 重用——下一个拿到该号的步骤会无声地变成论文报的那个结果。
+        out.append("⚠ project.md 里这几行成果声明现在指空了："
+                   + "、".join(f"`{x}`" for x in info["dangling_results"])
+                   + "。整条定稿流程就是从它们长出来的，现在推不出东西了。"
+                     "用 trace_result 重新指一步，或者 drop=true 撤掉那一行——"
+                     "**别放着不管**：id 会被重用，下一个拿到这个号的步骤会无声地"
+                     "变成论文报的那个结果。")
     out.append(f"⚠ id {info['id']} 可能被下一个新建的步骤重用——旧笔记里对它的引用会指向别的东西。")
     return "\n".join(out)
 
@@ -1671,7 +2352,7 @@ def t_new_step(be, args) -> str:
 
     payload = {k: args[k] for k in ("parent", "title", "status", "body", "date", "commit", "key",
                                     "tags", "paths", "inputs", "code", "lang",
-                                    "branch", "decision")
+                                    "branch", "decision", "pipeline")
                if k in args and args[k] not in (None, "")}
     payload.setdefault("status", "wip")
     payload["author"] = args.get("author") or DEFAULT_AUTHOR
@@ -1745,9 +2426,11 @@ def t_update_step(be, args) -> str:
             "顺带一提：如果你真正想说的是「这一步的数据来自那一步」，那是 inputs，不是 parent。")
     patch = {k: args[k] for k in ("status", "title", "date", "commit", "tags", "paths", "add_paths",
                                   "inputs", "add_inputs", "code", "add_code", "lang",
-                                  # 空串是有意义的取值（取消候选身份 / 撤回那句话），
-                                  # 所以这里过滤的是 None 而不是假值。
-                                  "branch", "decision")
+                                  # 空串是有意义的取值（取消候选身份 / 撤回那句话 /
+                                  # 撤销那个例外），所以这里过滤的是 None 而不是假值。
+                                  # 这张白名单是**按名字挑**的：漏一个不会报错，只会
+                                  # 静默丢掉——agent 会以为改成功了，然后在导出里找不到。
+                                  "branch", "decision", "pipeline")
              if k in args and args[k] is not None}
     if args.get("repro"):
         patch["add_repro"] = [args["repro"]]
@@ -1766,6 +2449,15 @@ def t_update_step(be, args) -> str:
     # 改完不说一声，做决定的那一刻反而是整条链上唯一没有回执的一步。
     if {"branch", "decision", "status"} & set(patch):
         lines += _fork_feedback(be, project, sid)
+    if "pipeline" in patch:
+        # `pipeline:` 除了改变一份导出之外**在界面上不留任何痕迹**，所以这一行必须
+        # 当场说清它做了什么。不说的话，回执是一句干净的「已更新」，而人唯一能验证
+        # 自己没写反的办法是再去生成一遍 Methods。
+        rule = str(patch["pipeline"]).split("|")[0].strip()
+        lines.append({"exclude": f"{sid} 从此**不算**定稿流程的一部分（上游会被接过去，图上不留断口）。",
+                      "include": f"{sid} 从此**留在**定稿流程里，连同它的上游一起。",
+                      }.get(rule, f"{sid} 的 pipeline 例外已撤销，回到算出来的结论。"))
+        lines.append("用 trace_pipeline 看一眼现在的流程——这个键唯一的作用就是改变它。")
     return "\n".join(lines)
 
 
@@ -2040,6 +2732,49 @@ def t_untranslated(be, args) -> str:
     return "\n".join(lines)
 
 
+def t_pipeline(be, args) -> str:
+    payload = be.pipeline(args["project"])
+    if args.get("methods"):
+        return pipeline_methods(payload)
+    out = fmt_pipeline(payload)
+    if payload["declared"]:
+        # 每次都说一遍这两句，因为最容易犯的错**不会报错**：拿开发路径当唯一真相去
+        # 复现（照着一棵含 dead 的树跑），以及把这份草稿当成品发出去。
+        out += ("\n\n要写论文就加 methods=true（Methods 草稿）。"
+                "「当时有几个候选、为什么选了这一条」在**开发路径**上，用 trace_read 看"
+                "——那两条路径都留着，正是为了这个问题。")
+    return out
+
+
+def t_result(be, args) -> str:
+    project, sid = args["project"], args["step"]
+    if args.get("drop"):
+        info = be.drop_result(project, sid)
+        left = info.get("results") or []
+        return (f"已撤销 {project}/{sid} 的成果声明。**记录一个字都没动**——"
+                f"它只是不再是定稿流程的终点，开发路径上还在原处。\n"
+                + (f"现在声明的成果：{'、'.join(r['step'] for r in left)}"
+                   if left else "现在一个成果都没有了，定稿流程也就推不出来了。"))
+    info = be.set_result(project, sid, args.get("note", ""))
+    verb = "已声明" if info.get("created") else "已改写"
+    lines = [f"{verb} {project}/{sid} 为成果：{info.get('line', '')}",
+             "定稿流程会从它沿 `input:` 反向算出来（一步没写 input: 时退回 parent，"
+             "剔掉 dead）。**成员清单一个字都不存**，所以你不用维护它。"]
+    left = info.get("results") or []
+    if len(left) > 1:
+        lines.append(f"这个项目现在有 {len(left)} 个成果："
+                     + "、".join(r["step"] for r in left)
+                     + "。它们合成**一张**图，共用的准备步骤只出现一次。")
+    # 声明完当场把算出来的流程摆出来。不摆的话，调用方拿到的是一句干净的「已声明」，
+    # 而这个动作真正改变的东西（哪几步进了 Methods、整条链的等级、有没有踩着 dead）
+    # 一样都看不见 —— 而它们恰恰是这一次调用的全部后果。
+    try:
+        lines += ["", fmt_pipeline(be.pipeline(project))]
+    except Exception:                       # 回执是加分项，拿不到就闭嘴，别把主操作说成失败
+        lines.append("（流程现算不出来，用 trace_pipeline 单独看一眼。）")
+    return "\n".join(lines)
+
+
 HANDLERS = {
     "trace_projects": t_projects,
     "trace_new_project": t_new_project,
@@ -2051,6 +2786,8 @@ HANDLERS = {
     "trace_update_step": t_update_step,
     "trace_move_step": t_move_step,
     "trace_flow": t_flow,
+    "trace_pipeline": t_pipeline,
+    "trace_result": t_result,
     "trace_check_paths": t_check_paths,
     "trace_attach": t_attach,
     "trace_translate": t_translate,
@@ -2078,7 +2815,7 @@ def dispatch(backend, name: str, args: dict[str, Any]) -> str:
 # 的客户端连上来跑一遍互操作。
 
 SERVER_NAME = "trace"
-SERVER_VERSION = "1.6.0"
+SERVER_VERSION = "1.7.0"
 
 # 收到客户端要的版本就原样回它（前提是我们认识），否则回我们最新的。
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
@@ -2177,7 +2914,8 @@ FORMAT_ESSENTIALS = (
     "`note.en.md`，项目笔记的是 `project.en.md`（`note.<短语言码>.md`，ja / zh-Hant 同理）。"
     "写它只有 trace_translate 一条路，它碰不到原文；还欠哪些用 trace_untranslated 查。"
     "译文的 front-matter **只准有 `title:`**（项目笔记是 `name:`），其余结构一律不重复——"
-    "id / parent / status / date / commit / author / tags / path / repro / key / input / code / moved "
+    "id / parent / status / date / commit / author / tags / path / repro / key / input / code / "
+    "moved / branch / decision / result / pipeline "
     "写进去会被忽略并报一条警告，因为那些在原文里已经有了，写两份就是双真相源。"
     "译文正文的小节名用目标语言那一套，和原文一一对应：为什么=Why、做了什么=What、"
     "结果=Result、结论=Conclusion、下一步=Next；项目洞察 核心想法=Ideas、有效=Works、"
@@ -2204,7 +2942,13 @@ INSTRUCTIONS = (
     "隔几天回到一个项目先 `trace_read(forks=true)` 看还有几个岔路口没定；"
     "⑨ 要双语就用 trace_translate 单独补一份译文（`note.en.md`），它碰不到原文——"
     "建完步骤马上调就是立刻翻译，过几天再调就是延迟翻译，同一条路径；"
-    "隔了几天先用 trace_untranslated 看还欠哪些。\n\n"
+    "隔了几天先用 trace_untranslated 看还欠哪些；"
+    "⑩ **一个项目有两条路径，别混**：trace_read 那棵树是**开发路径**（全部记录，"
+    "含 dead、含还没决定的岔路口，回答「当时是怎么走到那儿的」）；trace_pipeline 是"
+    "**定稿流程**（只有产出成果的那条链，回答「该怎么做」）。"
+    "**要复现结果或写 Methods 时读 trace_pipeline，不要照着那棵树走**——"
+    "树上有 dead 的步骤，照着它复现等于去重跑一条作者自己判定走不通的路。"
+    "流程是算出来的，唯一要写下来的是「哪一步是成果」（trace_result）。\n\n"
     + FORMAT_ESSENTIALS
 )
 

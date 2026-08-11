@@ -1218,3 +1218,221 @@ def test_the_translation_side_ignores_the_two_new_structural_keys(be):
         assert k in M.TR_STRUCT_KEYS and k in core.TR_STRUCT_KEYS
     with pytest.raises(M.ToolError):
         M._reject_front_matter("---\nbranch: alternative\n---\n\n## Why\na\n")
+
+
+# ══════════════════════════════ 两条路径：开发路径 ↔ 定稿流程
+#
+# 这一组全部在防同一个坏结果：**agent 把开发路径当成唯一的真相，然后照着一棵
+# 含 dead 的树去复现**。那棵树上有作者自己判定走不通的步骤，照着它跑一遍，
+# 得到的是一次注定失败的复现，而失败的原因不在数据也不在代码，在读错了图。
+
+
+def _pipeline_fixture(be):
+    """001 清洗 → 002 死路 → 002b 主实验（吃 002 的产物）。002 是 dead。
+
+    刻意让成果的上游**穿过一条 dead**：那是这一整套推导最该说话的形状——
+    流程照样给得出来（dead 被剔掉、上游接过去），但「你的结果建立在一条自己
+    判定走不通的路上」必须被指名说出来。
+    """
+    body = ("## 为什么\n要试\n\n## 做了什么\n跑了 `python train.py`\n\n"
+            "## 结果\nAUC 0.91\n\n## 结论\n成了\n")
+    call(be, "trace_new_step", project="alpha", title="清洗数据", status="done", body=body,
+         commit="c1d2e3f",
+         paths=["/blue/lab/clean | output | 去重后的训练集 | size=12884901888 sha256=aabbccdd"])
+    call(be, "trace_new_step", project="alpha", parent="001", title="试了 focal loss",
+         status="dead", body=body)
+    call(be, "trace_new_step", project="alpha", parent="002", title="主实验 AUC 0.91",
+         status="done", body=body, inputs=["002 | scores.csv"],
+         code=["snapshot | /orange/lab/snap/20260809 | manifest=MANIFEST.md5 n=43"])
+
+
+def test_a_project_without_a_declared_result_is_told_what_to_do_not_that_it_is_broken(be):
+    """空态是**常态**。写成缺陷，人就会随手指一步当成果——拿假结论换绿色。"""
+    out = call(be, "trace_pipeline", project="alpha")
+    assert "不是缺陷" in out
+    assert "trace_result" in out, "得说清下一步调哪个工具，不然这条提示落不了地"
+    assert "错误" not in out and "警告" not in out
+
+
+def test_the_pipeline_tool_description_keeps_the_two_paths_apart(be):
+    """agent 最容易犯的错**不会报错**：照着开发路径那棵树去复现。
+
+    工具描述是它唯一读得到的说明，两条路径的分工必须写死在这里。
+    """
+    d = next(t for t in M.TOOLS if t["name"] == "trace_pipeline")["description"]
+    assert "开发路径" in d and "定稿流程" in d
+    assert "trace_read" in d, "得点名另一条路径是哪个工具，不然分不清自己在看什么"
+    assert "dead" in d and "复现" in d, "「照着含 dead 的树复现」这个具体后果要说出来"
+    assert "Methods" in d
+
+
+def test_marking_a_result_is_described_as_the_heavy_decision_it_is(be):
+    """它决定整条流程长什么样、论文附录里出现哪几步。描述成一个字段就是降级。"""
+    d = next(t for t in M.TOOLS if t["name"] == "trace_result")["description"]
+    assert "Methods" in d and "唯一写下来的" in d
+    assert "dead" in d, "把 dead 的一步定成成果会被拒，得先说"
+    assert "不存在" in d, "悬空的成果让整条流程静默变空，这条也得先说"
+
+
+def test_the_derived_pipeline_names_the_dead_step_it_leans_on(be):
+    """流程里出现 dead ＝ 结果依赖着一条自己已经放弃的路。**必须指名**。"""
+    _pipeline_fixture(be)
+    out = call(be, "trace_result", project="alpha", step="003", note="主结果")
+    assert "002" in out
+    assert "已经放弃" in out or "dead" in out
+    assert "✕ 002" in out, "被剔掉的那一步要列出来，不然 001 看起来像凭空多出来的"
+
+
+def test_the_pipeline_drops_dead_steps_but_keeps_the_upstream_edge(be):
+    """剔掉 002 之后 001 不能变成孤点——它的字节确实流进了成果，只是路过了一段废路。"""
+    _pipeline_fixture(be)
+    call(be, "trace_result", project="alpha", step="003", note="主结果")
+    p = be.pipeline("alpha")["pipeline"]
+    assert p["order"] == ["001", "003"]
+    assert p["dead"] == ["002"]
+    assert any(e["from"] == "001" and e["to"] == "003" and e["via"] == ["002"]
+               for e in p["edges"]), "上游没接过去，图上就断了一口"
+
+
+def test_the_methods_draft_carries_commands_code_and_checksums(be):
+    """写论文时真正要抄的四样：做了什么、命令、代码在哪、产物与校验和。"""
+    _pipeline_fixture(be)
+    call(be, "trace_result", project="alpha", step="003", note="主结果")
+    md = call(be, "trace_pipeline", project="alpha", methods=True)
+    assert "python train.py" in md, "「做了什么」那一节的原文没进去，别人照着做不出来"
+    assert "c1d2e3f" in md and "/orange/lab/snap/20260809" in md and "MANIFEST.md5" in md
+    assert "/blue/lab/clean" in md and "aabbccdd" in md, "产物位置和校验和是溯源的另一半"
+    assert "初稿" in md and "不是成品" in md, "不说清是草稿，就会被原样投出去"
+    assert "试了 focal loss" in md, "被剔掉的那一步要单列——「这条路试过、没走通」论文里最缺"
+
+
+def test_the_methods_draft_does_not_invent_paper_prose(be):
+    """它只把记录里已有的事实排一遍。编出来的句子读着像成品，而实验没人核对过。"""
+    _pipeline_fixture(be)
+    call(be, "trace_result", project="alpha", step="003", note="主结果")
+    md = call(be, "trace_pipeline", project="alpha", methods=True)
+    for invented in ("我们提出", "本文", "实验表明", "结果显示", "综上所述"):
+        assert invented not in md, f"生成器替用户编了一句论文腔：{invented}"
+    # 这条承诺也要写进 methods 那个参数的描述里：agent 拿到一份「事实清单」，
+    # 下一个动作十有八九是「帮你润色成 Methods」——不拦住，编出来的句子就交出去了。
+    d = next(t for t in M.TOOLS if t["name"] == "trace_pipeline")["inputSchema"]
+    assert "论文腔" in d["properties"]["methods"]["description"]
+
+
+def test_a_missing_what_section_says_so_instead_of_going_quiet(be):
+    """「记录里这一节是空的」比一段空白有用得多：它是一条待办，空白只是个洞。"""
+    call(be, "trace_new_step", project="alpha", title="没写做了什么",
+         status="done", body="## 为什么\n要试\n")
+    call(be, "trace_result", project="alpha", step="001", note="主结果")
+    md = call(be, "trace_pipeline", project="alpha", methods=True)
+    assert "这一节是空的" in md
+
+
+def test_an_english_record_still_gets_its_what_section_into_methods(be):
+    """小节名是中英两套。认死中文的话，一份 `lang: en` 的记录会整篇变成「空的」。"""
+    call(be, "trace_new_step", project="alpha", title="English record", status="done",
+         lang="en", body="## Why\nbecause\n\n## What\nran `python eval.py --seed 0`\n")
+    call(be, "trace_result", project="alpha", step="001", note="main result")
+    md = call(be, "trace_pipeline", project="alpha", methods=True)
+    assert "python eval.py --seed 0" in md
+    assert "这一节是空的" not in md
+
+
+def test_the_exported_figure_is_self_contained_and_scriptless(be):
+    """自包含 SVG：审稿系统会把带脚本的图直接拒掉，引了外链的图在别人机器上会散架。"""
+    _pipeline_fixture(be)
+    call(be, "trace_result", project="alpha", step="003", note="主结果")
+    svg = M.pipeline_svg(be.pipeline("alpha"))
+    assert svg.startswith("<svg") and svg.rstrip().endswith("</svg>")
+    assert "<script" not in svg and "onload" not in svg
+    bare = svg.replace("http://www.w3.org/2000/svg", "")
+    assert "http://" not in bare and "https://" not in bare, "引了外部资源"
+    assert "@import" not in svg and "<image" not in svg and "<foreignObject" not in svg
+
+
+def test_the_exported_figure_does_not_rely_on_colour_alone(be):
+    """黑白打印和色觉障碍下要读得出来：关系靠线型和文字，不靠颜色。"""
+    import re as _re  # noqa: PLC0415
+
+    _pipeline_fixture(be)
+    call(be, "trace_result", project="alpha", step="003", note="主结果")
+    svg = M.pipeline_svg(be.pipeline("alpha"))
+    assert "stroke-dasharray" in svg, "「中间经过了被剔掉的步骤」得有非颜色的通道"
+    assert "已剔除" in svg, "虚线还要配一句文字，光靠线型也是猜"
+    assert "★成果" in svg and "◆最弱一环" in svg, "两个关键角色要有文字标记"
+    # 全图只有黑白灰：任何一个 R≠G≠B 的颜色都说明有信息挂在色相上。
+    for hexcolor in sorted(set(_re.findall(r"#([0-9a-fA-F]{6})", svg))):
+        r, g, b = hexcolor[0:2], hexcolor[2:4], hexcolor[4:6]
+        assert r == g == b, f"#{hexcolor} 不是灰阶——影印之后这条信息就没了"
+
+
+def test_every_export_is_byte_for_byte_deterministic(be):
+    """P3：两次生成逐字节一致，否则「重新生成」会在 diff 里制造假变更。"""
+    _pipeline_fixture(be)
+    call(be, "trace_result", project="alpha", step="003", note="主结果")
+    p1, p2 = be.pipeline("alpha"), be.pipeline("alpha")
+    for fn in (M.pipeline_svg, M.pipeline_methods, M.pipeline_page):
+        assert fn(p1) == fn(p2), f"{fn.__name__} 不是纯函数"
+
+
+def test_the_standalone_page_carries_only_the_final_pipeline(be):
+    """发给合作者的那一页：无脚本、无外链，而且不含开发路径上那些走不通的步骤。"""
+    _pipeline_fixture(be)
+    call(be, "trace_result", project="alpha", step="003", note="主结果")
+    page = M.pipeline_page(be.pipeline("alpha"))
+    assert "<script" not in page
+    assert 'src="http' not in page and 'href="http' not in page
+    assert "主实验 AUC 0.91" in page
+
+
+def test_the_pipeline_exception_is_passed_through_on_create_and_update(be):
+    """两条门面都要透传 `pipeline`。**漏了不会报错**，只会静默丢掉——
+    agent 以为自己排除了一步，而它照样出现在论文的 Methods 里。"""
+    import trace_write as W  # noqa: PLC0415
+
+    call(be, "trace_new_step", project="alpha", title="探索", status="done",
+         pipeline="exclude | 探索性的，成功了但没进最终流程")
+    assert W.load(be._sd("alpha"))["001"].pipeline == "exclude"
+    call(be, "trace_update_step", project="alpha", step="001",
+         pipeline="include | 想清楚了，它确实是流程的一环")
+    assert W.load(be._sd("alpha"))["001"].pipeline == "include"
+
+
+def test_updating_the_pipeline_exception_says_what_it_just_did(be):
+    """`pipeline:` 除了改变一份导出之外在界面上不留痕迹。回执不说，就没人验得了。"""
+    call(be, "trace_new_step", project="alpha", title="探索", status="done")
+    out = call(be, "trace_update_step", project="alpha", step="001",
+               pipeline="exclude | 探索性的")
+    assert "不算" in out and "trace_pipeline" in out
+
+
+def test_both_new_step_and_update_step_advertise_the_pipeline_field(be):
+    """schema 里没有的字段，agent 根本不会去传。"""
+    for tool in ("trace_new_step", "trace_update_step"):
+        props = next(t for t in M.TOOLS if t["name"] == tool)["inputSchema"]["properties"]
+        assert "pipeline" in props, f"{tool} 的 schema 少了 pipeline"
+        d = props["pipeline"]["description"]
+        assert "理由" in d, "不带理由的例外分不清是决定还是误点，这条必须写进描述"
+        assert "默认" in d, "得先劝人别动它，否则会被当成常规字段用"
+
+
+def test_the_instructions_tell_agents_which_path_to_reproduce_from():
+    """pip 装的机器上没有任何文档，instructions 是唯一一定送达的通道。"""
+    ins = M.INSTRUCTIONS
+    assert "trace_pipeline" in ins and "trace_result" in ins
+    assert "开发路径" in ins and "定稿流程" in ins
+    assert "复现" in ins, "「复现时读哪一条」正是这两条路径分家要解决的问题"
+
+
+def test_the_translation_side_ignores_result_and_pipeline_too(be):
+    """译文里写一句 `pipeline: exclude` 会被读侧一个字不看地丢掉。
+
+    后果比别的结构键重：「我明明排除了它」和「它还在 Methods 里」同时成立，
+    而人只会去怀疑推导错了。
+    """
+    import trace_core as core  # noqa: PLC0415
+
+    for k in ("result", "pipeline"):
+        assert k in M.TR_STRUCT_KEYS and k in core.TR_STRUCT_KEYS
+    with pytest.raises(M.ToolError):
+        M._reject_front_matter("---\npipeline: exclude\n---\n\n## Why\na\n")
