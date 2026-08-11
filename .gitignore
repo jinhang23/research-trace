@@ -1,5 +1,9 @@
 # 含 space 与 token，绝不入库
 config.json
+# 连同它的一切衍生物：.bak / .old / .orig / .save 里装的是同一个令牌。
+# 这一行是从一次真事里长出来的——改 space 时顺手存了个 .bak，
+# 而 .gitignore 只写了精确的 config.json，那个备份是可以被 git add -A 收走的。
+config.json.*
 
 # 编译产物是文件系统的纯函数，随时可以删掉重建
 dist/
