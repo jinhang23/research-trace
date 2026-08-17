@@ -880,7 +880,14 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
         return JSONResponse(
             {
                 "title": cfg.get("title"),
+                # 两个版本是两回事，别合并：
+                #   version  —— **内容**版本，文件一变就涨，SSE 靠它决定要不要重编译
+                #   software —— 这台机器上跑的**代码**版本
+                # 加 software 是因为更新流程缺一环：`git pull` + 重启之后，
+                # 没有任何办法从外面确认新代码真的起来了（旧进程还活着、
+                # 服务没重启、拉错了分支，症状都是"看起来一切正常"）。
                 "version": state.version,
+                "software": mcp.SERVER_VERSION,
                 "projects": len(ps),
                 "steps": sum(p["steps"] for p in ps),
                 # 以前直接回 git.last，里面的 detail 是 git 原文（含服务器绝对路径、

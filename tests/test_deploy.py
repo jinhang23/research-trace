@@ -803,3 +803,40 @@ def test_dropping_a_result_leaves_the_record_untouched(graded, capsys):
     assert cli.cmd_result(result_args(id="002", drop=True)) == 0
     assert "记录一个字都没动" in capsys.readouterr().out
     assert note.read_text(encoding="utf-8") == before
+
+
+# ---------------------------------------------------------------- 升级这条路
+
+def test_a_running_server_can_be_asked_what_code_it_is_running():
+    """`git pull` + 重启之后，唯一能确认新代码起来了的办法。
+
+    「拉错分支」「旧进程还活着」「服务压根没重启」三种情况的症状都是
+    「看起来一切正常」——页面照常打开、数据照常读。没有这个字段就只能靠猜。
+
+    它和 `version` 是两回事：那个是**内容**版本（文件一变就涨，SSE 靠它重编译），
+    这个是**代码**版本。合并成一个字段的话，一次普通的编辑就会让人以为
+    服务端升级了。
+    """
+    import trace_mcp as mcp
+    root = Path(__file__).resolve().parent.parent
+    src = (root / "trace_server.py").read_text(encoding="utf-8")
+    assert '"software": mcp.SERVER_VERSION' in src
+    assert '"version": state.version' in src, "内容版本要留着，网页的 SSE 靠它"
+
+
+def test_the_deploy_guide_says_how_to_upgrade_and_in_which_order():
+    """升级有两个地方（服务端的 clone、管理端的插件快照），而且有先后。
+
+    先更管理端的话，新插件会去调服务端还没有的端点——症状是几个工具莫名 404，
+    而你刚更新完，第一反应会是「新版本坏了」。这条顺序必须白纸黑字写着。
+    """
+    root = Path(__file__).resolve().parent.parent
+    doc = (root / "deploy" / "README.md").read_text(encoding="utf-8")
+    assert "## 升级" in doc, "部署文档只教了怎么装，没教怎么更新"
+    up = doc[doc.index("## 升级"):]
+    up = up[:up.index("\n## ", 1)] if "\n## " in up[1:] else up
+    assert "git -C /srv/trace pull" in up and "systemctl restart trace" in up
+    assert "先服务端" in up, "顺序是这一节最要紧的一句"
+    assert "software" in up, "要教怎么确认新代码真的在跑"
+    assert "--selfcheck" in up or "--version" in up, "管理端那边也要有自检的入口"
+    assert "数据仓不用动" in up or "数据仓" in up, "得说清数据不需要迁移"
