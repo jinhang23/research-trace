@@ -312,6 +312,14 @@ class State:
             d["counts"] = counts
             d["warnings"] = len(f["warnings"])
             d["latest"] = max((s["date"] for s in f["steps"] if s["date"]), default="")
+            # 分了章的项目在索引页上多一行「N 个章节 · 主实验 3 步 · 消融实验 4 步」。
+            # 索引页拿不到 forest（那是整棵树，一页几十个项目就是几十棵），所以这一行
+            # 只能由这里顺手带上。**没有章节就整个键不出现**：没分章的项目那份 JSON
+            # 必须逐字节和从前一样（现存项目完全无感），而网页那边没这个键就一个字
+            # 都不多显示——绝不显示一行「0 个章节」的谎话。
+            chs = (f.get("chapters") or {}).get("chapters") or []
+            if chs:
+                d["chapters"] = [{"name": c["name"], "n": c["n"]} for c in chs]
             out.append(d)
         return out
 
@@ -378,6 +386,12 @@ def search_hits(forests: list[tuple[str, str, dict[str, Any]]], query: str,
             # 站内搜索答不出就等于比 grep 弱。判据在 core，MCP 和网页用的是同一份。
             if q in core.fork_haystack(s).lower():
                 where.append("fork")
+            # 章节名和它那句说明也是人写的散文：`grep -rn 消融实验 projects/`
+            # 一秒就答出「消融那条线是从哪儿开始的」，站内搜索答不出就等于比 grep 弱。
+            # 判据在 core（收的是**自己声明的**那一行，不是继承来的归属），
+            # MCP 和网页用的是同一份——继承来的二十步一起命中会把真正的答案埋掉。
+            if q in core.chapter_haystack(s).lower():
+                where.append("chapter")
 
             # 摘要优先取原文：原文是权威，译文只在原文没命中时才拿来当上下文，
             # 否则同一条命中在不同语言下会给出两段不一样的摘要。
@@ -825,43 +839,71 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
     # 派生一次、三个门面共用：这里、MCP 的 trace_pipeline、CLI 的 `pipeline`，
     # 拼 payload 的是同一个 mcp.pipeline_payload。各拼一遍的话，迟早有一个字段
     # 在某个门面上分家 —— 而分家的那一份正好是要写进论文的。
-    def _pipeline(project: str, forest: dict) -> dict:
+    def _name_of(project: str) -> str:
         # 抬头用显示名而不是目录名：三样导出是要交出去的产物，抬头写着 slug
         # 的话，收到的人只会以为拿错了文件。
-        name = next((p.name for p in core.scan_projects(data_root) if p.slug == project),
+        return next((p.name for p in core.scan_projects(data_root) if p.slug == project),
                     project)
-        return mcp.pipeline_payload(forest, project, core.compute_pipeline({}, []), name)
+
+    def _pipeline(project: str, forest: dict, chapter: str = "") -> dict:
+        # 按章节切也走**同一个** pipeline_payload。这条路由不许自己筛一遍
+        # order/edges：切分的判据在 core，渲染在 trace_mcp，各筛一遍就会出现
+        # 「屏幕上讨论的图和投出去的图不是一张」——而投出去的那张会进论文。
+        try:
+            return mcp.pipeline_payload(forest, project, core.compute_pipeline({}, []),
+                                        _name_of(project), chapter)
+        except mcp.ToolError as exc:
+            # 章节名不认识。**404 而不是 400**：这是「你要的那个东西不在这儿」，
+            # 和写坏了一个字段是两回事，而报文里已经把有哪几章摆出来了。
+            raise W.NotFound(str(exc)) from None
 
     @app.get(base + "/api/p/{project}/pipeline")
-    async def api_pipeline(project: str) -> JSONResponse:
+    async def api_pipeline(project: str, chapter: str = "") -> JSONResponse:
         sd(project)
-        out = _pipeline(project, await state.forest(project))
+        out = _pipeline(project, await state.forest(project), chapter)
+        out["version"] = state.version
+        return JSONResponse(out)
+
+    # 章节。**读，所以公开**——和 forest / forks / pipeline 一致。
+    #
+    # 为什么单开一条路由而不是让客户端从 forest 里取那两个键：这份清单是**两份
+    # 派生的 join**（章节清单 × 每章自己那条定稿流程），而「消融那部分别人能不能
+    # 重做」正是分章之后第一个要问的问题。让每个门面各 join 一遍，等于把这条判据
+    # 复制三份；而且一个 `chapter:` 都没写的项目 forest 里那两个键**整个不出现**
+    # （现存项目必须完全无感），空态那句「怎么分章」只有主动问起来的这条路上拿得到。
+    @app.get(base + "/api/p/{project}/chapters")
+    async def api_chapters(project: str) -> JSONResponse:
+        sd(project)
+        out = mcp.chapters_payload(await state.forest(project), project, _name_of(project))
         out["version"] = state.version
         return JSONResponse(out)
 
     # 两样导出走**服务端**而不是让前端各画一遍。理由不是省事：markdown 和 SVG
     # 各写一份 Python 一份 JS，两份迟早不一致，**而其中一份会进论文**。
     # 生成器是纯函数、逐字节确定（P3），所以这两条路由没有缓存、也不需要缓存。
+    #
+    # 三条都收一个可选的 `?chapter=`：按章节导出**不在这里实现**，只是把参数递给
+    # 那一份 pipeline_payload（未分章那一组是 `?chapter=-`）。
     @app.get(base + "/api/p/{project}/pipeline/figure.svg", include_in_schema=False)
-    async def api_pipeline_svg(project: str) -> Response:
+    async def api_pipeline_svg(project: str, chapter: str = "") -> Response:
         sd(project)
-        svg = mcp.pipeline_svg(_pipeline(project, await state.forest(project)))
+        svg = mcp.pipeline_svg(_pipeline(project, await state.forest(project), chapter))
         return Response(svg, media_type="image/svg+xml; charset=utf-8")
 
     @app.get(base + "/api/p/{project}/pipeline/methods.md", include_in_schema=False)
-    async def api_pipeline_methods(project: str) -> Response:
+    async def api_pipeline_methods(project: str, chapter: str = "") -> Response:
         sd(project)
-        md = mcp.pipeline_methods(_pipeline(project, await state.forest(project)))
+        md = mcp.pipeline_methods(_pipeline(project, await state.forest(project), chapter))
         return PlainTextResponse(md, media_type="text/markdown; charset=utf-8")
 
     # 第三样：能直接发给合作者的那一页（单文件、无脚本、无外部资源）。
     # 它和上面两条是同一批字节的第三种包装，走同一个纯函数——网页上那个
     # 「独立页面」按钮就是指到这里，前端一行渲染逻辑都不再有。
     @app.get(base + "/api/p/{project}/pipeline/page.html", include_in_schema=False)
-    async def api_pipeline_page(project: str) -> Response:
+    async def api_pipeline_page(project: str, chapter: str = "") -> Response:
         sd(project)
         forest = await state.forest(project)
-        html = mcp.pipeline_page(_pipeline(project, forest))
+        html = mcp.pipeline_page(_pipeline(project, forest, chapter))
         return Response(html, media_type="text/html; charset=utf-8")
 
     @app.get(base + "/api/git")
@@ -948,6 +990,10 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             # 不在这里收下，那句**必填**的理由就得等一次 PATCH，而多一道摩擦
             # 它就永远空着——和 decision 是同一个道理。
             pipeline=payload.get("pipeline", ""),
+            # 章节比上面几个更急：这一行的作用是**开一条新线**（「下面开始做消融」），
+            # 只写在那条线的第一步上。建完再 PATCH 一次的话，这一步已经在上一章里
+            # 躺过一轮，期间任何一次读、任何一次导出都会把它算进上一章。
+            chapter=payload.get("chapter", ""),
         )
         if created:
             await touched([f"{project}/{step.id}"])

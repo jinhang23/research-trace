@@ -1277,8 +1277,12 @@ def test_the_legend_explains_all_three_relations_or_the_colours_are_just_noise()
         assert f'data-i18n-title="{key}.title"' in legend, f"{key} 没有解释它为什么长这样的 tooltip"
     assert 'data-i18n-html="list.legend.note"' in legend, \
         "图例没有说明「括弧 + 带箭头的曲线」这两条非颜色通道"
-    # 色样必须画出真正的形状（折线 / 括弧 / 带箭头的曲线），不能只是三段彩色横线
-    assert legend.count("<svg") == 3, "三种关系的色样不是形状，只是三段彩色的线"
+    # 色样必须画出真正的形状（折线 / 括弧 / 带箭头的曲线），不能只是三段彩色横线。
+    # 数的是**三种关系那一组**里的色样：⑨ 之后同一条图例里还有章节那一组
+    # （底色带 + 跨章记号），按整条图例数就等于把「关系有几种」和「图例里有几样
+    # 东西」混成一件事——而正是这条断言在防「彩色的边加上去而图例不接」。
+    rels = legend.split('class="lgset lgrels"')[1].split("</span>\n        </span>")[0]
+    assert rels.count("<svg") == 3, "三种关系的色样不是形状，只是三段彩色的线"
     assert "currentColor" in legend, "色样写死了颜色，深浅主题下会有一套是错的"
 
 
@@ -1605,7 +1609,9 @@ def test_the_three_exports_have_no_second_implementation_in_the_browser():
     url = re.search(RE % "exportURL", APP).group(0)
     assert "/pipeline/" in url and 'MODE === "static"' in url, \
         "两种模式都得指到同一份实现的产物上"
-    # 屏幕上那张图就是导出的那一份，一个字节都不差：它们出自同一个出口
+    # 屏幕上那张图就是导出的那一份，一个字节都不差：它们出自同一个出口。
+    # ⑨ 之后「此刻在导哪一章」是**一份**页面状态（exportChapter），图和三个按钮
+    # 都从它来，所以这两个函数的签名一个字都没变。
     screen = re.search(RE % r"pipeFigure\(\)", APP).group(0)
     assert "PIPE_SVG" in screen, "屏幕上画的是另一张图，人会对着一张、发出去另一张"
     fetcher = re.search(RE % "fetchFigure", APP).group(0)
@@ -1665,3 +1671,253 @@ def test_declaring_a_result_has_its_own_entry_and_no_member_list_editor():
     assert "/results" in APP, "声明成果没有写入路径"
     for forbidden in ("pipeline.members", "editMembers", "data-act=\"pipeline-members\""):
         assert forbidden not in APP, f"界面上出现了成员清单编辑口：{forbidden}"
+
+
+# ---------------------------------------------------------------- ⑨ 章节
+#
+# 章节是**横切**的：顶栏一个筛选器，开发路径按它 dim、定稿流程按它换编哪一条流程。
+# 这一组钉的全是「整块能力有没有真的接上线」，以及三条最容易被后来人拆掉的硬规矩：
+# 现存项目完全无感 · 筛选只 dim 不 hide · 不许抢占已经被占住的视觉通道。
+
+
+def test_the_chapter_filter_is_not_a_third_level_of_the_view_switcher():
+    """一级选「看哪一份东西」、二级选「同一份东西怎么画」，而章节两件都不改——
+    它选的是**看多大范围**，横切在那两级之上。塞进那两排按钮里，等于对读者说
+    「章节是第三种画法」，而它同时作用于开发路径和定稿流程。"""
+    assert 'id="chapfilter"' in HTML, "顶栏没有章节筛选器"
+    switcher = HTML[HTML.index('id="modeswitch"'):HTML.index('id="btn-new"')]
+    assert "chapfilter" not in switcher, "章节被塞进了两级切换器里"
+    assert 'data-mode="pipeline"' in switcher and 'data-view="flow"' in switcher, \
+        "锚点挪了，这条断言不再对着那两排按钮"
+    # 和搜索是同一类动作（缩小注意力范围），所以它挨着搜索框，不在视图按钮之间
+    assert HTML.index('id="search"') < HTML.index('id="chapfilter"') < HTML.index('id="modeswitch"')
+
+
+def test_a_project_without_a_single_chapter_line_is_completely_untouched():
+    """这一轮最硬的一条要求：现存项目一个 `chapter:` 都没有，它们的界面必须
+    一个字、一个属性、一个像素都不多。
+
+    `forest.chapters` 在那种项目里整个键都不存在（core 已经这么做了），所以
+    界面这一侧的判据只有一条：CH.declared。筛选器、图例那一组、卡片上的色条、
+    详情面板那一块、项目主页那块面板，全部挂在它上面。"""
+    f = re.search(RE % "renderChapFilter", APP).group(0)
+    assert "box.hidden = !CH.declared" in f, "没有章节时筛选器还在栏上（一个恒灰的下拉框）"
+    assert "lg.hidden = !CH.declared" in f, "图例里那一组没跟着收起来"
+    attrs = re.search(RE % "chapAttrs", APP).group(0)
+    assert 'if (!c) return "";' in attrs, "没有章节时卡片上还是多了属性"
+    assert "CH.declared &&" in attrs
+    for fn in ("renderChapterOf", "renderChapters"):
+        body = re.search(RE % fn, APP).group(0)
+        assert 'if (!CH.declared) return "";' in body, f"{fn} 在没有章节时还画东西"
+    # HTML 里那个下拉框出厂就是 hidden 的：首帧渲染之前它也不该闪一下
+    assert '<select id="chapfilter" hidden>' in HTML
+    assert 'id="chaplegend" hidden' in HTML
+
+
+def test_filtering_by_chapter_only_dims_and_never_hides():
+    """规格里那条「搜索只 dim 不 hide」的理由逐字适用：隐藏会打乱轨道对齐、
+    改变图的形状，而**形状本身是信息**——「消融是从主实验哪一步分出去的」这句话，
+    正是靠被筛掉的那些节点还在原位才看得见。"""
+    sel = re.search(RE % "renderSelection", APP).group(0)
+    assert 'el.classList.toggle("offchap", !inChapFilter(id));' in sel
+    for stolen in (".hidden = ", "display", "remove()"):
+        assert stolen not in sel.split("offchap")[1][:400], \
+            f"章节筛选动了「在不在」而不是「淡不淡」：{stolen}"
+    live = re.sub(r"/\*.*?\*/", "", CSS, flags=re.S)
+    m = re.search(r"#dnodes \.card\.offchap[^{]*\{([^}]*)\}", live)
+    assert m and "opacity" in m.group(1), ".offchap 不是靠不透明度实现的"
+    assert "display" not in m.group(1) and "visibility" not in m.group(1)
+
+
+def test_chapters_do_not_steal_a_visual_channel_that_is_already_taken():
+    """线型只归 status、不透明度只归「和你此刻的关注有没有关系」、边的颜色已经
+    归了三种关系（延伸 / 互斥候选 / 汇回）。章节只能用新通道：
+    一块底色带 + 卡片左侧一道窄条，外加跨章那一对小斜杠。"""
+    live = re.sub(r"/\*.*?\*/", "", CSS, flags=re.S)
+    band = re.search(r"#dedges \.chband \{([^}]*)\}", live)
+    assert band, "底色带没有样式"
+    for stolen in ("stroke-dasharray", "border-style"):
+        assert stolen not in band.group(1), f"底色带借了别的通道：{stolen}"
+    stripe = re.search(r"\.card\[data-chap\]::before[^{]*\{([^}]*)\}", live)
+    assert stripe, "卡片上那道章节色条没了"
+    for stolen in ("border-style", "stroke-dasharray", "opacity: .3"):
+        assert stolen not in stripe.group(1), f"色条借了别的通道：{stolen}"
+    # 卡片的 class 那一格已经被 status 占着，所以色相走属性（data-chi）
+    assert '[data-chi="0"]' in CSS, "色相没有属性入口，卡片上的色条会是空的"
+    cross = re.search(r"\.xchap \{([^}]*)\}", live)
+    assert cross and "stroke-dasharray" not in cross.group(1), \
+        "跨章记号用了虚线 —— 那是 status 的通道"
+    # 六个色相在两种主题下各有一套：深色底上太暗的色相压根显不出来
+    assert CSS.count("--ch0:") == 2 and CSS.count("--ch5:") == 2
+    # 图例里必须有它们，否则底色带和那对斜杠就是两个谜
+    assert 'id="chaplegend"' in HTML and 'data-i18n="chapter.cross.legend"' in HTML
+
+
+def test_the_chapter_a_step_belongs_to_is_read_off_core_not_off_the_step_itself():
+    """「这一步属于哪个章节」只有 core.resolve_chapters 一份判据，界面拿到的是
+    `forest.chapters.of`。拿「这一步自己写没写 chapter:」当归属判断，会让继承
+    下来的二十步集体看着像未分章——那是 `.declared`，说的是这一行**写在哪**。"""
+    of = re.search(RE % "chapOf", APP).group(0)
+    assert "CH.of[id]" in of, "归属不是从 core 那份判据读的"
+    assert "declared" not in of, "拿 declared 当归属判断了"
+    # 图上那块「章节从这里开始」的锚点用的才是 declared（它回答的是另一个问题）
+    src = re.search(RE % "chapterLabels", APP).group(0)
+    assert "chapter.declared" in src and "chapter.badge.title" in src
+
+
+def test_the_four_chapter_diagnostics_are_the_ones_core_really_sends():
+    """认不出 code 时 warnText 退回服务端原句，也就是在英文界面上原样漏出一整句
+    中文。这四条恰恰是给写错字的人看的。"""
+    core_src = (ROOT / "trace_core.py").read_text(encoding="utf-8")
+    codes = set(re.findall(r'"(chapter_[a-z_]+|bad_chapter)"', core_src))
+    assert codes, "core 那边一条章节诊断都没有了？"
+    for code in codes:
+        assert re.search(rf"\b{code}:\s*\{{ key:", APP), f"WARN_MAP 少了 {code}"
+    # 占位符必须逐字用 core 放进 vars 的那几个名字（warnText 不改名）
+    assert 'chapter_note_conflict: { key: "lint.chapter.desc.conflict", take: ["name", "ids", "id"] }' in APP
+    assert 'bad_chapter: { key: "lint.chapter.unnamed", take: ["note"] }' in APP
+
+
+def test_the_chapter_diagnostics_never_reach_the_top_warning_bar():
+    """和定稿流程那三条同一条规矩：`forest.chapters.diagnostics` 和
+    `forest.warnings` 是两份东西。章节的事让每个项目每次打开都多一条顶栏提示，
+    人很快连真警告一起不看了。"""
+    warn = re.search(RE % "renderWarnings", APP).group(0)
+    assert "F.warnings" in warn and "CH.diagnostics" not in warn
+    panel = re.search(RE % "renderChapters", APP).group(0)
+    assert "CH.diagnostics" in panel, "那三条诊断没人显示 = 白算"
+
+
+def test_the_editor_never_erases_a_chapter_line_it_cannot_see():
+    """`chapter: | 只写了说明没写名字` 那种写坏的行在 forest 里没有任何痕迹
+    （core 报一条 bad_chapter、归属退回继承，而那半句人写的话原样留在文件里）。
+    照空值发回去 = 一次无关的正文编辑悄悄把它删了。所以：值没变就不发这个键。"""
+    save = re.search(RE % "saveEditor", APP).group(0)
+    assert "if (chapterFieldValue(st) !== chapterFieldValue(was)) {" in save
+    assert "payload.chapter = chapterFieldValue(st);" in save
+    assert "!st.lang" in save, "译文里一行结构键都不许有"
+    # 草稿也要跟上，否则填了一半刷新一下就没了
+    st = re.search(RE % "editorState", APP).group(0)
+    assert "ed-chap" in st and "ed-chnote" in st
+    same = re.search(RE % "sameAsStep", APP).group(0)
+    assert "st.chapter" in same and "st.chnote" in same
+
+
+def test_neither_writing_surface_inherits_the_parent_chapter_into_the_form():
+    """章节本来就是沿树继承的。把父步骤那个名字预填进新建框，等于把一次继承
+    展开成一份会过期的拷贝——父步骤改个章节名，这一步就留在旧章里，而磁盘上
+    谁都看不出这是抄来的。编辑器里放的也只是**这一步自己写的**那个名字。"""
+    new = re.search(RE % "openNew", APP).group(0)
+    assert '$("#nf-chap").value = "";' in new, "新建框预填了父步骤的章节"
+    assert "inheritPath" in new, "锚点没了，这条断言就不再对着同一段代码"
+    tgt = re.search(RE % "editTarget", APP).group(0)
+    assert "(s.chapter && s.chapter.declared) ? s.chapter.name" in tgt, \
+        "编辑器里放的是继承来的归属，一按保存就在这一步身上多写一行"
+
+
+def test_starting_a_chapter_says_how_many_steps_come_with_it():
+    """换章磁盘上一个字节都没变（只有这一行），二十步集体转章，diff 里只看得见
+    那一行。用户吃过的亏正是「移动之后树形和创建顺序对不上」，这是同一类事、
+    只是更隐蔽。所以带走了几步要当场说出来，而且得**在写之前**数。"""
+    act = APP[APP.index('if (name === "chapter") {'):]
+    act = act[:act.index('if (name === "chapter-note")')]
+    assert "U.chapterCarry(IDX, cs.id).length" in act
+    assert "toast.chapter.carry" in act and "toast.chapter.set" in act
+    assert "toast.chapter.cleared" in act, "撤销之后没人说一声"
+    # 批量入口是**刻意没有**的：那会在二十个文件里各留一行会过期的拷贝
+    for forbidden in ("data-act=\"chapter-bulk\"", "markChapterAll", "chapter.bulk"):
+        assert forbidden not in APP, f"界面上出现了批量标章节的入口：{forbidden}"
+
+
+def test_the_chapter_description_is_written_where_core_says_it_takes_effect():
+    """说明跟着**章节**走，不跟着这一步走。core 的裁决是「id 序最早的那个带说明
+    的声明」生效，写到别处的结果是人改了说明、屏幕上显示的还是原来那一句。"""
+    act = APP[APP.index('if (name === "chapter-note")'):]
+    act = act[:act.index("if (name === \"edit-insights\")")]
+    assert "U.chapterNoteHome(entry, IDX)" in act
+    assert "toast.chapter.desc.saved" in act
+
+
+def test_exporting_one_chapter_asks_the_server_first():
+    """按章节导出的那三样字节只有 Python 一份实现，这一页只是指过去。所以得先
+    问清楚这台服务端会不会按章节编：一台还没升级的会**忽略** `?chapter=`、
+    老老实实回整个项目那一份，而文件名上写着「消融」——那正是这一整档设计要挡的
+    「屏幕上讨论一张、投出去另一张」，何况这次连文件名都在撒谎。"""
+    probe = re.search(RE % "probeChapterPipeline", APP).group(0)
+    # 判据必须是服务端**自己说**它编的是哪一章。以前这里钉的是
+    # `d.chapter === name` 那一串字面量 —— 而 payload 里那个 `chapter` 是一个
+    # **对象**，那句比较永远不成立，于是按章节导出整块静默消失，而这条测试
+    # 一路绿着：它钉的是写法，没人去问服务端到底回的是什么形状。现在改成钉
+    # 那个剥出来的纯函数，形状由 tests/test_seams_chapter.py 拿真响应当场量。
+    assert "U.chapterEcho(d)" in probe, "判据不是服务端自己说它编的是哪一章"
+    assert "d.chapter ===" not in probe, "又拿整个对象去和章节名比了"
+    # 「此刻在导哪一章」只有一份判据，图、三个按钮、那句 toast 全从它来 ——
+    # 有第二个入口，就有「屏幕上讨论的和投出去的不是同一份」的第二种得法。
+    scope = re.search(RE % "exportChapter", APP).group(0)
+    assert "chapExportable(ch) ? ch : null" in scope, \
+        "服务端不认按章节导时，按钮仍然挂着一个名不副实的文件名"
+    url = re.search(RE % "exportURL", APP).group(0)
+    assert '"?chapter=" + encodeURIComponent(ch)' in url and "exportChapterParam()" in url
+    # 文件名是**派生**出来的：章节名可以是 `主实验/数据准备`、`CON`
+    name = re.search(RE % "exportName", APP).group(0)
+    assert "CHAP_STEM[ch]" in name and "exportChapter()" in name
+    stems = re.search(RE % "chapStems", APP).group(0)
+    assert "U.chapterFileStems" in stems
+    assert "chapter.name" not in name, "章节名被直接拼进了文件名"
+
+
+def test_each_chapter_compiles_its_own_pipeline_and_the_ui_never_recomputes_it():
+    """主实验一段 Methods、消融一段，论文里本来就是两段。切分那一张 DAG 的事
+    core 已经做完了（`pipeline.chapters`）；浏览器里再算一遍闭包，就会出现
+    「屏幕上讨论的图和投出去的图不是一张」。"""
+    r = re.search(RE % "renderPipeline", APP).group(0)
+    assert "pipeGroup(focus)" in r and "U.pipelineChapterSteps(PIPE, group)" in r
+    assert "depClosure" not in r, "定稿流程这一屏自己算起闭包来了"
+    grp = re.search(RE % "pipeGroup", APP).group(0)
+    assert "PIPE.chapters" in grp
+    # 借来的上游要标出来：一个输入不在流程里的成员，写进 Methods 就是一句断了的话
+    steps = re.search(RE % "pipeSteps", APP).group(0)
+    assert "group.external" in steps and "chapter.of.head" in steps
+    # 这一章还没有成果时是一句邀请，不是一条错误
+    empty = re.search(RE % "pipeChapterEmpty", APP).group(0)
+    assert "chapter.pipeline.none" in empty
+
+
+def test_the_figure_on_screen_is_never_a_figure_of_another_chapter():
+    """按章节看和看整项目是两张图。谁也不许暂时顶替谁——一张顶替上去的图会被
+    当成这一章的方法图，那比空着糟得多。"""
+    fig = re.search(RE % r"pipeFigure\(\)", APP).group(0)
+    assert "PIPE_SVG_AT === figureKey(FOREST_SEQ)" in fig, \
+        "手上这份图不必正好是这一屏要的那一份（这一版记录 × 这一章）"
+    key = re.search(RE % "figureKey", APP).group(0)
+    assert "exportChapterParam()" in key, "缓存键里没有章节 —— 换一章之后旧图会留在屏幕上"
+    # 服务端不认按章节编时 exportChapter() 回 **null**：取的、画的、导的都是整项目
+    # 那份，三处一致；而按章节看的那一屏干脆不摆图，绝不拿整项目那张顶替。
+    # 判的是 `=== null` 而不是真值：**未分章那一组的名字就是空串**，它是一组真的
+    # 成果（多数项目的主线从没起过名字），`!""` 会把它错当成「没在导某一章」，
+    # 于是整项目那张图又被挂到了那一屏上——正是这条测试要挡的事。
+    r = re.search(RE % "renderPipeline", APP).group(0)
+    assert '(group && exportChapter() === null ? "" : pipeFigure())' in r, \
+        "服务端不认按章节编的时候，整项目那张图会被当成这一章的方法图挂上去"
+
+
+def test_the_cross_chapter_edges_are_drawn_not_tidied_away():
+    """消融当然要吃主实验的产物（`input: 023`），那条边说的正是「消融是对着
+    主结果测的」——它是两个章节之间唯一的连接，值得画出来。"""
+    d = re.search(RE % "renderDiagram", APP).group(0)
+    assert "CH.crossings" in d and "U.crossTick(" in d
+    f = re.search(RE % "renderFlow", APP).group(0)
+    assert "crossAt[e.from" in f and "U.crossTick(" in f
+    # 两种边各说各的意思（一条是「从哪儿分出来的」，一条是「字节从哪来」）
+    for key in ("chapter.cross.parent", "chapter.cross.input"):
+        assert key in APP, f"跨章节的边少了 {key}"
+
+
+def test_the_project_cards_show_chapters_only_when_the_server_sends_them():
+    """索引页拿到的是 `/api/projects`，里面没有 forest。服务端顺手带上
+    `chapters: [{name, n}]` 就显示，没带就一个字都不多——绝不显示一行
+    「0 个章节」的谎话。"""
+    fn = re.search(RE % "projectChapters", APP).group(0)
+    assert 'if (!cs.length) return "";' in fn
+    assert "count.chapters" in fn
+    assert "projectChapters(p)" in re.search(RE % "renderHome", APP).group(0)

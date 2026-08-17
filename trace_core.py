@@ -61,6 +61,22 @@ BRANCH_STATES = ("open", "decided", "abandoned")
 # 把某支标 dead，那份清单立刻过期，而且没有任何机制会告诉你它过期了。
 PIPELINE_RULES = ("include", "exclude")
 
+# 章节（`chapter:` 写在开启那条线的步骤上，**沿树继承**）。
+#
+# 项目本来就是森林，多个根已经给了「独立的探索路径」；章节做的只是给它们**起名字**，
+# 于是「主实验」「消融实验」各自能当一个单元来看、各自有自己的定稿流程和可溯源等级。
+#
+# **没有词表**：章节名是人起的名字，不是枚举。所以这里没有 CHAPTER_KINDS 这种常量
+# ——一旦收窄成词表，「消融实验」这种名字就得先注册再用，而注册表就是中心索引（P1 禁止）。
+#
+# 两件**刻意不做**的事，写在这里免得后来人以为是漏了：
+#   1. **id 不按章节重编号。**消融不从 001 重新开始。id 是分配顺序不是章节内序号，
+#      而 `[[007]]` 和论文脚注要在整个项目里唯一——这是只追加的地基。
+#   2. **章节不嵌套。**名字里可以写 `主实验/数据准备`，显示时按 `/` 分组，
+#      但语义上仍然是一层：真正的树形章节要么变成第二棵树（和步骤树打架），
+#      要么逼出一份父子关系表（又是中心索引）。
+CHAPTER_SEP = "/"
+
 # 列表视图：行高与轨道宽。前端要用同一组数字，这里是唯一来源。
 # 行高必须固定——轨道 SVG 和行文本是两套坐标系，只靠它对齐。
 ROW_H = 28
@@ -163,7 +179,12 @@ TR_STRUCT_KEYS = ("id", "parent", "status", "date", "commit", "author",
                   # result / pipeline 同理，而且后果更重：它们决定**哪些步骤进定稿流程**。
                   # 译文里写一份，中文页面和英文页面会导出两条不同的 Methods，
                   # 而两边看着都像对的——正是双真相源最难查的那一种。
-                  "result", "pipeline")
+                  "result", "pipeline",
+                  # chapter 是结构里最能悄悄分家的一个：它沿树继承，所以译文里多写
+                  # 一行不是「这一步换了个章节」，是**整条子树**在英文页面上换了归属，
+                  # 于是同一个项目按两种分法各导出一份 Methods。章节名要 grep 得到
+                  # （G4），译名想有的话是界面的事，不是文件里的第二份声明。
+                  "chapter")
 
 _HPC_RE = re.compile(r"^(/blue/|/orange/|/red/|/scratch/|/gpfs/|/lustre/|/work/)", re.I)
 _WIN_RE = re.compile(r"^[a-z]:[\\/]", re.I)
@@ -484,6 +505,32 @@ def fork_haystack(step: dict[str, Any]) -> str:
     return " ".join(b for b in bits if b)
 
 
+def chapter_haystack(step: dict[str, Any]) -> str:
+    """这一步**自己写下的**那一行 `chapter:`（名字 + 那句说明），供搜索用。**只读，不存。**
+
+    收的是「写在这一步身上的那几个字」，不是它继承来的归属。判据就是 grep：
+    `grep -rn "消融实验" projects/` 命中的是**声明它的那一步**那一个文件，
+    继承来的二十步文件里一个「消融」都没有。站内搜索照着 grep 来，于是搜「消融」
+    得到的是「这条线从哪儿开始的」那一条，而不是二十条一模一样的命中——
+    后者会把真正的答案埋掉，人下次就不再用搜索框。
+
+    章节名和它那句说明是**人写的散文**（不像 branch 的取值来自词表），
+    和标题、`decision:` 同一档：这一块当年是怎么想的，只写在那半句话里。
+
+    入参是 forest 里的 step（`chapter` 是 `{name, declared, note}`）或
+    Step.to_dict()（**没有** `chapter` 键 —— 那个字段刻意不进 to_dict，
+    见 Step.chapter 的注释）。拿不到就回空串：没有章节的项目搜索行为一个字不变。
+    """
+    ch = step.get("chapter")
+    if not isinstance(ch, dict):
+        return ""
+    # `declared` 才是「这一行写在这一步身上」；`name` 是归属（多半是继承来的）。
+    # 拿 name 当判据，一个章节的二十个成员会集体命中——那是二十条噪音。
+    bits = [str(ch.get("name") or "") if ch.get("declared") else "",
+            str(ch.get("note") or "")]
+    return " ".join(b for b in bits if b)
+
+
 def parse_inputs(raw: str) -> list[dict[str, str]]:
     """每行一条 `<步骤 id> | <消费的是哪份产物>`。
 
@@ -555,6 +602,40 @@ def format_pipeline(p: dict[str, str]) -> str:
     rule = str(p.get("rule") or "").strip()
     note = str(p.get("note") or "").strip()
     return f"{rule} | {note}" if note else rule
+
+
+def parse_chapter(raw: str) -> dict[str, str]:
+    """`chapter: 消融实验 | 逐个拿掉模块，对着主实验的 023 比` → `{"name", "note"}`。
+
+    竖线右边是**这个章节**的说明，不是这一步的（这一步的说明是 title 和正文）。
+    多处声明同一个章节时该信哪一句由 compute_chapters 裁决（按 id 序最早的那句），
+    这里只管切字符串。
+
+    和 `branch:` / `pipeline:` 的**唯一分歧：名字不转小写、不做任何归一化。**
+    那两个是词表里的取值（机器读），章节名是人起的名字：`grep -r "chapter: 消融实验"`
+    要能原样捞到写下去的那几个字（G4）。归一化一次，磁盘上的字和程序认的字就分了家。
+
+    空名字 = 没声明（`chapter:` 独占一行、或者只写了竖线右边的说明）。
+    「写了说明却没写名字」由 build_step 报一声——那半句话是人写的字，
+    静静吞掉它比报错更坏。
+    """
+    name, _, note = str(raw or "").partition("|")
+    return {"name": name.strip(), "note": note.strip()}
+
+
+def format_chapter(c: dict[str, str]) -> str:
+    """还原成 note.md 里的一行（不含 `chapter: ` 前缀）。
+
+    名字空、只有说明时给的是 `| 说明` 而不是 ` | 说明`：那是**写坏的那一行**
+    （build_step 会为它报 bad_chapter），而写入侧要能把它原样写回去——多一个
+    前导空格，人写的那一行就在下一次保存后变了样，`grep -r "chapter: | 逐个"`
+    也就再也捞不到它。
+    """
+    name = str(c.get("name") or "").strip()
+    note = str(c.get("note") or "").strip()
+    if not note:
+        return name
+    return f"{name} | {note}" if name else f"| {note}"
 
 
 def parse_results(text: str) -> list[dict[str, str]]:
@@ -801,6 +882,20 @@ class Step:
     # compile_forest 给出的 step["pipeline"]（只在项目声明了成果时才有）。
     pipeline: str = ""
     pipeline_note: str = ""
+    # 这一步开启的**章节**（`chapter:`）：主实验 / 消融实验 / …，空串就是没声明。
+    # 只装**这一步自己写的那个名字**——「我属于哪个章节」是沿 parent 继承出来的
+    # （resolve_chapters），绝不存储：写进每一步就是 20 份会漂移的拷贝，
+    # 而移动一步之后它们会集体过期且没人发现。
+    #
+    # `chapter_note` 是**这个章节**的说明（不是这一步的）。同一个章节在好几处声明
+    # 时，只有 id 序最早的那句会生效（compute_chapters），但每一处写的字都留着——
+    # 那是人写的字，程序不替人合并。
+    #
+    # **刻意不进 to_dict()**，理由和 pipeline 那两行一字不差：一个 `chapter:`
+    # 都没写的项目（现存全部如此）不该因为这一轮改动多出一个字段值。要问
+    # 「这一步属于哪个章节」，读 compile_forest 给出的 step["chapter"]。
+    chapter: str = ""
+    chapter_note: str = ""
     body: str = ""
     dirname: str = ""
     # note.md 自己声明的语言（front-matter 的 `lang:`）。**没声明就是空串**，
@@ -1239,6 +1334,20 @@ def build_step(dirname: str, meta: dict[str, str], body: str) -> tuple[Step, lis
                              dirname, {"pipeline": pipeline}))
         pipeline = ""
 
+    # `chapter:` 没有词表可校验（名字是人起的），唯一认得出来的写坏法是
+    # **只写了说明、没写名字**：`chapter: | 逐个拿掉模块`。那一行看着像声明了章节，
+    # 实际上一个字都不生效，而这一步会静静继承 parent 的章节——人以为自己开了一条
+    # 新线，页面上它却仍在主实验里。所以报一声（和 bad_branch / bad_pipeline 同一条路：
+    # 报一声、当没写、继续建树），说明**原样留在文件里**，不动。
+    ch = parse_chapter(meta.get("chapter", ""))
+    chapter, chapter_note = ch["name"], ch["note"]
+    if not chapter and chapter_note:
+        warnings.append(warn("warn", "bad_chapter",
+                             "`chapter:` 只写了竖线右边的说明、没写章节名，这一行不算声明"
+                             "（这一步仍然继承 parent 的章节）。写法是 "
+                             "`chapter: <章节名> | <这个章节是干什么的>`",
+                             dirname, {"note": chapter_note}))
+
     step = Step(
         id=sid,
         parent=parent,
@@ -1260,6 +1369,8 @@ def build_step(dirname: str, meta: dict[str, str], body: str) -> tuple[Step, lis
         decision=(meta.get("decision") or "").strip(),
         pipeline=pipeline,
         pipeline_note=pipeline_note,
+        chapter=chapter,
+        chapter_note=chapter_note,
         body=body,
         dirname=dirname,
         # 没写就是空串。**不做任何猜测**：字符集探测能把一段引用了中文论文标题的
@@ -2625,11 +2736,67 @@ def _pipeline_order(members: list[str], edges: list[dict[str, Any]]
     return out, [m for m in members if m not in done]
 
 
+def _pipeline_chapters(seeds: list[dict[str, Any]], chapter_of: dict[str, str],
+                       order: list[str], levels: dict[str, str],
+                       by_id: dict[str, Step]) -> list[dict[str, Any]]:
+    """把算好的那**一张** DAG 按章节切开，而不是给每个章节各算一遍。
+
+    `result:` 指的是某一步，那一步的章节就决定了这条流程属于哪个章节——主实验一条
+    Methods、消融一条，论文里本来就是两段。
+
+    **为什么是切分而不是各算一份。**各算一份就要跑 N 遍闭包，而 N 个闭包必然相交
+    （同一份清洗好的数据集既喂了主结果也喂了消融），于是同一步在 N 份派生里各算一遍
+    ——「同一个事实只有一份」是这套系统的地基，多算一遍就是给漂移开了口子。
+    切分则是同一张图的 N 个视图：一步一定在 order 里的同一个位置。
+
+    `external` 是这条流程里**不属于本章节**的成员：消融吃着主实验的 023，那 023
+    和它的上游当然要出现在消融的 Methods 里（一个输入不在流程里的成员，写进 Methods
+    就是一句断了的话），但它们是**借来的**，导出时该标出来——那正是「消融是对着
+    主结果测的」这句话在图上的样子。
+    """
+    groups: list[dict[str, Any]] = []
+    index: dict[str, dict[str, Any]] = {}
+    # 章节的先后跟着 `result:` 在 project.md 里的**声明顺序**：那是作者自己排的
+    # 论文段落顺序，比任何一种 id 序都更接近他想要的 Methods 结构。
+    for s in seeds:
+        name = chapter_of.get(s["step"], "")
+        g = index.get(name)
+        if g is None:
+            g = {"name": name, "results": [], "_members": set()}
+            index[name] = g
+            groups.append(g)
+        g["results"].append(s["step"])
+        g["_members"].update(s["members"])
+    out: list[dict[str, Any]] = []
+    for g in groups:
+        members = [sid for sid in order if sid in g["_members"]]   # 仍按全局拓扑序
+        weakest = ""
+        for sid in members:
+            if not weakest or LEVELS.index(levels[sid]) < LEVELS.index(levels[weakest]):
+                weakest = sid
+        out.append({
+            "name": g["name"],
+            "results": g["results"],
+            "order": members,
+            "external": [sid for sid in members if chapter_of.get(sid, "") != g["name"]],
+            "level": levels[weakest] if weakest else "",
+            "weakest": weakest,
+            "weak": [sid for sid in members if levels[sid] in ("L0", "L1")],
+            "dead": [sid for sid in members if by_id[sid].status == "dead"],
+        })
+    return out
+
+
 def compute_pipeline(by_id: dict[str, Step],
-                     results: list[dict[str, str]]) -> dict[str, Any]:
+                     results: list[dict[str, str]],
+                     chapter_of: dict[str, str] | None = None) -> dict[str, Any]:
     """派生定稿流程。**派生字段，绝不存储**（P1）。
 
     `results` 是 project.md 里那几行 `result:`（parse_results 的产物）。
+
+    `chapter_of` 是每一步属于哪个章节（resolve_chapters 的产物）。**不传就整个
+    `chapters` 键都不出现**——一个 `chapter:` 都没写的项目，它的流程必须和这一轮
+    改动之前逐字节一样，理由和「没声明成果就没有 pipeline 键」一字不差。
 
     **多个成果合成一张 DAG，不是几条独立的链。** 两个成果的闭包几乎一定相交
     （同一份清洗好的数据集喂了主结果和消融），拆成几条链就会把同一步在图上和
@@ -2651,6 +2818,8 @@ def compute_pipeline(by_id: dict[str, Step],
         # 都被念一遍，而那正是让人从此不看警告的做法。
         out = dict(empty)
         out["diagnostics"] = [warn("info", "pipeline_no_result", PIPELINE_EMPTY_HINT)]
+        if chapter_of is not None:
+            out["chapters"] = []
         return out
 
     # 成果：按声明顺序，重复声明同一步只算一次（第二行没有新信息）。
@@ -2788,10 +2957,12 @@ def compute_pipeline(by_id: dict[str, Step],
             st.extend(parents_of.get(cur, []))
         return [sid for sid in order if sid in seen]
 
-    return {
+    seeds_out = [{"step": s["step"], "note": s["note"], "members": _upstream(s["step"])}
+                 for s in seeds]
+
+    out: dict[str, Any] = {
         "declared": True,
-        "results": [{"step": s["step"], "note": s["note"], "members": _upstream(s["step"])}
-                    for s in seeds],
+        "results": seeds_out,
         "order": order,
         "edges": edges,
         "why": why,
@@ -2804,6 +2975,11 @@ def compute_pipeline(by_id: dict[str, Step],
         "included": included,
         "diagnostics": diags,
     }
+    # 位置固定在最后（dict 的插入顺序就是 JSON 里的顺序，静态导出要逐字节一致）。
+    # 没有章节时整个键不出现——不是「算一份只有一组的清单挂上去」。
+    if chapter_of is not None:
+        out["chapters"] = _pipeline_chapters(seeds_out, chapter_of, order, levels, by_id)
+    return out
 
 
 def scan_results(steps_dir: Path) -> list[dict[str, str]]:
@@ -2824,6 +3000,273 @@ def scan_results(steps_dir: Path) -> list[dict[str, str]]:
         return []
     text, _w = decode_note(raw, PROJECT_NOTE)
     return parse_results(text)
+
+
+# ---------------------------------------------------------------- 章节
+#
+# 一个项目内部还要分子章节：主实验、消融实验、数据准备——它们各有独立的探索路径。
+# 森林（多个根）早就给了「独立的路径」，缺的只是给它们**起名字**、当作一个单元来看。
+#
+# 落盘的只有一行 `chapter: 消融实验 | …`，写在**开启那条线的那一步**上，
+# **沿树继承**：整条子树跟着它，不用给 20 步各写一遍。其余全部派生：
+# 有哪些章节、各自有谁、各自的根、各自的等级、跨章节的边，一律扫出来现算。
+#
+# 为什么继承而不是每步各写一份：每步各写就是 20 份拷贝，移动一步之后它们集体过期，
+# 而**没有任何机制会告诉你它们过期了**——这正是上一代系统的死因。继承的另一半好处
+# 是 `moved:` 之后章节自动跟着变：把一条线从主实验挪进消融，改的是 parent 一个字。
+#
+# 一个章节可以**横跨多棵树**：消融可能是好几条独立的根。所以章节是**一组步骤**，
+# 不必是一棵子树——这也是它不能用「子树 = 章节」来实现的原因。
+
+
+def resolve_chapters(by_id: dict[str, Step]) -> dict[str, str]:
+    """每一步属于哪个章节：自己声明的，没有就沿 parent 一路往上找。**派生，绝不存储**。
+
+    返回只装**进了章节的**那些步骤（`{id: 章节名}`）。一路到根都没有声明的不出现在
+    这里，调用方 `.get(sid, "")` 拿到空串——那是「未分章」，是绝大多数项目的状态，
+    不是错。
+
+    两件必须做对的事：
+
+    * **不死循环。**validate 之后 parent 已经无环、也不悬空，但这个函数也会被直接
+      拿去算手工造出来的 by_id（测试、演算），而十年后的日志一定是残缺的。所以
+      环和悬空都当「这条链到此为止」处理：算出「未分章」，绝不中断。
+    * **记忆化。**1000 步的项目不能每步都重爬一遍祖先链（那是 n²/2 次跳跃，深链上
+      正是 compute_traces 当初栽的那个跟头）。爬一次把**整条路径**上的步骤一起写进
+      memo，于是每个节点只被走一次。
+    """
+    # 一个 `chapter:` 都没写时连爬都不用爬——现存项目全是这个状态，这条让它们
+    # 一次跳跃都不多做（「完全无感」不只是输出上的，也是开销上的）。
+    if not any(s.chapter for s in by_id.values()):
+        return {}
+
+    memo: dict[str, str] = {}
+    for start in sorted(by_id, key=id_key):        # 定序：memo 的填法不该影响结果，但确定的遍历更好复现
+        if start in memo:
+            continue
+        path: list[str] = []                       # 一路上没自己声明的那些，等着接同一个答案
+        seen: set[str] = set()                     # 环的刹车
+        cur: str | None = start
+        while cur is not None and cur in by_id and cur not in memo and cur not in seen:
+            seen.add(cur)
+            s = by_id[cur]
+            if s.chapter:
+                memo[cur] = s.chapter
+                break
+            path.append(cur)
+            cur = s.parent
+        val = memo.get(cur, "") if cur else ""     # 到根 / 悬空 / 踩到环：都是未分章
+        for sid in path:
+            memo[sid] = val
+    return {sid: name for sid, name in memo.items() if name}
+
+
+def chapter_crossings(by_id: dict[str, Step], of: dict[str, str],
+                      seq: Iterable[str]) -> list[dict[str, str]]:
+    """跨章节的边：`parent` 跨过去的、`input:` 跨过去的。
+
+    这不是要藏起来的脏东西，正相反——消融当然要吃主实验的产物（`input: 023`），
+    那条边说的正是**「消融是对着主结果测的」**，它是两个章节之间唯一的连接，
+    值得画出来。`parent` 跨章节同理：消融那条线是从主实验某一步分出去的，
+    那一步就是「消融从哪儿开始的」。
+
+    **一头未分章也算跨。**主实验没起名字、消融起了名字是很常见的写法，此时那条边
+    仍然是「消融接在某个东西上」——把它当成同一章内部的边就等于把唯一的连接抹掉。
+    两头都未分章才不算（那是普通项目里的普通边，跟章节没关系）。
+
+    `kind` 是这条边在文件里的依据（parent / input），`note` 只有 `input:` 那边有
+    （竖线右边那句「消费的是哪份产物」）；键恒在，值可以是空串——静态导出要逐字节
+    确定，键的有无不能随内容变。
+    """
+    out: list[dict[str, str]] = []
+    for sid in seq:
+        s = by_id.get(sid)
+        if s is None:
+            continue
+        mine = of.get(sid, "")
+        p = s.parent
+        if p and p in by_id and of.get(p, "") != mine:
+            out.append({"from": p, "to": sid, "kind": "parent",
+                        "from_chapter": of.get(p, ""), "to_chapter": mine, "note": ""})
+        done: set[str] = set()
+        for i in s.inputs:                          # 文件里的行序，同一个来源只画一次
+            t = (i.get("step") or "").strip()
+            if not t or t == sid or t not in by_id or t in done:
+                continue
+            if of.get(t, "") == mine:
+                continue
+            done.add(t)
+            out.append({"from": t, "to": sid, "kind": "input",
+                        "from_chapter": of.get(t, ""), "to_chapter": mine,
+                        "note": (i.get("note") or "").strip()})
+    return out
+
+
+# 屏幕上不占位置的那些字符：Cf（格式类）加上 BOM 和软连字符。
+# 它们能让两个「看起来完全相同」的名字在字节上不同。
+#
+# **必须写成转义，不许把字面字符敲进来**——那样这一行自己就是不可见的：
+# 读代码的人看到的是一对空方括号，grep 也搜不到，改的人不知道自己在改什么。
+_ZERO_WIDTH_RE = re.compile(
+    "[" + chr(0xAD) + chr(0x200B) + "-" + chr(0x200F) + chr(0x202A) + "-" + chr(0x202E)
+    + chr(0x2060) + "-" + chr(0x2064) + chr(0xFEFF) + "]"
+)
+
+
+def _chapter_fold(name: str) -> str:
+    """章节名归一化**只用来找笔误**，绝不用来判定归属。
+
+    判定归属用的永远是原样的字节（章节名一个字符不同就是两个章节，见 parse_chapter）。
+    这里把大小写和空白抹平，是为了逮住 `Ablation` / `ablation ` / `消融 实验` 这种
+    「同一个章节被拆成两半」——两半各导出一份 Methods，而两边看着都像对的。
+    """
+    # 零宽字符要在折叠时**抹掉**，不是当空白切开。
+    # `消融实验` 和 `消融<U+200B>实验` 在屏幕上逐像素一模一样，而它们是两个章节：
+    # 各导出一份 Methods、各有一个等级，两边看着都对。str.split() 只认 Unicode
+    # 空白，Cf 类（零宽空格 / 零宽连接符 / 软连字符 / LTR-RTL 标记 / BOM）
+    # 一个都不在其中，于是这类笔误从写入侧的控制字符检查和读侧的近似检查
+    # 之间整个漏过去——而它恰恰是"肉眼绝对发现不了"的那一种。
+    return " ".join(_ZERO_WIDTH_RE.sub("", name).casefold().split())
+
+
+def compute_chapters(by_id: dict[str, Step], order: list[str],
+                     levels: dict[str, str] | None = None,
+                     result_ids: Iterable[str] = (),
+                     of: dict[str, str] | None = None) -> dict[str, Any]:
+    """派生章节清单。**派生字段，绝不存储**（P1）。
+
+    `levels` 是每一步**自己**的可溯源等级（compile_forest 把 compute_traces 已经
+    算好的那份传进来，省一遍正文解析）；不传就现算。`result_ids` 是 project.md 里
+    声明过、且确实存在的那些成果步骤——用来判断「这个章节推不推得出自己的定稿流程」。
+
+    每个章节回答的问题，全部是「把消融单独拿出来看」时会问的那几个：
+    有哪些步骤（按 order，也就是树上的先后）、从哪里开始（roots）、多少步、
+    状态怎么分布、说明是什么、**别人能不能重做**（level + 最弱的那一步）。
+
+    **章节之间的顺序**按「这个章节最早那一步的 id」排。理由：id 是分配顺序，
+    所以这就是章节被开启的先后，和步骤列表的顺序对得上——界面上从上往下读，
+    章节的先后和步骤的先后是同一个方向。按名字排也能做到逐字节确定（码点序），
+    但那个顺序对读的人不对应任何东西，而且下一个人一旦「修好」成按语言的排序规则，
+    同一份文件在两台机器上就能排出两种顺序（P3 禁止）——不给那条路留门。
+    """
+    of = resolve_chapters(by_id) if of is None else of
+    # order 之外的步骤（parent 成环时 compute_order 够不到它们）也要算进来：
+    # 残缺输入上章节照样得给得出来，不然「构建不中断」在这里就破了个口子。
+    tail = [sid for sid in sorted(by_id, key=id_key) if sid not in set(order)]
+    seq = list(order) + tail
+
+    declared_at: dict[str, list[str]] = {}          # 章节名 → 在哪几步上声明过（id 序）
+    for sid in sorted(by_id, key=id_key):
+        name = by_id[sid].chapter
+        if name:
+            declared_at.setdefault(name, []).append(sid)
+
+    members: dict[str, list[str]] = {}
+    unassigned: list[str] = []
+    for sid in seq:
+        name = of.get(sid, "")
+        (members.setdefault(name, []) if name else unassigned).append(sid)
+
+    # 传进来的那份可能不全（order 够不到的那几步不在里面），缺的现算：
+    # 残缺输入上也得给出等级，不能让一条脏 parent 边把整份章节清单炸掉。
+    levels = dict(levels or {})
+    for sid in seq:
+        if sid not in levels:
+            levels[sid] = traceability(by_id[sid])["level"]
+
+    diags: list[dict[str, Any]] = []
+    out_chapters: list[dict[str, Any]] = []
+    for name in sorted(members, key=lambda n: id_key(members[n][0])):
+        steps = members[name]
+        # 这个章节的**入口**：parent 不在同一个章节里的成员（含真正的树根）。
+        # 一个章节可以有好几个入口——它横跨几棵树时本来就该是这样。
+        roots = [sid for sid in steps
+                 if not by_id[sid].parent or of.get(by_id[sid].parent or "", "") != name]
+        weakest = ""
+        for sid in steps:                           # 平局取 order 里靠前的那个（补记录从头补）
+            if not weakest or LEVELS.index(levels[sid]) < LEVELS.index(levels[weakest]):
+                weakest = sid
+        # 说明归谁：**id 序最早的那个带说明的声明**。为什么不是「最早的声明」——
+        # 在第二处声明同一个章节时不重复说明是正常写法（说明只该写一遍），
+        # 按「最早的声明」算会把唯一的那句说明扔掉，而那不是任何人的本意。
+        notes = [(sid, by_id[sid].chapter_note)
+                 for sid in declared_at.get(name, []) if by_id[sid].chapter_note]
+        distinct = list(dict.fromkeys(n for _sid, n in notes))
+        if len(distinct) > 1:
+            who = " / ".join(sid for sid, _n in notes)
+            diags.append(warn(
+                "warn", "chapter_note_conflict",
+                f"章节「{name}」在 {who} 上写了 {len(distinct)} 句不同的说明。"
+                f"按 id 序最早的那句生效（{notes[0][0]} 写的），其余几句在界面上一个字都不会出现"
+                "——多半是笔误，或者两个人各写各的。留一句；要是本来就想说两个章节，"
+                "把名字改开",
+                by_id[notes[0][0]].dirname,
+                {"name": name, "ids": who, "id": notes[0][0], "n": len(distinct)}))
+        out_chapters.append({
+            "name": name,
+            # 名字里的 `主实验/数据准备` 拆开给界面分组用。**语义上仍然是一层**：
+            # 这里给的是显示用的段，不是一棵章节树（见文件头 CHAPTER_SEP 那一段）。
+            "parts": name.split(CHAPTER_SEP),
+            "note": notes[0][1] if notes else "",
+            "declared_at": list(declared_at.get(name, [])),
+            "steps": list(steps),
+            "roots": roots,
+            "n": len(steps),
+            # 三个键恒在（值可以是 0）：静态导出要逐字节确定，键的有无不能随内容变。
+            "status": {st: sum(1 for sid in steps if by_id[sid].status == st) for st in STATUSES},
+            "level": levels[weakest] if weakest else "",
+            "weakest": weakest,
+        })
+
+    # 「这个章节推不出自己的定稿流程」。**只在项目已经声明过成果时才说**：
+    # 一个 result 都没有的项目，该说的话 pipeline_no_result 已经说过一遍了，
+    # 在这里按章节再说 N 遍就是同一件事念 N+1 次，而那正是让人从此不看诊断的做法。
+    # 措辞和那一条同一个路子：教怎么办，不是责备——现存项目本来就没有成果声明。
+    rset = set(result_ids)
+    if rset:
+        for c in out_chapters:
+            if any(sid in rset for sid in c["steps"]):
+                continue
+            diags.append(warn(
+                "info", "chapter_no_result",
+                f"章节「{c['name']}」里一条 `result:` 都没有，所以推不出它自己的定稿流程"
+                "（这个项目别的章节有）。论文里主实验和消融本来就是两段 Methods，"
+                "想要这一段，在 project.md 里给这个章节的成果写一行 "
+                "`result: <步骤 id> | <这是什么成果>`",
+                PROJECT_NOTE, {"name": c["name"], "n": str(c["n"])}))
+
+    # 「几乎同名的两个章节」。**刻意只认大小写和空白**，不做任何相似度猜测：
+    # `消融实验` vs `消融試驗` 靠猜才认得出来，而猜错一次就是对着人指认一个不存在的
+    # 笔误——评级一旦会撒谎人就不再看它，诊断也一样。
+    #
+    # 为什么**不做**「章节只有一个步骤 → 也许是笔误」：一个章节被开启的那一刻
+    # 必然只有一步（就是声明它的那一步），这条会在每一次正确使用时当场炸一声。
+    # 合法的单步章节也确实存在（一步就说完的「数据准备」）。会在正确用法上响的
+    # 诊断，人学会的是忽略整个诊断栏。
+    folds: dict[str, list[str]] = {}
+    for c in out_chapters:
+        folds.setdefault(_chapter_fold(c["name"]), []).append(c["name"])
+    for fold in sorted(folds):
+        names = folds[fold]
+        if len(names) < 2:
+            continue
+        shown = " / ".join(f"「{n}」" for n in names)
+        diags.append(warn(
+            "warn", "chapter_near_duplicate",
+            f"{shown} 只差大小写或空白，几乎肯定是同一个章节被拆成了两半——"
+            "两半各自算一份成员、各自导出一段 Methods，而两边看着都像对的。"
+            "章节名一个字符不同就是两个章节，统一成一种写法",
+            PROJECT_NOTE, {"names": " / ".join(names), "n": str(len(names))}))
+
+    return {
+        "declared": bool(out_chapters),
+        "chapters": out_chapters,
+        # 每一步属于哪个章节。只装进了章节的那些，未分章的 `.get(sid, "")` 拿空串。
+        "of": {sid: of[sid] for sid in seq if sid in of},
+        "unassigned": unassigned,
+        "crossings": chapter_crossings(by_id, of, seq),
+        "diagnostics": diags,
+    }
 
 
 # ---------------------------------------------------------------- compile
@@ -2852,14 +3295,29 @@ def compile_forest(steps_dir: Path, with_files: bool = True) -> dict[str, Any]:
     w_branch = validate_branches(by_id, groups)
 
     traces = compute_traces(by_id, order)             # 派生，不存储
+    # 每一步**自己**的等级（不是整链的）。章节的等级取的就是它，理由和定稿流程
+    # 那边一字不差：整链会把不属于本章节的祖先算进来，而「消融这部分别人能不能重做」
+    # 问的正是这几步自己。从 traces 里取，省一遍正文解析（1000 步上这是实打实的钱）。
+    self_levels = {sid: traces[sid]["self"] for sid in order}
 
-    # 定稿流程。**只在项目声明了成果时才存在**：现存项目一个 `result:` 都没有，
-    # 它们的 forest 必须和这一轮改动之前逐字节一样——不多一个键、不多一条警告。
-    # 所以这里不是「算出一个空流程挂上去」，而是整个键都不出现。
+    # 章节。和定稿流程同一条规矩：**只在真有人写过 `chapter:` 时才存在**。
+    # 现存项目一个 `chapter:` 都没有，它们的 forest 必须和这一轮改动之前逐字节一样
+    # ——不多一个键、不多一条诊断。所以这里不是「算一份『未分章』挂上去」，
+    # 而是整个键都不出现（forest 和每个 step 上都是）。
+    chapter_of = resolve_chapters(by_id)           # 派生，绝不存储；没人写就是空 dict
+
+    # 定稿流程。**只在项目声明了成果时才存在**，理由同上。
     results = scan_results(steps_dir)
-    pipeline = compute_pipeline(by_id, results) if results else None
+    pipeline = compute_pipeline(
+        by_id, results, chapter_of if chapter_of else None) if results else None
     pipe_pos = {sid: i for i, sid in enumerate(pipeline["order"])} if pipeline else {}
     pipe_results = {r["step"] for r in pipeline["results"]} if pipeline else set()
+
+    # 章节清单。`result_ids` 用的是流程那边已经筛过的那份（声明了、而且真存在），
+    # 不是 project.md 的原样行——悬空的 `result:` 已经由 dangling_result 报过一次，
+    # 拿它去判断「这个章节有没有成果」只会让同一个笔误引出第二条诊断。
+    chapters = compute_chapters(by_id, order, self_levels, pipe_results, chapter_of) \
+        if chapter_of else None
 
     w_lint: list[dict[str, str]] = []
     steps_out = []
@@ -2901,6 +3359,17 @@ def compile_forest(steps_dir: Path, with_files: bool = True) -> dict[str, Any]:
                 "rule": step.pipeline,
                 "note": step.pipeline_note,
             }
+        # 「我属于哪个章节」。`name` 是**继承**出来的（自己没写就是 parent 的），
+        # `declared` 说的是这一行是不是写在自己身上——两者必须分开：界面要把
+        # 「这一步开启了消融」和「这一步跟着消融走」画成两回事，否则一整条子树
+        # 看着都像各自声明过，而实际上改一个字就能整条搬走。
+        # `note` 是这一步写下的**章节说明**（多数是空的；生效的那句在 chapters 里）。
+        if chapters is not None:
+            d["chapter"] = {
+                "name": chapters["of"].get(sid, ""),
+                "declared": bool(step.chapter),
+                "note": step.chapter_note,
+            }
         steps_out.append(d)
 
     out: dict[str, Any] = {
@@ -2918,6 +3387,12 @@ def compile_forest(steps_dir: Path, with_files: bool = True) -> dict[str, Any]:
     # 而 dict 的插入顺序就是 JSON 里的顺序）。没有成果时整个键不出现。
     if pipeline is not None:
         out["pipeline"] = pipeline
+    # 章节同理：位置固定在 pipeline 之后、warnings 之前，一个 `chapter:` 都没写
+    # 的项目整个键不出现。诊断走 chapters["diagnostics"]，**不进 warnings**——
+    # 和定稿流程那几条同一档：它们问的是「这个项目分得清不清楚」，
+    # 不是「这个结果追不追得到」，一条都不影响可溯源等级。
+    if chapters is not None:
+        out["chapters"] = chapters
     out["warnings"] = w_scan + w_val + w_inputs + w_branch + w_lint
     out["row_h"] = ROW_H
     out["lane_w"] = LANE_W

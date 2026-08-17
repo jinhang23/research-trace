@@ -361,11 +361,15 @@ def test_format_md_lists_every_front_matter_key_render_note_can_emit(tmp_path):
 
     `lang` 是这么漏掉的：双语上线时 render_note 学会了回写它，而第 2 节的键表
     还是十一行——照文档写的人不知道自己可以声明正文是什么语言。所以构造的
-    Step 必须把**每一个**可选键都填上，包括 lang、branch、decision。
+    Step 必须把**每一个**可选键都填上，包括 lang、branch、decision、chapter。
     """
     step = core.Step(id="001", parent="000", status="done", title="t", lang="zh",
                      branch="alternative", branch_note="先试最便宜的那条",
                      decision="类别不平衡怎么处理？",
+                     # chapter 和上面几个同一个理由要填上：它是**每条记录都可能有**、
+                     # 但绝大多数记录都没有的键，漏填的话键表里少一行也没人会发现，
+                     # 而照文档写的人就不知道自己可以给一条线起名字。
+                     chapter="消融实验", chapter_note="逐个拿掉模块",
                      date="2026-01-01",
                      commit="c", author="a", key="k", tags=["x"],
                      paths=[{"location": "/blue/x", "note": "n", "kind": "hpc"}],
@@ -598,6 +602,10 @@ def test_the_front_matter_key_order_in_format_md_is_the_order_render_note_emits(
                      # 位置一言不发，而它恰好夹在 decision 和 lang 之间——排错了
                      # 文件仍然合法，只是「人的判断」和「机器记录」两区混在一起。
                      pipeline="exclude", pipeline_note="探索性的，没进最终流程",
+                     # `chapter` 同理，而且它就紧跟在 pipeline 后面：两行回答的是
+                     # 同一份对外产出的两个问题（算不算方法的一环 / 算哪一章的方法）。
+                     # 不填的话文档把它排到 lang 下面（机器记录区）也不会被发现。
+                     chapter="消融实验", chapter_note="逐个拿掉模块",
                      moved=[{"date": "2026-01-02", "from": "000", "to": "001b",
                              "by": "human", "reason": "r"}],
                      inputs=[{"step": "000", "note": "a.csv"}],
@@ -1638,6 +1646,544 @@ def test_the_docs_are_honest_about_which_front_doors_carry_the_pipeline_fields()
         if wired else
         "MCP 的 trace_update_step / POST …/steps 仍然丢掉 pipeline，"
         "SKILL.md 必须明说这件事（agent 会以为记上了）")
+
+
+# ------------------------------------------------- 章节（FORMAT.md 第 17 节）
+# 这一节讲的是「一个项目内部并列的几块」，而它整节压在一句承诺上：**一行 `chapter:`
+# 写在开启那条线的那一步，其余全部沿树继承、全部现算**。所以这里同样不校对散文，
+# 只做四件事：把第 17.2 节那张「在脑子里算一遍」的表整块喂给 resolve_chapters
+# （读者信不信这套继承，取决于他照着算出来的和程序算出来的是不是同一份）、
+# 把文档印出来的跨章节边和分章流程逐字对上代码、把四条诊断的 code 两个方向核一遍、
+# 以及钉住「没有 chapter: 的项目完全无感」和两件**刻意不做**的事。
+
+
+def chapter_section() -> str:
+    return format_numbered_section("章节")
+
+
+def chapter_table_rows() -> list[dict[str, str]]:
+    """第 17.2 节那张继承表，每行一个步骤。
+
+    按表头定位而不是按行号：这张表是读者唯一能自己验算的东西，它和 resolve_chapters
+    一旦分家，「只标第一步」这条**整个设计的支点**就变成了一句听着有理的话。
+    """
+    sec = chapter_section()
+    head = "| 步骤 | `parent` | 这一步写的 `chapter:` | 它属于哪个章节 | 凭什么 |"
+    start = sec.find(head)
+    assert start != -1, "FORMAT.md 第 17 节里找不到那张「在脑子里算一遍」的继承表"
+    out: list[dict[str, str]] = []
+    for line in sec[start:].split("\n")[2:]:            # 跳过表头和分隔行
+        if not line.startswith("|"):
+            break
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        assert len(cells) == 5, f"继承表这一行不是五列: {line}"
+        ids = re.findall(r"`([0-9]+[a-z]*)`", cells[0])
+        assert ids, f"继承表这一行第一列没有步骤 id: {line}"
+        out.append({
+            "id": ids[0],
+            "parent": (re.findall(r"`([0-9]+[a-z]*)`", cells[1]) or [""])[0],
+            # 章节名可以带斜杠、可以是中文，所以取的是整段反引号内容而不是 id 那种形状
+            "declares": (re.findall(r"`([^`]+)`", cells[2]) or [""])[0],
+            "belongs": (re.findall(r"`([^`]+)`", cells[3]) or [""])[0],
+        })
+    assert len(out) >= 5, f"那张继承表只扫到 {len(out)} 行，扫描器可疑"
+    return out
+
+
+def chapter_forest():
+    """把第 17.2 节那张表建成真的森林，并补上文档里写明的那条 `input:`。"""
+    rows = chapter_table_rows()
+    metas: dict[str, dict[str, str]] = {}
+    for r in rows:
+        meta: dict[str, str] = {"status": "done", "title": "t"}
+        if r["parent"]:
+            meta["parent"] = r["parent"]
+        if r["declares"]:
+            meta["chapter"] = r["declares"]
+        metas[r["id"]] = meta
+    # 表格里没有 `input:` 那一列（六列的表没人读得下去），那一行写在表下面的散文里，
+    # 而它正是跨章节那条 input 边的**唯一**来源——所以从文档里取，不在这里写死。
+    m = re.search(r"`([0-9]+[a-z]*)` 完整的写法还带一行 `input:\s*([^`]+)`", chapter_section())
+    assert m, "第 17.2 节没写清 030 那行 `input:` 的完整写法"
+    assert m.group(1) in metas, f"那句话说的 {m.group(1)} 不在继承表里"
+    metas[m.group(1)]["input"] = m.group(2)
+    by_id, _children, order = build_forest(metas)
+    return rows, by_id, order
+
+
+def test_the_chapter_examples_in_the_docs_round_trip_and_are_accepted_by_the_writer():
+    """每条 `chapter:` 示例都得：解析得出**名字**、回写后逐字不变、并被写入侧接受。
+
+    「解析得出名字」这条不是形式：只写竖线右边的说明（`chapter: | 逐个拿掉模块`）
+    是这个键唯一机械可判的写坏法，它看着像声明了章节，实际一个字都不生效——
+    文档里要是混进这么一条示例，照抄的人以为自己开了一条新线，页面上它却还在原来那章。
+    """
+    seen = 0
+    for doc, raw in front_matter_lines("chapter"):
+        got = core.parse_chapter(raw)
+        assert got["name"], f"{where(doc)} 的 `chapter: {raw}` 没解析出章节名"
+        assert core.format_chapter(got) == raw, \
+            f"{where(doc)} 的 chapter 回写后变了样: {raw!r} → {core.format_chapter(got)!r}"
+        assert W.norm_chapter(raw) == got, \
+            f"{where(doc)} 的 `chapter: {raw}` 写入侧规整后和读侧解析的不一样"
+        seen += 1
+    assert seen >= 2, f"只扫到 {seen} 条 chapter 示例，扫描器可疑"
+
+
+def test_the_inheritance_table_in_format_md_is_what_resolve_chapters_derives():
+    """第 17.2 节把七个步骤和「它属于哪个章节」**都印了出来**，读者会照着验算。
+
+    直接把那张表喂给 `core.resolve_chapters`：算出来的归属必须和文档印的逐字一致。
+    这一节的全部说服力都压在这件事上——表和代码一旦分家，读的人会先信文档，
+    然后给每一步都补一行 `chapter:`（正是这个设计要避免的那件事）。
+
+    顺带钉住这一节明确承诺过的三件事：**声明只写在开启那条线的那一步**（表里
+    写了 `chapter:` 的行数就是磁盘上 `chapter:` 的行数）、未分章的步数、
+    以及那个横跨两棵树的章节有几个入口。
+    """
+    rows, by_id, order = chapter_forest()
+    of = core.resolve_chapters(by_id)
+    for r in rows:
+        assert of.get(r["id"], "") == r["belongs"], \
+            f"{r['id']} 文档说属于 {r['belongs']!r}，resolve_chapters 给的是 {of.get(r['id'], '')!r}"
+
+    # 继承是真的在起作用：绝大多数行**没写** chapter:，归属却不是空的。
+    inherited = [r for r in rows if not r["declares"] and r["belongs"]]
+    assert len(inherited) >= 3, "这张表没能体现继承（几乎每一行都自己声明了）"
+    # 「磁盘上一共只有 N 行 chapter:」——这句话是「只标第一步」在这个例子里的证据，
+    # 它和表格一旦对不上，读者算出来的和文档说的就不是一回事。
+    m = re.search(r"一共只有 (\d+) 行 `chapter:`", chapter_section())
+    assert m, "第 17.2 节没写清这个例子里磁盘上有几行 `chapter:`"
+    declared = [r for r in rows if r["declares"]]
+    assert len(declared) == int(m.group(1)), \
+        f"文档说 {m.group(1)} 行，表里写了 {len(declared)} 行"
+    assert len(declared) < len(rows) - 1, "声明的行数没比步骤数少多少，继承就没什么可省的了"
+
+    ch = core.compute_chapters(by_id, order, of=of)
+    m = re.search(r"未分章 (\d+) 步", chapter_section())
+    assert m, "第 17.2 节没写清这个例子里未分章有几步"
+    assert len(ch["unassigned"]) == int(m.group(1)), \
+        f"文档说未分章 {m.group(1)} 步，实际是 {ch['unassigned']}"
+
+    m = re.search(r"`([^`]+)` 有 \*\*(\d+) 个入口\*\*（`([0-9a-z]+)` 和 `([0-9a-z]+)`）",
+                  chapter_section())
+    assert m, "第 17.2 节没写清哪个章节有几个入口"
+    got = next(c for c in ch["chapters"] if c["name"] == m.group(1))
+    assert got["roots"] == [m.group(3), m.group(4)], \
+        f"文档说 {m.group(1)} 的入口是 {m.group(3)} / {m.group(4)}，实际是 {got['roots']}"
+    assert len(got["roots"]) == int(m.group(2))
+
+
+def test_the_cross_chapter_edges_format_md_prints_are_the_ones_the_code_finds():
+    """第 17.6 ③把那三条跨章节的边**逐条印了出来**，包括它们各自的依据。
+
+    这一段的价值全在「不藏起来」四个字上：消融吃主实验的产物那条 `input:` 边，
+    说的正是「消融是对着主结果测的」。文档要是印错一条（比如漏掉同一对步骤上
+    `parent` 和 `input` 各有一条），读的人会以为两章之间只有一种连接。
+    """
+    _rows, by_id, order = chapter_forest()
+    printed = re.findall(r"^([0-9]+[a-z]*) → ([0-9]+[a-z]*)\s+(parent|input)",
+                         chapter_section(), re.M)
+    assert printed, "第 17 节没有印出跨章节的边"
+    of = core.resolve_chapters(by_id)
+    real = [(c["from"], c["to"], c["kind"])
+            for c in core.chapter_crossings(by_id, of, order)]
+    assert printed == real, f"文档印的跨章节边和代码算出来的 {real} 对不上"
+    # 同一对步骤既跨 parent 又跨 input 时两条都在——文档专门说了这一句。
+    assert len({(f, t) for f, t, _k in real}) < len(real), \
+        "这个例子里没有「同一对步骤两种依据各一条」的情形，那句话就没有示例了"
+
+
+def test_the_per_chapter_pipelines_in_format_md_are_slices_of_the_one_dag():
+    """第 17.6 ①那张表印的是「每章各自的定稿流程」，它必须是**同一张 DAG 的切片**。
+
+    「切分而不是各算一遍」是这里唯一要守住的事：N 个闭包必然相交（同一份清洗好的
+    数据集既喂了主结果也喂了消融），各算一遍就是同一个事实算了 N 遍，
+    而那正是「屏幕上讨论的图和投出去的图不是一张」的来源。所以这里除了逐字比对
+    成员和 `external`，还断言每一组的顺序是全局顺序的**子序列**。
+    """
+    _rows, by_id, order = chapter_forest()
+    sec = chapter_section()
+    # 成果不从表里猜：那两行 `result:` 就印在这一节里，直接交给真解析器。
+    block = next((b for b in re.findall(r"```[a-z]*\n(.*?)```", sec, re.S)
+                  if b.startswith("result:")), "")
+    declared = core.parse_results(f"---\nname: x\n{block}---\n")
+    assert len(declared) == 2, f"第 17.6 节那两行 result: 没解析出来: {declared}"
+
+    head = "| 章节 | 这一章的成果 | 这一组的成员（按全局顺序） | 其中**借来的**（`external`） |"
+    start = sec.find(head)
+    assert start != -1, "第 17.6 节里找不到那张分章流程表"
+    printed: list[dict] = []
+    for line in sec[start:].split("\n")[2:]:
+        if not line.startswith("|"):
+            break
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        assert len(cells) == 4, f"分章流程表这一行不是四列: {line}"
+        printed.append({
+            "name": (re.findall(r"`([^`]+)`", cells[0]) or [""])[0],
+            "results": re.findall(r"`([0-9]+[a-z]*)`", cells[1]),
+            "order": re.findall(r"`([0-9]+[a-z]*)`", cells[2]),
+            # 借自哪一章那半句里的章节名是中文，不会被这条 id 形状的正则捞到
+            "external": re.findall(r"`([0-9]+[a-z]*)`", cells[3]),
+        })
+
+    of = core.resolve_chapters(by_id)
+    p = core.compute_pipeline(by_id, declared, of)
+    real = [{"name": g["name"], "results": g["results"],
+             "order": g["order"], "external": g["external"]} for g in p["chapters"]]
+    assert printed == real, f"文档印的分章流程和 compute_pipeline 算出来的 {real} 对不上"
+
+    for g in p["chapters"]:                     # 每一组都是总图顺序的子序列
+        pos = [p["order"].index(sid) for sid in g["order"]]
+        assert pos == sorted(pos), f"{g['name']} 那一组的顺序不是全局顺序的子序列"
+    assert any(g["external"] for g in p["chapters"]), \
+        "这个例子里没有任何一组借了别章的上游，`external` 那一列就没有示例了"
+
+
+def test_the_chapter_level_is_the_weakest_member_of_that_chapter_only():
+    """第 17.6 ②承诺：一个章节的等级 = **本章成员里**最弱的一步，不是它整链的等级。
+
+    差别是实打实的：消融那几步各自记得再全，它的祖先（主实验、数据准备）也在
+    另一条章节里；照整链算的话，消融会被别人那一章的窟窿压成 L0，而那个数会
+    让人去补一份**不属于这一章**的记录。反过来，本章自己那一步弱下去必须压得住。
+    """
+    full = ("## 为什么\n因为。\n\n## 做了什么\n跑了 `a.py`。\n\n"
+            "## 结果\n0.9。\n\n## 结论\n成立。\n")
+    by_id = {
+        # 001 什么都没记 ⇒ L0，而且它在**另一个**章节里。
+        "001": core.Step(id="001", status="done", title="数据准备那一步", body="",
+                         chapter="数据准备", dirname="001_x"),
+        "030": core.Step(id="030", parent="001", status="done", title="消融第一步",
+                         chapter="消融实验", commit="c1d2e3f", body=full,
+                         paths=[{"location": "/blue/x", "note": "n", "kind": "hpc"}],
+                         dirname="030_x"),
+        "031": core.Step(id="031", parent="030", status="done", title="消融第二步",
+                         commit="c1d2e3f", body=full,
+                         paths=[{"location": "/blue/y", "note": "n", "kind": "hpc"}],
+                         dirname="031_x"),
+    }
+    assert core.traceability(by_id["001"])["level"] == "L0"
+    ch = core.compute_chapters(by_id, ["001", "030", "031"])
+    got = {c["name"]: (c["level"], c["weakest"]) for c in ch["chapters"]}
+    assert got["消融实验"] == ("L2", "030"), \
+        f"消融那一章被别的章节的祖先压下去了: {got['消融实验']}"
+    assert got["数据准备"] == ("L0", "001")
+
+
+def test_the_chapter_diagnostics_in_the_docs_are_the_real_codes():
+    """四条诊断的 `code` 是精确匹配的字符串（人要拿它 grep、前端要拿它选文案）。
+
+    两个方向都盯着：文档列的必须真报得出来，报得出来的也必须都被列上——
+    界面上冒出来一句文档里查不到的提示，读的人只能当它是 bug。
+
+    另外钉住这一节的三条边界：前三条**不进 `forest["warnings"]`**（现存项目一个
+    `chapter:` 都没有，挂进全局警告栏等于每次打开都被念一遍）、四条**一条都不改
+    L0–L4**、以及那条**刻意不做**的诊断（章节只有一个步骤）真的没被做出来——
+    它会在每一次正确使用时当场响一声，而人学会的只会是忽略整个诊断栏。
+    """
+    sec = chapter_section()
+    documented = set(re.findall(r"^\|\s*`([a-z]+_[a-z_]+)`\s*\|", sec, re.M))
+
+    emitted: set[str] = set()
+    # ① 只写了说明没写名字：这一行不算声明，走的是项目的 warnings。
+    lone, w = core.build_step("007_x", {"id": "007", "status": "done", "title": "t",
+                                        "chapter": "| 逐个拿掉模块"}, "")
+    emitted |= {d["code"] for d in w}
+    assert lone.chapter == "" and lone.chapter_note == "逐个拿掉模块", \
+        "只写说明那一行既没退回默认，也没把人写的字留下"
+    # ② 一次造齐另外三条：同名章节两句不同的说明、一个没有成果的章节、
+    #    以及两个只差大小写的章节名。
+    by_id, _c, order = build_forest({
+        "001": {"status": "done", "chapter": "主实验 | 论文图 3 那条主线"},
+        "002": {"parent": "001", "status": "done", "chapter": "主实验 | 另一句说明"},
+        "003": {"status": "done", "chapter": "Ablation"},
+        "004": {"status": "done", "chapter": "ablation"},
+    })
+    ch = core.compute_chapters(by_id, order, result_ids=["001"])
+    emitted |= {d["code"] for d in ch["diagnostics"]}
+    assert emitted == {"bad_chapter", "chapter_note_conflict",
+                       "chapter_no_result", "chapter_near_duplicate"}, \
+        f"章节这一摊报出来的是 {sorted(emitted)} —— 造用例的场景该更新了"
+    assert emitted == documented, (
+        f"第 17 节没列全: {sorted(emitted - documented)}；"
+        f"列了报不出来的: {sorted(documented - emitted)}")
+
+    # 说明冲突时**最早那句生效**，而每一处写的字都留在各自的文件里。
+    conflict = next(d for d in ch["diagnostics"] if d["code"] == "chapter_note_conflict")
+    assert conflict["vars"]["id"] == "001"
+    assert next(c for c in ch["chapters"] if c["name"] == "主实验")["note"] \
+        == "论文图 3 那条主线"
+    assert by_id["002"].chapter_note == "另一句说明", "第二处写的那句话被程序改掉了"
+
+    # 「一个章节只有一个步骤」**刻意没做**：上面那四个章节里有两个只有一步，
+    # 一条相关的诊断都不许冒出来（它会在每一次正确使用时当场响一声）。
+    assert [len(c["steps"]) for c in ch["chapters"]].count(1) >= 2
+    assert not [d for d in ch["diagnostics"] if "lone" in d["code"] or "single" in d["code"]]
+    assert "只有一个步骤" in sec, "第 17 节没写清这条诊断是**刻意不做**的，后来人会来补"
+
+    # 同一份记录，加不加章节，等级必须一模一样。
+    body = "## 为什么\n因为。\n\n## 做了什么\n跑了 `a.py`。\n\n## 结论\n成立。\n"
+    kw = dict(id="002", status="done", title="t", commit="c1d2e3f", body=body,
+              paths=[{"location": "/blue/x", "note": "n", "kind": "hpc"}], dirname="002_t")
+    assert core.traceability(core.Step(chapter="消融实验", chapter_note="逐个拿掉", **kw))["level"] \
+        == core.traceability(core.Step(**kw))["level"] == "L2", \
+        "`chapter:` 把等级动了 —— 第 17 节说这四条一条都不降级"
+
+
+def test_a_project_without_any_chapter_notices_nothing(tmp_path):
+    """第 17.10 节承诺「一个 `chapter:` 都没有的项目完全无感」，README 也照这句话写。
+
+    这句话是有代价的承诺：现存的每一个项目都是这个状态，所以 `compile_forest`
+    的输出里**不能因此多出任何东西**——多一个键，前端要多一条判空；多一条提示，
+    每个项目每次打开都被念一遍，而那正是让人从此不看提示的做法。
+    （和第 16.1 节那条 `result:` 的承诺是同一个要求，测法也照着它写。）
+    """
+    p = W.create_project(tmp_path, "还没分章的项目")
+    sd = core.steps_dir_of(tmp_path, p.slug)
+    a, _ = W.create_step(sd, title="第一步", body="## 为什么\n因为。\n")
+    W.create_step(sd, parent=a.id, title="第二步", body="## 为什么\n因为。\n")
+    forest = core.compile_forest(sd)
+    assert "chapters" not in forest, "没分章的项目也长出了 chapters 键"
+    for s in forest["steps"]:
+        assert "chapter" not in s, "没分章的项目在步骤上多了字段"
+    assert not [w for w in forest["warnings"] if "chapter" in w["code"]], \
+        "没分章却多出了警告"
+    # 归属那份派生也一样：连爬都不爬，返回空。
+    assert core.resolve_chapters(W.load(sd)) == {}
+
+    # 加一行 chapter: 之后**只**多出那两个键，布局一个数都不变。
+    before = {k: forest[k] for k in ("order", "lanes", "lane_count", "tree",
+                                     "branch_groups", "merges")}
+    W.update_step(sd, a.id, {"chapter": "主实验 | 论文图 3 那条主线"})
+    after = core.compile_forest(sd)
+    assert set(after) - set(forest) == {"chapters"}
+    assert {k: after[k] for k in before} == before, "分了章之后布局跟着变了"
+    assert set(after["steps"][0]) - set(forest["steps"][0]) == {"chapter"}
+
+    # 第 17.8 节的分档：章节自己那三条诊断**自成一份**（`chapters.diagnostics`），
+    # 只有写坏了一行 front-matter 的 `bad_chapter` 才进项目的 warnings。
+    # 混进去的后果和第 16.5 节那条一样：现存项目每次打开都被念一遍。
+    b = W.load(sd)[[s for s in W.load(sd) if s != a.id][0]]
+    W.update_step(sd, b.id, {"chapter": "主实验 | 另一句说明"})
+    got = core.compile_forest(sd)
+    assert [d["code"] for d in got["chapters"]["diagnostics"]] == ["chapter_note_conflict"]
+    assert not [w for w in got["warnings"] if w["code"].startswith("chapter")], \
+        "章节的诊断混进了项目的 warnings 列表"
+    # 反过来：`bad_chapter` 必须**进** warnings（它和 bad_branch 是同一档）。
+    note = sd / b.dirname / "note.md"
+    note.write_text(note.read_text(encoding="utf-8")
+                    .replace("chapter: 主实验 | 另一句说明", "chapter: | 另一句说明"),
+                    encoding="utf-8")
+    assert "bad_chapter" in {w["code"] for w in core.compile_forest(sd)["warnings"]}
+
+
+def test_moving_a_step_carries_its_chapter_the_way_format_md_says(tmp_path):
+    """第 17.2 节承诺「`moved:` 之后章节**自己跟着变**：改的是 `parent` 一个字」。
+
+    这句话是继承的另一半好处，也是它最隐蔽的一面：把一条线从主实验挪进消融，
+    那几步的 `note.md` 里**一个字节都没变**（只多了一行 `moved:`），归属却全换了。
+    所以文档同时承诺写入侧会**把这次换章的名单报出来**——不报的话，
+    这是一次在 diff 里完全看不见的改动。两句话在这里一起核。
+    """
+    p = W.create_project(tmp_path, "要挪一条线的项目")
+    sd = core.steps_dir_of(tmp_path, p.slug)
+    main, _ = W.create_step(sd, title="主线", chapter="主实验 | 论文图 3",
+                            body="## 为什么\n因为。\n")
+    kid, _ = W.create_step(sd, parent=main.id, title="接着做", body="## 为什么\n因为。\n")
+    abl, _ = W.create_step(sd, title="消融的起点", chapter="消融实验 | 逐个拿掉模块",
+                           body="## 为什么\n因为。\n")
+    assert core.resolve_chapters(W.load(sd))[kid.id] == "主实验"
+
+    before = (sd / kid.dirname / "note.md").read_text(encoding="utf-8")
+    info = W.move_step(sd, kid.id, abl.id, "这一步其实是对着消融做的")
+    assert core.resolve_chapters(W.load(sd))[kid.id] == "消融实验", \
+        "移动之后章节没跟着 parent 走"
+
+    # 它自己从来没写过 `chapter:`——归属全靠继承，所以正文里一个字都没多。
+    after = (sd / kid.dirname / "note.md").read_text(encoding="utf-8")
+    assert "chapter:" not in after, "移动竟然给这一步落了一行 chapter:"
+    touched = [ln.split(":", 1)[0] for ln in after.split("\n")
+               if ln not in before.split("\n") and ":" in ln]
+    assert touched == ["parent", "moved"], \
+        f"这次移动改的不止 parent 和那一行 moved:（还动了 {touched}）"
+
+    # 写入侧把换章的名单报出来（`chapter` 这个键只在两头真有章节时才有值）。
+    assert info["chapter"]["from"] == "主实验" and info["chapter"]["to"] == "消融实验"
+    assert info["chapter"]["changed"] and kid.id in info["chapter"]["steps"]
+
+
+def test_the_two_things_chapter_does_not_do_are_written_down_and_the_code_agrees(tmp_path):
+    """两件**刻意不做**的事必须写在文档里，否则后来人会当成漏了去「补上」。
+
+    ① **id 不按章节重编号**：消融不从 001 重新开始。id 是分配顺序不是章节内序号，
+       而 `[[007]]` 和论文脚注要在整个项目里唯一——那是只追加的地基。
+    ② **章节不嵌套**：名字里的 `/` 只是显示分组，`主实验/数据准备` 和 `主实验`
+       是两个**平级**的章节，成员不会算进后者。
+
+    两条都同时核对文档和代码：光断言文档里有这句话，等于只防住了「有人删掉它」。
+    """
+    for doc in (FORMAT, README, SKILL):
+        body = text(doc)
+        assert "id 不按章节重编号" in body or "别按章节重编号 id" in body, \
+            f"{where(doc)} 没写「id 不按章节重编号」"
+        assert "章节不嵌套" in body, f"{where(doc)} 没写「章节不嵌套」"
+
+    p = W.create_project(tmp_path, "分了章的项目")
+    sd = core.steps_dir_of(tmp_path, p.slug)
+    a, _ = W.create_step(sd, title="建库", chapter="主实验/数据准备 | 建库与清洗",
+                         body="## 为什么\n因为。\n")
+    b, _ = W.create_step(sd, parent=a.id, title="主结果", chapter="主实验 | 论文图 3",
+                         body="## 为什么\n因为。\n")
+    c, _ = W.create_step(sd, parent=b.id, title="消融", chapter="消融实验 | 逐个拿掉",
+                         body="## 为什么\n因为。\n")
+    assert [a.id, b.id, c.id] == ["001", "002", "003"], \
+        f"id 按章节重编号了: {[a.id, b.id, c.id]}"
+
+    ch = core.compile_forest(sd)["chapters"]
+    names = [x["name"] for x in ch["chapters"]]
+    assert names == ["主实验/数据准备", "主实验", "消融实验"]
+    nested = next(x for x in ch["chapters"] if x["name"] == "主实验/数据准备")
+    flat = next(x for x in ch["chapters"] if x["name"] == "主实验")
+    assert nested["parts"] == ["主实验", "数据准备"], "显示分组的段没有拆出来"
+    assert nested["steps"] == [a.id] and flat["steps"] == [b.id], \
+        "带斜杠的章节被当成了子章节，成员算进了父名字里"
+    assert core.CHAPTER_SEP == "/" and "CHAPTER_SEP" in text(FORMAT), \
+        "分隔符的唯一来源没写进 FORMAT.md，界面会自己写死一个"
+
+
+def test_the_chapter_name_rules_in_format_md_are_the_ones_the_writer_enforces():
+    """第 17.9 节那两张表（抹平三种、拒绝三种）是**写入侧的硬校验**，逐条核对。
+
+    章节靠**同名**成立（没有章节注册表，P1 不许有），所以「看着一样、比起来不一样」
+    的差别会把一章静悄悄劈成两半。文档少写一条，人就会踩到一次自己看不见的分家；
+    多写一条（比如写成「大小写也会抹平」），他会以为 `Ablation` 和 `ablation`
+    是同一章，而系统当它们是两章。
+    """
+    sec = chapter_section()
+    assert W.norm_chapter("  主实验  ")["name"] == "主实验"
+    assert W.norm_chapter("Main  Experiment")["name"] == "Main Experiment"
+    assert W.norm_chapter("étude")["name"] == "étude", "NFC 归一没生效"
+    # **不折叠大小写**：这两个就是两个章节，交给读侧的 chapter_near_duplicate 点名。
+    assert W.norm_chapter("Ablation")["name"] != W.norm_chapter("ablation")["name"]
+    assert "不折叠大小写" in sec, "第 17.9 节没写清大小写不折叠"
+    # 斜杠合法（17.5 ②要求的显示分组），所以名字不能按路径段来限制字符。
+    assert W.norm_chapter("主实验/数据准备")["name"] == "主实验/数据准备"
+
+    with pytest.raises(W.WriteError):
+        W.norm_chapter({"name": "消融 | 实验"})           # 竖线会把这一行劈成两段
+    with pytest.raises(W.WriteError):
+        W.norm_chapter("消融\x07实验")                    # 看不见却参与相等比较
+    m = re.search(r"超过 (\d+) 个字符", sec)
+    assert m, "第 17.9 节没写出章节名的长度上限"
+    assert int(m.group(1)) == W.MAX_CHAPTER, \
+        f"文档写的上限是 {m.group(1)}，trace_write.MAX_CHAPTER 是 {W.MAX_CHAPTER}"
+    with pytest.raises(W.WriteError):
+        W.norm_chapter("消" * (W.MAX_CHAPTER + 1))
+    # 三条硬约定：空 = 撤销、只写说明直接拒绝、说明可选。
+    assert W.norm_chapter("") == {"name": "", "note": ""}
+    with pytest.raises(W.WriteError):
+        W.norm_chapter("| 逐个拿掉模块")
+    assert W.norm_chapter("消融实验") == {"name": "消融实验", "note": ""}
+    for doc in (FORMAT, SKILL):
+        assert "说明可选" in text(doc) or "说明**可选**" in text(doc), \
+            f"{where(doc)} 没说清章节说明是可选的（`pipeline:` 那边是必填，两者会被搞混）"
+
+
+def test_every_doc_teaches_declaring_a_chapter_only_on_the_first_step():
+    """**这条防的是 agent 最容易犯的错**：给每一步都标一遍章节。
+
+    每步各标一遍不是「更保险」，是把一次声明展开成 N 份会漂移的拷贝——改一次
+    章节名要改 N 个文件、把一支挪走它还带着一行过期的声明，而「章节说明归谁」
+    会被 N 份同名声明搅浑。这正是 P1 禁止的那种中心索引，只是它长在每个步骤自己身上。
+
+    所以三份文档（人读的 FORMAT、上手的 README、agent 读的 SKILL）必须都把这句话
+    写成一样的说法，并且都写出「继承」这个机制本身——只说「别标」不说「为什么不用标」，
+    照做的人会以为底下那些步骤根本没有章节。
+    """
+    for doc in (FORMAT, README, SKILL):
+        body = text(doc)
+        assert "只标开启那条线的第一步" in body, \
+            f"{where(doc)} 没有「只标开启那条线的第一步」这句话"
+        assert "继承" in body and "chapter" in body, f"{where(doc)} 没讲清继承"
+    # agent 那两份也要知道章节是什么，否则「按章节报结论」无从谈起。
+    for doc in (ROOT / "agents" / "trace-auditor.md", ROOT / "agents" / "trace-reproducer.md"):
+        assert "chapter" in text(doc) and "章节" in text(doc), \
+            f"{where(doc)} 一个字都没提章节"
+
+
+def test_the_three_concepts_are_told_apart_the_same_way_in_every_doc():
+    """项目 / 章节 / 分叉是这一版最容易被误用的一处，而误用的方向是固定的：
+    **人会拿章节去表达分叉**。
+
+    分界线只有一句话——**章节之间不互斥**（都要留、都写进论文），分叉只能剩一条。
+    三份文档各讲一遍，说法必须是同一套；判别问句也要和第 15 节那句逐字一致
+    （「这两条能同时成立吗」是已经教过一次的动作，换个问法等于又要人学一遍）。
+    """
+    for doc in (README, FORMAT, SKILL):
+        body = text(doc)
+        assert "这两条能同时成立吗" in body, f"{where(doc)} 没有那句判别问句"
+        assert "不互斥" in body, \
+            f"{where(doc)} 没写出「章节之间不互斥」——这是章节和分叉唯一的分界线"
+        assert "都写进论文" in body, f"{where(doc)} 没说清章节都要留、都要写进论文"
+
+
+def test_the_unassigned_group_sentinel_in_the_docs_is_the_one_the_code_uses():
+    """未分章那一组在命令行和查询串上写成一个记号，文档里那个记号必须就是代码里的。
+
+    为什么它非说不可：核心把未分章那组的名字定成**空串**，而空串在 `?chapter=` 和
+    `--chapter` 上和「没给」长得一模一样。而这一组恰恰常常是主实验（多数人只给消融
+    起了名字，主线一直没起）——记号写错一个字符，最该单独导一份 Methods 的那一块
+    反而导不出来，而命令本身不报任何错，只是回了整份流程。
+    """
+    sentinel = M.CHAPTER_NONE
+    assert f"?chapter={sentinel}" in text(FORMAT), \
+        f"FORMAT.md 没写出未分章那一组的查询串写法（应为 ?chapter={sentinel}）"
+    assert f"--chapter {sentinel}" in text(FORMAT), \
+        f"FORMAT.md 没写出未分章那一组的命令行写法（应为 --chapter {sentinel}）"
+    assert f'chapter="{sentinel}"' in text(SKILL), \
+        f"SKILL.md 没写出未分章那一组的参数写法（应为 chapter=\"{sentinel}\"）"
+
+
+def test_the_docs_are_honest_about_which_front_doors_carry_chapter():
+    """和 pipeline / branch 那两条同一个理由：**静默丢字段是最坏的一类缺陷**。
+
+    `chapter` 的四个门面各要单独接：MCP 的 `trace_update_step` 是**白名单**转发的、
+    `LocalBackend.create` 和 `POST …/steps` 各自逐个键地传参、REST 的 `PATCH`
+    把请求体整个透传（所以它靠 `W.MUTABLE`）。少接一个，从那个门进来的
+    `chapter` 会一声不吭地消失，而调用方拿到的是 200/201。
+
+    所以这条测试盯的是**文档说的和门面真接的一致**：全接上了，文档就该像现在这样
+    直接教怎么调；哪天有人在重构里把某个门面的透传丢了，这里会立刻要求文档
+    退回去写一句「这条路还没接」，而不是让 agent 对着一个静默丢字段的入口写记录。
+    """
+    assert "chapter" in W.MUTABLE, "chapter 不在 W.MUTABLE 里，PATCH 那条路也不通了"
+    mcp_src = (ROOT / "trace_mcp.py").read_text(encoding="utf-8")
+    m = re.search(r"def t_update_step\(.*?\n\ndef ", mcp_src, re.S)
+    assert m, "trace_mcp.py 里找不到 t_update_step 了（函数名变了？）"
+    # LocalBackend 那一份才逐个键地传参（HttpBackend 直接把 payload 整个转发出去，
+    # 所以它天然带得动新字段）。按类定位，别撞上同名的那一个。
+    i = mcp_src.find("class LocalBackend")
+    assert i != -1, "trace_mcp.py 里找不到 LocalBackend 了（类名变了？）"
+    c = re.search(r"    def create\(self, project, payload\):\n(?:(?!    def ).)*",
+                  mcp_src[i:mcp_src.find("\nclass ", i + 10)], re.S)
+    assert c, "trace_mcp.py 里找不到 LocalBackend.create 了"
+    server_src = (ROOT / "trace_server.py").read_text(encoding="utf-8")
+    s = re.search(r"async def api_create\(.*?\n\n", server_src, re.S)
+    assert s, "trace_server.py 里找不到建步骤那条路由了（函数名变了？）"
+
+    missing = [name for name, ok in (
+        ("MCP trace_update_step", '"chapter"' in m.group(0)),
+        ("MCP LocalBackend.create", 'payload.get("chapter"' in c.group(0)),
+        ("POST …/steps", 'payload.get("chapter"' in s.group(0)),
+    ) if not ok]
+    marker = "章节还没落到那两个门面"
+    warned = [where(d) for d in (FORMAT, SKILL) if marker in text(d)]
+    assert bool(missing) == bool(warned), (
+        f"这些门面仍然丢掉 chapter: {missing} —— FORMAT.md / SKILL.md 必须明说"
+        "（agent 会以为记上了，而磁盘上什么都没有）"
+        if missing else
+        f"门面都收 chapter 了，请删掉 {warned} 里那段「{marker}」的注意事项，"
+        "否则调用方会一直多发一个 PATCH")
 
 
 # ---------------------------------------------------------------- 前端资源

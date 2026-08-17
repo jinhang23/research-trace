@@ -43,6 +43,22 @@
   --alt: #6d3fc0;
   --join: #0d7f8a;
 
+  /* ⑨ 章节的六个色相。章节是**新通道**：一块底色带（同一章的卡片压在同一块
+     底色上）＋ 卡片左侧一道同色窄条。线型仍然只归 status、不透明度只归
+     「和你此刻的关注有没有关系」、上面那两个只归三种关系——一个都没借。
+     为什么敢和上面那几个颜色靠近：章节的色只出现在**大面积的淡底**和一道
+     3px 的窄条上，那两处从来没有别的含义；而且色相旁边永远跟着章节名
+     （图上是入口处那块牌子，卡片上是 tooltip）。**颜色只负责一眼扫到，
+     名字负责说得准**——和「颜色 + 形状」那条是同一句话。
+     只给六个：再多人也分不清，而分不清的颜色等于没有颜色（超过就循环用，
+     此时靠的就是名字那一半）。 */
+  --ch0: #3d6f9e;
+  --ch1: #9a6b2f;
+  --ch2: #4f7f6a;
+  --ch3: #85527e;
+  --ch4: #9a5350;
+  --ch5: #5c6480;
+
   --mono: ui-monospace, "Cascadia Mono", "Cascadia Code", Consolas, "DejaVu Sans Mono", monospace;
   --serif: "Source Han Serif SC", "Noto Serif CJK SC", "Songti SC", Georgia, "Times New Roman", serif;
   --sans: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
@@ -64,6 +80,14 @@
        都是 1.5–1.8px 的细线，细线对对比度比色块敏感得多。 */
     --alt: #b393f0;
     --join: #4fd1c5;
+    /* 深色底上同样提亮：底色带是 10% 的淡底，深色主题里太暗的色相压根显不出来，
+       于是「这两张卡片是一组」这件事就只剩那道 3px 的窄条了。 */
+    --ch0: #7aa8d6;
+    --ch1: #cfa25e;
+    --ch2: #79b39a;
+    --ch3: #c08fba;
+    --ch4: #d4867f;
+    --ch5: #98a1c0;
   }
 }
 
@@ -1351,6 +1375,144 @@ body.pipeline-mode #forkbar { display: none; }
   color: var(--muted); margin-right: 8px;
 }
 
+/* ---------------------------------------------------------------- ⑨ 章节
+ *
+ * 项目内部并列的几块（主实验 / 消融 / 数据准备）。界面上它是**横切**的：
+ * 顶栏一个筛选器，开发路径那三张图上按它 dim，定稿流程那一档按它换编哪一条流程。
+ *
+ * 两个新通道，一个都没借既有的：
+ *   底色带 + 卡片左侧窄条   同一章的步骤（色相 6 个循环，旁边永远跟着名字）
+ *   一对 45° 小斜杠         这条边跨出了自己那一章
+ * 线型仍然只归 status，不透明度仍然只归「和你此刻的关注有没有关系」
+ * （祖先链 / 搜索命中 / 章节筛选是同一件事的三种问法），边的颜色仍然只归三种关系。
+ */
+
+/* 色相有两个入口：面板里的东西带 class（.ch-2），图上的卡片和行带属性
+   （data-chi="2"）。卡片的 class 那一格已经被 status 占着（.card.s-dead 那一套），
+   往里塞第二种含义会让「这张卡片是什么」变成两句话拼出来的——所以那一侧走属性。 */
+.ch-0, [data-chi="0"] { --chc: var(--ch0); }
+.ch-1, [data-chi="1"] { --chc: var(--ch1); }
+.ch-2, [data-chi="2"] { --chc: var(--ch2); }
+.ch-3, [data-chi="3"] { --chc: var(--ch3); }
+.ch-4, [data-chi="4"] { --chc: var(--ch4); }
+.ch-5, [data-chi="5"] { --chc: var(--ch5); }
+
+#chapfilter {
+  font: inherit; font-size: 12.5px; max-width: 190px; flex: 0 0 auto;
+  padding: 5px 8px; border: 1px solid var(--rule); border-radius: 5px;
+  background: var(--bg); color: var(--ink); cursor: pointer;
+}
+#chapfilter[hidden] { display: none; }
+body.home-mode #chapfilter { display: none; }   /* 索引页没有「本项目的章节」这回事 */
+
+/* 图上那块底色带。淡到不和卡片抢，但足够看出「这几张是一组」。
+   描边用同色的 30%：纯填充在深色主题下几乎看不出边界。 */
+#dedges .chband {
+  fill: color-mix(in srgb, var(--chc) 11%, transparent);
+  stroke: color-mix(in srgb, var(--chc) 34%, transparent);
+  stroke-width: 1;
+}
+#dedges .chband.offchap { opacity: .3; }
+
+/* 卡片/行上那道窄条。**自己声明章节的那一步**画满、继承来的画淡——
+   前者是那个改一行就能把整条线搬走的锚点，值得一眼分得出。 */
+.card[data-chap]::before, .fcard[data-chap]::before {
+  content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+  background: var(--chc); opacity: .45;
+}
+.card[data-chdecl]::before, .fcard[data-chdecl]::before { opacity: .95; }
+#rows .row[data-chap] { box-shadow: inset 3px 0 0 color-mix(in srgb, var(--chc) 55%, transparent); }
+#rows .row[data-chdecl] { box-shadow: inset 3px 0 0 var(--chc); }
+
+/* 章节在图上的名牌，落在这个章节的每一个**入口**上。
+   ◆ = 章节从这里开始（自己声明的）· ◇ = 这个入口是继承进来的。
+   那两个字形是第二个通道：灰度打印和色觉异常下，「哪一步是锚点」照样看得见。 */
+.chaplabel {
+  position: absolute; z-index: 2; pointer-events: none;
+  display: inline-flex; align-items: center; gap: 3px;
+  max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 10px; line-height: 14px; padding: 0 5px; border-radius: 3px;
+  color: var(--chc);
+  background: color-mix(in srgb, var(--chc) 12%, var(--panel));
+  border: 1px solid color-mix(in srgb, var(--chc) 40%, transparent);
+}
+.chaplabel.decl { font-weight: 700; }
+.chaplabel .chdot { font-size: 8px; }
+.chaplabel.offchap { opacity: .28; }
+
+/* 跨章节的那条边上的记号。灰的：它说的不是「什么关系」（那三种颜色管着），
+   而是「这条边越过了一条章节的界」。 */
+.xchap { fill: none; stroke: var(--muted); stroke-width: 1.5; stroke-linecap: round; }
+.xchap.faded, .xchap.offchap { opacity: .24; }
+
+/* 章节筛选**只 dim、绝不 hide**（和搜索那条同一条理由：隐藏会打乱轨道对齐、
+   改变图的形状，而形状本身是信息）。写在 .faded / .miss 之后：一个节点同时
+   落在几种「和你无关」里时，取最淡的那一档。 */
+/* 值刻意**不比 .miss（.16）更淡**，而且要能和它分开。
+   dim 不 hide 的全部理由是「形状本身是信息」——「消融是从主实验哪一步分出去的」
+   靠的正是被筛掉的那一步还在原位看得见。.14 实测对比度 1.20:1，
+   比现存最淡的一档还低一格，等于把它藏了；而和 .miss 只差 0.02，
+   人也分不出一个淡掉的节点是「不在这一章」还是「没搜中」。 */
+#dnodes .card.offchap, #fnodes .fcard.offchap { opacity: .26; }
+#rows .row.offchap { opacity: .16; }
+
+/* ---- 详情面板里那一块 */
+
+.chapbox { border-left: 3px solid color-mix(in srgb, var(--chc, var(--rule)) 60%, transparent); padding-left: 12px; }
+.chapbox .chwhere {
+  margin: 0 0 8px; font-size: 12px; color: var(--muted);
+}
+.chapbox .chwhere.decl { color: var(--chc, var(--ink)); font-weight: 600; }
+.chapbox .chwhere a { color: var(--accent); font-family: var(--mono); }
+.chapbox .chdesc { margin: 0 0 8px; font-size: 12.5px; line-height: 1.8; }
+.chapbox .chdesc b {
+  font-size: 10px; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--muted); margin-right: 8px;
+}
+.chapbox .chfacts { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; margin: 0 0 8px; }
+.chroots { font-size: 11.5px; color: var(--muted); }
+.chsteps { font-size: 11.5px; line-height: 2; }
+.chsteps b { font-family: var(--mono); }
+.chapchip {
+  padding: 0 5px; border-radius: 3px; border: 1px dashed var(--rule); color: var(--muted);
+}
+.xchip {
+  font-size: 11px; padding: 0 5px; border-radius: 3px; color: var(--muted);
+  border: 1px solid var(--rule);
+}
+.xlist li { margin: .35em 0; }
+
+/* ---- 项目主页上那一块，以及定稿流程里的按章清单 */
+
+.chappanel .chlist { margin: 10px 0 4px; }
+.chrow {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px;
+  margin: .45em 0; padding-left: 8px;
+  border-left: 3px solid color-mix(in srgb, var(--chc, var(--rule)) 65%, transparent);
+}
+/* 章节名本身就是「只看这一章」那个开关：不做成按钮的样子（一行里全是按钮
+   反而读不出哪个是名字），只在悬停时露出它可点。 */
+.chapgo {
+  padding: 1px 6px; font-size: inherit; font-weight: 600;
+  border-color: transparent; background: transparent; color: inherit;
+}
+.chapgo:hover { border-color: var(--rule); background: var(--hi); }
+.chrow .chapgo { color: var(--chc, var(--ink)); }
+.chchecks { margin-top: 12px; }
+.chchecks .wrow { font-size: 12.5px; line-height: 1.8; padding: 3px 0; }
+.chchecks .wrow b { font-family: var(--mono); font-size: 11.5px; }
+.pchaps { margin-top: 6px; font-size: 11px; color: var(--muted); }
+
+/* 图例里那两条。色块和斜杠都是图上真正画出来的样子。 */
+#legend .lgband {
+  width: 18px; height: 9px; border-radius: 2px; border-top-width: 0;
+  background: color-mix(in srgb, var(--chc) 22%, transparent);
+  border: 1px solid color-mix(in srgb, var(--chc) 45%, transparent);
+}
+#legend .lgcross { width: 20px; border-top-width: 0; color: var(--muted); }
+#legend .lgcross svg { width: 20px; height: 12px; display: block; }
+#chaplegend[hidden] { display: none; }
+
 /* ---------------------------------------------------------------- 窄屏 */
 
 /* 图视图在窄屏上的说法：不删、不改布局算法（那是纯函数，改了图和列表就对不上），
@@ -1374,6 +1536,10 @@ body.pipeline-mode #forkbar { display: none; }
   #gitdot, #gitwarn, #live { order: 12; }
   .seg.lang button { padding: 4px 6px; }
   #proj { max-width: 33vw; padding: 5px 4px; }
+  /* 章节筛选跟着搜索框那一行走（order 和 #top .grow 同一档）：它和搜索是同一类
+     动作，而且第一行已经被项目选择、两级切换器和「＋ 新步骤」占满了——挤进去
+     会把顶栏从两行顶成三行，在 812px 高的屏上白吃掉一整行。 */
+  #chapfilter { order: 10; max-width: 34vw; padding: 5px 4px; font-size: 12px; }
   #btn-new, #btn-newproj, #btn-token { padding: 5px 7px; font-size: 12.5px; }
   .seg button { padding: 5px 8px; }
   #hitlist { top: 0; position: static; max-height: none; }

@@ -483,7 +483,7 @@ def test_new_can_write_inputs_and_a_code_snapshot(sandbox, tmp_path: Path, monke
     new_args = type("A", (), {"project": None, "parent": None, "status": "wip", "date": "",
                               "commit": "", "author": "human", "tags": "", "path": None,
                               "title": "配对", "input": ["001 | pocket.csv"],
-                              "branch": "", "decision": "",
+                              "branch": "", "decision": "", "chapter": "",
                               "code": ["snapshot | /orange/snap/20260809 | manifest=MANIFEST.md5"]})()
     sd = core.steps_dir_of(data, "第一个课题")
     W.create_step(sd, title="上游")
@@ -657,7 +657,9 @@ def result_args(**kw):
 
 
 def pipeline_args(**kw):
-    return type("A", (), {"project": None, "methods": False, "svg": None, "page": None, **kw})()
+    return type("A", (), {"project": None, "methods": False, "svg": None, "page": None,
+                          # 不给就是整个项目的一张总图（章节之间共用的准备步骤只出现一次）。
+                          "chapter": "", **kw})()
 
 
 def test_pipeline_without_a_declared_result_teaches_instead_of_scolding(graded, capsys):
@@ -840,3 +842,190 @@ def test_the_deploy_guide_says_how_to_upgrade_and_in_which_order():
     assert "software" in up, "要教怎么确认新代码真的在跑"
     assert "--selfcheck" in up or "--version" in up, "管理端那边也要有自检的入口"
     assert "数据仓不用动" in up or "数据仓" in up, "得说清数据不需要迁移"
+
+
+# ------------------------------------------------------------ 章节（chapter / pipeline --chapter）
+#
+# CLI 这一侧防的是三件事：**按章节筛在 CLI 里重写了一遍**（那就是第二份实现，
+# 而其中一份产物会进论文）、按章节导出的文件名拿章节名直接拼（章节名不是路径
+# 安全的），以及章节的诊断被混进影响等级的那两栏里。
+
+
+def chapter_args(**kw):
+    return type("A", (), {"project": None, **kw})()
+
+
+@pytest.fixture()
+def chaptered(sandbox, tmp_path: Path, monkeypatch):
+    """001 清洗 → 002 主实验★（都未分章）；003 开消融 → 004 消融汇总★。
+
+    004 的 `input:` 同时指着 003 和主线的 002 —— 那条跨章节的边就是
+    「消融是对着主结果测的」。
+    """
+    import trace_write as W
+
+    data = tmp_path / "chdata"
+    data.mkdir()
+    init(sandbox, data_dir=str(data))
+    monkeypatch.setattr(cli, "load_config", lambda: {"data_dir": str(data)})
+    sd = core.steps_dir_of(data, "第一个课题")
+    body = "## 为什么\n试试\n## 做了什么\n跑\n## 结果\n0.91\n## 结论\n有用\n"
+    W.create_step(sd, title="清洗数据", status="done", commit="abc",
+                  paths=["/blue/x | output | 训练集"], body=body)
+    W.create_step(sd, parent="001", title="主实验 AUC 0.91", status="done", commit="abc",
+                  paths=["/blue/y | output | 权重"], body=body)
+    W.create_step(sd, parent="002", title="拿掉注意力模块", status="done", commit="abc",
+                  paths=["/blue/z | output | 消融权重"], body=body,
+                  chapter="消融实验 | 逐个拿掉模块，对着主实验的 002 比")
+    W.create_step(sd, parent="003", title="消融汇总表", status="done", commit="abc",
+                  paths=["/blue/w | output | 汇总表"], body=body,
+                  inputs=["003 | 逐个拿掉之后的数字", "002 | 主结果那一版权重"])
+    W.set_result(data, "第一个课题", "002", "主结果")
+    W.set_result(data, "第一个课题", "004", "图 4 的消融")
+    return data
+
+
+def test_chapter_lists_what_the_project_is_split_into(chaptered, capsys):
+    """分章之后第一个要问的问题：消融那部分多少步、能被追到哪一级、有没有成果。"""
+    assert cli.cmd_chapter(chapter_args()) == 0
+    out = capsys.readouterr().out
+    assert "消融实验" in out and "逐个拿掉模块" in out
+    assert "2 步" in out and "★ 成果 004" in out
+    assert "未分章" in out and "不是缺陷" in out, "主线常常没起过名字，这一组不带缺失感"
+    assert "互不排斥" in out and "分叉" in out, "章节和分叉的分界在这份清单上也要说"
+
+
+def test_chapter_on_an_unchaptered_project_teaches_instead_of_scolding(graded, capsys):
+    """没分章是**常态**。写成缺陷，人就会为了让输出干净随手分两块。"""
+    assert cli.cmd_chapter(chapter_args()) == 0
+    out = capsys.readouterr().out
+    assert "不是缺陷" in out and "chapter:" in out
+    assert "错误" not in out and "警告" not in out
+
+
+def test_pipeline_chapter_is_a_slice_not_a_second_filter(chaptered, capsys):
+    """CLI 自己筛一遍 order 就是第二份实现 —— 而其中一份产物会进论文。
+
+    这条把 CLI 的输出钉在 trace_mcp 那**一份** pipeline_payload 上。
+    """
+    import trace_mcp as mcp  # noqa: PLC0415
+
+    assert cli.cmd_pipeline(pipeline_args(chapter="消融实验", methods=True)) == 0
+    got = capsys.readouterr().out
+    want = mcp.pipeline_methods(
+        mcp.pipeline_payload(
+            core.compile_forest(core.steps_dir_of(chaptered, "第一个课题")),
+            "第一个课题", core.compute_pipeline({}, []), "第一个课题", "消融实验"))
+    assert got == want, "CLI 输出和那一份实现逐字节相同，否则两份迟早分家"
+    assert "借自" in got, "借来的上游要标出来，不能算成本章自己做的"
+
+
+def test_pipeline_without_a_chapter_points_at_the_per_chapter_export(chaptered, capsys):
+    """能按章节导这件事，不说就没人知道 —— 磁盘上分章只是一行 `chapter:`。"""
+    assert cli.cmd_pipeline(pipeline_args()) == 0
+    out = capsys.readouterr().out
+    assert "--chapter" in out and "消融实验" in out
+
+
+def test_an_unknown_chapter_name_lists_the_real_ones(chaptered):
+    """章节名是人起的中文，打错一个字是最常见的失败方式；
+    而「没有这一章」和「这一章是空的」在输出上长得一模一样。"""
+    import trace_write as W  # noqa: PLC0415
+
+    with pytest.raises(W.NotFound) as e:
+        cli.cmd_pipeline(pipeline_args(chapter="消融試驗"))
+    assert "消融实验" in str(e.value)
+
+
+def test_build_ships_one_export_per_chapter_with_a_derived_filename(chaptered, tmp_path: Path):
+    """论文里主实验一段 Methods、消融一段，本来就是两份文件。
+
+    文件名必须是**派生**的：章节名合法地可以是 `主实验/数据准备`、`CON`、`..`，
+    拿它直接拼路径要么写到别的目录去，要么在 Windows 上打开一个设备。
+    """
+    out = tmp_path / "site"
+    assert cli.cmd_build(type("A", (), {"out": str(out)})()) == 0
+    pd = out / "p" / "第一个课题"
+    assert (pd / "pipeline.md").is_file(), "合起来的那一份照样在"
+    made = sorted(p.name for p in pd.glob("pipeline-*.md"))
+    assert len(made) == 2, f"两个章节各一份，实际 {made}"
+    for name in made:
+        assert "/" not in name and ".." not in name
+    ab = next(p for p in pd.glob("pipeline-*.md")
+              if "消融实验" in p.read_text(encoding="utf-8"))
+    assert "借自" in ab.read_text(encoding="utf-8")
+
+
+def test_the_per_chapter_exports_are_byte_identical_across_builds(chaptered, tmp_path: Path):
+    """P3：删掉产物再重建，逐字节一致。分章之后这条不许松。"""
+    out = tmp_path / "site"
+    assert cli.cmd_build(type("A", (), {"out": str(out)})()) == 0
+    first = {p.name: p.read_bytes() for p in (out / "p" / "第一个课题").glob("pipeline*")}
+    assert cli.cmd_build(type("A", (), {"out": str(out)})()) == 0
+    again = {p.name: p.read_bytes() for p in (out / "p" / "第一个课题").glob("pipeline*")}
+    assert first == again and first
+
+
+def test_check_reports_each_chapter_level_separately(chaptered, capsys):
+    """整份流程的等级是**全项目**最弱的一步。拿它回答「消融那部分别人能不能重做」
+    就是让消融替别的章背锅 —— 而那正是分章之后要单独问的一句。"""
+    assert cli.cmd_check(check_args()) == 0
+    out = capsys.readouterr().out
+    assert "定稿流程" in out and "消融实验" in out and "未分章" in out
+    assert "--chapter" in out, "得给出照抄就能用的那条命令"
+
+
+def test_check_keeps_chapter_notes_out_of_the_columns_that_affect_the_level(chaptered, capsys):
+    """章节的三条诊断**一条都不影响 L0–L4**，也不进退出码。
+
+    混进上面那两栏，人会以为「两个人各写了一句章节说明」和「dead 没写结论」
+    一样严重，然后开始整体忽略这一段 —— 那正是警告失效的方式。
+    """
+    import trace_write as W  # noqa: PLC0415
+
+    sd = core.steps_dir_of(chaptered, "第一个课题")
+    W.update_step(sd, "004", {"chapter": "消融实验 | 另一个人写的另一句说明"})
+    assert cli.cmd_check(check_args(strict=True)) == 0, "章节提示不许让 --strict 失败"
+    out = capsys.readouterr().out
+    assert "章节提示" in out and "不影响 L0–L4" in out
+    assert "句不同的说明" in out, "说清是哪几处、哪一句生效，人才知道该删哪一句"
+    assert "⚠ [" not in out.split("章节提示")[1], "它不许被复述进那两栏"
+
+
+def test_a_project_without_any_chapter_gains_nothing_in_check(graded, capsys):
+    """现存项目必须**完全无感**：不多一栏、不多一条提示。"""
+    cli.cmd_result(result_args(id="002", note="主结果"))
+    capsys.readouterr()
+    assert cli.cmd_check(check_args()) == 0
+    out = capsys.readouterr().out
+    assert "章节" not in out and "未分章" not in out
+
+
+def test_new_can_open_a_chapter_and_says_it_carries_the_subtree(chaptered, capsys):
+    """章节写在**开启那条线的第一步**上，所以 new 这里就得能给：
+    建完再改一次的话，这一步已经在上一章里躺过一轮。"""
+    new_args = type("A", (), {"project": None, "parent": "001", "status": "wip", "date": "",
+                              "commit": "", "author": "human", "tags": "", "path": None,
+                              "title": "开数据准备", "input": None, "code": None,
+                              "branch": "", "decision": "", "chapter": "数据准备"})()
+    assert cli.cmd_new(new_args) == 0
+    out = capsys.readouterr().out
+    assert "数据准备" in out and "继承" in out
+    assert "别给每一步各写一遍" in out, "不说这一句，人会给二十步各标一遍"
+
+
+def test_mv_says_which_chapter_the_line_just_moved_into(chaptered, capsys):
+    """换章**磁盘上一个字节都没变**：二十步集体转章，diff 里只有一行 `moved:`。
+
+    这是移动最常见的用意之一，而它比「树形和创建顺序对不上」更隐蔽。
+    """
+    assert cli.cmd_mv(mv_args(id="003", parent="001",
+                              reason="消融其实是直接从清洗好的数据出发的")) == 0
+    out = capsys.readouterr().out
+    assert "章节" in out and "消融实验" in out
+
+
+def test_mv_on_an_unchaptered_project_says_nothing_about_chapters(graded, capsys):
+    """两头都没有章节时 move_step 给的是 None —— 现存项目不该多读一条信息。"""
+    assert cli.cmd_mv(mv_args(id="003", parent="001", reason="003 的输入来自 001")) == 0
+    assert "章节" not in capsys.readouterr().out

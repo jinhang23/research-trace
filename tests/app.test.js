@@ -849,3 +849,210 @@ test("模型只收 core 算出来的成员，dead 的那一步一个字都不进
  * 被发出去的那批字节。留在这里等于对着一个已经不存在的实现做保证。
  */
 
+/* ==================== ⑨ 章节：项目内部并列的几块 ====================
+ *
+ * 磁盘上只多一行 `chapter:`，写在开启那条线的那一步上，底下整棵子树继承。
+ * 这一组钉的是「界面拿它算出来的那些东西」——归属、色相、底色带、跨章记号、
+ * 换章会带走谁、按章导出的文件名。
+ */
+
+const CHAP_FOREST = {
+  steps: [
+    { id: "001", status: "done", chapter: { name: "数据准备", declared: true, note: "清洗与切分" } },
+    { id: "002", parent: "001", status: "done", chapter: { name: "数据准备", declared: false, note: "" } },
+    { id: "003", parent: "002", status: "done", chapter: { name: "主实验", declared: true, note: "出论文的主结果" } },
+    { id: "004", parent: "003", status: "wip", chapter: { name: "主实验", declared: false, note: "" } },
+    { id: "005", parent: "004", status: "wip", chapter: { name: "消融实验", declared: true, note: "逐个拿掉模块" } },
+    { id: "006", status: "wip" },
+    { id: "007", parent: "006", status: "dead", chapter: { name: "消融实验", declared: true, note: "" } },
+  ],
+  chapters: {
+    declared: true,
+    chapters: [
+      { name: "数据准备", parts: ["数据准备"], note: "清洗与切分", declared_at: ["001"],
+        steps: ["001", "002"], roots: ["001"], n: 2,
+        status: { wip: 0, done: 2, dead: 0 }, level: "L2", weakest: "002" },
+      { name: "主实验", parts: ["主实验"], note: "出论文的主结果", declared_at: ["003"],
+        steps: ["003", "004"], roots: ["003"], n: 2,
+        status: { wip: 1, done: 1, dead: 0 }, level: "L1", weakest: "004" },
+      { name: "消融实验", parts: ["消融实验"], note: "逐个拿掉模块", declared_at: ["005", "007"],
+        steps: ["005", "007"], roots: ["005", "007"], n: 2,
+        status: { wip: 1, done: 0, dead: 1 }, level: "L0", weakest: "007" },
+      { name: "主实验/画图", parts: ["主实验", "画图"], note: "", declared_at: ["009"],
+        steps: ["009"], roots: ["009"], n: 1,
+        status: { wip: 1, done: 0, dead: 0 }, level: "L1", weakest: "009" },
+    ],
+    of: { "001": "数据准备", "002": "数据准备", "003": "主实验", "004": "主实验",
+          "005": "消融实验", "007": "消融实验", "009": "主实验/画图" },
+    unassigned: ["006"],
+    crossings: [
+      { from: "002", to: "003", kind: "parent", from_chapter: "数据准备", to_chapter: "主实验", note: "" },
+      { from: "004", to: "005", kind: "input", from_chapter: "主实验", to_chapter: "消融实验", note: "主结果的 checkpoint" },
+      { from: "006", to: "007", kind: "parent", from_chapter: "", to_chapter: "消融实验", note: "" },
+    ],
+    diagnostics: [{ level: "info", code: "chapter_no_result", where: "project.md", vars: { name: "数据准备" } }],
+  },
+};
+
+function chapById() {
+  const byId = {};
+  CHAP_FOREST.steps.forEach((s) => { byId[s.id] = s; });
+  return byId;
+}
+
+test("一个 chapter: 都没写的项目：模型是空的，界面据此一个像素都不画", () => {
+  // 这是这一整轮最硬的一条要求。forest 里连 chapters 这个键都不该有，
+  // 而模型必须老实说 declared:false —— 造一份空章节清单出来，界面就会开始
+  // 渲染一个恒灰的下拉框和一块「你还没分章」的面板，那已经不是「完全无感」了。
+  const m = U.chapterModel({ steps: [{ id: "001" }] });
+  assert.equal(m.declared, false);
+  assert.deepEqual(m.list, []);
+  assert.deepEqual(m.crossings, []);
+  assert.deepEqual(m.unassigned, []);
+  assert.deepEqual(Object.keys(m.of), []);
+  assert.equal(U.chapterModel(null).declared, false);      // forest 还没到就渲染时
+});
+
+test("章节的色相按清单顺序循环，同一个章节永远是同一个色 —— 颜色只负责一眼扫到", () => {
+  const m = U.chapterModel(CHAP_FOREST);
+  assert.deepEqual(m.list.map((c) => c.hue), [0, 1, 2, 3]);
+  assert.equal(m.byName["消融实验"].hue, 2);
+  // 超过六个就循环用：再多人也分不清，此时靠的是名字那一半（图上的名牌、tooltip）
+  assert.equal(U.chapterHue(U.CHAPTER_HUES), 0);
+  assert.equal(U.chapterHue(U.CHAPTER_HUES + 3), 3);
+});
+
+test("斜杠只用来分组显示，parts 直接用 core 拆好的那份 —— 界面不认识那个分隔符", () => {
+  // 章节不嵌套（chapter.nest.note）。分隔符的唯一来源是 core.CHAPTER_SEP，
+  // 前端再写一个 "/" 就是第二份声明：core 改了分隔符，界面会继续按旧的分组。
+  const m = U.chapterModel(CHAP_FOREST);
+  assert.equal(m.byName["主实验/画图"].group, "主实验");
+  assert.deepEqual(m.byName["主实验/画图"].parts, ["主实验", "画图"]);
+  assert.equal(m.byName["主实验"].group, "", "单段的名字不该被塞进一个分组里");
+});
+
+test("归属是继承出来的，declared 说的是这一行写在哪 —— 两者混用会让整条子树看着像未分章", () => {
+  const byId = chapById();
+  assert.equal(U.chapterSourceOf(byId, "004"), "003", "继承来的要指回声明它的那一步");
+  assert.equal(U.chapterSourceOf(byId, "003"), "003", "自己声明的就是自己");
+  assert.equal(U.chapterSourceOf(byId, "006"), "", "未分章的没有声明处");
+  // 归属本身仍然只有 core 那一份判据（chapters.of），这里只回答「改哪一步」
+  assert.equal(U.chapterModel(CHAP_FOREST).of["004"], "主实验");
+});
+
+test("parent 成环时找声明处不转死 —— 磁盘上真出现过环，界面也得画得出来", () => {
+  const byId = { a: { id: "a", parent: "b" }, b: { id: "b", parent: "a" } };
+  assert.equal(U.chapterSourceOf(byId, "a"), "");
+});
+
+test("在这一步开一章会带走底下哪几步 —— 自己声明过的那一支整支不跟着走", () => {
+  // 换章磁盘上一个字节都不变（只有这一行），二十步集体转章，diff 里什么都看不出来。
+  // 所以这个数得在 toast 里说出来，而它必须**在写之前**算得准。
+  const byId = chapById();
+  assert.deepEqual(U.chapterCarry(byId, "001"), ["002"],
+    "003 自己声明了主实验，它和它底下那一整支都不跟着走");
+  assert.deepEqual(U.chapterCarry(byId, "003"), ["004"], "004 是继承来的，它跟着走");
+  assert.deepEqual(U.chapterCarry(byId, "004"), [], "005 声明过，所以一步都带不走");
+  assert.deepEqual(U.chapterCarry(byId, "006"), [], "007 声明过");
+});
+
+test("章节说明写回哪一步：id 序最早的那个**带说明的**声明 —— 和 core 的裁决逐字一致", () => {
+  // 不一致的后果很气人：人在界面上改了说明，屏幕上显示的还是另一步写的那句。
+  const byId = chapById();
+  const m = U.chapterModel(CHAP_FOREST);
+  assert.equal(U.chapterNoteHome(m.byName["消融实验"], byId), "005",
+    "007 也声明了这一章，但它没写说明");
+  // 一句说明都没有时落在最早的那个声明上（那是唯一能写进去的地方）
+  assert.equal(U.chapterNoteHome({ declaredAt: ["007"] }, byId), "007");
+  assert.equal(U.chapterNoteHome({ declaredAt: [] }, byId), "");
+});
+
+test("底色带绝不覆盖别人家的节点：中间夹一张外人就断开", () => {
+  // 一个章节可以横跨好几棵树，随手圈一个包围盒会把别的章节的卡片圈进去，
+  // 而人相信的正是自己看见的那一圈。
+  const nodes = { a: { x: 0, y: 0 }, b: { x: 200, y: 0 }, c: { x: 400, y: 0 } };
+  const one = U.chapterBands(nodes, ["a", "b", "c"], { nw: 176, nh: 58, pad: 0 });
+  assert.deepEqual(one, [{ x: 0, y: 0, w: 576, h: 58 }], "一层里连着的成员是一段");
+  const cut = U.chapterBands(nodes, ["a", "c"], { nw: 176, nh: 58, pad: 0 });
+  assert.deepEqual(cut, [{ x: 0, y: 0, w: 176, h: 58 }, { x: 400, y: 0, w: 176, h: 58 }],
+    "b 不是成员，带子必须在它那里断开");
+});
+
+test("底色带横跨几棵树时各画各的，而且是纯函数（同一份数据永远同一批坐标）", () => {
+  const nodes = { a: { x: 0, y: 0 }, b: { x: 600, y: 0 }, c: { x: 0, y: 96 },
+                  x: { x: 300, y: 0 } };
+  const got = U.chapterBands(nodes, ["a", "b", "c"], { nw: 100, nh: 50, pad: 4 });
+  assert.equal(got.length, 3, "同一层被外人 x 切成两段，另一棵树上还有一段");
+  assert.deepEqual(got, U.chapterBands(nodes, ["a", "b", "c"], { nw: 100, nh: 50, pad: 4 }));
+});
+
+test("跨章记号钉在边的中点上，是两笔独立的斜杠 —— 它不改线型也不改颜色", () => {
+  const d = U.crossTick({ x: 10, y: 0 }, { x: 10, y: 20 }, { len: 4, gap: 4 });
+  assert.equal((d.match(/M/g) || []).length, 2, "两笔平行的斜杠");
+  assert.ok(!/stroke|dasharray/.test(d), "记号只出坐标，线型和颜色归 CSS 和别的通道");
+  // 两笔各自的中心落在中点两侧（沿着边的方向各让开半个 gap）：
+  // 这条边的中点是 (10, 10)，两笔就该以 (10, 8) 和 (10, 12) 为心。
+  const mid = d.split("M").filter(Boolean).map(function (seg) {
+    const p = seg.split("L").map(function (q) { return q.trim().split(" ").map(Number); });
+    return [(p[0][0] + p[1][0]) / 2, (p[0][1] + p[1][1]) / 2];
+  });
+  assert.deepEqual(mid, [[10, 8], [10, 12]]);
+  assert.deepEqual(d, U.crossTick({ x: 10, y: 0 }, { x: 10, y: 20 }, { len: 4, gap: 4 }));
+});
+
+test("章节名不是路径安全的，导出文件名必须派生：斜杠、设备名、超长都得中和掉", () => {
+  // `主实验/数据准备` 是合法名字（设计要求按 `/` 分组显示），`CON` 也是。
+  // 拿名字直接拼文件名，前者会写到子目录去、后者在 Windows 上打开的是设备。
+  assert.equal(U.chapterSlug("主实验/数据准备"), "主实验-数据准备");
+  assert.equal(U.chapterSlug("  Ablation study  "), "ablation-study");
+  assert.ok(!["con", "nul", "lpt1"].includes(U.chapterSlug("CON")), "设备名要被挪开");
+  assert.equal(U.chapterSlug("../../etc"), "etc");
+  // 未分章那一组也要有自己的文件名，而且**必须和 Python 侧叫同一个名字**：
+  // 这一份和 trace_mcp.chapter_export_name 派生的是同一批字节的文件名，
+  // 各起各的（曾经是 `unchaptered` 对 `unassigned`）就等于同一份导出在浏览器里
+  // 和在 `build` 出来的目录里叫两个名字。tests/test_seams_chapter.py 逐个比对。
+  assert.equal(U.chapterSlug(""), "unassigned", "未分章那一组也要有自己的文件名");
+  assert.equal(U.chapterSlug("CON"), "con-ch", "设备名的躲法也得和 Python 侧一致");
+  assert.ok(U.chapterSlug("章".repeat(80)).length <= 40);
+});
+
+test("服务端回执里那个 chapter 是对象不是字符串 —— 探针拿整个对象去比会永远说「不认」", () => {
+  // 这条钉的是一个真实缺陷：`d.chapter === name` 永远不成立（那是个 dict），
+  // 于是按章节导出整块**静默消失**——没有报错，只是按钮不出现。
+  assert.equal(U.chapterEcho({ chapter: { name: "消融实验", label: "消融实验" } }), "消融实验");
+  assert.equal(U.chapterEcho({ chapter: { name: "", label: "（未分章）" } }), "",
+               "未分章那一组的名字就是空串，它是**一个回答**，不是「没回答」");
+  assert.equal(U.chapterEcho({ pipeline: {} }), null, "没升级的服务端会忽略参数，得判得出来");
+  assert.equal(U.chapterEcho(null), null);
+});
+
+test("只差大小写的两个章节导出成两个文件 —— 后一份绝不许静默盖掉前一份", () => {
+  // 大小写是**故意**不折叠的（core 的 chapter_near_duplicate 专门逮这种笔误），
+  // 于是两个不同章节完全可能 slug 成同一个词。
+  const got = U.chapterFileStems(["Ablation", "ablation", "消融"]);
+  assert.equal(new Set(got).size, 3, "两份 Methods 草稿落到了同一个文件名上");
+  assert.equal(got[0], "ablation");
+});
+
+test("没有章节的项目，定稿流程那份派生一个键都不多 —— chapters 是空数组不是假数据", () => {
+  const m = U.pipelineModel(fixture(), OPTS);
+  assert.deepEqual(m.chapters, []);
+});
+
+test("每章各一条流程：切的是 core 给的那一份，浏览器里不重算闭包", () => {
+  // 各算一遍的代价是「屏幕上讨论的图和投出去的图不是一张」。core 已经把那一张
+  // DAG 按 result: 所属的章节切好了，这里只负责挑出对应的条目。
+  const f = fixture();
+  f.pipeline.chapters = [
+    { name: "主实验", results: ["003"], order: ["001", "003"], external: ["001"],
+      level: "L1", weakest: "003", weak: ["003"], dead: [] },
+  ];
+  const m = U.pipelineModel(f, OPTS);
+  assert.equal(m.chapters.length, 1);
+  assert.deepEqual(m.chapters[0].external, ["001"], "借来的上游要能标出「借自哪一章」");
+  const items = U.pipelineChapterSteps(m, m.chapters[0]);
+  assert.deepEqual(items.map((s) => s.id), ["001", "003"]);
+  // **编号不重编**：开发路径卡片上的 [2]、这一屏上的 2、导出那张图上的 2 是同一个数
+  assert.deepEqual(items.map((s) => s.n), [1, 2]);
+  assert.deepEqual(U.pipelineChapterSteps(m, { order: ["003"] }).map((s) => s.n), [2]);
+});

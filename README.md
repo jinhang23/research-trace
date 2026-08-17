@@ -350,8 +350,9 @@ repro: verified | 2026-08-08 | agent:claude | 干净 split 重跑 3 个种子，
 完整的写法契约（每个键什么意思、指标表怎么写、图注怎么写、L0–L4 怎么判、
 渲染器认哪些 markdown）在 [FORMAT.md](FORMAT.md)。
 
-这几个键各自解决一个具体问题（后三个上面的示例里没有：前两个只在分了叉时才写，
-最后一个只在算出来的定稿流程需要被推翻时才写）：
+这几个键各自解决一个具体问题（后四个上面的示例里没有：`branch` / `decision` 只在分了叉
+时才写，`pipeline` 只在算出来的定稿流程需要被推翻时才写，`chapter` 只在开启并列的
+一块时写一次）：
 
 | 键 | 回答的问题 | 详见 |
 |---|---|---|
@@ -361,6 +362,7 @@ repro: verified | 2026-08-08 | agent:claude | 干净 split 重跑 3 个种子，
 | `branch` | **这一步和它 parent 之间那条边什么意思**：接着往下做，还是一个互斥候选 | [FORMAT.md](FORMAT.md) 第 15 节 |
 | `decision` | **这一步底下那个岔路口在决定什么**——和「为什么」一样只能人写 | [FORMAT.md](FORMAT.md) 第 15 节 |
 | `pipeline` | **这一步算不算定稿流程的一环**（`include` / `exclude`），用来推翻算出来的结论。理由必填 | [FORMAT.md](FORMAT.md) 第 16 节 |
+| `chapter` | **这一步开启了哪一块**（主实验 / 消融实验 / 数据准备）。只写在开启那条线的**那一步**上，整条子树沿 parent 继承 | [FORMAT.md](FORMAT.md) 第 17 节 |
 
 `path` / `repro` / `input` / `code` / `moved` 这五个键**可以重复多行**，其余的后写覆盖先写。
 
@@ -562,6 +564,61 @@ python trace_cli.py pipeline -P <项目> --svg fig.svg --page share.html # 图 +
 流程的步骤带一个徽标，一点就跳进流程。
 
 完整的推导规则、七条诊断和写法见 [FORMAT.md](FORMAT.md) 第 16 节。
+
+## 一个项目里并列的几块：章节
+
+同一个项目内部本来就不是一条线：**主实验**、**消融实验**、**数据准备**各有各的探索
+路径，在论文里各占一段 Methods。森林（多个根）早就给了「独立的路径」，缺的只是给
+这几条线**起个名字**，好让「消融这一块」能被当成一个单元来看。
+
+一行就够，写在**开启那条线的那一步**上，整条子树沿 `parent` 继承：
+
+```
+chapter: 消融实验 | 逐个拿掉模块，对着主实验的 023 比
+```
+
+**只标开启那条线的第一步。**底下那二十步一个字都不用写——每一步各标一遍就成了二十份
+会漂移的拷贝：改一次章节名要改二十个文件，把一支挪走它还带着一行过期的声明。
+反过来，`moved:` 之后章节自己跟着走，改的是 `parent` 一个字。想让某一步脱离，
+它自己声明一个新名字即可；一路到根都没人声明就是**未分章**，
+**绝大多数项目就是这个状态，而它们一个字都不会多出来**（没有 `chapters` 那个键、
+没有多余的提示、布局一个数不变）。
+
+### 项目 / 章节 / 分叉是三样东西
+
+误用的方向是固定的：**人会拿章节去表达分叉**。各问一句话就分得开：
+
+| 问自己 | 是哪一种 | 怎么写 |
+|---|---|---|
+| 它们会写进**同一篇论文**吗？不会 | 两个**项目** | 各建一个项目 |
+| 这几块**要不要都留着、都写进论文**？要 | 几个**章节** | 开启那条线的第一步写一行 `chapter:` |
+| **这两条能同时成立吗**？不能，只能选一条 | 一组**互斥候选** | 各写一行 `branch: alternative`，定了把其余的标 `dead` |
+
+**章节之间不互斥**，这就是分界线：消融不是主实验的替代方案，两者同时成立、都要留。
+拿分叉去写章节，等主实验定下来你就得把消融那一支标 `dead`——而 `dead` 的意思是
+「这条路走不通」，等于把一整节 Methods 判了死刑。
+
+### 白拿的三样
+
+- **每个章节各有自己的定稿流程。**`result:` 指的那一步在哪一章，这条流程就属于哪一章
+  ——主实验一段 Methods、消融一段，论文里本来就是两段。三样导出因此可以**按章节导**。
+  两组会相交（消融当然吃着主实验的产物），所以那是把**同一张 DAG 切开**，
+  不是每章各算一遍闭包；借来的上游标成「借自哪一章」，不悄悄混进本章
+- **每个章节各有自己的可溯源等级**（本章最弱的那一步说了算，并点名是谁）。
+  「主实验能重做、消融不行」比一个项目级的总分有用得多——要补的记录从来不是均匀分布的
+- **跨章节的边要画出来，不是藏起来。**消融吃主实验的产物（`input:`）说的正是
+  **「消融是对着主结果测的」**，而 `parent` 跨过去说的是「消融这条线从主实验的哪一点
+  分出去的」。它是两章之间唯一的连接，藏起来两章就成了两个不相干的项目
+- **章节名和那句说明跟着一起能搜。**「消融那块当时是怎么想的」`grep -r 消融实验`
+  一秒就答得出，站内搜索答不出就等于比 grep 弱。判据也照着 grep 来：只命中**声明它
+  的那一步**，继承来的那二十步不算——它们文件里一个「消融」都没有，一起命中只会
+  把真正的答案（这条线从哪儿开始）埋掉
+
+**两件刻意不做的事**，免得后来人以为是漏了：**id 不按章节重编号**（消融不从 001 开始，
+`[[007]]` 和论文脚注要在整个项目里唯一，那是只追加的地基）；**章节不嵌套**
+（名字里可以写 `主实验/数据准备`，显示时按 `/` 分组，语义上仍然是一层）。
+
+写法、继承规则、四条诊断见 [FORMAT.md](FORMAT.md) 第 17 节。
 
 ## 外部产物的位置（溯源的另一半）
 
@@ -816,17 +873,18 @@ Base = `/t/<space>`。读公开，写要 `Authorization: Bearer <token>`。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/projects` | 项目列表 + 各自的步骤数与状态分布 |
+| GET | `/api/projects` | 项目列表 + 各自的步骤数与状态分布。分了章的项目多一个 `chapters: [{name, n}]`（**没分章就整个键不出现**，那些项目的卡片必须逐字节和从前一样） |
 | POST | `/api/projects` | 建项目 `{name}` |
 | PATCH | `/api/projects/{项目}` | 改显示名 `{name}` 和/或洞察：`{insights}` 整体替换那四个小节、`{add_insight: {kind, text, supersedes?, lang?}}` 追加一条（响应里的 `insight.id` 是分配到的 id）、`{add_insight: {id, text?, supersedes?}}` 就地改一条。slug 不动 |
 | GET | `/api/p/{项目}/forest` | 全量：steps（含 lane/row/children/backlinks/files/trace/digest）+ tree + warnings |
 | GET | `/api/p/{项目}/steps/{id}` | 单步 + `lineage`（到根的完整路径） |
-| GET | `/api/search` | 跨项目搜索。`?q=` 或 `?query=`，不给 `project` 就搜全部；回 `hits/total/truncated` |
+| GET | `/api/search` | 跨项目搜索。`?q=` 或 `?query=`，不给 `project` 就搜全部；回 `hits/total/truncated`。搜的是标题/正文/标签/`path:` 与 `code:` 的位置/`decision:` 与候选说明/`chapter:` 的名字与说明/各语言译文 —— 判据一律和 `grep -r` 对齐 |
 | GET | `/api/p/{项目}/untranslated` | 还欠哪些译文。`?lang=en`（默认 `en`）。回 `missing/translated/native/project_note`。**读，所以公开** |
 | GET | `/api/p/{项目}/forks` | 还有哪几个岔路口没做决定。`?scope=any` 连已定的一起给。回 `forks/total/open/titles`。**读，所以公开** |
 | POST | `/api/p/{项目}/forks` | 把一组**同父**的兄弟成组标成互斥候选：`{ids: [...], decision?, notes?: {id: 说明}}`。相对逐个 PATCH `branch` 的增量只有同父校验和原子性 |
-| GET | `/api/p/{项目}/pipeline` | **定稿流程**：产出成果的那条链、顺序、边、每步凭什么在里面、整链等级与最弱的一步、诊断。一个 `result:` 都没声明时回的是「怎么声明」那条提示。**读，所以公开** |
-| GET | `/api/p/{项目}/pipeline/figure.svg` | 那张图，自包含 SVG（无外部资源、无脚本、黑白可读） |
+| GET | `/api/p/{项目}/pipeline` | **定稿流程**：产出成果的那条链、顺序、边、每步凭什么在里面、整链等级与最弱的一步、诊断。一个 `result:` 都没声明时回的是「怎么声明」那条提示。`?chapter=<章节名>` 只出那一章（未分章那一组是 `?chapter=-`）。**读，所以公开** |
+| GET | `/api/p/{项目}/chapters` | **章节清单**：每一章几步、状态分布、等级与最弱的一步、自己的成果、跨章节的边、诊断。一个 `chapter:` 都没写的项目回 `declared: false` 和一份空清单，**不报任何警告**。**读，所以公开** |
+| GET | `/api/p/{项目}/pipeline/figure.svg` | 那张图，自包含 SVG（无外部资源、无脚本、黑白可读）。三样导出都收 `?chapter=` |
 | GET | `/api/p/{项目}/pipeline/methods.md` | Methods 草稿（markdown）。**是初稿不是成品** |
 | GET | `/api/p/{项目}/pipeline/page.html` | 能发给合作者的那一页（单文件、无脚本、无外部资源） |
 | PUT | `/api/p/{项目}/results/{id}` | 把这一步声明成成果 `{note}`。新建回 201、就地改写回 200。指向不存在的步骤或 `dead` 的步骤直接拒绝 |
@@ -905,6 +963,8 @@ python trace_cli.py result -P <项目> <id> --note "…"  # 声明「这一步�
 python trace_cli.py pipeline -P <项目>            # 定稿流程：产出成果的那条链 + 整链等级
 python trace_cli.py pipeline -P <项目> --methods  # Methods 草稿（`> methods.md` 收走）
 python trace_cli.py pipeline -P <项目> --svg fig.svg --page share.html  # 图 + 独立页面
+python trace_cli.py chapter -P <项目>             # 章节清单：各几步、各自的等级和最弱一步
+python trace_cli.py pipeline -P <项目> --chapter 消融实验   # 只出那一章（未分章那组写 -）
 python trace_cli.py tr -P <项目> --lang en        # 还欠哪些英文版
 python trace_cli.py tr -P <项目> --lang en --step 007 --file note.en.md   # 补一份译文
 python trace_cli.py build --out dist              # 静态导出，file:// 可直接打开，断网可用

@@ -1065,3 +1065,345 @@ test("⑧ 导出是逐字节确定的，文案要把这件事说出来 —— �
   assert.match(one("en", "toast.export.ready"), /same bytes|byte-identical/i);
   assert.match(one("zh", "toast.export.ready"), /逐字节/);
 });
+
+/* ------------------------------------------------ ⑨ 章节：项目内部并列的几块
+ *
+ * 这一组挡的是**一个概念被认成另一个概念**。项目 / 章节 / 分叉在屏幕上都是
+ * 「一堆步骤分成了几摞」，唯一的区别在语义：章节之间不互斥（都要留、都要写进
+ * 论文），分叉之间互斥（只能选一条）。认错的方向是固定的——人会拿章节去表达
+ * 分叉，于是一整块工作在图上看起来像是被否掉了。
+ * 第二件要挡的是**每一步都标一遍**：继承的全部意义就是只标一次，标二十次的人
+ * 改一次章节名要动二十个文件，然后再也不会用这个功能。
+ */
+
+test("⑨ 章节这个概念本身：名字、一句话、和另外两样的分界都有文案", () => {
+  needKeys([
+    "chapter.name", "chapter.lead", "chapter.vs.note",
+    "chapter.head", "chapter.entry", "chapter.entry.bare",
+    "chapter.badge.title", "chapter.of.head", "chapter.of.lead",
+    "count.chapters", "app.chapter.all", "app.chapter.title",
+    "search.where.chapter",
+  ], "章节是这一轮唯一的新概念，缺一句解释它就只是个没来由的分组");
+
+  assert.deepEqual(placeholders(one("en", "chapter.entry")), ["chapter", "what"].sort());
+  assert.deepEqual(placeholders(one("zh", "chapter.entry")), ["chapter", "what"].sort());
+  assert.deepEqual(placeholders(one("en", "chapter.of.head")), ["chapter"]);
+  assert.deepEqual(placeholders(one("zh", "chapter.of.head")), ["chapter"]);
+});
+
+test("⑨ 章节名的占位符一律叫 {chapter} —— {name} 在导出那边是别的意思", () => {
+  // toast.export.ready 里的 {name} 是「导出的那样东西」。两个意思共用一个名字，
+  // 接线的人把哪个塞进哪个只能靠猜，而猜错了页面上不会报错，只会说错话。
+  // 例外只有 lint.chapter.*：那几条的变量名由 core 定（见下面那条断言）。
+  const scoped = (k) => /^(chapter\.|editor\.chapter\.|toast\.chapter\.|export\.chapter\.|app\.chapter\.)/.test(k);
+  for (const lang of ["en", "zh"]) {
+    for (const [k, v] of values(lang)) {
+      if (!scoped(k)) continue;
+      assert.ok(!placeholders(v).includes("name"),
+        `${lang}.${k} 用了 {name} 表示章节名，改成 {chapter}：${v}`);
+    }
+  }
+});
+
+test("⑨ 最要紧的一句：章节之间**不互斥**，别拿它去表达分叉", () => {
+  // 不说清这一点，人会用章节表达「这条路我放弃了」——而那是 branch: alternative。
+  // 三样必须同时出现在同一句话里，读者才分得清自己手上的是哪一样。
+  const en = one("en", "chapter.vs.note"), zh = one("zh", "chapter.vs.note");
+  assert.match(en, /project/i, "英文里要点出「项目」是另一回事");
+  assert.match(en, /chapter/i);
+  assert.match(en, /alternative/i, "英文里要点出「互斥候选」是另一回事");
+  assert.match(en, /do not compete|not exclusive|both.*kept|both are kept/i,
+    "英文里必须说出章节之间不互斥：" + en);
+  assert.match(zh, /项目/);
+  assert.match(zh, /章节/);
+  assert.match(zh, /候选|分叉/);
+  assert.match(zh, /不互斥/, "中文里必须逐字说出「不互斥」：" + zh);
+  for (const s of [en, zh]) {
+    assert.ok(s.length > 80, "这一句要同时讲清三样东西，短了讲不完：" + s);
+  }
+});
+
+test("⑨ 章节的名字不许借 git 的词 —— 「分支 / 合并」在读者脑子里已经有别的意思", () => {
+  // 和 ⑦ 同一条规矩：借了 git 的词，读者会自动套上 git 的模型（可以合并、
+  // 只有一条主干），而章节恰恰是「几块并排都要留」。
+  for (const k of ["chapter.name", "chapter.lead", "chapter.cross.legend", "chapter.none"]) {
+    assert.ok(!/\bbranch(es|ing|ed)?\b|\bmerge[ds]?\b|\bmaster\b|\btrunk\b/i.test(one("en", k)),
+      `en.${k} 用了 git 的词：${one("en", k)}`);
+    assert.ok(!/分支|合并|主干/.test(one("zh", k)), `zh.${k} 用了 git 的词：${one("zh", k)}`);
+  }
+});
+
+test("⑨ 继承：「只在开启那条线的那一步声明一次」必须写出来，还要说清怎么脱离", () => {
+  needKeys([
+    "chapter.declared", "chapter.declared.title",
+    "chapter.inherited", "chapter.inherited.title",
+    "chapter.inherit.note", "chapter.leave.note",
+    "chapter.roots", "chapter.roots.title",
+  ], "继承是这套东西最省事的地方；不说，人会给二十步各标一遍");
+
+  assert.deepEqual(placeholders(one("en", "chapter.inherited")), ["id"]);
+  assert.deepEqual(placeholders(one("zh", "chapter.inherited")), ["id"]);
+
+  // 「一次」和「底下整棵子树」是这句话的两半，缺一半都变成废话
+  assert.match(one("en", "chapter.inherit.note"), /once/i);
+  assert.match(one("en", "chapter.inherit.note"), /below|inherit|grow/i);
+  assert.match(one("zh", "chapter.inherit.note"), /一次/);
+  assert.match(one("zh", "chapter.inherit.note"), /子树|底下/);
+  // 省下来的到底是什么，要具体：改名时改一行而不是二十处
+  assert.match(one("en", "chapter.inherit.note"), /renam/i);
+  assert.match(one("zh", "chapter.inherit.note"), /改章节名|改名/);
+  // 脱离的写法只有一种（自己声明一个新的），没有「置空」
+  assert.match(one("en", "chapter.leave.note"), /declare/i);
+  assert.match(one("zh", "chapter.leave.note"), /声明一个新的/);
+});
+
+test("⑨ 一个章节可以横跨好几棵树 —— 它是一组步骤，不是一棵子树", () => {
+  // 消融可能是好几条独立的根。把章节说成「子树」，人会去找那个共同的父节点，
+  // 找不到就以为自己标错了。core 那边这个字段叫 roots（章节的入口，parent 不在
+  // 同一章的那些成员），一个章节有好几个入口是常态。
+  assert.match(one("en", "chapter.roots.title"), /not a subtree|set of steps/i);
+  assert.match(one("zh", "chapter.roots.title"), /不是一棵子树|一组步骤/);
+  assert.deepEqual(placeholders(one("en", "chapter.roots")), ["n"]);
+  assert.deepEqual(placeholders(one("zh", "chapter.roots")), ["n"]);
+});
+
+test("⑨ 「未分章」不能读起来像缺了什么 —— 现存项目全是这个状态", () => {
+  // 一个 chapter: 都没写是绝大多数项目的常态。措辞一旦带上「还没分 / 待补」的
+  // 味道，人会去给每一步补一个章节名，而那正是这套继承要省掉的事。
+  needKeys(["chapter.none", "chapter.none.title"], "未分章是常态，它也得有个体面的说法");
+  const en = one("en", "chapter.none") + " " + one("en", "chapter.none.title");
+  const zh = one("zh", "chapter.none") + " " + one("zh", "chapter.none.title");
+  assert.ok(!/\berror\b|\bincomplete\b|\bnot set\b|\bunset\b|\btodo\b/i.test(en),
+    "en 的未分章像在报缺失：" + en);
+  assert.ok(!/错误|未设置|待补|还没分|缺少/.test(zh), "zh 的未分章像在报缺失：" + zh);
+  // 光是不报错还不够，得正面说一句「这里没缺东西」
+  assert.match(one("en", "chapter.none.title"), /nothing is missing|never need/i);
+  assert.match(one("zh", "chapter.none.title"), /没有缺/);
+});
+
+test("⑨ 每章各有自己的定稿流程和自己的等级 —— 这是分章白拿的两件事", () => {
+  needKeys([
+    "chapter.pipeline.head", "chapter.pipeline.note", "chapter.pipeline.none",
+    "chapter.level.head", "chapter.level.note", "chapter.level.weakest",
+    "chapter.steps",
+  ], "「消融这部分别人能不能重做」要能单独回答，否则分章只是换了个排版");
+
+  for (const lang of ["en", "zh"]) {
+    assert.deepEqual(placeholders(one(lang, "chapter.pipeline.head")), ["chapter"]);
+    assert.deepEqual(placeholders(one(lang, "chapter.level.head")), ["chapter"]);
+    assert.deepEqual(placeholders(one(lang, "chapter.level.weakest")), ["link", "title"].sort());
+    // 步数与状态分布沿用项目卡片那一行的形状，四个变量一个都不能少
+    assert.deepEqual(placeholders(one(lang, "chapter.steps")),
+      ["dead", "done", "steps", "wip"].sort());
+  }
+  // 为什么每章各一条：论文里本来就是两段。不说这句，人不知道分章能拿来干什么
+  assert.match(one("en", "chapter.pipeline.note"), /Methods/);
+  assert.match(one("zh", "chapter.pipeline.note"), /Methods/);
+  // 等级那条要说明是「只按这一章算」，否则和整项目那个数分不清
+  assert.match(one("en", "chapter.level.note"), /weakest/i);
+  assert.match(one("zh", "chapter.level.note"), /最弱/);
+});
+
+test("⑨ 某一章没有成果时是邀请不是报错 —— 复用 pipeline 空状态那条思路", () => {
+  // 和 pipeline.warn.noresult 同一个道理：一个章节完全可以只是探索性的。
+  // 而且要给出那一行真实的写法，不能只说「去声明一个成果」。
+  for (const lang of ["en", "zh"]) {
+    assert.deepEqual(placeholders(one(lang, "chapter.pipeline.none")), ["chapter"]);
+    assert.match(one(lang, "chapter.pipeline.none"), /result:/,
+      `${lang}.chapter.pipeline.none 没写出 result: 那一行长什么样`);
+  }
+  assert.ok(!/\berror\b|\bfail(ed|ure)?\b|\bmust\b/i.test(one("en", "chapter.pipeline.none")),
+    "en.chapter.pipeline.none 用了报错口吻");
+  assert.ok(!/错误|失败|必须/.test(one("zh", "chapter.pipeline.none")),
+    "zh.chapter.pipeline.none 用了报错口吻");
+});
+
+test("⑨ 跨章节的边要说清它意味着什么 —— 那条边正是「消融是对着主结果测的」", () => {
+  needKeys([
+    "chapter.cross.head", "chapter.cross.note", "chapter.cross.legend",
+    "chapter.cross.entry", "chapter.cross.entry.bare",
+    "chapter.cross.input", "chapter.cross.input.title",
+    "chapter.cross.parent", "chapter.cross.parent.title",
+  ], "跨章节的边是这套设计的收益，藏起来两块工作就看着毫无关系");
+
+  // 一条跨章节的边要说得出「另一头是谁、在哪一章、读的是什么」——
+  // core 的 crossings 每条正好带着这三样（from/to · from_chapter/to_chapter · note）
+  assert.deepEqual(placeholders(one("en", "chapter.cross.entry")),
+    ["chapter", "link", "what"].sort());
+  assert.deepEqual(placeholders(one("zh", "chapter.cross.entry")),
+    ["chapter", "link", "what"].sort());
+
+  for (const lang of ["en", "zh"]) {
+    assert.deepEqual(placeholders(one(lang, "chapter.cross.input")), ["chapter"]);
+    assert.deepEqual(placeholders(one(lang, "chapter.cross.parent")), ["chapter"]);
+    assert.deepEqual(placeholders(one(lang, "chapter.cross.head")), ["n"]);
+  }
+  // input 那一条说的是字节，parent 那一条说的是想法从哪儿接过来的——
+  // 两条要能分开，不然跨章节就只剩「有条线过去了」
+  assert.match(one("en", "chapter.cross.input.title"), /bytes|artifact|consum/i);
+  assert.match(one("zh", "chapter.cross.input.title"), /字节|产物/);
+  assert.match(one("en", "chapter.cross.parent.title"), /thinking|grew out|split off/i);
+  assert.match(one("zh", "chapter.cross.parent.title"), /想法|分出去/);
+  // 「要画出来而不是藏起来」这半句是这条设计的理由，别被后来的人当啰嗦删掉
+  assert.match(one("en", "chapter.cross.note"), /drawn/i);
+  assert.match(one("zh", "chapter.cross.note"), /画出来/);
+});
+
+test("⑨ 两件故意没做的事有自己的说法 —— 否则后来的人会以为是漏了", () => {
+  // ① id 不按章节重编号（只追加的地基）；② 章节不嵌套（斜杠只分组显示）。
+  // 这两条在界面上都会被问，没有答案的话，下一个人会动手把它们「补上」。
+  needKeys(["chapter.ids.note", "chapter.nest.note", "chapter.group.title"],
+    "消融为什么不从 001 开始、斜杠是不是父子——不答，这两个问题会变成两个改动");
+  assert.match(one("en", "chapter.ids.note"), /001/);
+  assert.match(one("zh", "chapter.ids.note"), /001/);
+  assert.match(one("en", "chapter.nest.note"), /do not nest|don't nest|flat/i);
+  assert.match(one("zh", "chapter.nest.note"), /不嵌套/);
+});
+
+/* core 此刻真发出来的四条章节诊断。key 名对着 code，占位符对着 core 放进
+   w.vars 的变量名——这两件事错一件，英文界面上就原样漏出一整句中文
+   （warnText 认不出就退回 esc(w.message)，那条退路是对的，但漏的正是最该读懂的话）。 */
+const CHAPTER_LINTS = {
+  chapter_note_conflict: { key: "lint.chapter.desc.conflict", vars: ["id", "ids", "name"] },
+  chapter_no_result: { key: "lint.chapter.noresult", vars: ["name"] },
+  chapter_near_duplicate: { key: "lint.chapter.nearduplicate", vars: ["names"] },
+  bad_chapter: { key: "lint.chapter.unnamed", vars: ["note"] },
+};
+
+test("⑨ 四条诊断：各自说清值得一提在哪，并且都写明不影响等级", () => {
+  const keys = Object.values(CHAPTER_LINTS).map((m) => m.key);
+  needKeys(keys, "说明打架 / 这一章没成果 / 两个几乎同名的章节 / `chapter:` 只写了说明");
+
+  for (const lang of ["en", "zh"]) {
+    for (const k of keys) {
+      assert.ok(one(lang, k).length > 50, `${lang}.${k} 太短，说不出为什么值得一提`);
+      // 顶栏那句 lint.note 会被当背景板略过，所以每条自己也要说一遍：
+      // 章节这几条问的是「这几块讲清楚了没有」，不是「这个结果追不追得到」。
+      if (lang === "en") assert.match(one(lang, k), /level/i, `en.${k} 没说不影响等级`);
+      else assert.match(one(lang, k), /不影响等级/, `zh.${k} 没说不影响等级`);
+    }
+  }
+});
+
+test("⑨ 诊断的占位符逐字就是 core 放进 w.vars 的那几个名字 —— 改名就漏中文", () => {
+  // warnText（app.js 的 WARN_MAP.take）把 w.vars 原样喂进来，不改名。所以这里
+  // 写 {chapter} 而 core 发的是 name，那一条会整条退回去显示服务端的中文。
+  const core = fs.readFileSync(path.join(ROOT, "trace_core.py"), "utf8");
+  for (const [code, m] of Object.entries(CHAPTER_LINTS)) {
+    for (const lang of ["en", "zh"]) {
+      assert.deepEqual(placeholders(one(lang, m.key)), m.vars.slice().sort(),
+        `${lang}.${m.key} 的占位符和 ${code} 发出来的 vars 对不上`);
+    }
+    if (core.includes(`"${code}"`)) {
+      for (const v of m.vars) {
+        assert.ok(new RegExp(`"${v}"\\s*:`).test(core),
+          `trace_core 里找不到 ${code} 的变量 ${v}`);
+      }
+    } else {
+      console.log(`  (trace_core.py 里还没有 ${code}，只校验了占位符)`);
+    }
+  }
+});
+
+test("⑨ 「几乎同名的两个章节」说的是同一章被拆成两半，不是「你名字起重了」", () => {
+  // 这条替掉了「章节只有一个步骤 → 也许是笔误」。后者会在**每一次正确使用**时
+  // 响一声（一个章节被开启的那一刻必然只有一步），而人从会误报的诊断学到的
+  // 只有一件事：忽略整个诊断栏。合法的单步章节也确实存在。
+  assert.ok(!("lint.chapter.lone" in i18n.STRINGS.en),
+    "单步章节那条诊断没有做，它的文案不该留在表里当死键");
+  for (const lang of ["en", "zh"]) {
+    // 后果要说出来：两半各导出一段 Methods，而两边看着都像对的
+    assert.match(one(lang, "lint.chapter.nearduplicate"), /Methods/);
+  }
+  assert.match(one("en", "lint.chapter.nearduplicate"), /case or spacing/i);
+  assert.match(one("zh", "lint.chapter.nearduplicate"), /大小写|空白/);
+});
+
+test("⑨ 四条诊断都不许写成责备 —— 分章本来就是可选的", () => {
+  // 被责备的人的第一反应是把那一行删掉，而 `chapter:` 和它那句说明都是只有人
+  // 写得出来的字。尤其 bad_chapter 那条：读它的人刚刚写坏了一行，最需要的是
+  // 「你写的半句话还在」，不是「格式错误」。
+  for (const m of Object.values(CHAPTER_LINTS)) {
+    assert.ok(!/\bshould have\b|\bforgot|\bfail(ed|ure)?\b|\bmust\b|\berror\b/i.test(one("en", m.key)),
+      `en.${m.key} 像在责备用户：${one("en", m.key)}`);
+    assert.ok(!/错误|失败|忘了|忘记|应该|必须|遗漏/.test(one("zh", m.key)),
+      `zh.${m.key} 像在责备用户：${one("zh", m.key)}`);
+  }
+  // bad_chapter 是唯一「写坏了」的一条，它必须说清后果（这一步仍在继承）
+  // 和归宿（那半句说明原样留着），否则人会以为自己的字被吞了
+  assert.match(one("en", "lint.chapter.unnamed"), /inherit/i);
+  assert.match(one("zh", "lint.chapter.unnamed"), /继承/);
+  assert.match(one("en", "lint.chapter.unnamed"), /still in the file|untouched/i);
+  assert.match(one("zh", "lint.chapter.unnamed"), /原样留在文件里|一个字没动/);
+});
+
+test("⑨ 编辑：标在哪一步、怎么撤、章节说明写在哪，三件事都说得出来", () => {
+  needKeys([
+    "editor.chapter.label", "editor.chapter.placeholder", "editor.chapter.hint",
+    "editor.chapter.inherited", "editor.chapter.note.label",
+    "editor.chapter.note.placeholder",
+    "chapter.set.act", "chapter.set.act.title", "chapter.set.prompt",
+    "chapter.unset.act", "chapter.unset.act.title",
+    "chapter.write.act", "chapter.write.act.title", "chapter.write.prompt",
+    "chapter.desc.label", "chapter.desc.title", "chapter.desc.missing",
+    "toast.chapter.set", "toast.chapter.carry", "toast.chapter.cleared",
+    "toast.chapter.desc.saved",
+  ], "写得进去这个功能才成立；只能看不能标的话，页面上永远只有「未分章」一组");
+
+  assert.deepEqual(placeholders(one("en", "editor.chapter.inherited")), ["chapter", "id"].sort());
+  assert.deepEqual(placeholders(one("zh", "editor.chapter.inherited")), ["chapter", "id"].sort());
+  assert.deepEqual(placeholders(one("en", "toast.chapter.set")), ["chapter", "id"].sort());
+  assert.deepEqual(placeholders(one("en", "toast.chapter.carry")), ["n"]);
+  assert.deepEqual(placeholders(one("zh", "toast.chapter.carry")), ["n"]);
+  assert.deepEqual(placeholders(one("en", "toast.chapter.desc.saved")), ["chapter"]);
+});
+
+test("⑨ 编辑侧最要紧的一句：标在开启那条线的那一步，别的步骤留空", () => {
+  // 这一栏被误用的方式只有一种，而且代价明确：每一步都填 → 改一次章节名要动
+  // 二十个文件 → 从此没人再改章节名。所以 hint 的第一件事是说「填在哪一步」。
+  assert.match(one("en", "editor.chapter.hint"), /starts?/i);
+  assert.match(one("en", "editor.chapter.hint"), /leave it empty|empty everywhere/i);
+  assert.match(one("zh", "editor.chapter.hint"), /开启/);
+  assert.match(one("zh", "editor.chapter.hint"), /留空/);
+  for (const lang of ["en", "zh"]) {
+    assert.ok(one(lang, "editor.chapter.hint").length > 80,
+      `${lang}.editor.chapter.hint 太短，说不清标在哪一步、以及标错了会怎样`);
+  }
+  // 章节说明归章节，不归这一步：同一个名字被多处声明时，按 id 序最早的那个说了算
+  assert.match(one("en", "chapter.desc.title"), /earliest/i);
+  assert.match(one("zh", "chapter.desc.title"), /最早/);
+});
+
+test("⑨ 标一个章节会带走整棵子树 —— 屏幕上那和一个光杆节点长得一模一样", () => {
+  // 和 drag.carry 同一条理由：子树的大小在树上看不出来，不说出来的人会以为
+  // 只标了一步，然后在另一个地方又标一次。
+  assert.match(one("en", "toast.chapter.set"), /below/i);
+  assert.match(one("zh", "toast.chapter.set"), /底下/);
+  assert.match(one("en", "toast.chapter.cleared"), /parent/i);
+  assert.match(one("zh", "toast.chapter.cleared"), /父步骤/);
+});
+
+test("⑨ 按章节导出：说清为什么分开导，以及文件名怎么不互相盖掉", () => {
+  needKeys([
+    "export.chapter.head", "export.chapter.note",
+    "export.chapter.all", "export.chapter.one",
+    "export.chapter.file", "export.chapter.file.title",
+    "toast.export.chapter.ready",
+  ], "论文里主实验一段 Methods、消融另一段，导出就该照这个分开");
+
+  assert.deepEqual(placeholders(one("en", "export.chapter.one")), ["chapter"]);
+  assert.deepEqual(placeholders(one("zh", "export.chapter.one")), ["chapter"]);
+  assert.deepEqual(placeholders(one("en", "export.chapter.file")), ["file"]);
+  assert.deepEqual(placeholders(one("en", "toast.export.chapter.ready")), ["chapter", "name"].sort());
+  assert.deepEqual(placeholders(one("zh", "toast.export.chapter.ready")), ["chapter", "name"].sort());
+
+  // 为什么分开导：不是「过滤掉几行」，是另一份派生
+  assert.match(one("en", "export.chapter.note"), /Methods/);
+  assert.match(one("zh", "export.chapter.note"), /Methods/);
+  // 文件名里带章节名的理由要写出来，否则那看着只是个啰嗦的命名
+  assert.match(one("en", "export.chapter.file.title"), /never lands on top|overwrit|never replaces/i);
+  assert.match(one("zh", "export.chapter.file.title"), /不会盖掉/);
+  // 导出仍然逐字节确定（P3），⑧ 那条规矩不因为分章而松掉
+  assert.match(one("en", "toast.export.chapter.ready"), /same bytes|byte-identical/i);
+  assert.match(one("zh", "toast.export.chapter.ready"), /逐字节/);
+});

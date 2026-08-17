@@ -45,6 +45,17 @@ write_project_translation / drop_translation。它们碰不到原文，也写不
 
 单步上的例外（`pipeline: include|exclude | 理由`）同样只写在**那一步自己**身上，
 和 `branch:` 一个套路：项目上绝不列「哪些步骤要排除」的清单。
+
+子章节（`chapter:`）是这一版新加的第三件「人写一行、其余全派生」的事：一个项目
+内部可以分主实验 / 消融实验，各有各的探索路径、各有各的定稿流程。写入侧要守住的
+就一句话——**一条线只写一次**：
+
+    chapter: 消融实验 | 逐个拿掉模块，对着主实验的 023 比
+
+声明写在开启那条线的那一步上，整条子树沿 parent 继承（判据在 core）。所以这里
+**没有**「把这 20 步都标进某章」的批量入口：批量写会在每一步落一行 chapter:，
+而那正好毁掉继承带来的全部好处（改一次章节名要改 20 个文件，移走一支还会带着
+一行过期的声明）。要脱离就在那一步自己声明一个新的，一样是一次调用。
 """
 
 from __future__ import annotations
@@ -92,6 +103,7 @@ from trace_core import (
     find_insight,
     fmt_id,
     format_branch,
+    format_chapter,
     format_code,
     format_input,
     format_insight,
@@ -102,6 +114,7 @@ from trace_core import (
     id_key,
     next_insight_id,
     parse_branch,
+    parse_chapter,
     parse_code,
     parse_inputs,
     parse_insights,
@@ -113,6 +126,7 @@ from trace_core import (
     path_kind,
     project_dir,
     projects_root,
+    resolve_chapters,
     scan,
     scan_projects,
     split_id,
@@ -163,6 +177,16 @@ except ImportError:      # pragma: no cover - 仅在 core 尚未加入双语常�
     PROJECT_TR_ONLY_KEYS = ("name",)
 
 MAX_SLUG = 40
+# 章节名的长度上限。它不是标题：标题一步一个、想写多长写多长，而章节名是**一个
+# 标签**——它要出现在每张导出图的分组头上、每一份按章导出的 Methods 抬头上、
+# 每个节点卡片的角上。超过这个长度的多半是把说明整段写进了名字里（该写在竖线
+# 右边），所以报错时直接告诉人往哪儿挪。取 60 而不是更小：`主实验/数据准备` 这种
+# 带斜杠的分组名和一句英文章节名（"Ablation studies / data preparation"）都要装得下。
+MAX_CHAPTER = 60
+# 章节名里绝对不许出现的控制字符。空白（含 \t、NBSP）在 _chapter_name 里先被压成
+# 普通空格，剩下这些是没有任何视觉表现的字节：它们会让两个**看起来一模一样**的
+# 名字变成两个章节，而人在界面上永远看不出差别。
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 MAX_FILE_BYTES = 32 * 1024 * 1024
 
 BODY_TEMPLATE = """## 为什么
@@ -1106,6 +1130,28 @@ def render_note(step: Step) -> str:
     pl = _pipeline_of(step)
     if pl["rule"]:
         lines.append("pipeline: " + format_pipeline(pl))
+    # chapter 紧跟 pipeline，因为这两行回答的是同一份对外产出的两个问题：
+    # 「这一步算不算方法的一环」和「它属于哪一章的方法」。主实验一条 Methods、
+    # 消融一条，论文里本来就是两段。它同样是**人对结构下的判断**，所以留在
+    # decision / pipeline 这个区里，从 lang 往下才是机器记录区。
+    #
+    # 没声明就不写这一行——这是整个设计的支点：一个步骤没写 chapter 时**继承它
+    # parent 的章节**，于是开启消融那一步声明一次，整条子树都归它。把继承来的值
+    # 展开写进每个孩子，等于把派生写成数据：改一次章节名要改 20 个文件，
+    # 而移走一支还会带着一行过期的声明。
+    ch = _chapter_of(step)
+    if ch["name"] or ch["note"]:
+        # 名字空、只剩说明（`chapter: | 逐个拿掉模块`）时**照原样写回去**。
+        #
+        # 这一行是写坏的：读侧当它没声明（归属退回继承），core 为它报一条
+        # bad_chapter。但那半句话是**人写的字**，而这里是全量重写 front-matter 的
+        # 地方——不写回去，改一个不相干的标题就把它删了，人不会收到任何提示，
+        # 那条本来在催他补上章节名的警告也跟着一起消失。规矩在 _hydrate 的注释里
+        # 立着（原文里是什么就读回什么），这里是它的另一半。
+        #
+        # 和「撤销声明不留一行空的 `chapter:`」不冲突：撤销走的是 norm_chapter，
+        # 名字和说明一起清空，这里两个都空，整行照样不写。
+        lines.append("chapter: " + format_chapter(ch))
     # lang 也要写回去。它是这份 note.md 自己声明的主语言，翻译文件靠它判断
     # 「这个语言不用翻」。render_note 是全量重写 front-matter 的，漏掉一个键
     # 就等于每次在网页上点一下 done 都把用户手写的那一行悄悄删掉。
@@ -1378,6 +1424,120 @@ def norm_pipeline(raw: Any) -> dict[str, str]:
     return {"rule": rule, "note": note}
 
 
+def _chapter_name(raw: Any) -> str:
+    """校验并归一化章节名。它是**人写的自由文本**，但同时是一个**身份**。
+
+    「身份」这半句决定了这里做什么、不做什么。章节不是靠登记成立的（没有一张章节
+    表，P1 不许有），它靠**同名**成立：两个步骤写了同一个名字，它们就在同一章。
+    于是任何「看着一样、比起来不一样」的差别都会把一个章节**静悄悄地劈成两半**，
+    而人在界面上完全看不出来——所以这几种差别在写入时就抹平：
+
+      * **首尾空白**：`主实验 ` 和 `主实验` 是同一个章节。从网页输入框、从别处复制
+        粘贴带出来的尾随空格，是最常见的一种；
+      * **中间的连续空白**（含 tab、NBSP）压成一个普通空格：`Main  Experiment`
+        和 `Main Experiment` 同理；
+      * **Unicode 规范化到 NFC**：`é` 可以是一个码位也可以是 e + 组合符，macOS 的
+        文件名默认给的是后者。两种写法在屏幕上逐像素相同（fs_key 为附件名踩过同一个坑）。
+
+    **不做**大小写折叠：中文没有大小写，而英文章节名里的大小写是人有意写的
+    （`RNA 口袋` 折成 `rna 口袋` 就成了另一句话）。于是 `Ablation` 和 `ablation`
+    是两个章节——这正是「一个章节里只有一个步骤」那条诊断要捞的东西（笔误），
+    交给读侧点名，比在写入侧替人猜哪个才是本意好。
+
+    三种拒绝，各挡一类：竖线会把这一行劈成「名字 | 说明」（写入的是名字，读回来
+    的是名字 + 说明）；控制字符看不见却参与相等比较；超长的名字多半是把说明写进
+    了名字里，那半句话该在竖线右边。
+    """
+    s = unicodedata.normalize("NFC", re.sub(r"\s+", " ", str(raw or ""))).strip()
+    if not s:
+        return ""
+    if "|" in s:
+        raise WriteError(
+            f"章节名里不能有竖线: {s!r}。这一行是 `chapter: 名字 | 这个章节是什么` 的形状，"
+            "竖线右边那半句是**章节的说明**——想写说明请放到竖线右边，不要塞进名字里。")
+    bad = _CTRL_RE.search(s)
+    if bad:
+        raise WriteError(
+            f"章节名里有控制字符（第 {bad.start()} 个字符 {bad.group()!r}）。"
+            "章节是靠同名成立的，一个看不见的字符会让它和另一个看起来一模一样的名字"
+            "变成两个章节，而界面上永远看不出差别。")
+    if len(s) > MAX_CHAPTER:
+        raise WriteError(
+            f"章节名太长（{len(s)} 个字符，上限 {MAX_CHAPTER}）: {s[:20]!r}…。"
+            "章节名是个标签——它要出现在分组标题、按章导出的文件名和每个节点卡片上。"
+            "这一段更像是章节的**说明**，请写到竖线右边：`chapter: 消融实验 | 这一段`。")
+    return s
+
+
+def norm_chapter(raw: Any) -> dict[str, str]:
+    """把外部传来的章节声明规整成 core 那对 parse/format 用的 {name, note}。
+
+    接受 `"消融实验"`、`"消融实验 | 逐个拿掉模块，对着主实验的 023 比"`、
+    `{"name": …, "note": …}`。三条约定：
+
+      * **写空 = 撤销声明**（这一步回到「跟着 parent 继承」），不是非法值。
+        「这条线其实属于消融」是回头才想清楚的，写反了当然也是——标错要能改回来。
+        撤销时说明一起丢掉，而且**绝不留一行空的 `chapter:`**：一行没有名字的
+        chapter 什么都没说，读侧看不见它，人却以为自己声明过了。
+      * **只写说明不写名字直接拒绝**，不悄悄当成撤销。那句说明是人写的字，
+        默默吃掉它比报错糟得多（和 norm_pipeline 逐字同一条）。
+      * **说明是可选的**——这是它和 `pipeline:` 的分歧所在。`pipeline:` 逼着写理由，
+        因为它除了改变一份导出之外不留任何痕迹；而一个章节是**看得见**的：树上一整条
+        子树都归了它，导出里多出一节。名字本身已经说清了这是什么，为一句可有可无的
+        说明抬高门槛，换来的只会是「消融实验 | 消融实验」这种仪式性文字。
+    """
+    if isinstance(raw, dict):
+        name = raw.get("name") if raw.get("name") is not None else raw.get("chapter")
+        note = _clean_line(raw.get("note") if raw.get("note") is not None else raw.get("desc"))
+        name = _chapter_name(_clean_line(name))
+    else:
+        got = parse_chapter(_clean_line(raw))
+        name, note = _chapter_name(got["name"]), got["note"]
+    if not name:
+        if note:
+            raise WriteError(
+                f"章节要先有名字，只写说明的话这一行没有取值，读侧看不见它"
+                f"（收到的说明是 {note!r}）。写成 `chapter: 消融实验 | {note}`。"
+                "要撤销声明请传空串。")
+        return {"name": "", "note": ""}
+    row = {"name": name, "note": note}
+    # 和 _result_row / _path_row 同一个做法：拼出那一行，交给读侧的解析器读一遍，
+    # 比对。多花一次解析，换「写进去的和读出来的一模一样」。竖线和控制字符上面
+    # 已经各挡过一次，这一道是给将来的：哪天 core 的分段规则改了（比如多出第三段），
+    # 症状会是「章节声明写得进去、读不回来」，而磁盘上那一行看着完全正常。
+    if parse_chapter(format_chapter(row)) != row:
+        raise WriteError(f"这条章节声明读回来和写进去的不一样: chapter: {format_chapter(row)!r}。")
+    return row
+
+
+def _chapter_of(step: Step) -> dict[str, str]:
+    """从 Step 上取 core 那对 parse/format 用的 {name, note}。
+
+    getattr 兜底的理由和 branch / pipeline 那两条一样：纯手工造出来的 Step
+    （测试、演算）可能连这两个字段都没有。名字空 = 没声明 = 跟着 parent 继承。
+    """
+    return {"name": _clean_line(getattr(step, "chapter", "")),
+            "note": _clean_line(getattr(step, "chapter_note", ""))}
+
+
+def _chapter_change(before: dict[str, str], after: dict[str, str],
+                    sid: str, ids: list[str]) -> dict[str, Any] | None:
+    """这次移动把哪些步骤换到了别的章节。纯派生量，现算，一个字不落盘。
+
+    两头的章节名都由 core 的 resolve_chapters 给出（继承的判据只有那一份：
+    说给人听的那句话和界面上画出来的必须出自同一次推导，理由和 _branch_groups
+    用 compute_branch_groups 一字不差）。这里只做**差集**。
+
+    `None` 的意思是「这次移动和章节完全无关」（两头都没有章节）——绝大多数项目
+    永远是这个状态，而它们不该因为这一轮改动在返回值里多出一条要人读的信息。
+    """
+    frm, to = before.get(sid, ""), after.get(sid, "")
+    if not frm and not to:
+        return None
+    changed = sorted((i for i in ids if before.get(i, "") != after.get(i, "")), key=id_key)
+    return {"from": frm, "to": to, "changed": bool(changed), "steps": changed}
+
+
 def _branch_groups(by_id: dict[str, Step]) -> dict[str, dict[str, Any]]:
     """按分叉点 id 索引的候选组（根之间那一组的键是空串）。
 
@@ -1417,6 +1577,13 @@ def _hydrate(step: Step, text: str) -> Step:
     pl = parse_pipeline(meta.get("pipeline", ""))
     step.pipeline = pl["rule"]                             # type: ignore[attr-defined]
     step.pipeline_note = pl["note"]                        # type: ignore[attr-defined]
+    # chapter 同理**原样读回**，不过 norm_chapter 的校验。文件里那个名字可能是手写
+    # 的、可能超长、可能带着一个当年没挡住的怪字符——照校验过的值回写等于替人把
+    # 那一行删掉，而整条子树的归属就跟着一起没了，改一个不相干的标题就能触发。
+    # 校验只管这次**新传进来**的值（见 norm_chapter）。
+    ch = parse_chapter(meta.get("chapter", ""))
+    step.chapter = ch["name"]                              # type: ignore[attr-defined]
+    step.chapter_note = ch["note"]                         # type: ignore[attr-defined]
     return step
 
 
@@ -1442,6 +1609,7 @@ def create_step(
     branch: Any = "",
     decision: str = "",
     pipeline: Any = "",
+    chapter: Any = "",
 ) -> tuple[Step, bool]:
     """新建一步。返回 (step, created)；created=False 表示命中幂等键返回了既有步骤。
 
@@ -1483,6 +1651,10 @@ def create_step(
         # 而逼人建完再 PATCH 一次，那句理由大概率就永远空着了。
         # 校验同样放在 mkdir 之前：非法值一个目录都不该留下。
         pipeline_row = norm_pipeline(pipeline)
+        # 建的时候就能开一章。这是章节最主要的用法：「现在开始做消融」这句话和
+        # 「新建这一步」本来就是同一个动作，而这一步正是那条线的头——声明在它身上，
+        # 后面派生出来的 20 步一个字都不用再写。校验同样在 mkdir 之前。
+        chapter_row = norm_chapter(chapter)
 
         sid = alloc_id(by_id, parent)
         step = Step(
@@ -1519,6 +1691,10 @@ def create_step(
         step.decision = decision                # type: ignore[attr-defined]
         step.pipeline = pipeline_row["rule"]         # type: ignore[attr-defined]
         step.pipeline_note = pipeline_row["note"]    # type: ignore[attr-defined]
+        # 章节同理直接挂在实例上。注意这里**不从 parent 抄**：继承是读侧现算的，
+        # 抄下来就成了每个孩子身上一份会过期的拷贝。
+        step.chapter = chapter_row["name"]           # type: ignore[attr-defined]
+        step.chapter_note = chapter_row["note"]      # type: ignore[attr-defined]
 
         text = _utf8_bytes(render_note(step), "正文")
         d = steps_dir / step.dirname
@@ -1543,7 +1719,10 @@ MUTABLE = ("status", "title", "body", "date", "commit", "author", "tags",
            "branch", "decision",
            # 「这一步到底进不进最终流程」天然是回头才定的：先跑完、先看见结果，
            # 才知道它是主线还是一次探索。只能在 create 时给等于要求人预判。
-           "pipeline")
+           "pipeline",
+           # 「这条线其实属于消融」同样是回头才想清楚的，而且改的是**整条子树**的
+           # 归属——正因为一次调用就能挪一整章，它更要能改回来。
+           "chapter")
 
 
 def norm_repro(raw: Any) -> list[dict[str, str]]:
@@ -1703,6 +1882,14 @@ def _update_step_locked(steps_dir: Path, sid: str, patch: dict[str, Any], expect
         row = norm_pipeline(patch["pipeline"])
         step.pipeline = row["rule"]                           # type: ignore[attr-defined]
         step.pipeline_note = row["note"]                      # type: ignore[attr-defined]
+    if "chapter" in patch:
+        # 这一步开的那一章。空串是撤销（回到跟着 parent 继承），撤销之后
+        # render_note 不写这一行——不留一行空的（见 norm_chapter）。
+        # **改一个字影响的是整条子树**，所以这条路只碰这一步自己那一行：
+        # 底下 20 步的归属跟着继承自己变，一个文件都不用动。
+        row = norm_chapter(patch["chapter"])
+        step.chapter = row["name"]                            # type: ignore[attr-defined]
+        step.chapter_note = row["note"]                       # type: ignore[attr-defined]
 
     # 目录名不跟着 title 改：目录名里的 id 是给 shell 补全用的，
     # 改名会让所有已经发出去的相对链接失效。
@@ -1923,6 +2110,14 @@ def move_step(steps_dir: Path, sid: str, new_parent: str | None, reason: str,
         day = _clean_line(date) or today()
         if not _DATE_RE.match(day):
             raise WriteError(f"移动日期要写成 YYYY-MM-DD，收到 {day!r}")
+        # 章节和候选组一样是派生的，所以移动**写入侧同样什么都不用做**：那一行
+        # `chapter:` 一个字不改，而整条子树的归属会自己跟着新的 parent 走。
+        # 但这一次要**当场说一声**——理由比候选组那条更硬：候选组的变化在树上看得见
+        # （少了一个候选），而章节的变化**磁盘上一个字节都没变**，20 步集体从主实验
+        # 转到消融，diff 里只有一行 moved:。用户吃过的亏正是「移动之后树形和创建
+        # 顺序对不上」，章节悄悄换了是同一类事，只是更隐蔽。
+        # 说一声，不拦、不改数据：把一条线挪进另一章正是移动最常见的用意之一。
+        before_ch = resolve_chapters(by_id)
         entry = {"date": day, "from": old_parent or "", "to": new_parent or "",
                  "by": _clean_line(by), "reason": reason}
         # 只追加：一个节点可以被移动多次，那是一段历史，不是一个当前值。
@@ -1930,8 +2125,11 @@ def move_step(steps_dir: Path, sid: str, new_parent: str | None, reason: str,
         step.parent = new_parent
         write_atomic(note_path, _utf8_bytes(render_note(step), "正文"))
         # 移完再扫一遍：两边候选组**现在**长什么样，才是要说给人听的那句话。
-        after = _branch_groups(load(steps_dir))
+        reloaded = load(steps_dir)
+        after = _branch_groups(reloaded)
         alt_left, alt_joined = after.get(old_parent or ""), after.get(new_parent or "")
+        chapter = _chapter_change(before_ch, resolve_chapters(reloaded), sid,
+                                  [sid] + sorted(subtree, key=id_key))
 
     return {"id": sid, "old_parent": old_parent, "new_parent": new_parent,
             "reason": reason, "by": entry["by"], "date": entry["date"],
@@ -1943,6 +2141,11 @@ def move_step(steps_dir: Path, sid: str, new_parent: str | None, reason: str,
             # 现算，不落盘（见上面那段说明）。两边都可能是 None：那一头压根没有
             # 候选组——「这次移动和任何一个岔路口都无关」也是一句要说清的话。
             "alternatives": {"left": alt_left, "joined": alt_joined},
+            # 这一步（连同子树里跟着继承的那些）从哪一章换到了哪一章。派生量，现算。
+            # **两头都没有章节时是 None**：现存项目全是这个状态，它们不该因为这一轮
+            # 改动在返回值里多出一条要人读的信息（和 alternatives 两头都是 None
+            # 同一个道理）。同章内部的移动给的是 changed=False，那也是一句要说的话。
+            "chapter": chapter,
             "digest": digest_of(note_path)}
 
 

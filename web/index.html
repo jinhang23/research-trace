@@ -37,6 +37,16 @@
     <button id="btn-scope" type="button"></button>
     <span id="hits" class="mono"></span>
   </div>
+  <!-- ⑨ 章节筛选。它**不在**下面那两排切换器里，这不是排版偏好：
+       第一级选「看哪一份东西」（开发路径 / 定稿流程），第二级选「同一份东西怎么画」
+       （图 / 列表 / 数据流），而章节两件都不改——它选的是**看多大范围**，
+       横切在那两级之上：开发路径要能按章节看，定稿流程也要按章节编。
+       所以它长在搜索框旁边（同样是「缩小注意力范围」那一类动作），而不是在
+       那两排按钮里再加一个格子——加进去就等于说「章节是第三种画法」。
+       选项与内容全部由 app.js 的 renderChapFilter() 按 forest.chapters 生成，
+       一个 `chapter:` 都没写的项目里它**整个不渲染**：多一个恒灰的下拉框，
+       就已经不是「现存项目完全无感」了。 -->
+  <select id="chapfilter" hidden></select>
   <!-- 切换器是**两级**的，这不是排版偏好，是这两样东西本来的层次。
        第一级「开发路径 / 定稿流程」选的是**看哪一份东西**：开发路径是这棵树的
        全部（含走不通的、含还悬着的岔路口），定稿流程是从 `result:` 沿 `input:`
@@ -182,6 +192,15 @@
                Methods 草稿里的编号是同一个，于是两条路径互相指得回去。 -->
           <span class="lgm"><i class="cmk pipe">[1]</i><span data-i18n="pipeline.badge" data-i18n-title="pipeline.badge.title"></span></span>
         </span>
+        <!-- ⑨ 章节。两样东西，两个**新**通道：底色带（同一章的卡片压在同一块
+             底色上，卡片左侧还有一道同色的窄条）和跨章记号（一对 45° 小斜杠钉在
+             那条边的中点上）。线型仍然只归 status、不透明度仍然只归「和你此刻的
+             关注有没有关系」、颜色仍然只归三种关系——一个都没借。
+             这一组只在项目真有章节时才露出来（app.js 的 renderChapFilter 一起管）。 -->
+        <span class="lgset" id="chaplegend" hidden>
+          <span class="lgm"><i class="lgband ch-0"></i><span data-i18n="chapter.name" data-i18n-title="chapter.lead"></span></span>
+          <span class="lgm"><i class="lgcross"><svg viewBox="0 0 20 12" aria-hidden="true"><path d="M10 0v12" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M6.5 8.2L12 2.4M8.5 9.6L14 3.8" fill="none" stroke="currentColor" stroke-width="1.4"/></svg></i><span data-i18n="chapter.cross.legend" data-i18n-title="chapter.cross.note"></span></span>
+        </span>
         <!-- 「颜色负责一眼扫到，形状负责说得准」那句话。压成一行加省略号、整句在
              title 里：图例是常驻的，让它长到三行就是永久吃掉一块画布。 -->
         <span class="lgnote" data-i18n-html="list.legend.note" data-i18n-title="list.legend.note"></span>
@@ -261,6 +280,19 @@
       <input id="nf-decision" maxlength="300" data-i18n-ph="editor.decision.placeholder">
     </label>
     <p class="hint" data-i18n-html="editor.decision.hint"></p>
+    <!-- ⑨ 这一步开不开一条新线（一个章节）。和 branch / decision 一样**不从父步骤
+         继承**，而且理由更硬：章节本来就是沿树继承的，把父步骤那个名字预填进来
+         等于把继承展开成一份会过期的拷贝——父步骤改个名字，这一步就留在旧章里。
+         留空 = 跟着上面那条线走。maxlength 对着 trace_write.MAX_CHAPTER。 -->
+    <div class="row2">
+      <label><span data-i18n="editor.chapter.label"></span>
+        <input id="nf-chap" maxlength="60" data-i18n-ph="editor.chapter.placeholder">
+      </label>
+      <label><span data-i18n="editor.chapter.note.label"></span>
+        <input id="nf-chnote" maxlength="200" data-i18n-ph="editor.chapter.note.placeholder">
+      </label>
+    </div>
+    <p class="hint" data-i18n-html="editor.chapter.hint"></p>
     <!-- 正文语言 ≠ 界面语言。界面是英文的人完全可能用中文记笔记，而这几个小节
          标题是要写进 note.md 的**内容**，写错了 trace_core 就找不到「为什么」，
          评级和 check 一起失灵。所以这里给一个显式的选择，默认值由

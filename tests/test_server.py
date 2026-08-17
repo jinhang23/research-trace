@@ -64,6 +64,12 @@ def waited(cond, seconds: float = 4.0):
 
 # 这张表是硬边界：**每一个会改磁盘的端点都必须在这里**。
 # 新增写端点却忘了加进来，等于公网上多一个任意写的口子。
+#
+# 章节（`chapter:`）**没有自己的写端点**，这是判断不是遗漏：它是步骤上的一个字段，
+# 走 POST /steps 和 PATCH /steps/{id} 这两条已经在表上的路。给它单开一条
+# `PUT /chapters/{名字}` 会造出第二条写入路径，而「一步属于哪一章」是**派生**的
+# （沿 parent 继承），根本没有一个能被写的对象。读那条 GET /chapters 在下面的
+# 公开读里，和 forest / pipeline 一致。
 WRITES = [
     ("POST", "/api/projects", {"name": "另一个"}),
     ("PATCH", "/api/projects/课题", {"name": "改名"}),
@@ -1323,3 +1329,130 @@ def test_both_front_doors_derive_the_very_same_pipeline(client):
     over_http.pop("version")
     local = M.LocalBackend(client.root).pipeline("课题")
     assert over_http == local
+
+
+# ------------------------------------------------------- 章节
+#
+# 一个项目内部并列的几块（主实验 / 消融 / 数据准备）。这一组防的是四件事：
+# 现存项目多出一个字、按章节导出在服务端被重新筛一遍（第二份实现）、
+# 章节名打错了却静默给出一份空流程、以及那条读路由被当成写路由设了防（或没设防）。
+
+
+def _chaptered(client):
+    """001 清洗 → 002 主实验★（都未分章）；003 开消融 → 004 消融汇总★。
+
+    004 的 `input:` 同时指着 003 和主线的 002 —— 那条跨章节的边就是
+    「消融是对着主结果测的」。
+    """
+    mkstep(client, title="清洗数据", body=BODY, status="done", commit="c1d2e3f",
+           paths=["/blue/lab/clean | output | 训练集 | size=12884901888 sha256=aabbccdd"])
+    mkstep(client, parent="001", title="主实验 AUC 0.91", body=BODY, status="done",
+           commit="c1d2e3f")
+    mkstep(client, parent="002", title="拿掉注意力模块", body=BODY, status="done",
+           commit="c1d2e3f", chapter="消融实验 | 逐个拿掉模块，对着主实验的 002 比")
+    mkstep(client, parent="003", title="消融汇总表", body=BODY, status="done",
+           commit="c1d2e3f", inputs=["003 | 逐个拿掉之后的数字", "002 | 主结果那一版权重"])
+    client.put("/api/p/课题/results/002", json={"note": "主结果"}, headers=AUTH)
+    client.put("/api/p/课题/results/004", json={"note": "图 4 的消融"}, headers=AUTH)
+
+
+def test_creating_a_step_can_open_a_chapter(client):
+    """漏传的症状是**静默丢字段**：调用方填了 chapter，返回 201，磁盘上没有。
+
+    而这一行的作用是**开一条新线**，建完再 PATCH 一次的话，这一步已经在上一章里
+    躺过一轮 —— 期间任何一次读、任何一次导出都会把它算进上一章。
+    """
+    r = client.post("/api/p/课题/steps", headers=AUTH,
+                    json={"title": "开始做消融", "body": BODY,
+                          "chapter": "消融实验 | 逐个拿掉模块"})
+    assert r.status_code == 201, r.text
+    assert "chapter: 消融实验 | 逐个拿掉模块" in note_of(client, "001").read_text(encoding="utf-8")
+
+
+def test_patching_a_step_can_move_a_whole_line_into_a_chapter(client):
+    """「回头才想明白这一整支是消融」是这个字段的主要用法：只改那一支的第一步。"""
+    _chaptered(client)
+    r = client.patch("/api/p/课题/steps/002", headers=AUTH, json={"chapter": "主实验"})
+    assert r.status_code == 200, r.text
+    forest = client.get("/api/p/课题/forest").json()
+    at = {s["id"]: s["chapter"]["name"] for s in forest["steps"]}
+    assert at["002"] == "主实验" and at["001"] == "", "只有这一步和它的子树"
+    assert at["003"] == "消融实验", "子树里自己声明过的那一支不受影响"
+
+
+def test_the_chapters_endpoint_is_a_public_read_like_the_forest(client):
+    """读公开、写要令牌是这套系统的硬边界，章节清单在读这一侧。"""
+    _chaptered(client)
+    r = client.get("/api/p/课题/chapters")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["declared"] is True
+    one = next(c for c in body["chapters"] if c["name"] == "消融实验")
+    assert one["n"] == 2 and one["note"].startswith("逐个拿掉模块")
+    assert one["results"] == ["004"], "有没有自己的成果 = 能不能单独导一段 Methods"
+    assert one["pipeline"]["level"], "每章各有自己的可溯源等级"
+    assert body["unassigned"] == ["001", "002"]
+    assert any(x["from"] == "002" and x["to"] == "004" for x in body["crossings"]), \
+        "跨章节的那条边要给出来 —— 它说的正是「消融是对着主结果测的」"
+
+
+def test_a_project_without_any_chapter_gains_nothing_anywhere(client):
+    """现存项目必须**完全无感**：不多一个键、不多一条警告、不多一个字段值。"""
+    _chain(client)
+    client.put("/api/p/课题/results/003", json={"note": "主结果"}, headers=AUTH)
+    forest = client.get("/api/p/课题/forest").json()
+    assert "chapters" not in forest, "一个 `chapter:` 都没写，这个键整个不该出现"
+    assert all("chapter" not in s for s in forest["steps"])
+    assert "chapters" not in forest["pipeline"], "流程那份派生也一个键都不多"
+    pipe = client.get("/api/p/课题/pipeline").json()
+    assert "chapter" not in pipe
+    ch = client.get("/api/p/课题/chapters").json()
+    assert ch["declared"] is False and ch["chapters"] == [] and ch["diagnostics"] == [], \
+        "没分章不是缺陷，一条诊断都不该有"
+
+
+def test_the_exports_take_a_chapter_and_do_not_filter_it_here(client):
+    """按章节导出**只有一份实现**（pipeline_payload）。服务端自己筛一遍 order
+    的话，屏幕上讨论的图和投出去的图就不是一张 —— 而投出去的那张会进论文。"""
+    import trace_mcp as M  # noqa: PLC0415
+
+    _chaptered(client)
+    md = client.get("/api/p/课题/pipeline/methods.md?chapter=消融实验").text
+    assert "消融实验" in md.splitlines()[0] and "借自" in md
+    whole = client.get("/api/p/课题/pipeline/methods.md").text
+    assert md != whole
+    # 逐字节等于本地后端那一份：两条路走的是同一个纯函数。
+    local = M.LocalBackend(client.root).pipeline("课题", "消融实验")
+    assert md == M.pipeline_methods(local)
+    for path in ("figure.svg", "page.html"):
+        got = client.get(f"/api/p/课题/pipeline/{path}?chapter=消融实验")
+        assert got.status_code == 200 and "消融实验" in got.text
+
+
+def test_the_unassigned_group_is_addressable_too(client):
+    """多数项目的主线从没起过名字 —— 没有这个记号，最该单独导一份的那一块导不了。"""
+    import trace_mcp as M  # noqa: PLC0415
+
+    _chaptered(client)
+    body = client.get(f"/api/p/课题/pipeline?chapter={M.CHAPTER_NONE}").json()
+    assert body["pipeline"]["order"] == ["001", "002"]
+    assert [r["step"] for r in body["pipeline"]["results"]] == ["002"]
+
+
+def test_an_unknown_chapter_is_a_404_that_names_the_real_ones(client):
+    """章节名是人起的中文，打错一个字是最常见的失败方式；
+    而「没有这一章」和「这一章是空的」在响应里长得一模一样。"""
+    _chaptered(client)
+    r = client.get("/api/p/课题/pipeline?chapter=消融試驗")
+    assert r.status_code == 404, "这是「你要的那个东西不在这儿」，不是写坏了一个字段"
+    assert "消融实验" in r.json()["error"]
+
+
+def test_both_front_doors_derive_the_very_same_chapter_slice(client):
+    """远端后端照着 REST 拿数据，本地后端直接读盘。两边必须是同一条流程。"""
+    import trace_mcp as M  # noqa: PLC0415
+
+    _chaptered(client)
+    over_http = client.get("/api/p/课题/pipeline?chapter=消融实验").json()
+    over_http.pop("version")
+    assert over_http == M.LocalBackend(client.root).pipeline("课题", "消融实验")

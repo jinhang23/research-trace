@@ -164,6 +164,16 @@
   function forkHay(step) {
     return [step.decision || "", step.branch_note || ""].filter(Boolean).join(" ");
   }
+  /* 这一步**自己写下的**那一行 `chapter:`（名字 + 那句说明）。判据就是 grep：
+     `grep -rn 消融实验 projects/` 命中的是声明它的那一个文件，继承来的二十步
+     文件里一个「消融」都没有。拿归属（继承来的 name）当判据，搜「消融」会一口气
+     命中二十条一模一样的，真正的答案（这条线从哪儿开始）反而被埋掉。
+     判据和 core.chapter_haystack、服务端、MCP 是同一份。 */
+  function chapterHay(step) {
+    var ch = step && step.chapter;
+    if (!ch) return "";
+    return [ch.declared ? (ch.name || "") : "", ch.note || ""].filter(Boolean).join(" ");
+  }
   function hay(step) {
     var tr = (step && step.tr) || {}, extra = "";
     Object.keys(tr).sort().forEach(function (l) {
@@ -172,7 +182,7 @@
     });
     return (step.id + " " + (step.title || "") + " " + (step.body || "") + " "
             + (step.tags || []).join(" ") + " " + locationsHay(step) + " " + forkHay(step)
-            + extra).toLowerCase();
+            + " " + chapterHay(step) + extra).toLowerCase();
   }
   function matches(step, q) {
     q = String(q || "").trim().toLowerCase();
@@ -867,7 +877,7 @@
     var empty = {
       declared: false, order: [], steps: [], edges: [], results: [], why: {},
       levels: {}, level: "", weakest: "", weak: [], dead: [], included: [], excluded: [],
-      diagnostics: (P && P.diagnostics) || [],
+      diagnostics: (P && P.diagnostics) || [], chapters: [],
     };
     if (!P || !P.declared) return empty;
     var noteOf = Object.create(null);
@@ -902,7 +912,261 @@
       weak: (P.weak || []).slice(), dead: (P.dead || []).slice(),
       included: (P.included || []).slice(), excluded: (P.excluded || []).slice(),
       diagnostics: P.diagnostics || [],
+      /* 每个章节各一条定稿流程。**core 已经把那一张 DAG 切好了**（一条 `result:`
+         指的那一步在哪一章，这条流程就属于哪一章），这里一步闭包都不重算——
+         各算一遍就会出现「屏幕上讨论的图和投出去的图不是一张」。
+         `chapters` 只在项目真有章节时才被 core 放进来，没有就是空数组。 */
+      chapters: (P.chapters || []).map(function (g) {
+        return { name: g.name || "", results: (g.results || []).slice(),
+                 order: (g.order || []).slice(), external: (g.external || []).slice(),
+                 level: g.level || "", weakest: g.weakest || "",
+                 weak: (g.weak || []).slice(), dead: (g.dead || []).slice() };
+      }),
     };
+  }
+
+  /* ================================================ ⑨ 章节：项目内部并列的几块
+   *
+   * 主实验 / 消融实验 / 数据准备。磁盘上只多一行 `chapter: 消融实验 | 说明`，
+   * 写在**开启那条线的那一步**上，底下整棵子树沿 parent 继承（core.resolve_chapters）。
+   *
+   * 这一层只做三件不碰 DOM 的事：把 forest.chapters 整理成一份模型、算章节在图上
+   * 那几块底色带的坐标、以及「换一次章节会带走底下哪几步」。
+   *
+   * **归属只有一份判据**，就是服务端给的 `step.chapter.name`（core 算好的继承结果）。
+   * 这里绝不拿「这一步自己写没写 chapter:」当归属判断——那是 `.declared`，
+   * 混用会让继承来的二十步集体看着像未分章。
+   *
+   * 界面上章节**不是第三级视图**，它是横切的：开发路径要能按章节看，定稿流程也要，
+   * 所以它的入口在顶栏（和搜索并排），而不是在「图/列表/数据流」那一排里再加一个。
+   * 理由和 index.html 里 #modeswitch 那段注释同源——一级选**看哪一份东西**，
+   * 二级选**怎么画**，章节两者都不改，它改的是**看多大范围**。
+   */
+
+  /* 章节在图上用的是一条**新通道**：一块底色带 + 卡片左侧一道色条。
+     线型仍然只归 status、不透明度仍然只归祖先链/搜索/章节筛选（同一个语义：
+     「和你此刻的关注有没有关系」）、边的颜色仍然只归三种关系。
+     六个色相循环用：再多人也分不清，而分不清的颜色等于没有颜色；带子上永远
+     跟着章节名（图上是入口处那块牌子，卡片上是 tooltip），色相只负责一眼扫到。 */
+  var CHAPTER_HUES = 6;
+  function chapterHue(i) {
+    var n = Math.floor(Number(i));
+    if (!isFinite(n) || n < 0) n = 0;
+    return n % CHAPTER_HUES;
+  }
+
+  /* forest.chapters → 界面共用的一份模型。
+     `forest.chapters` **只在真有人写过 `chapter:` 时才存在**（现存项目完全无感），
+     所以第一件事是老实返回 declared:false，让界面一个像素都不渲染——顶栏那个
+     筛选器、章节面板、按章节导出全都不该在没有章节的项目里冒出来。 */
+  function chapterModel(forest) {
+    var C = (forest && forest.chapters) || null;
+    var out = { declared: false, list: [], of: Object.create(null), unassigned: [],
+                crossings: [], diagnostics: [], byName: Object.create(null) };
+    if (!C || !C.declared) return out;
+    out.declared = true;
+    out.list = (C.chapters || []).map(function (c, i) {
+      /* `parts` 是 core 按名字里的斜杠拆好的。**不在这边自己 split**：分隔符的
+         唯一来源是 core.CHAPTER_SEP，这里再写一个 "/" 就是第二份声明。
+         而且它只影响显示分组——章节不嵌套，底下仍然是平的一层名字。 */
+      var parts = (c.parts && c.parts.length ? c.parts : [c.name || ""]).slice();
+      var st = c.status || {};
+      var e = {
+        name: c.name || "", parts: parts,
+        group: parts.length > 1 ? parts[0] : "",
+        note: c.note || "",
+        declaredAt: (c.declared_at || []).slice(),
+        steps: (c.steps || []).slice(),
+        roots: (c.roots || []).slice(),
+        n: c.n === undefined ? (c.steps || []).length : c.n,
+        status: { done: st.done || 0, wip: st.wip || 0, dead: st.dead || 0 },
+        level: c.level || "", weakest: c.weakest || "",
+        index: i, hue: chapterHue(i),
+      };
+      out.byName[e.name] = e;
+      return e;
+    });
+    Object.keys(C.of || {}).forEach(function (k) { out.of[k] = C.of[k]; });
+    out.unassigned = (C.unassigned || []).slice();
+    out.crossings = (C.crossings || []).map(function (x) {
+      return { from: x.from, to: x.to, kind: x.kind || "",
+               from_chapter: x.from_chapter || "", to_chapter: x.to_chapter || "",
+               note: x.note || "" };
+    });
+    out.diagnostics = (C.diagnostics || []).slice();
+    return out;
+  }
+
+  /* 这一步的章节是**从哪一步继承来的**：沿 parent 往上找第一个自己写了 `chapter:`
+     的祖先（可能就是它自己）。人要知道「改哪一步才能改整条线」，而那个答案只有
+     一个——声明的那一步。找不到（未分章）就回空串。防环。 */
+  function chapterSourceOf(byId, id) {
+    var cur = id, seen = Object.create(null);
+    while (cur && byId[cur] && !seen[cur]) {
+      seen[cur] = 1;
+      var ch = byId[cur].chapter;
+      if (ch && ch.declared) return cur;
+      cur = byId[cur].parent;
+    }
+    return "";
+  }
+
+  /* 在这一步上开一个章节，会**带走底下哪几步**。
+     沿子树往下走，遇到自己声明过章节的那一步就整支停住——它和它底下的子树
+     早就不听这条线的了。用户吃过的亏是「二十步集体转章，diff 里只有一行」，
+     所以这个数得在 toast 里说出来（toast.chapter.carry）。 */
+  function chapterCarry(byId, id) {
+    var kids = Object.create(null);
+    Object.keys(byId || {}).forEach(function (k) {
+      var p = byId[k] && byId[k].parent;
+      if (p) (kids[p] || (kids[p] = [])).push(k);
+    });
+    var out = [], seen = Object.create(null), stack = (kids[id] || []).slice();
+    while (stack.length) {
+      var cur = stack.shift();
+      if (seen[cur]) continue;
+      seen[cur] = 1;
+      var s = byId[cur];
+      if (!s) continue;
+      if (s.chapter && s.chapter.declared) continue;   // 它自己开了一章，整支不跟着走
+      out.push(cur);
+      (kids[cur] || []).forEach(function (k) { stack.push(k); });
+    }
+    return out.sort();
+  }
+
+  /* 那句章节说明**写在哪一步身上**（要改它就得 PATCH 那一步）。
+     和 core 的裁决逐字一致：id 序最早的那个**带说明的**声明生效；一句说明都没有
+     时落在最早的那个声明上。不一致的话，人在界面上改了说明，屏幕上显示的还是
+     另一步写的那句——而那正是「双真相源」最气人的形状。 */
+  function chapterNoteHome(entry, byId) {
+    var ids = (entry && entry.declaredAt) || [];
+    for (var i = 0; i < ids.length; i++) {
+      var s = byId[ids[i]];
+      if (s && s.chapter && s.chapter.note) return ids[i];
+    }
+    return ids[0] || "";
+  }
+
+  /* 图视图上那几块章节底色带。
+   *
+   * 一个章节可以横跨好几棵树，所以不能简单地按位置圈一个方框——**一个方框里
+   * 只要混进一张别的章节的卡片，这块底色就是在撒谎**。所以按层切：每一层里
+   * 连续的成员算一段，中间夹进一张外人就断开。于是带子覆盖的**只可能是成员**。
+   * 布局一个数都没动（core 的 tree.nodes 原样用），章节只是画在底下的一层。
+   */
+  function chapterBands(nodes, ids, opts) {
+    opts = opts || {};
+    var nw = opts.nw || 176, nh = opts.nh || 58;
+    var pad = opts.pad === undefined ? 5 : opts.pad;
+    var mine = Object.create(null);
+    (ids || []).forEach(function (id) { mine[id] = 1; });
+    var rows = Object.create(null);
+    Object.keys(nodes || {}).forEach(function (id) {
+      var n = nodes[id];
+      if (!n) return;
+      (rows[n.y] || (rows[n.y] = [])).push({ id: id, x: n.x, y: n.y });
+    });
+    var out = [];
+    Object.keys(rows).sort(function (a, b) { return Number(a) - Number(b); }).forEach(function (k) {
+      var row = rows[k].sort(function (a, b) {
+        return a.x - b.x || (a.id < b.id ? -1 : (a.id > b.id ? 1 : 0));
+      });
+      var run = null;
+      row.forEach(function (n) {
+        if (mine[n.id]) {
+          if (run) run.x2 = n.x + nw;
+          else run = { x1: n.x, x2: n.x + nw, y: n.y };
+        } else if (run) { out.push(run); run = null; }
+      });
+      if (run) out.push(run);
+    });
+    return out.map(function (r) {
+      return { x: r.x1 - pad, y: r.y - pad, w: r.x2 - r.x1 + pad * 2, h: nh + pad * 2 };
+    });
+  }
+
+  /* 跨章节那条边上的记号：一对 45° 的小斜杠，画在边的中点上（电路图里「这条线
+     跨过去了」用的就是这个记号）。
+     它是**又一个新通道**——线型仍然归 status、颜色仍然归三种关系、不透明度仍然
+     归「和选中有没有关系」。这条边不该藏起来：消融吃着主实验的产物，那正是
+     整个项目里最有话说的一条边。 */
+  function crossTick(a, b, opts) {
+    opts = opts || {};
+    var len = opts.len === undefined ? 4.5 : opts.len;
+    var gap = opts.gap === undefined ? 3.4 : opts.gap;
+    var dx = b.x - a.x, dy = b.y - a.y;
+    var m = Math.sqrt(dx * dx + dy * dy) || 1;
+    var ux = dx / m, uy = dy / m;
+    var sx = ux - uy, sy = uy + ux;                 // 沿边方向转 45°
+    var sm = Math.sqrt(sx * sx + sy * sy) || 1;
+    sx /= sm; sy /= sm;
+    var cx = (a.x + b.x) / 2, cy = (a.y + b.y) / 2;
+    var r2 = function (v) { return Math.round(v * 100) / 100; };
+    var one = function (off) {
+      var px = cx + ux * off, py = cy + uy * off;
+      return "M" + r2(px - sx * len) + " " + r2(py - sy * len)
+           + "L" + r2(px + sx * len) + " " + r2(py + sy * len);
+    };
+    return one(-gap / 2) + one(gap / 2);
+  }
+
+  /* 章节名**不是路径安全的**：`主实验/数据准备` 是合法名字（设计要求按 `/` 分组
+     显示），`CON` 也是。所以按章节导出的文件名必须**派生**出来，绝不能拿名字直接
+     拼——这一份逐字对着 trace_write.slugify（NFKC + 非字词字符压成 `-` + 40 字上限），
+     外加 Windows 设备名那一道（`con.svg` 打开的是设备不是文件）。 */
+  var WIN_RESERVED = ["con", "prn", "aux", "nul",
+                      "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+                      "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"];
+  var MAX_SLUG = 40;
+  function chapterSlug(name) {
+    var s = String(name == null ? "" : name);
+    if (s.normalize) s = s.normalize("NFKC");
+    s = s.trim().toLowerCase()
+      .replace(/[^\p{L}\p{N}_]+/gu, "-")
+      .replace(/^-+|-+$/g, "")
+      .replace(/-{2,}/g, "-");
+    if (s.length > MAX_SLUG) s = s.slice(0, MAX_SLUG).replace(/-+$/, "");
+    /* 下面这两行的取值**逐字对着 trace_mcp.chapter_export_name**（未分章那一组是
+       `unassigned`，Windows 设备名后面补 `-ch`）。两侧各起各的名字的话，同一份
+       导出在浏览器里下载下来叫一个名、`build` 写到磁盘上叫另一个名，而那两份
+       字节是同一个纯函数的同一份输出——tests/test_seams_chapter.py 拿一张
+       名字表逐个比对着这一条。 */
+    if (!s) return "unassigned";                    // 未分章那一组也要有自己的文件名
+    return WIN_RESERVED.indexOf(s) >= 0 ? s + "-ch" : s;
+  }
+  /* 服务端**自己说**它刚才编的是哪一章。`?chapter=` 那条路由的回执里，`chapter`
+     是一个对象（`{name, label, external, known, no_result}`），不是一个字符串——
+     直接拿整个对象和名字比永远不相等，而症状是按章节导出整块静默消失。
+     没有这个键（还没升级的服务端会忽略查询参数、回整个项目那一份）就回 null，
+     调用方据此降级到整项目那三样，而不是挂一个名不副实的文件名。 */
+  function chapterEcho(payload) {
+    var ch = payload && payload.chapter;
+    return ch && typeof ch.name === "string" ? ch.name : null;
+  }
+  /* 一批章节名 → 一批**互不相同**的文件名词干。大小写是故意不折叠的（`Ablation`
+     和 `ablation` 是两个章节，core 的 chapter_near_duplicate 专门逮它），于是两个
+     不同章节完全可能 slug 成同一个名字——用它在清单里的顺序号消歧，绝不让后一份
+     静默盖掉前一份。 */
+  function chapterFileStems(names) {
+    var used = Object.create(null), out = [];
+    (names || []).forEach(function (nm, i) {
+      var s = chapterSlug(nm), pick = s, k = i + 1;
+      while (used[pick]) { pick = s + "-" + k; k++; }
+      used[pick] = 1;
+      out.push(pick);
+    });
+    return out;
+  }
+
+  /* 某个章节那条定稿流程上的步骤条目。用的是**整份模型里现成的那些条目**，
+     不重新算一遍：core 保证每章的 order 是全局 order 的子序列，所以同一步在总图
+     和分章图里位置一致，编号也就还是那一个——屏幕上的 [3]、开发路径卡片上的 [3]、
+     导出那张图上的 3 必须是同一个数。 */
+  function pipelineChapterSteps(model, group) {
+    var want = Object.create(null);
+    ((group && group.order) || []).forEach(function (id) { want[id] = 1; });
+    return ((model && model.steps) || []).filter(function (it) { return want[it.id]; });
   }
 
   var U = {
@@ -913,7 +1177,7 @@
     splitInsightBody: splitInsightBody, foreignHeadings: foreignHeadings,
     draftKey: draftKey, matches: matches, snippet: snippet, locationsHay: locationsHay,
     pickLang: pickLang, headingsIn: headingsIn, langByHeadings: langByHeadings,
-    forkHay: forkHay,
+    forkHay: forkHay, chapterHay: chapterHay,
     sizeUnit: sizeUnit, formatPath: formatPath, formatInput: formatInput, formatCode: formatCode,
     MEASURED_ATTRS: MEASURED_ATTRS, inheritPath: inheritPath,
     parseInsights: parseInsights, parseInsightLine: parseInsightLine,
@@ -926,7 +1190,12 @@
     rejoinCurve: rejoinCurve, railRejoin: railRejoin,
     rejoinRelated: rejoinRelated, groupOf: groupOf,
     SECTION_ORDER: SECTION_ORDER, headingList: headingList, sectionOf: sectionOf,
-    pipelineModel: pipelineModel,
+    pipelineModel: pipelineModel, pipelineChapterSteps: pipelineChapterSteps,
+    CHAPTER_HUES: CHAPTER_HUES, chapterHue: chapterHue, chapterModel: chapterModel,
+    chapterSourceOf: chapterSourceOf, chapterCarry: chapterCarry,
+    chapterNoteHome: chapterNoteHome, chapterBands: chapterBands, crossTick: crossTick,
+    chapterSlug: chapterSlug, chapterFileStems: chapterFileStems,
+    chapterEcho: chapterEcho,
   };
   global.traceUtil = U;
   if (typeof module !== "undefined" && module.exports) module.exports = U;
@@ -979,6 +1248,23 @@
      当版本会让缓存永远命中，于是改完一步图再也不更新。 */
   var FOREST_SEQ = 0;
   var PROJECTS = [];
+  /* ⑨ 章节。`forest.chapters` 只在项目里真有人写过 `chapter:` 时才存在，
+     没有时这份模型的 declared 是 false，界面上一个像素都不多画。 */
+  var CH = U.chapterModel(null);
+  /* 顶栏那个章节筛选器选中的是谁。空串 = 全部；CHAP_NONE = 只看未分章的那些。
+     **不记进 localStorage**：它和搜索是同一类动作（缩小注意力范围），而一个
+     记住了的筛选器会让人下次打开时对着半屏淡掉的节点找原因——mode / view 记得住
+     是因为它们换的是「看哪一份东西」，不是「看多大范围」。
+     哨兵值里那个竖线是**故意**的：写入侧拒收带竖线的章节名（那一行的语法就是
+     「名字 | 说明」），所以它是一个真章节名永远不可能长成的样子。 */
+  var CHAP_NONE = "|none";
+  /* 未分章那一组在 `?chapter=` 上的记号。**逐字就是 trace_mcp.CHAPTER_NONE**
+     （tests/test_seams_chapter.py 直接读那个常量比着这一行）：核心把未分章那组的
+     名字定成空串，而空串在查询串上和「没给」长得一模一样，可它常常就是主实验。
+     和上面那个哨兵是两回事——上面那个只活在这一页里（所以敢用竖线），
+     这一个要发到服务端去，两边必须是同一个字节。 */
+  var CHAP_SENT = "-";
+  var chapFilter = "";
   var query = "";
   var editing = false;
   /* 窄屏（手机、竖着的平板）第一次打开默认走列表视图。
@@ -1211,6 +1497,24 @@
         }).join("");
   }
 
+  /* 项目卡片上那一行章节：分了几章、各几步。
+   *
+   * 索引页拿到的是 `/api/projects` 那一份，里面**没有** forest，所以这一行只能由
+   * 服务端顺手带上（`chapters: [{name, n}]`，没有章节的项目整个键不出现——
+   * 那些项目的卡片必须逐字节和从前一样）。带上了就显示，没带就一个字都不多，
+   * 于是这一页对着还没升级的服务端也不会显示一行「0 个章节」的谎话。 */
+  function projectChapters(p) {
+    var cs = (p && p.chapters) || [];
+    if (!cs.length) return "";
+    return '<div class="pchaps mono" title="' + esc(i18n.t("chapter.badge.title")) + '">'
+      + esc(i18n.t("count.chapters", { n: cs.length })) + " · "
+      + cs.map(function (c) {
+          return esc(i18n.t("chapter.entry.bare", { chapter: c.name || i18n.t("chapter.none") })
+            + " " + i18n.t("count.steps", { n: c.n || 0 }));
+        }).join(" · ")
+      + "</div>";
+  }
+
   function renderHome() {
     // 项目索引页的搜索框以前被 CSS 直接隐藏。现在它同时干两件事：
     // 筛项目卡片（下面这段），以及跨项目搜步骤正文（#hitlist）。
@@ -1235,6 +1539,7 @@
             done: c.done || 0, wip: c.wip || 0, dead: c.dead || 0,
           })
         + (p.latest ? " · " + i18n.tHtml("home.card.latest", { date: p.latest }) : "") + "</div>"
+        + projectChapters(p)
         + (p.warnings ? '<div class="pwarn">'
             + i18n.tHtml("home.card.warnings", { warnings: i18n.t("count.warnings", { n: p.warnings }) })
             + "</div>" : "")
@@ -1253,6 +1558,13 @@
     FOREST_SEQ++;                       // 记录变了 —— 那张图得重新去取，缓存的那份已经过期（见 fetchFigure）
     IDX = Object.create(null);
     F.steps.forEach(function (s) { IDX[s.id] = s; });
+    CH = U.chapterModel(F);
+    // 筛的那个章节可能刚被改名/删空了。留着一个不存在的筛选值，屏幕上就是
+    // 满屏淡掉的节点而没有任何一个亮的——那看着像功能坏了。
+    if (chapFilter && chapFilter !== CHAP_NONE && !CH.byName[chapFilter]) chapFilter = "";
+    if (!CH.declared) chapFilter = "";
+    chapStems();
+    renderChapFilter();
     document.documentElement.style.setProperty("--row-h", (F.row_h || 28) + "px");
     renderRails();
     renderRows();
@@ -1278,6 +1590,88 @@
       // 不在这里重画一次的话，第一次打开项目看到的就是个空框。
       if (!selected() && !editing) renderDetail();
     }).catch(function () {});
+  }
+
+  /* -------------------------------------------------------------- ⑨ 章节筛选器
+   *
+   * 它长在顶栏、挨着搜索框，**不在**「图 / 列表 / 数据流」那一排里，也不在
+   * 「开发路径 / 定稿流程」那一排里。理由是层次本来就是这样的：那两排一个选
+   * 「看哪一份东西」、一个选「怎么画」，而章节两者都不改——它选的是**看多大范围**，
+   * 横切在这两级之上。所以开发路径按章节看、定稿流程按章节编，用的是同一个控件。
+   *
+   * 一个 `chapter:` 都没写的项目里它**整个不渲染**：多一个恒灰的下拉框就已经不是
+   * 「完全无感」了。
+   */
+  function renderChapFilter() {
+    var box = $("#chapfilter");
+    if (!box) return;
+    box.hidden = !CH.declared;
+    // 图例里那两条（底色带 / 跨章记号）跟着一起：没有章节的项目图例上一个字都不多。
+    var lg = $("#chaplegend");
+    if (lg) lg.hidden = !CH.declared;
+    if (!CH.declared) { box.innerHTML = ""; return; }
+    box.title = i18n.t("app.chapter.title");
+    var opt = function (v, label, title) {
+      return '<option value="' + esc(v) + '"' + (v === chapFilter ? " selected" : "")
+        + (title ? ' title="' + esc(title) + '"' : "") + ">" + esc(label) + "</option>";
+    };
+    var html = opt("", i18n.t("app.chapter.all"));
+    /* 名字里的斜杠只影响**显示分组**（章节不嵌套，见 chapter.nest.note）。
+       分组用的是 core 已经拆好的 parts[0]，这边不认识那个分隔符。
+
+       同一组的几章要收在**一个** optgroup 里，所以这里按组聚一次而不是顺着清单
+       边走边开：章节的先后是「谁先被开启」（core 按最早那一步的 id 排），
+       主实验/画图 和 主实验/检索 完全可能中间隔着别的章节，顺着走就会开出两个
+       同名的分组框——同一个名字在下拉框里出现两次，读的人只会以为自己看花了眼。
+       组之间仍按**首次出现**的先后，组内仍按 core 给的顺序：两者都还是那句
+       「和步骤列表同向」。 */
+    var groups = [], byGroup = Object.create(null);
+    CH.list.forEach(function (c) {
+      var g = c.group;
+      if (!byGroup[g]) { byGroup[g] = []; groups.push(g); }
+      byGroup[g].push(c);
+    });
+    var one = function (c) {
+      return opt(c.name, i18n.t("chapter.entry.bare", { chapter: c.name })
+        + "  " + i18n.t("count.steps", { n: c.n }), c.note || i18n.t("chapter.desc.missing"));
+    };
+    groups.forEach(function (g) {
+      if (!g) { byGroup[g].forEach(function (c) { html += one(c); }); return; }
+      html += '<optgroup label="' + esc(g) + '" title="'
+        + esc(i18n.t("chapter.group.title")) + '">';
+      byGroup[g].forEach(function (c) { html += one(c); });
+      html += "</optgroup>";
+    });
+    // 「只看还没分章的那些」也得是一个选项：一个项目分了章之后，剩下没归位的
+    // 那几步正是最容易被忘掉的，而它们在 core 那边本来就自成一组（名字是空串）。
+    if (CH.unassigned.length) {
+      html += opt(CHAP_NONE, i18n.t("chapter.none")
+        + "  " + i18n.t("count.steps", { n: CH.unassigned.length }),
+        i18n.t("chapter.none.title"));
+    }
+    box.innerHTML = html;
+  }
+
+  /* 这一步在不在当前筛选范围内。没筛就人人都在。 */
+  function inChapFilter(id) {
+    if (!chapFilter) return true;
+    var name = CH.of[id] || "";
+    return chapFilter === CHAP_NONE ? !name : name === chapFilter;
+  }
+  /* 这一步归哪一章（继承来的那个名字），以及它该用第几号色相。
+     **归属只问 CH.of**（core 的 resolve_chapters），绝不看这一步自己写没写。 */
+  function chapOf(id) {
+    var name = CH.of[id] || "";
+    return name ? (CH.byName[name] || null) : null;
+  }
+  /* 卡片/行上那一道章节色条要带的属性。没有章节时返回空串——现存项目连一个
+     多余的属性都不该多出来。 */
+  function chapAttrs(s) {
+    var c = CH.declared && chapOf(s.id);
+    if (!c) return "";
+    var own = s.chapter && s.chapter.declared;
+    return ' data-chap="' + esc(c.name) + '" data-chi="' + c.hue + '"'
+      + (own ? ' data-chdecl="1"' : "");
   }
 
   /* -------------------------------------------------------------- 图视图 */
@@ -1310,6 +1704,23 @@
     svg.setAttribute("viewBox", "0 0 " + T.w + " " + T.h);
 
     var out = [];
+
+    /* 章节的底色带**排在最前面**，于是它落在所有边和卡片底下——章节是一层背景，
+       不是图上的一样东西。按层切段（U.chapterBands）保证一块带子覆盖的只可能是
+       本章的卡片：一个章节完全可以横跨好几棵树，随手圈一个大方框就会把别人家的
+       节点圈进来，而人相信的正是自己看见的那一圈。 */
+    CH.list.forEach(function (c) {
+      U.chapterBands(T.nodes, c.steps, { nw: NW, nh: NH }).forEach(function (b) {
+        out.push('<rect class="chband ch-' + c.hue + '" data-chap="' + esc(c.name) + '"'
+          + ' x="' + b.x + '" y="' + b.y + '" width="' + b.w + '" height="' + b.h
+          + '" rx="9"/>');
+      });
+    });
+
+    // 跨章节的那些 parent 边（消融那条线是从主实验某一步分出去的）。
+    var crossParent = Object.create(null);
+    CH.crossings.forEach(function (x) { if (x.kind === "parent") crossParent[x.to] = x; });
+
     F.steps.forEach(function (s) {
       var p = s.parent && IDX[s.parent];
       if (!p || !T.nodes[p.id] || !T.nodes[s.id]) return;
@@ -1335,6 +1746,17 @@
       out.push('<path class="dedge s-' + s.status + rel + '" data-id="' + esc(s.id) + '" d="' + d + '"/>');
       out.push('<path class="darrow s-' + s.status + rel + '" data-id="' + esc(s.id) + '" d="M'
         + (cx - 4.5) + " " + tip + "L" + (cx + 4.5) + " " + tip + "L" + cx + " " + (tip + 7) + 'Z"/>');
+      /* 这条边跨章节：一对小斜杠钉在子节点正上方那一竖上。**新通道**——
+         线型还是 status、颜色还是三种关系、不透明度还是「和选中有没有关系」。
+         它说的是「消融那条线是从主实验的这一步分出去的」，值得画出来。 */
+      var xp = crossParent[s.id];
+      if (xp) {
+        out.push('<path class="xchap" data-id="' + esc(s.id) + '" data-from="' + esc(p.id)
+          + '" data-to="' + esc(s.id) + '" d="'
+          + U.crossTick({ x: cx, y: midY }, { x: cx, y: tip }) + '"><title>'
+          + esc(i18n.t("chapter.cross.parent", { chapter: xp.from_chapter || i18n.t("chapter.none") })
+                + " — " + i18n.t("chapter.cross.parent.title")) + "</title></path>");
+      }
     });
 
   /* 互斥候选的括弧。颜色一眼扫到，括弧说得准——灰度打印出来，「这几条是一组」
@@ -1371,6 +1793,7 @@
         + (other ? '<span class="cmk" title="' + esc(i18n.t("count.files", { n: other })) + '">📎' + (other > 1 ? other : "") + "</span>" : "")
         + nodeMarks(s);
       return '<div class="card s-' + s.status + '" data-id="' + esc(s.id) + '" tabindex="0"'
+        + chapAttrs(s)
         + ' style="left:' + n.x + "px;top:" + n.y + "px;width:" + NW + "px;height:" + NH + 'px">'
         + '<div class="chead"><span class="cid">' + esc(s.id) + "</span>"
         + '<span class="cst">' + s.status + "</span>"
@@ -1398,10 +1821,36 @@
    * 「点开这个岔路口」正是「告诉我这里在决定什么」这个动作本身，所以这一档
    * 不需要另外教，而不选中的时候图形状一个像素都不变。
    */
+  /* 章节在图上的名牌，落在这个章节的**每一个入口**上（core 给的 roots：
+     parent 不在同一章的那些成员）。一个章节可以横跨好几棵树，所以名牌可能有好几块——
+     那正是「章节是一组步骤，不是一棵子树」这句话在图上的样子。
+     写着「章节从这里开始」的那种（declared）和继承来的入口画成两回事：前者是
+     改一个字就能把整条线搬走的那个锚点。 */
+  function chapterLabels(T, NW) {
+    if (!CH.declared) return "";
+    var out = "";
+    CH.list.forEach(function (c) {
+      c.roots.forEach(function (id) {
+        var n = T.nodes[id];
+        if (!n) return;
+        var s = IDX[id] || {};
+        var declared = !!(s.chapter && s.chapter.declared);
+        var tip = (c.note ? c.name + " — " + c.note : c.name) + " · "
+          + i18n.t(declared ? "chapter.declared.title" : "chapter.badge.title");
+        out += '<div class="chaplabel ch-' + c.hue + (declared ? " decl" : "")
+          + '" data-chap="' + esc(c.name) + '" data-chapat="' + esc(id) + '"'
+          + ' style="left:' + (n.x - 4) + "px;top:" + (n.y - 17) + 'px" title="' + esc(tip) + '">'
+          + (declared ? '<span class="chdot">◆</span>' : '<span class="chdot">◇</span>')
+          + esc(c.name) + "</div>";
+      });
+    });
+    return out;
+  }
+
   function renderForkLabels(T, NW) {
     var box = $("#dmarks");
     if (!box) return;
-    box.innerHTML = (F.branch_groups || []).map(function (g) {
+    box.innerHTML = chapterLabels(T, NW) + (F.branch_groups || []).map(function (g) {
       var bk = U.forkBracket(T.nodes, g, { nw: NW, skip: outsiderXs(T.nodes, g, NW) });
       var lab = U.forkLabel(g);
       if (!bk || !lab) return "";
@@ -1467,6 +1916,12 @@
     svg.setAttribute("height", FLOW.h);
     svg.setAttribute("viewBox", "0 0 " + FLOW.w + " " + FLOW.h);
 
+    /* 跨章节的边在这张图上更要紧：消融吃着主实验的产物，那条 `input:` 正是
+       「消融是对着主结果测的」这句话本身。两端的章节名进 <title>，记号本身
+       和树上那一处是同一对小斜杠（同一个新通道，别处一个都没借）。 */
+    var crossAt = Object.create(null);
+    CH.crossings.forEach(function (x) { crossAt[x.from + ">" + x.to] = x; });
+
     var out = [];
     FLOW.edges.forEach(function (e) {
       var a = FLOW.nodes[e.from], b = FLOW.nodes[e.to];
@@ -1481,6 +1936,18 @@
       out.push('<path class="fedge k-' + e.kind + '"' + tag + ' d="' + d + '"/>');
       out.push('<path class="farrow k-' + e.kind + '"' + tag + ' d="M' + (x2 - 4) + " " + y2
         + "L" + (x2 + 4) + " " + y2 + "L" + x2 + " " + (y2 + 6.5) + 'Z"/>');
+      var xc = crossAt[e.from + ">" + e.to];
+      if (xc) {
+        // 三次贝塞尔在 t=0.5 上正好是两端的中点（两个控制点各自只沿 y 偏移），
+        // 所以记号钉在中点上就是钉在曲线上，不用去解曲线。画在边之后 = 压在边上。
+        out.push('<path class="xchap"' + tag + ' d="'
+          + U.crossTick({ x: x1, y: y1 }, { x: x2, y: y2 }) + '"><title>'
+          + esc(i18n.t(xc.kind === "input" ? "chapter.cross.input" : "chapter.cross.parent",
+                       { chapter: xc.from_chapter || i18n.t("chapter.none") })
+                + " — " + i18n.t(xc.kind === "input"
+                                 ? "chapter.cross.input.title" : "chapter.cross.parent.title"))
+          + "</title></path>");
+      }
     });
     svg.innerHTML = out.join("");
 
@@ -1489,6 +1956,7 @@
       if (!n) return "";
       var off = (s.inputs || []).filter(function (i) { return i.step !== s.parent; }).length;
       return '<div class="fcard s-' + s.status + '" data-id="' + esc(s.id) + '" tabindex="0"'
+        + chapAttrs(s)
         + ' style="left:' + n.x + "px;top:" + n.y + "px;width:" + NW + "px;height:" + NH + 'px">'
         + '<div class="chead"><span class="cid">' + esc(s.id) + "</span>"
         + (off ? '<span class="cmk dep" title="'
@@ -1590,7 +2058,9 @@
   function renderRows() {
     $("#rows").innerHTML = F.steps.map(function (s) {
       var pics = (s.files || []).length;
-      return '<div class="row s-' + s.status + '" data-id="' + esc(s.id) + '">'
+      // 章节在这一档是行首那一道色条（data-chap）。行高一个像素都不许变——
+      // 轨道 SVG 和行文本只靠固定行高对齐，所以它走 inset box-shadow，不占位置。
+      return '<div class="row s-' + s.status + '" data-id="' + esc(s.id) + '"' + chapAttrs(s) + ">"
         + '<span class="id s-' + s.status + '">' + esc(s.id) + "</span>"
         + '<span class="t">' + esc(stepTitle(s) || i18n.t("common.untitled")) + "</span>"
         + nodeMarks(s)
@@ -1708,6 +2178,13 @@
    */
   var WARN_MAP = {
     section_without_prose: { key: "lint.subheads", pick: /「[#\s]*([^」]+)」/, as: "section" },
+    /* 这四条 core 一直在发，而这张表里一直没有——于是英文界面的警告栏
+       原样漏出整句中文。它们都不带变量（`where` 已经指明了是哪个文件），
+       所以只要一个 key 就够，不需要从句子里抠值。 */
+    missing_why: { key: "lint.missing.why" },
+    missing_what: { key: "lint.missing.what" },
+    missing_conclusion: { key: "lint.missing.conclusion" },
+    figure_without_caption: { key: "lint.figure.nocaption" },
     table_without_explanation: { key: "lint.table.nodesc" },
     code_without_explanation: { key: "lint.pre.nodesc" },
     dangling_input: { key: "input.warn.missing", pick: /(\S+)\s*$/, as: "id" },
@@ -1741,6 +2218,16 @@
        pipeline.diagnostics），和 bad_branch 并排——它只在有人真写了这一行时才出现，
        而那个人正是最需要读懂这句话的人。 */
     bad_pipeline: { key: "lint.pipeline.unknown", take: ["pipeline"] },
+    /* ⑨ 章节那四条。变量名**逐字**照抄 core 放进 w.vars 的那几个（warnText 不改名），
+       所以这里写的是 name / names / ids / id / note，不是 chapter——页面自己拼的
+       文案里 {chapter} 才是章节名，这四条是唯一的例外，i18n 那侧有一条断言钉着。
+       前三条走 forest.chapters.diagnostics（和 pipeline 的诊断同一档，**不进顶栏
+       警告栏**：现存项目必须完全无感），bad_chapter 走 forest.warnings，和
+       bad_branch / bad_pipeline 并排——它只在有人真写坏了那一行时才出现。 */
+    chapter_note_conflict: { key: "lint.chapter.desc.conflict", take: ["name", "ids", "id"] },
+    chapter_no_result: { key: "lint.chapter.noresult", take: ["name"] },
+    chapter_near_duplicate: { key: "lint.chapter.nearduplicate", take: ["names"] },
+    bad_chapter: { key: "lint.chapter.unnamed", take: ["note"] },
   };
   /* w.vars 里那个值，取成字符串。**不许只认 string**：core 的
      validate_branches 发的是 {"n": len(options)}，那是个**数字**，
@@ -1860,7 +2347,62 @@
    * 屏幕上那张图和导出的 SVG 是**同一个出口的同一份字节**（exportURL("figure")）：
    * 让屏幕一张、发出去另一张，等于对着一张图讨论、拿另一张去投稿。
    */
-  var PIPE = { declared: false, order: [], steps: [], results: [], diagnostics: [] };
+  var PIPE = { declared: false, order: [], steps: [], results: [], diagnostics: [], chapters: [] };
+
+  /* 章节名在界面上的显示名。未分章那一组的名字是空串（core 的约定），它照样
+     是一组真的成果，所以给它一个说得出口的名字，而不是让它变成一行空白。 */
+  function chapName(name) { return name || i18n.t("chapter.none"); }
+
+  /* 顶栏筛选器此刻聚焦的是哪个章节。null = 没筛（看整个项目那一条流程）。 */
+  function chapFocusName() {
+    if (!chapFilter) return null;
+    return chapFilter === CHAP_NONE ? "" : chapFilter;
+  }
+  function pipeGroup(name) {
+    var got = null;
+    (PIPE.chapters || []).forEach(function (g) { if (g.name === name) got = g; });
+    return got;
+  }
+
+  /* 服务端认不认 `?chapter=`。
+   *
+   * 按章节导出的那三样字节**只有一份实现**，在 Python 那一侧；这一页只是指过去。
+   * 于是有一件事必须先问清楚：这台服务端到底会不会按章节编。不问就挂上按钮的话，
+   * 一台还没升级的服务端会**忽略这个查询参数**、老老实实回整个项目的那一份，
+   * 而文件名上写着「消融」——「屏幕上讨论的是一张图、投出去的是另一张」正是
+   * 这一整档设计要挡的那件事，何况这一次连文件名都在撒谎。
+   *
+   * 判据是服务端**自己说**它编的是哪一章（payload 里回一个 `chapter`）。
+   * 认不出来就一个按章节的按钮都不画，整项目那三样照旧——少一个按钮是遗憾，
+   * 一份名不副实的 Methods 草稿是事故。
+   *
+   * 那个 `chapter` 是**一个对象**（trace_mcp.pipeline_payload 给的
+   * `{name, label, external, known, no_result}`），不是一个字符串——拿整个对象
+   * 去和名字比永远不相等，于是探针永远说「这台服务端不认」，而症状不是报错，
+   * 是按章节导出整块**静默消失**。所以那一步比较剥成了 U.chapterEcho，
+   * 由 tests/test_seams_chapter.py 拿真服务端的响应喂给它当场量。
+   */
+  var CH_PIPE_OK = 0;              // 0 还没问 / 2 正在问 / 1 认 / -1 不认
+  function probeChapterPipeline(name) {
+    if (MODE !== "server" || CH_PIPE_OK) return;
+    CH_PIPE_OK = 2;
+    fetch(BASE + "/api/p/" + encodeURIComponent(PROJECT) + "/pipeline?chapter="
+          + encodeURIComponent(name))
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .catch(function () { return null; })
+      .then(function (d) {
+        CH_PIPE_OK = (U.chapterEcho(d) === name) ? 1 : -1;
+        if (mode === "pipeline") renderPipeline();
+      });
+  }
+  function chapExportable(name) {
+    if (CH_PIPE_OK !== 1 || name === null || name === undefined) return false;
+    /* 未分章那一组在查询串上只有记号可用，而一个**真叫 `-` 的章节**会赢过它
+       （真名优先，Python 侧逐字同一条规矩）。真撞上了就不摆这个按钮：宁可少一份
+       导出，也不要一份文件名写着「未分章」、内容却是别人那一章的 Methods。 */
+    if (!name) return !CH.byName[CHAP_SENT];
+    return true;
+  }
 
   /* 「这一步凭什么在流程里」。四选一的枚举由 core 给（result / include / input /
      parent），这里只负责说成话；认不出来的取值就不说——编一句比不说更糟。 */
@@ -1914,8 +2456,14 @@
       + "</div>";
   }
 
-  function pipeResults() {
+  function pipeResults(group) {
     var m = PIPE;
+    // 按章节看时只列这一章声明的那几个成果：这条流程正是从它们反推出来的。
+    if (group) {
+      var want = Object.create(null);
+      (group.results || []).forEach(function (id) { want[id] = 1; });
+      m = { results: m.results.filter(function (r) { return want[r.step]; }) };
+    }
     if (!m.results.length) return "";
     return '<div class="sec presults"><h3>'
       + esc(i18n.t("pipeline.result.head", { n: m.results.length })) + "</h3>"
@@ -1974,10 +2522,49 @@
      的输出——**屏幕上看到的就是发出去的那批字节**。 */
   var EXPORT_FILE = { figure: "pipeline.svg", methods: "pipeline.md", page: "pipeline.html" };
   var EXPORT_ROUTE = { figure: "figure.svg", methods: "methods.md", page: "page.html" };
+  /* 这一屏此刻在导**哪一章**。只有这一份判据：屏幕上那张图、三个下载按钮、
+     那句 toast 全从它来，谁也不可能漏传一个参数而各指一处——「屏幕上讨论的
+     和投出去的不是同一份」这条毛病，最省事的堵法就是不给它第二个入口。
+     空串 = 整个项目那一条（没筛，或者服务端不认按章节编）。
+     **null** = 整个项目那一条（没筛，或者服务端不认按章节编）。
+     **空串** = 未分章那一组：它的名字本来就是空的，可它是一组真的成果——多数项目
+     的主线从头到尾没起过名字，最该单独导一份 Methods 的恰恰是它。空串在查询串上
+     和「没给」长得一模一样，所以那一组用记号 CHAP_SENT 指（= trace_mcp.CHAPTER_NONE）。 */
+  function exportChapter() {
+    var ch = chapFocusName();
+    return ch !== null && chapExportable(ch) ? ch : null;
+  }
+  /* 放进 `?chapter=` 的那个值。名字**原样**送出去（不折叠大小写、不做近似匹配：
+     服务端认不出会回 404，替人猜一次，导出的是哪一章就取决于猜法，
+     而其中一份会进论文）。空串 = 不加这个参数。 */
+  function exportChapterParam() {
+    var ch = exportChapter();
+    return ch === null ? "" : (ch || CHAP_SENT);
+  }
   function exportURL(kind) {
     if (!EXPORT_FILE[kind]) return "";
     if (MODE === "static") return EXPORT_FILE[kind];
-    return BASE + "/api/p/" + encodeURIComponent(PROJECT) + "/pipeline/" + EXPORT_ROUTE[kind];
+    var u = BASE + "/api/p/" + encodeURIComponent(PROJECT) + "/pipeline/" + EXPORT_ROUTE[kind];
+    var ch = exportChapterParam();
+    return ch ? u + "?chapter=" + encodeURIComponent(ch) : u;
+  }
+  /* 按章节导出的文件名。章节名**不是路径安全的**（`主实验/数据准备` 合法、`CON`
+     合法），所以名字是派生出来的（U.chapterSlug + 顺序号去重），绝不拿原名拼。
+     去重按的是章节在清单里的顺序：大小写是故意不折叠的（core 靠它逮笔误），
+     于是两个不同章节完全可能 slug 成同一个词。 */
+  var CHAP_STEM = Object.create(null);
+  function chapStems() {
+    CHAP_STEM = Object.create(null);
+    var names = CH.list.map(function (c) { return c.name; });
+    /* 未分章那一组也要有一个自己的词干。它不在 core 的章节清单里（它不是一个
+       章节），但它常常就是主实验——导它那一份的时候文件名不能是空的，
+       更不能和整项目那份撞名。 */
+    if (CH.unassigned.length) names.push("");
+    U.chapterFileStems(names).forEach(function (st, i) { CHAP_STEM[names[i]] = st; });
+  }
+  function exportName(kind) {
+    var stem = (PROJECT || "trace") + "-", ch = exportChapter();
+    return stem + (ch === null ? "" : (CHAP_STEM[ch] || U.chapterSlug(ch)) + "-") + EXPORT_FILE[kind];
   }
 
   /* 那张图的字节。静态导出里 `build` 已经灌进页面（file:// 下 fetch 一个相对
@@ -1992,17 +2579,25 @@
     if (raw) { try { PIPE_SVG = JSON.parse(raw) || ""; } catch (e) { PIPE_SVG = ""; } }
   })();
 
+  /* 手上这份图的身份：**这一次编译**（FOREST_SEQ）× **这一章**。两样有一样变了，
+     手上那份就过期了。编译轮次由调用方传进来而不是在这里读全局，是为了让
+     「我问的是哪一版」写在问的那一行上——一张过期的方法图会被当成现在的方法图。 */
+  function figureKey(seq) { return seq + "|" + exportChapterParam(); }
   function pipeFigure() {
     // 屏幕上就是那张要进论文的图：纸上的墨、黑白可读、不跟主题走。
     // 换一套「屏幕好看版」的代价是人对着一张图讨论、发出去另一张。
-    return '<div class="pfig" id="pfig">' + PIPE_SVG + "</div>";
+    /* 手上这份图必须**正好**是这一屏要的那一份（这一版记录 × 这一章）。
+       按章节看和看整项目是两张图，谁也不许暂时顶替谁——一张顶替上去的图会被
+       当成这一章的方法图，那比空着糟得多。静态导出里灌进来的那份永远是整项目那张。 */
+    var ok = MODE === "static" ? exportChapter() === null : (PIPE_SVG_AT === figureKey(FOREST_SEQ));
+    return '<div class="pfig" id="pfig">' + (ok ? PIPE_SVG : "") + "</div>";
   }
 
   /* 服务模式下把那张图取回来填进去。**不重画**：如果这次没取到，上一次那张
      （版本可能已经旧了）也不留在屏幕上——一张过期的图会被当成现在的方法图。 */
   function fetchFigure() {
     if (MODE === "static" || !PIPE.declared) return;
-    var want = FOREST_SEQ;
+    var want = figureKey(FOREST_SEQ);
     // 已经取到这一版、或这一版正在取的路上，就不再发第二次：renderPipeline
     // 一次 apply 里会被调两遍（apply 一遍、项目名到了再一遍）。
     if (PIPE_SVG_AT === want || PIPE_SVG_WANT === want) return;
@@ -2018,14 +2613,25 @@
     });
   }
 
-  function pipeSteps() {
-    return PIPE.steps.map(function (it) {
+  function pipeSteps(items, group) {
+    var ext = Object.create(null);
+    ((group && group.external) || []).forEach(function (id) { ext[id] = 1; });
+    return (items || []).map(function (it) {
       var s = it.step || {};
       var badges = "";
       if (it.result) {
         badges += '<span class="pipechip result" title="'
           + esc(i18n.t("pipeline.result.badge.title")) + '">'
           + esc(i18n.t("pipeline.result.badge")) + "</span>";
+      }
+      /* **借来的那几步**：这条流程里不属于本章的成员。消融吃着主实验的 023，
+         那 023 和它的上游当然要出现在消融的 Methods 里（一个输入不在流程里的
+         成员，写进 Methods 就是一句断了的话），但它们是借来的，得标出来——
+         那正是「消融是对着主结果测的」这句话在这一屏上的样子。 */
+      if (ext[it.id]) {
+        badges += '<span class="chapchip" title="' + esc(i18n.t("chapter.badge.title")) + '">'
+          + esc(i18n.t("chapter.of.head", { chapter: chapName(CH.of[it.id] || "") }))
+          + "</span>";
       }
       if ((s.pipeline || {}).rule === "include") {
         badges += '<span class="pipechip" title="' + esc(i18n.t("pipeline.include.badge.title"))
@@ -2060,18 +2666,89 @@
      做成 <a download> 而不是「取回来再 Blob 一下」：file:// 下 fetch 一个相对
      路径会被当成跨源，静态导出里那三个按钮会一按什么都不发生。 */
   function pipeExport() {
-    var stem = (PROJECT || "trace") + "-";
+    // null = 整项目那一份。空串是**未分章那一组**（一组真的成果），所以这里
+    // 判的是 !== null 而不是真值——`!""` 会把它错当成「没在导某一章」。
+    var ch = exportChapter(), show = ch === null ? "" : chapName(ch);
     var one = function (kind, key) {
-      return '<div class="pexp"><a class="btn" data-export="' + kind + '" href="'
-        + esc(exportURL(kind)) + '" download="' + esc(stem + EXPORT_FILE[kind]) + '" title="'
+      return '<div class="pexp"><a class="btn" data-export="' + kind + '"'
+        + (show ? ' data-expchap="' + esc(show) + '"' : "") + ' href="'
+        + esc(exportURL(kind)) + '" download="' + esc(exportName(kind)) + '" title="'
         + esc(i18n.t(key + ".note")) + '">' + esc(i18n.t(key)) + "</a>"
         + '<span class="dropnote">' + esc(i18n.t(key + ".note")) + "</span></div>";
     };
-    return '<div class="sec pexport"><h3>' + esc(i18n.t("export.head")) + "</h3>"
-      + '<p class="dropnote deplead">' + i18n.tHtml("export.lead") + "</p>"
+    /* 按章节导的时候多说两句：为什么它是另一份派生而不是「整项目那份过滤几行」，
+       以及文件名长什么样——导消融那一份永远不会盖掉主实验的 Methods 草稿，
+       靠的就是文件名里那一段。 */
+    var head = ch !== null
+      ? '<h3>' + esc(i18n.t("export.chapter.head")) + "</h3>"
+        + '<p class="dropnote deplead">' + i18n.tHtml("export.chapter.note") + "</p>"
+        + '<p class="dropnote"><b>' + esc(i18n.t("export.chapter.one", { chapter: show }))
+        + "</b> · " + '<span title="' + esc(i18n.t("export.chapter.file.title")) + '">'
+        + esc(i18n.t("export.chapter.file", { file: exportName("methods") })) + "</span></p>"
+      : '<h3>' + esc(i18n.t("export.head")) + "</h3>"
+        + '<p class="dropnote deplead">' + i18n.tHtml("export.lead") + "</p>";
+    return '<div class="sec pexport">' + head
       + '<div class="pexps">' + one("figure", "export.figure")
       + one("methods", "export.methods") + one("page", "export.page") + "</div>"
       + '<p class="dropnote">' + i18n.tHtml("export.draft.note") + "</p></div>";
+  }
+
+  /* 这一章还没有任何 `result:`。它不是错误（一个章节完全可以只是探索性的），
+     所以这一屏和整项目的空态同一个路子：说清楚为什么这里是空的，并且把那一行
+     `result:` 的真实写法印出来——按钮那条路要服务端配合，手写那一行永远有效。 */
+  function pipeChapterEmpty(name) {
+    return '<div class="pdoc pempty">'
+      + '<h2 class="viewtitle">' + esc(i18n.t("chapter.pipeline.head", { chapter: chapName(name) })) + "</h2>"
+      + '<p class="viewlead">' + i18n.tHtml("chapter.pipeline.none", { chapter: chapName(name) }) + "</p>"
+      + '<p class="viewlead quiet">' + i18n.tHtml("chapter.pipeline.note") + "</p>"
+      + (canWrite()
+          ? '<p class="pacts"><button class="primary" data-act="result-mark" title="'
+            + esc(i18n.t("pipeline.result.mark.title")) + '">'
+            + esc(i18n.t("pipeline.empty.act")) + "</button></p>"
+          : "")
+      + "</div>";
+  }
+
+  /* 只看这一章时的等级。**只按本章的成员算**，不把别的章节的祖先算进来——
+     它回答的是读者对某一块真正会问的那个问题：消融这部分别人能不能重做。 */
+  function pipeChapterLevel(g) {
+    if (!g || !g.level) return "";
+    var w = g.weakest && IDX[g.weakest];
+    var weak = w
+      ? '<p class="lvcap">' + i18n.tHtml("chapter.level.weakest", {
+          link: { html: '<a href="#' + esc(w.id) + '" data-pgoto="' + esc(w.id) + '">'
+            + esc(w.id) + "</a>" },
+          title: stepTitle(w),
+        }) + "</p>"
+      : "";
+    return '<div class="sec plevel"><h3>'
+      + esc(i18n.t("chapter.level.head", { chapter: chapName(g.name) })) + "</h3>"
+      + '<div class="lvrow">' + lvChip(g.level) + "</div>"
+      + weak
+      + '<p class="dropnote">' + esc(i18n.t("chapter.level.note")) + "</p></div>";
+  }
+
+  /* 没筛章节时，整项目那条流程后面附一份「各章各自那条」的清单。
+     每一章有自己的成果、自己的等级、自己的一段 Methods——论文里本来就是两段。 */
+  function pipeChapterList() {
+    if (!CH.declared || !PIPE.chapters.length) return "";
+    return '<div class="sec pchaps"><h3>'
+      + esc(i18n.t("chapter.head", { n: CH.list.length })) + "</h3>"
+      + '<p class="dropnote deplead">' + i18n.tHtml("chapter.pipeline.note") + "</p>"
+      + '<ul class="deplist">' + CH.list.map(function (c) {
+          var g = pipeGroup(c.name);
+          /* 没有成果的那一章不写成一条错误：一个章节完全可以只是探索性的。
+             整句「怎么给它一条自己的流程」放在 tooltip 里，行上只报事实。 */
+          var body = g
+            ? lvChip(g.level, "mini") + '<span class="deptitle">'
+              + esc(i18n.t("count.steps", { n: g.order.length })) + " · "
+              + esc(g.results.join(" · ")) + "</span>"
+            : '<span class="deptitle quiet" title="'
+              + esc(i18n.t("chapter.pipeline.none", { chapter: chapName(c.name) })) + '">'
+              + esc(i18n.t("chapter.steps", { steps: i18n.t("count.steps", { n: c.n }),
+                    done: c.status.done, wip: c.status.wip, dead: c.status.dead })) + "</span>";
+          return '<li class="chrow ch-' + c.hue + '">' + chapGoBtn(c.name) + " " + body + "</li>";
+        }).join("") + "</ul></div>";
   }
 
   function renderPipeline() {
@@ -2079,14 +2756,27 @@
     if (!box) return;
     buildPipeline();
     if (!PIPE.declared) { box.innerHTML = pipeEmpty(); return; }
+    /* 顶栏那个章节筛选器在这一档换的是**编哪一条流程**：主实验一条、消融一条，
+       各有自己的成果、自己的等级、自己那份导出。它不是「把整项目那份过滤掉几行」
+       ——每一章是从它自己的 `result:` 反推出来的另一份派生（core 已经把那一张
+       DAG 切好了，这里一步闭包都不重算）。 */
+    var focus = chapFocusName();
+    if (focus !== null && CH.declared) probeChapterPipeline(focus || CH.list[0].name);
+    var group = focus === null ? null : pipeGroup(focus);
+    if (focus !== null && !group) { box.innerHTML = pipeChapterEmpty(focus); return; }
+    var items = group ? U.pipelineChapterSteps(PIPE, group) : PIPE.steps;
     box.innerHTML = '<div class="pdoc">'
-      + '<h2 class="viewtitle">' + esc(i18n.t("pipeline.head", { n: PIPE.order.length })) + "</h2>"
-      + '<p class="viewlead">' + i18n.tHtml("pipeline.lead") + "</p>"
+      + '<h2 class="viewtitle">' + esc(group
+          ? i18n.t("chapter.pipeline.head", { chapter: chapName(group.name) })
+          : i18n.t("pipeline.head", { n: PIPE.order.length })) + "</h2>"
+      + '<p class="viewlead">' + i18n.tHtml(group ? "chapter.pipeline.note" : "pipeline.lead") + "</p>"
       + '<p class="viewlead quiet">' + i18n.tHtml("pipeline.pair.note") + "</p>"
-      + pipeLevel() + pipeResults() + pipeChecks()
-      + pipeFigure()
+      + (group ? pipeChapterLevel(group) : pipeLevel())
+      + pipeResults(group) + pipeChecks() + (group ? "" : pipeChapterList())
+      // 按章节看的时候，只有服务端真会按章节编时才摆那张图（见 probeChapterPipeline）。
+      + (group && exportChapter() === null ? "" : pipeFigure())
       + '<p class="dropnote">' + esc(i18n.t("pipeline.order.note")) + "</p>"
-      + pipeSteps()
+      + pipeSteps(items, group)
       + pipeExport()
       + '<p class="dropnote pfoot">' + i18n.tHtml("pipeline.derived.note") + "</p>"
       + "</div>";
@@ -2097,11 +2787,17 @@
   /* 按下三个导出之一。真正的下载由 <a download> 自己完成（这个处理器**不**
      preventDefault），这里只负责说一声——那句话里带着「逐字节确定」这件事，
      人知道了才会去重新生成，而不是把导出存进仓库当第二份真相。 */
-  function doExport(kind) {
+  function doExport(kind, chapter) {
     var name = { figure: "export.figure", methods: "export.methods", page: "export.page" }[kind];
     // 认不出的取值什么都不说：一次拼错的按钮名不该冒充成一次成功的导出。
     if (!name || !PIPE.declared) return;
-    toast(i18n.t("toast.export.ready", { name: i18n.t(name) }));
+    /* 按章节导的时候说清是哪一章：一份写着「消融」的文件如果其实是整个项目，
+       收到的人不会发现，而它可能就是投出去的那一份。
+       章节名取自**被点的那个链接自己**（data-expchap），不是重新算一遍页面状态：
+       说出来的必须是刚刚下载的那一份的身份。 */
+    toast(chapter
+      ? i18n.t("toast.export.chapter.ready", { chapter: chapter, name: i18n.t(name) })
+      : i18n.t("toast.export.ready", { name: i18n.t(name) }));
   }
 
   /* 在这一屏里跳到某一步的卡片。和跳回开发路径是两个动作：这个不换模式。 */
@@ -2170,7 +2866,23 @@
       var inChain = el.classList.contains("fcard") ? dchain[id] : chain[id];
       el.classList.toggle("miss", !!q && !hit);
       el.classList.toggle("faded", !!sel && !inChain);
+      /* 章节筛选**只 dim，绝不 hide**——和搜索那条是同一条理由：隐藏会打乱轨道
+         对齐、改变图的形状，而形状本身是信息（「消融是从主实验哪一步分出去的」
+         这句话，正是靠周围那些被筛掉的节点还在原位才看得见）。
+         用的也是同一个通道：不透明度承载的一直是「和你此刻的关注有没有关系」，
+         祖先链、搜索、章节筛选说的是同一件事的三种问法。 */
+      el.classList.toggle("offchap", !inChapFilter(id));
       el.classList.toggle("sel", id === sel);
+    });
+    // 底色带、名牌、跨章记号跟着一起淡：筛到消融时，主实验那块满亮的底色
+    // 读起来就是「这块也是你要看的」。
+    document.querySelectorAll("#dedges .chband, #dmarks .chaplabel").forEach(function (el) {
+      el.classList.toggle("offchap", !!chapFilter && el.getAttribute("data-chap") !== chapFilter);
+    });
+    document.querySelectorAll(".xchap").forEach(function (el) {
+      var a = el.getAttribute("data-from") || el.getAttribute("data-id");
+      var b = el.getAttribute("data-to") || el.getAttribute("data-id");
+      el.classList.toggle("offchap", !(inChapFilter(a) || inChapFilter(b)));
     });
     document.querySelectorAll("#fedges [data-to]").forEach(function (el) {
       var from = el.getAttribute("data-from"), to = el.getAttribute("data-to");
@@ -2667,6 +3379,192 @@
       + '<p class="dropnote deplead">' + i18n.tHtml("pipeline.lead") + "</p>" + body + "</div>";
   }
 
+  /* ⑨ 这一步属于哪一章 —— 详情面板里那一块。
+   *
+   * 整块只在项目里**真有人写过 `chapter:`** 时才出现（`forest.chapters` 是 core 在
+   * 那时候才加的键）。没有章节的项目一个字都不多出来。
+   *
+   * 四件事，缺一件这块就没用：
+   *   1) 它属于哪一章（继承出来的那个名字，不是它自己写没写）；
+   *   2) 这个归属是**继承来的还是自己声明的**，以及声明在哪一步——人要知道
+   *      「改哪一步才能改整条线」，而那个答案只有一个；
+   *   3) 这个章节是什么（说明归章节不归步骤）、有多大、能被追到哪一步；
+   *   4) 同章还有哪些步、以及**跨出这一章的那几条边**（消融吃着主实验的产物）。
+   */
+  /* 一条跨章节的边写成一行。**方向由边自己定，不由「我是谁」定**：这句话说的
+     永远是箭头那一端在做什么——「{to} 读的是 {from_chapter} 的产物」。
+     于是本步在上游时，行首那个链接是对面那一步，而那句话仍然成立（说的是对面）；
+     本步在下游时，链接是产物的来处。反过来按「本步」组织的话，同一条边在两头
+     会被说成两句相反的话，而边只有一条。 */
+  function crossRow(x, selfId) {
+    var other = x.from === selfId ? x.to : x.from;
+    var otherChap = x.from === selfId ? x.to_chapter : x.from_chapter;
+    var link = stepLink(other);
+    var kind = x.kind === "input" ? "chapter.cross.input" : "chapter.cross.parent";
+    var line = x.note
+      ? i18n.tHtml("chapter.cross.entry",
+                   { link: { html: link }, chapter: chapName(otherChap), what: x.note })
+      : i18n.tHtml("chapter.cross.entry.bare",
+                   { link: { html: link }, chapter: chapName(otherChap) });
+    return '<li><span class="xchip" title="' + esc(i18n.t(kind + ".title")) + '">'
+      + esc(i18n.t(kind, { chapter: chapName(x.from_chapter) }))
+      + "</span> " + line + '<span class="deptitle">' + esc(titleOf(other)) + "</span></li>";
+  }
+
+  function renderChapterOf(s) {
+    if (!CH.declared) return "";
+    var name = CH.of[s.id] || "";
+    var c = name ? CH.byName[name] : null;
+    var declared = !!(s.chapter && s.chapter.declared);
+    var src = U.chapterSourceOf(IDX, s.id);
+
+    var head = '<h3>' + esc(name ? i18n.t("chapter.of.head", { chapter: name })
+                                 : i18n.t("chapter.none")) + "</h3>"
+      + '<p class="dropnote deplead" ' + (name ? "" : 'title="' + esc(i18n.t("chapter.none.title")) + '"')
+      + ">" + i18n.tHtml(name ? "chapter.of.lead" : "chapter.none.title") + "</p>";
+
+    /* 「章节从这里开始」和「继承自 007」是两回事，而这个区别正是人最需要的那一条：
+       前者是那个改一行就能把整条线搬走的锚点，后者只是跟着走的一步。 */
+    var where = "";
+    if (declared) {
+      where = '<p class="chwhere decl" title="' + esc(i18n.t("chapter.declared.title")) + '">'
+        + esc(i18n.t("chapter.declared")) + "</p>"
+        + '<p class="dropnote">' + i18n.tHtml("chapter.inherit.note") + "</p>";
+    } else if (src) {
+      where = '<p class="chwhere" title="' + esc(i18n.t("chapter.inherited.title", { id: src })) + '">'
+        + i18n.tHtml("chapter.inherited", { id: { html: stepLink(src) } }) + "</p>"
+        + '<p class="dropnote">' + i18n.tHtml("chapter.leave.note") + "</p>";
+    }
+
+    var about = "";
+    if (c) {
+      about = '<p class="chdesc" title="' + esc(i18n.t("chapter.desc.title")) + '"><b>'
+        + esc(i18n.t("chapter.desc.label")) + "</b>"
+        + (c.note ? esc(c.note) : '<i class="quiet">' + esc(i18n.t("chapter.desc.missing")) + "</i>")
+        + "</p>"
+        + '<p class="chfacts">'
+        + '<span class="chroots" title="' + esc(i18n.t("chapter.roots.title")) + '">'
+        + esc(i18n.t("chapter.roots", { n: c.roots.length })) + "</span>"
+        + (c.level ? lvChip(c.level, "mini") : "") + "</p>"
+        + (c.weakest && IDX[c.weakest]
+            ? '<p class="lvcap">' + i18n.tHtml("chapter.level.weakest", {
+                link: { html: stepLink(c.weakest) }, title: stepTitle(IDX[c.weakest]) }) + "</p>"
+            : "")
+        + '<p class="dropnote">' + esc(i18n.t("chapter.level.note")) + "</p>";
+    }
+
+    // 同章还有哪些步。它们在图上被一块底色带圈着，这里给的是同一组的可点清单。
+    var sibs = "";
+    if (c && c.steps.length > 1) {
+      /* 小标题就是这一章的规模与状态分布（chapter.steps）：一句话说完「这一章
+         有多大、走通了多少」，底下紧跟着的就是那一批步骤本身。 */
+      sibs = '<h4 class="rhead mono" title="' + esc(i18n.t("chapter.badge.title")) + '">'
+        + esc(i18n.t("chapter.steps", { steps: i18n.t("count.steps", { n: c.n }),
+              done: c.status.done, wip: c.status.wip, dead: c.status.dead })) + "</h4>"
+        + '<div class="crumbs chsteps">' + c.steps.map(function (id) {
+            return id === s.id ? "<b>" + esc(id) + "</b>" : stepLink(id);
+          }).join(" ") + "</div>";
+    }
+
+    // 跨出这一章的边：这一步读的是别章的产物，或者这条线是从别章分出来的。
+    var xs = CH.crossings.filter(function (x) { return x.from === s.id || x.to === s.id; });
+    var cross = xs.length
+      ? '<h4 class="rhead" title="' + esc(i18n.t("chapter.cross.note")) + '">'
+        + esc(i18n.t("chapter.cross.head", { n: xs.length })) + "</h4>"
+        + '<ul class="deplist xlist">' + xs.map(function (x) { return crossRow(x, s.id); }).join("") + "</ul>"
+      : "";
+
+    var acts = "";
+    if (canWrite()) {
+      acts = '<p class="pacts">'
+        + '<button data-act="chapter" title="'
+        + esc(i18n.t(declared ? "chapter.unset.act.title" : "chapter.set.act.title")) + '">'
+        + esc(i18n.t(declared ? "chapter.unset.act" : "chapter.set.act")) + "</button>"
+        + (c ? '<button data-act="chapter-note" title="'
+              + esc(i18n.t("chapter.write.act.title")) + '">'
+              + esc(i18n.t("chapter.write.act")) + "</button>" : "")
+        + "</p>";
+    }
+    return '<div class="sec chapbox' + (c ? " ch-" + c.hue : "") + '">'
+      + head + where + about + acts + sibs + cross + "</div>";
+  }
+
+  /* ⑨ 项目这一级的章节面板。没选步骤时详情面板就是项目主页，这一块和洞察并排。
+   *
+   * 三样东西只在这里说一次，绝不在别处再说一遍：各章是什么（含说明、步数、等级）、
+   * **跨章节的那些边**、以及 core 那三条章节诊断。诊断**不进顶栏警告栏**——
+   * 和定稿流程那三条同一条规矩：现存项目必须完全无感，而一条每次打开都在的提示
+   * 只会让人从此不看提示栏。 */
+  /* 「只看这一章」那个开关。名字本身就是开关（和顶栏那个筛选器同一份状态、
+     同一份判据），所以清单里不再另摆一个写着同名的按钮。 */
+  function chapGoBtn(value, label, title) {
+    return '<button class="chapgo" data-chapgo="' + esc(value) + '" title="'
+      + esc(title || i18n.t("app.chapter.title")) + '">'
+      + esc(label === undefined ? value : label) + "</button>";
+  }
+
+  function renderChapters() {
+    if (!CH.declared) return "";
+    var rows = CH.list.map(function (c) {
+      /* 章节名**本身**就是「只看这一章」那个开关（tooltip 说清点了会怎样）。
+         名字旁边再摆一个写着同一个名字的按钮，同一行里就出现了两次同一个词，
+         而人得先读完两遍才知道那是一回事。 */
+      var line = c.note
+        ? i18n.tHtml("chapter.entry", { chapter: { html: chapGoBtn(c.name) }, what: c.note })
+        : i18n.tHtml("chapter.entry.bare", { chapter: { html: chapGoBtn(c.name) } });
+      return '<li class="chrow ch-' + c.hue + '">'
+        + line
+        + '<span class="deptitle mono">'
+        + esc(i18n.t("chapter.steps", { steps: i18n.t("count.steps", { n: c.n }),
+              done: c.status.done, wip: c.status.wip, dead: c.status.dead })) + "</span>"
+        + (c.level ? lvChip(c.level, "mini") : "")
+        + '<span class="chroots" title="' + esc(i18n.t("chapter.roots.title")) + '">'
+        + esc(i18n.t("chapter.roots", { n: c.roots.length })) + "</span>"
+        + "</li>";
+    }).join("");
+    var none = CH.unassigned.length
+      ? '<li class="chrow chnone">'
+        + chapGoBtn(CHAP_NONE, i18n.t("chapter.none"), i18n.t("chapter.none.title"))
+        + '<span class="deptitle mono">'
+        + esc(i18n.t("count.steps", { n: CH.unassigned.length })) + "</span></li>"
+      : "";
+    var cross = CH.crossings.length
+      ? '<h4 class="rhead">' + esc(i18n.t("chapter.cross.head", { n: CH.crossings.length })) + "</h4>"
+        + '<p class="dropnote deplead">' + i18n.tHtml("chapter.cross.note") + "</p>"
+        + '<ul class="deplist xlist">' + CH.crossings.map(function (x) {
+            return '<li><span class="xchip" title="'
+              + esc(i18n.t(x.kind === "input" ? "chapter.cross.input.title"
+                                              : "chapter.cross.parent.title")) + '">'
+              + esc(i18n.t(x.kind === "input" ? "chapter.cross.input" : "chapter.cross.parent",
+                           { chapter: chapName(x.from_chapter) })) + "</span> "
+              + (x.note
+                  ? i18n.tHtml("chapter.cross.entry", { link: { html: stepLink(x.to) },
+                      chapter: chapName(x.to_chapter), what: x.note })
+                  : i18n.tHtml("chapter.cross.entry.bare", { link: { html: stepLink(x.to) },
+                      chapter: chapName(x.to_chapter) }))
+              + '<span class="deptitle">' + esc(titleOf(x.to)) + "</span></li>";
+          }).join("") + "</ul>"
+      : "";
+    var checks = CH.diagnostics.length
+      ? '<div class="chchecks">' + CH.diagnostics.map(function (w) {
+          var lv = w.level === "info" ? "info" : U.warnLevel(w);
+          return '<div class="wrow w-' + esc(lv) + '">' + (lv === "info" ? "· " : "⚠ ")
+            + "<b>" + esc(w.where || w.code) + "</b> — " + warnText(w) + "</div>";
+        }).join("") + "</div>"
+      : "";
+    return '<div class="insights chappanel"><h2 class="title">'
+      + esc(i18n.t("chapter.head", { n: CH.list.length })) + "</h2>"
+      + '<p class="dropnote deplead">' + i18n.tHtml("chapter.lead") + "</p>"
+      + '<p class="dropnote">' + i18n.tHtml("chapter.vs.note") + "</p>"
+      + '<ul class="deplist chlist">' + rows + none + "</ul>"
+      + cross + checks
+      // 两件**刻意不做**的事。不写在这儿的话，后来人会当成漏了去补：
+      // id 不按章节重编号（[[007]] 要在整个项目里唯一）· 章节不嵌套（斜杠只分组）。
+      + '<p class="dropnote quiet">' + i18n.tHtml("chapter.ids.note") + "</p>"
+      + '<p class="dropnote quiet">' + i18n.tHtml("chapter.nest.note") + "</p>"
+      + "</div>";
+  }
+
   /* ---------------------------------------------------------- 可溯源性 */
 
   function levelName(l) { return i18n.t("trace.level." + l); }
@@ -2908,6 +3806,9 @@
       + '<h1 class="title">' + esc(i18n.t("insight.title", { name: projectName(p) || PROJECT })) + "</h1>"
       + '<p class="dropnote">' + i18n.tHtml("insight.lead") + "</p>"
       + acts + content + "</div>"
+      // ⑨ 章节面板紧跟洞察：两者都是**项目这一级**的东西，而没选步骤时这一栏
+      // 就是项目主页。没有章节的项目这里一个字都不多（renderChapters 返回空串）。
+      + renderChapters()
       + '<div class="sec"><h3>' + esc(i18n.t("keys.title")) + '</h3><p class="dropnote">'
       + keyRow("↑ ↓", "keys.move") + " · " + keyRow("g", "keys.toggle") + " · "
       + keyRow("n", "keys.new") + " · " + keyRow("e", "keys.edit") + " · "
@@ -3143,7 +4044,7 @@
       + '<div class="meta">' + meta.join("") + "</div>" + acts + paths + renderCode(s)
       + trNotice(s)
       + '<div class="prose">' + body + "</div>"
-      + renderFork(s) + renderDeps(s) + renderRejoin(s) + renderPipelineOf(s) + back
+      + renderChapterOf(s) + renderFork(s) + renderDeps(s) + renderRejoin(s) + renderPipelineOf(s) + back
       + renderMoved(s) + renderTrace(s) + files;
     enhanceProse(el);
     el.scrollTop = 0;
@@ -3191,13 +4092,17 @@
              // 这一步在定稿流程上的例外。控件只在项目真的有流程时才画出来
              // （见 pipelineField），画不出来时这两项恒为空、也不会被发出去。
              pipe: ($("#ed-pipe") || {}).value || "",
-             pnote: ($("#ed-pnote") || {}).value || "", lang: edLang };
+             pnote: ($("#ed-pnote") || {}).value || "",
+             // 这一步开的那个章节（空 = 不开，沿 parent 继承）
+             chapter: ($("#ed-chap") || {}).value || "",
+             chnote: ($("#ed-chnote") || {}).value || "", lang: edLang };
   }
   /* 编辑器此刻对着的那一份磁盘内容。译文只有标题和正文——path / input / code
      都是结构信息，翻译文件里一行都不许有（写两份就是双真相源，而且 core 会
      把它们读都不读地丢掉并报一条 translation_structural_key）。 */
   var EMPTY_TARGET = { title: "", body: "", paths: "", inputs: "", code: "",
-                       branch: "extends", bnote: "", decision: "", pipe: "", pnote: "" };
+                       branch: "extends", bnote: "", decision: "", pipe: "", pnote: "",
+                       chapter: "", chnote: "" };
   function editTarget(s, l) {
     if (!s) return Object.assign({}, EMPTY_TARGET);
     if (!l) {
@@ -3205,7 +4110,14 @@
                inputs: inputsToText(s), code: codeToText(s),
                branch: s.branch || "extends", bnote: s.branch_note || "",
                decision: s.decision || "",
-               pipe: (s.pipeline || {}).rule || "", pnote: (s.pipeline || {}).note || "" };
+               pipe: (s.pipeline || {}).rule || "", pnote: (s.pipeline || {}).note || "",
+               /* 框里放的是**这一步自己写的那个名字**，不是它继承来的归属：
+                  把继承来的名字预填进去，一按保存就在这一步身上多写了一行
+                  ——二十步各一行、章节名改一次要改二十个文件，正是继承要避免的。
+                  `declared` 说的是「这一行写在哪」，`name` 说的是「归谁」，
+                  两者混用会让整条继承下来的子树看着像未分章。 */
+               chapter: (s.chapter && s.chapter.declared) ? s.chapter.name : "",
+               chnote: (s.chapter && s.chapter.declared) ? (s.chapter.note || "") : "" };
     }
     var e = (s.tr || {})[l] || {};
     return Object.assign({}, EMPTY_TARGET, { title: e.title || "", body: e.body || "" });
@@ -3219,7 +4131,8 @@
       && (st.inputs || "") === base.inputs && (st.code || "") === base.code
       && (st.branch || "extends") === base.branch && (st.bnote || "") === base.bnote
       && (st.decision || "") === base.decision
-      && (st.pipe || "") === base.pipe && (st.pnote || "") === base.pnote;
+      && (st.pipe || "") === base.pipe && (st.pnote || "") === base.pnote
+      && (st.chapter || "") === base.chapter && (st.chnote || "") === base.chnote;
   }
   function isDirty() {
     if (!editing) return false;
@@ -3508,6 +4421,33 @@
       + '<span class="edtip">' + i18n.tHtml("editor.pipeline.note.required") + "</span>";
   }
 
+  /* ⑨ 这一步开不开一个章节。
+   *
+   * 这一栏**一直在**（不像 pipelineField 那样要等项目先有流程）：它是这个功能
+   * 唯一的发现入口，而人真的想开一条新线时看的正是这里。代价是安全的——
+   * 它默认空着，而 saveEditor 只在**值真的变了**时才把 `chapter` 发出去，
+   * 所以一次无关的正文编辑绝不会碰到磁盘上那一行。
+   *
+   * 留空 = 继承 parent 的章节。所以留空时那行灰字要说清它此刻在继承谁的哪一章——
+   * 没有这句话，「留空 = 继承」在界面上完全不可见，人就会每一步都填，
+   * 而那正好毁掉继承的全部好处（改一次章节名要动二十个文件）。 */
+  function chapterField(base, s) {
+    var src = base.chapter ? "" : U.chapterSourceOf(IDX, s.id);
+    var inh = (!base.chapter && src && CH.of[s.id])
+      ? '<span class="edtip">'
+        + esc(i18n.t("editor.chapter.inherited", { chapter: CH.of[s.id], id: src })) + "</span>"
+      : "";
+    return '<div class="edrel">'
+      + '<label class="edpaths"><span>' + esc(i18n.t("editor.chapter.label")) + "</span>"
+      + '<input id="ed-chap" maxlength="60" value="' + esc(base.chapter) + '" placeholder="'
+      + esc(i18n.t("editor.chapter.placeholder")) + '"></label>'
+      + '<label class="edpaths"><span>' + esc(i18n.t("editor.chapter.note.label")) + "</span>"
+      + '<input id="ed-chnote" maxlength="200" value="' + esc(base.chnote) + '" placeholder="'
+      + esc(i18n.t("editor.chapter.note.placeholder")) + '"></label>'
+      + "</div>" + inh
+      + '<span class="edtip">' + i18n.tHtml("editor.chapter.hint") + "</span>";
+  }
+
   function renderEditor(s) {
     var base = editTarget(s, edLang);
     $("#detail").innerHTML =
@@ -3553,7 +4493,7 @@
             + '<input id="ed-decision" maxlength="300" value="' + esc(base.decision) + '" placeholder="'
             + esc(i18n.t("editor.decision.placeholder")) + '">'
             + '<span class="edtip">' + i18n.tHtml("editor.decision.hint") + "</span></label>"
-            + pipelineField(base))
+            + chapterField(base, s) + pipelineField(base))
       + '<div class="edtools">' + TOOLS.map(function (x) {
           return '<button type="button" data-md="' + x.k + '" title="'
             + esc(i18n.t("editor.tool." + x.k)) + '">' + x.html + "</button>";
@@ -3778,6 +4718,15 @@
     var note = String((st && st.pnote) || "").trim();
     return note ? rule + " | " + note : rule;
   }
+  /* 同上，`chapter: <名字> | <这个章节是什么>`。说明是**可选**的（这是它和
+     pipeline 唯一的分歧：一个章节是看得见的，整条子树归了它，名字本身已经说清
+     它是什么）；名字空着就发空串 = 撤销声明，回到继承，文件里不留一行空的。 */
+  function chapterFieldValue(st) {
+    var name = String((st && st.chapter) || "").trim();
+    if (!name) return "";
+    var note = String((st && st.chnote) || "").trim();
+    return note ? name + " | " + note : name;
+  }
 
   function saveEditor() {
     var s = IDX[selected()];
@@ -3821,6 +4770,18 @@
         return;
       }
       payload.pipeline = pipelineFieldValue(st);
+    }
+    /* `chapter` **只在真的改了的时候才发**。理由和上面 pipeline 那条同源，
+       但形状不一样：这一栏一直画得出来，可它有一种我们看不见的磁盘状态——
+       `chapter: | 只写了说明没写名字` 那种写坏的行（core 报 bad_chapter、
+       归属退回继承、而那半句人写的话原样留在文件里）。它在 forest 里没有任何
+       痕迹，照空值发回去就是替人把那半句话删了，而他不会收到任何提示。
+       比一次「差值才发」更贵的，只有一次静默的数据丢失。 */
+    if (!st.lang) {
+      var was = editTarget(s, "");
+      if (chapterFieldValue(st) !== chapterFieldValue(was)) {
+        payload.chapter = chapterFieldValue(st);
+      }
     }
     var go = st.lang
       ? putTranslation(s.id, st.lang, {
@@ -3937,6 +4898,19 @@
       out += " · " + (g.at ? i18n.t("toast.moved.fork", { at: g.at, n: n })
                            : i18n.t("toast.moved.fork.roots", { n: n }));
     });
+    /* 换章节也要说。章节是**继承**来的，所以挪一步会把它整条子树一起换掉——
+       屏幕上那几步的归属、它们各自算进哪一份 Methods，全都变了，而这一切
+       没有任何一行 `chapter:` 被写过（它是派生的）。不说的话，这就是一次
+       悄悄发生的结构变动——而 `moved:` 那套审计存在的全部理由就是不许这样。
+       服务端的回执里带着，CLI 也早就在打了，只有网页把它丢了。 */
+    var ch = (info || {}).chapter;
+    if (ch && ch.changed) {
+      var from = ch.from || i18n.t("chapter.none");
+      var to = ch.to || i18n.t("chapter.none");
+      var also = (ch.steps || []).length - 1;      // 减掉被拖的那一步自己
+      out += " · " + i18n.t("toast.moved.chapter", { from: from, to: to });
+      if (also > 0) out += i18n.t("toast.moved.chapter.also", { n: also });
+    }
     return out;
   }
 
@@ -4190,6 +5164,7 @@
               lang: $("#nf-lang").value,
               branch: $("#nf-branch").value, bnote: $("#nf-bnote").value,
               decision: $("#nf-decision").value,
+              chapter: $("#nf-chap").value, chnote: $("#nf-chnote").value,
               parent: $("#nf-parent").dataset.pid || "", at: Date.now() };
     // 只有模板原样没动、其余都空时才算「没写东西」。判定要认两种语言的模板，
     // 否则切一下内容语言就会留下一份「什么都没写」的草稿在下次弹出来。
@@ -4225,6 +5200,12 @@
     $("#nf-branch").value = "extends";
     $("#nf-bnote").value = "";
     $("#nf-decision").value = "";
+    /* **章节也一个字都不继承**，而且理由更硬：章节本来就是沿树继承的，把父步骤
+       那个名字预填进来，等于把一次继承展开成一份会过期的拷贝——父步骤改个章节名，
+       这一步就留在原来那一章里，而磁盘上谁都看不出这是抄来的。
+       开一条新线是显式动作（填这一栏），留空就是「跟着上面那条线走」。 */
+    $("#nf-chap").value = "";
+    $("#nf-chnote").value = "";
 
     var d = newDraft();
     $("#nf-draft").hidden = !d;
@@ -4248,6 +5229,8 @@
     $("#nf-branch").value = d.branch || "extends";
     $("#nf-bnote").value = d.bnote || "";
     $("#nf-decision").value = d.decision || "";
+    $("#nf-chap").value = d.chapter || "";
+    $("#nf-chnote").value = d.chnote || "";
     if (d.status) $("#nf-status").value = d.status;
     if (d.lang && i18n.STRINGS[d.lang]) $("#nf-lang").value = d.lang;
     if (d.parent && IDX[d.parent]) {
@@ -4265,6 +5248,7 @@
     var wantCode = textToPaths($("#nf-code").value);
     var wantBranch = branchField({ branch: $("#nf-branch").value, bnote: $("#nf-bnote").value });
     var wantDecision = $("#nf-decision").value.trim();
+    var wantChapter = chapterFieldValue({ chapter: $("#nf-chap").value, chnote: $("#nf-chnote").value });
     papi("/steps", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -4286,6 +5270,9 @@
         lang: $("#nf-lang").value,
         branch: wantBranch,
         decision: wantDecision,
+        // 开一条新线多半就是「建这一步」的同一次动作（消融的头一步），
+        // 逼人建完再改一次，这一行大概率就永远空着了——和 decision 同一个道理。
+        chapter: wantChapter,
       }),
     }).then(function (step) {
       dropDraft(NEW_DRAFT_ID);
@@ -4299,12 +5286,17 @@
         || (wantCode.length && !(step.code || []).filter(function (c) { return c.from !== "commit"; }).length)
         || (wantBranch && step.branch !== U.BRANCH_ALT)
         || (wantDecision && !(step.decision || ""));
-      var go = lack
+      /* 章节这一项判不出来：`chapter` **刻意不进 to_dict()**（一个 `chapter:` 都
+         没写的项目不该多出一个字段值），所以建步骤那条路由回来的这份里根本没有它。
+         判不出来就补一次——只在人真的填了这一栏时才多发这一个请求，而这一栏
+         绝大多数时候是空的。服务端已经透传了的话，这次 PATCH 写回去的是同一行字。 */
+      var go = (lack || wantChapter)
         ? papi("/steps/" + encodeURIComponent(step.id), {
             method: "PATCH",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ inputs: wantInputs, code: wantCode,
-                                   branch: wantBranch, decision: wantDecision }),
+                                   branch: wantBranch, decision: wantDecision,
+                                   chapter: wantChapter }),
           }).catch(fail)
         : Promise.resolve();
       return go.then(refresh).then(function () {
@@ -4376,6 +5368,8 @@
         if ($("#ed-decision")) $("#ed-decision").value = dd.decision || "";
         if ($("#ed-pipe")) $("#ed-pipe").value = dd.pipe || "";
         if ($("#ed-pnote")) $("#ed-pnote").value = dd.pnote || "";
+        if ($("#ed-chap")) $("#ed-chap").value = dd.chapter || "";
+        if ($("#ed-chnote")) $("#ed-chnote").value = dd.chnote || "";
         updatePreview(ds);
         toast(i18n.t("toast.draft.restored"));
       } else {
@@ -4425,10 +5419,15 @@
     var pj = e.target.closest("[data-pgoto]");
     if (pj) { e.preventDefault(); pipeScrollTo(pj.getAttribute("data-pgoto")); return; }
 
+    // 「只看这一章」。点的是章节清单里那一行，做的事和顶栏那个筛选器一模一样
+    // ——同一个状态、同一份判据，界面上两个入口。
+    var cg = e.target.closest("[data-chapgo]");
+    if (cg) { e.preventDefault(); setChapFilter(cg.getAttribute("data-chapgo")); return; }
+
     /* 导出。**故意不 preventDefault**：下载是那个 <a download> 自己的事，
        拦下来就得在这一页里再造一份字节，而「只有一份实现」正是这一档的规矩。 */
     var ex = e.target.closest("[data-export]");
-    if (ex) { doExport(ex.getAttribute("data-export")); return; }
+    if (ex) { doExport(ex.getAttribute("data-export"), ex.getAttribute("data-expchap")); return; }
 
     var goto = e.target.closest("[data-goto]");
     if (goto) { e.preventDefault(); select(goto.getAttribute("data-goto")); scrollToSelected(); return; }
@@ -4564,6 +5563,64 @@
         .catch(fail);
       return;
     }
+    /* ⑨ 开一个章节 / 不开。落盘的**只有这一步自己那一行 `chapter:`**——
+       底下那些步一个字都不写，它们的归属是沿 parent 继承算出来的。
+       所以这里永远不会有一个「把这些步都标成消融」的批量按钮：那会在二十个文件里
+       各留一行会过期的拷贝，改一次章节名要改二十处，而「章节说明归谁」也会被
+       二十份同名声明搅浑。 */
+    if (name === "chapter") {
+      var cs = IDX[selected()];
+      if (!cs) return;
+      var had = !!(cs.chapter && cs.chapter.declared);
+      if (had) {
+        patch(cs.id, { chapter: "", expect: cs.digest || "" })
+          .then(function () { toast(i18n.t("toast.chapter.cleared", { id: cs.id })); })
+          .catch(fail);
+        return;
+      }
+      var nm = prompt(i18n.t("chapter.set.prompt"), "");
+      if (nm === null || !nm.trim()) return;
+      // 跟着一起换章的有几步——**在写之前**数：换章磁盘上一个字节都不变，
+      // 二十步集体转过去，diff 里只有这一行。不说的话没人会发现。
+      var carry = U.chapterCarry(IDX, cs.id).length;
+      patch(cs.id, { chapter: nm.trim(), expect: cs.digest || "" })
+        .then(function () {
+          toast(i18n.t("toast.chapter.set", { id: cs.id, chapter: nm.trim() })
+            + (carry ? " · " + i18n.t("toast.chapter.carry", { n: carry }) : ""));
+        }).catch(fail);
+      return;
+    }
+    /* 「这个章节是什么」。它跟着**章节**走，不跟着这一步走——所以它写在
+       core 裁定生效的那一处（id 序最早的那个带说明的声明），而不是随手写在
+       正在看的这一步身上：写在别处的话，屏幕上显示的还是原来那一句，
+       人会以为没保存成功。 */
+    if (name === "chapter-note") {
+      var ns = IDX[selected()];
+      var cname = ns && CH.of[ns.id];
+      var entry = cname && CH.byName[cname];
+      if (!entry) return;
+      /* **永远写到那句生效的说明所在的那一步**，哪怕你正站在另一个声明者身上。
+         以前这里是「自己声明过就写自己」——于是在 006 上改（004 才是生效的那个）
+         写进了 006、面板照旧显示 004 的旧句子，toast 还说保存成功。
+         「改了等于没改，而且它说改了」是所有 bug 里最气人的一种。 */
+      var home = U.chapterNoteHome(entry, IDX);
+      var hs = IDX[home];
+      if (!hs) return;
+      var txt = prompt(i18n.t("chapter.write.prompt"), entry.note || "");
+      if (txt === null) return;
+      var own = (hs.chapter && hs.chapter.name) || cname;
+      patch(home, { chapter: txt.trim() ? own + " | " + txt.trim() : own,
+                    expect: hs.digest || "" })
+        .then(function () {
+          // 落在别人身上时把那一步说出来：一次写入改的不是你选中的那个文件，
+          // 不说的话下次 diff 会莫名其妙。
+          toast(home === ns.id
+            ? i18n.t("toast.chapter.desc.saved", { chapter: cname })
+            : i18n.t("toast.chapter.desc.saved.elsewhere", { chapter: cname, id: home }));
+        })
+        .catch(fail);
+      return;
+    }
     if (name === "edit-insights") { openInsightEditor(); return; }
     if (name === "save-insights") { saveInsights(); return; }
     if (name === "move") { openMove(selected()); return; }
@@ -4658,6 +5715,19 @@
   $("#proj").addEventListener("change", function (e) {
     location.href = e.target.value ? projectHref(e.target.value) : homeHref();
   });
+  /* 章节筛选换的是**看多大范围**，不是看哪一份东西、也不是怎么画：
+     开发路径那三张图上它只 dim（形状一个像素不变），定稿流程那一档它换的是
+     「编哪一条流程」。一个控件，两处含义都对得上——因为它横切在那两级之上。 */
+  function setChapFilter(v) {
+    chapFilter = v || "";
+    var box = $("#chapfilter");
+    if (box && box.value !== chapFilter) box.value = chapFilter;
+    renderSelection();
+    // 定稿流程那一档换的是编哪一条流程，所以得重画；开发路径那三张图只是
+    // 换了谁淡谁亮（renderSelection 已经做完），布局一个数都没动。
+    if (mode === "pipeline") renderPipeline();
+  }
+  $("#chapfilter").addEventListener("change", function (e) { setChapFilter(e.target.value); });
   $("#search").addEventListener("input", function (e) {
     query = e.target.value;
     renderSelection();
@@ -5127,6 +6197,9 @@
     renderRows();
     renderDiagram();
     renderFlow();
+    // 章节筛选器里的选项文字（「所有章节」「3 步」）是这一页自己拼的，
+    // data-i18n 那一趟刷不到它们 —— 不重画的话切完语言那一栏还留着旧语言。
+    renderChapFilter();
     renderWarnings();        // 警告栏和缺失横幅现在都是本语言的说法，切换要跟上
     renderMissingPaths();
     // 定稿流程整块（含那张图上的字）都是本语言的，而且导出就是屏幕上这一份

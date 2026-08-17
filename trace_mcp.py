@@ -104,6 +104,33 @@ PIPELINE_DESC = (
     "**它推翻的是算出来的结果，所以是例外不是常规**：一个项目里写满 include/exclude，"
     "等于把「成员清单」一行行手抄回了记录里，而那正是这套推导要避免的东西。"
 )
+# 章节。这一段几乎全部篇幅都花在**三样东西的分界**上，因为 agent 在这里犯的错
+# 是「三选一选错了」而不是「格式写错了」，而选错了不会报任何错：
+#   项目 = 不同的研究        章节 = 同一个研究里并列的几块      分叉 = 同一个问题的互斥候选
+# 拿章节去表达分叉（「章节 A / 章节 B，最后选一个」）在磁盘上完全合法，读侧只会
+# 老老实实给两块都导出一段 Methods —— 而那正是「只能选一条」这句话被弄丢的样子。
+#
+# 第二个必须说死的是**只标第一步**。沿树继承是这个设计的全部收益：不写这一句，
+# agent 会给 20 步各标一遍（那是它对「让这些步骤属于消融」最直觉的实现），
+# 于是改一次章节名要改 20 个文件、移走一支还带着一行过期的声明。
+CHAPTER_DESC = (
+    "这一步开启的**章节**（同一个项目内部并列的几块：主实验 / 消融实验 / 数据准备）。"
+    "写成 \"消融实验\" 或 \"消融实验 | 逐个拿掉模块，对着主实验的 023 比\"，"
+    "竖线右边是**这个章节**的说明（不是这一步的），可选。\n"
+    "**只标在开启那条线的第一步上。** 下面整棵子树自动继承，不用也不要给每一步各标一遍——"
+    "标满了的代价是改一次章节名要改 20 个文件、移走一支还带着一行过期的声明，"
+    "而继承下来的归属本来一个字都不用维护。想让某一步脱离，让它自己声明一个新的章节名。\n"
+    "**和另外两样别混，选错了不会报错，只会让记录说出你没打算说的话**：\n"
+    "  · **项目**（trace_new_project）＝ 不同的研究。步骤 id 各自从 001 开始，互不相干。\n"
+    "  · **章节**（这个字段）＝ 同一个研究里**并列**的几块。**互不排斥，都要留着**——"
+    "论文里主实验一段 Methods、消融一段，两段都要写。章节之间的引用是正常的"
+    "（消融当然吃主实验的产物，写成 `input:` 就行，那条跨章节的边会被标出来）。\n"
+    "  · **分叉**（branch: alternative）＝ 同一个问题的**互斥候选**，**只能选一个**，"
+    "其余的最后要标 dead。「A 方案 / B 方案，最后二选一」是分叉，**不是**两个章节；"
+    "拿章节去写它，读侧只会给两边各导出一段 Methods，而「只能选一条」这句话就此丢了。\n"
+    "id **不按章节重编号**（消融不从 001 重新开始）：`[[007]]` 和论文脚注要在整个项目里唯一。"
+    "章节也**不嵌套**——名字里可以写 \"主实验/数据准备\"，那只是显示时按 `/` 分组，语义上仍是一层。"
+)
 CODE_DESC = (
     "跑这一步的代码在哪，一条一行，写成 \"kind | 位置 | k=v …\"。kind 三选一：\n"
     "  git       —— 位置是仓库/树的 URL 或本地仓库路径（`commit:` 字段等价于这一种，"
@@ -144,7 +171,12 @@ TR_STRUCT_KEYS = ("id", "parent", "status", "date", "commit", "author",
                   # ——论文附录里出现哪几步。译文里写一句 `pipeline: exclude` 会被读侧
                   # 一个字不看地丢掉，于是「我明明把它排除了」和「它还在 Methods 里」
                   # 同时成立，而人只会去怀疑推导错了。
-                  "result", "pipeline")
+                  "result", "pipeline",
+                  # chapter 是这一批里最能悄悄分家的一个：它**沿树继承**。译文里多写
+                  # 一行 `chapter: Ablation`，改的不是这一步，是它底下整棵子树在英文
+                  # 页面上的归属——同一个项目按两种分法各导出一份 Methods，而两边
+                  # 看着都像对的。读侧一个字节都不看它。
+                  "chapter")
 
 # 小节名的中英对照。agent 手上**没有别的地方**能知道这张表：FORMAT.md 在 pip 装的
 # 机器上根本不存在，而小节名是精确匹配的——写成 `## Why not`，评级和 check 就都
@@ -395,10 +427,18 @@ class HttpBackend:
         return self._call("GET", f"/api/p/{urllib.parse.quote(project)}/untranslated"
                                  f"?lang={urllib.parse.quote(lang)}")
 
-    def pipeline(self, project):
+    def pipeline(self, project, chapter: str = ""):
         # 读，所以不要令牌（和 forest / forks 一致）。服务端已经把 pipeline_payload
         # 拼好了，这里一个字段都不重算——远端和本地必须给出同一条流程。
-        return self._call("GET", f"/api/p/{urllib.parse.quote(project)}/pipeline")
+        #
+        # 按章节切也走**服务端**那一次调用，不在这边拿整份流程自己筛：切分的判据
+        # （哪几步属于这一章、哪几步是借来的）只有 core 那一份，客户端再筛一遍就是
+        # 第二份实现，而其中一份会进论文。
+        q = f"?chapter={urllib.parse.quote(chapter)}" if chapter else ""
+        return self._call("GET", f"/api/p/{urllib.parse.quote(project)}/pipeline{q}")
+
+    def chapters(self, project):
+        return self._call("GET", f"/api/p/{urllib.parse.quote(project)}/chapters")
 
     def set_result(self, project, step, note):
         return self._call("PUT", f"/api/p/{urllib.parse.quote(project)}/results/"
@@ -518,6 +558,10 @@ class LocalBackend:
             # 「这一步进不进最终流程」偶尔动手之前就知道（「拿来试试看的」）。
             # 收不下的话那句必填的理由就得等一次 PATCH，而多一道摩擦它就永远空着。
             pipeline=payload.get("pipeline", ""),
+            # 章节更急：这一行的作用是**开一条新线**（「下面开始做消融了」），
+            # 而它只该写在那条线的第一步上。建完再 PATCH 一次的话，那一步已经
+            # 在别的章节里躺过一轮，中间任何一次读都会把它算进上一章。
+            chapter=payload.get("chapter", ""),
         )
         d = step.to_dict()
         d["created"] = created
@@ -566,7 +610,13 @@ class LocalBackend:
         p = next((x.to_dict() for x in self.core.scan_projects(self.root) if x.slug == project), None)
         return untranslated_report(self.forest(project), p, lang)
 
-    def pipeline(self, project):
+    def _display_name(self, project: str) -> str:
+        """显示名。和目录名可以不一样（改显示名不动目录名，已发出去的链接才不会失效），
+        而导出的抬头要的是显示名——那是一份要进论文的产物。"""
+        return next((x.name for x in self.core.scan_projects(self.root)
+                     if x.slug == project), project)
+
+    def pipeline(self, project, chapter: str = ""):
         """定稿流程。**和 REST 的 /pipeline 走同一个 pipeline_payload**。
 
         `compute_pipeline({}, [])` 那个 fallback 不是形式：一个 `result:` 都没声明
@@ -574,11 +624,13 @@ class LocalBackend:
         于是那条「教你怎么办」的 info 级诊断只有主动问起来的这条路上拿得到。
         """
         f = self.forest(project)
-        # 显示名和目录名可以不一样（改显示名不动目录名，已发出去的链接才不会失效）。
-        # 导出的抬头要的是显示名——那是一份要进论文的产物。
-        name = next((x.name for x in self.core.scan_projects(self.root)
-                     if x.slug == project), project)
-        return pipeline_payload(f, project, self.core.compute_pipeline({}, []), name)
+        return pipeline_payload(f, project, self.core.compute_pipeline({}, []),
+                                self._display_name(project), chapter)
+
+    def chapters(self, project):
+        """章节清单。判据全在 core.compute_chapters / compute_pipeline 里，
+        这里和 REST 的 /chapters 共用同一个 chapters_payload。"""
+        return chapters_payload(self.forest(project), project, self._display_name(project))
 
     def set_result(self, project, step, note):
         self._sd(project)          # 项目不存在时给和别的工具一样的报错
@@ -758,13 +810,29 @@ def step_context(forest: dict[str, Any], sid: str) -> dict[str, Any]:
     于是远端后端（照着 REST 拿数据）和本地后端渲染出来的东西逐字一样。
     """
     at_me = [g for g in (forest.get("branch_groups") or []) if sid in (g.get("options") or [])]
-    return {
+    out = {
         # 我是某一组候选里的一个 → 整组给出来（同组还有谁、定了没有、谁被选中）。
         "in_fork": dict(at_me[0]) if at_me else None,
         # 和本步有关的汇回边，两个方向都在里面（from/to 自带方向，不用分两个键）。
         "rejoins": [dict(m) for m in (forest.get("merges") or [])
                     if m.get("from") == sid or m.get("to") == sid],
     }
+    # 章节是**从哪一步继承来的**。step 自己带的 `chapter` 只回答「我属于哪一章」和
+    # 「这一行是不是写在我身上」，而读一步的人接着要问的是「那一行写在哪」——
+    # 改章节名、把整支挪进别的章，动的都是那一步，不是眼前这一步。
+    # 只有真有章节的项目才多这个键（现存项目一个字都不该多），所以它和 forest
+    # 里那两个键同一条规矩：没人写过 `chapter:` 就整个键不出现。
+    idx = {s["id"]: s for s in (forest.get("steps") or [])}
+    mine = (idx.get(sid) or {}).get("chapter")
+    if mine and mine.get("name"):
+        cur, seen = sid, set()
+        while cur and cur in idx and cur not in seen:
+            seen.add(cur)
+            if (idx[cur].get("chapter") or {}).get("declared"):
+                break
+            cur = idx[cur].get("parent")
+        out["chapter_at"] = cur if cur in idx else ""
+    return out
 
 
 def fork_label(g: dict[str, Any]) -> str:
@@ -870,6 +938,25 @@ def _fork_haystack(s: dict) -> str:
         return " ".join(b for b in bits if b)
 
 
+def _chapter_haystack(s: dict) -> str:
+    """这一步自己写下的那一行 `chapter:`（名字 + 说明），供 trace_search 用。
+
+    权威实现在 core.chapter_haystack；退路的理由和上面那两条一模一样。
+    收的是**自己声明的**那几个字，不是继承来的归属 —— 判据是 grep：
+    `grep -rn 消融实验 projects/` 命中的就是声明它的那一个文件。
+    """
+    try:
+        import trace_core as _core  # noqa: PLC0415
+        return _core.chapter_haystack(s)
+    except Exception:
+        ch = s.get("chapter")
+        if not isinstance(ch, dict):
+            return ""
+        bits = [str(ch.get("name") or "") if ch.get("declared") else "",
+                str(ch.get("note") or "")]
+        return " ".join(b for b in bits if b)
+
+
 def _matched_locations(s: dict, q: str) -> list[str]:
     """命中落在正文之外（位置、`decision:`、候选说明）时，把是哪一行说出来。
 
@@ -893,6 +980,12 @@ def _matched_locations(s: dict, q: str) -> list[str]:
         out.append("decision: " + str(s["decision"]))
     if q in str(s.get("branch_note") or "").lower():
         out.append("branch: " + str(s.get("branch") or "") + " | " + str(s["branch_note"]))
+    # 命中落在这一步自己那一行 `chapter:` 上：摆出来的就是文件里那一行，
+    # 和 `grep -rn 消融实验 projects/` 打出来的一模一样。
+    if q in _chapter_haystack(s).lower():
+        ch = s.get("chapter") or {}
+        out.append("chapter: " + str(ch.get("name") or "")
+                   + (f" | {ch['note']}" if ch.get("note") else ""))
     return out
 
 
@@ -1066,6 +1159,18 @@ def _fmt_step(project: str, s: dict) -> str:
     if meta:
         head.append("  " + "  ".join(meta))
     head.append("  溯源: " + " → ".join(s.get("lineage", [s["id"]])))
+    ch = s.get("chapter") or {}
+    if ch.get("name"):
+        # **归属**和**这一行写在哪**是两件事，必须分开说：拿后者当归属判断，
+        # 继承来的整条子树会集体看着像未分章。
+        at = s.get("chapter_at") or ""
+        head.append(f"  章节: {ch['name']}"
+                    + ("（`chapter:` 就写在这一步上——它是这条线的起点，"
+                       "底下整棵子树都继承它；改这一行就能整条搬走）"
+                       if ch.get("declared")
+                       else f"（继承来的，声明在 {at or '某个祖先'}；"
+                            "这一步自己没写，也不该写——重复声明只会让改名要改很多处）")
+                    + (f"  —— {ch['note']}" if ch.get("note") else ""))
     t = s.get("trace") or {}
     if t:
         line = f"  可溯源性: {t['self']} {LEVELS.get(t['self'], '')}"
@@ -1132,6 +1237,207 @@ def _fmt_step(project: str, s: dict) -> str:
             head.append("  ⓘ 图片内容你看不到，只能读正文里的图注。要看原图就取 "
                         "{base}/p/{项目}/files/{id}/{文件名}")
     return "\n".join(head) + "\n\n" + (s.get("body") or "（正文为空）")
+
+
+# ---------------------------------------------------------------- 章节
+#
+# 一个项目内部并列的几块：主实验 / 消融实验 / 数据准备。磁盘上只有一行
+# `chapter: 消融实验 | …`，写在**开启那条线的那一步**上，整棵子树沿 parent 继承。
+# 判据一条都不在这里——归属是 core.resolve_chapters，清单是 core.compute_chapters，
+# 按章切开的流程是 core.compute_pipeline 的 `chapters`。这一段只做**渲染**和
+# **把两份派生join 起来**（章节清单 × 它自己那条定稿流程）。
+#
+# 「一步属于哪个章节」全项目只有 core.resolve_chapters 一份判据。任何地方都不要
+# 拿「这一步自己写没写 chapter」当归属判断——那是 `declared`，和归属是两件事，
+# 混用会让继承来的 20 步集体看着像未分章。
+
+# 命令行和查询串上指代**未分章**那一组。
+#
+# 为什么要一个记号：核心把未分章那组的名字定成空串，而空串在 `?chapter=` 和
+# `--chapter` 上和「没给」长得一模一样。而这一组恰恰常常是主实验——多数人只给
+# 消融起了名字，主线一直没起——没有它，最该单独导一份 Methods 的那一块反而导不了。
+#
+# 取舍写在这里：一个**真叫 `-` 的章节**会赢过这个记号（真名优先，未分章那组退回
+# 只能从整份流程里看）。`-` 通过得了写入侧的章节名校验，所以这个歧义理论上存在；
+# 换一个不可能撞名的记号（比如含竖线的串）要用户在命令行上引号转义，那是拿一个
+# 天天付的代价去换一个几乎不会发生的碰撞。
+CHAPTER_NONE = "-"
+
+# 空态那句话。和 PIPELINE_EMPTY_TIP 同一个路子：说给 agent 听（它手上有工具），
+# 而且**不带缺失感**——没分章不是少写了什么，绝大多数项目从头到尾就是一条线。
+CHAPTER_EMPTY_TIP = (
+    "要分章，只在**开启那条线的那一步**上写一行 "
+    "`chapter: 消融实验 | 逐个拿掉模块，对着主实验的 023 比`"
+    "（trace_new_step / trace_update_step 的 chapter 参数），"
+    "它底下整棵子树自动继承——**不要给每一步各标一遍**。\n"
+    "章节之间**互不排斥**（主实验和消融两段 Methods 都要写）；"
+    "「同一个问题的几个答案、只能选一条」不是章节，那是 branch: alternative。"
+)
+
+
+def chapter_label(name: str) -> str:
+    """章节名的显示形态。未分章那组的名字是空串，直接打出来是一片空白。"""
+    return name or "（未分章）"
+
+
+def _pick_chapter(groups: list[dict[str, Any]], want: str) -> dict[str, Any] | None:
+    """按名字从一份分组里挑一组。挑不中回 None（由调用方决定怎么说）。
+
+    **不做任何模糊匹配**（大小写折叠、前缀、相似度）：章节靠同名成立，`Ablation`
+    和 `ablation` 在这套系统里就是两个章节（core 会为此报一条 near_duplicate），
+    这里替人猜一次，等于让「导出的是哪一章」取决于猜法——而其中一份会进论文。
+    """
+    hit = next((g for g in groups if g.get("name") == want), None)
+    if hit is None and want == CHAPTER_NONE:
+        # 真名优先（见 CHAPTER_NONE 那段的取舍）：一个**真叫 `-`** 的章节存在时，
+        # 上面那一行已经命中了它，这里的记号不会把它抢走。
+        hit = next((g for g in groups if g.get("name") == ""), None)
+    return hit
+
+
+def chapters_payload(forest: dict[str, Any], project: str, name: str = "") -> dict[str, Any]:
+    """章节清单。三个门面（REST 的 /chapters、MCP 的 trace_read(chapters=true)、
+    CLI 的 `chapter`）共用这一份。
+
+    做的唯一一件事是 **join**：core 给了两份派生——章节清单（谁属于哪一章、多少步、
+    等级、最弱一步）和按章切开的定稿流程（这一章有哪几个 `result:`）——而人问的
+    「消融做到哪了」需要同时看这两份。join 一次胜过每个门面各 join 一次。
+
+    一个 `chapter:` 都没写的项目：`forest["chapters"]` 整个键不存在，这里回
+    `declared: False` 和一份空清单，**不报任何警告**——现存项目全是这个状态。
+    """
+    ch = forest.get("chapters") or {}
+    groups = {g["name"]: g for g in ((forest.get("pipeline") or {}).get("chapters") or [])}
+    rows = []
+    for c in ch.get("chapters") or []:
+        g = groups.get(c["name"])
+        row = dict(c)
+        # 「有没有成果声明」是这份清单最要紧的一列：没有 `result:` 的章节推不出
+        # 自己那段 Methods，而那正是分章之后最想要的东西。
+        row["results"] = list(g["results"]) if g else []
+        row["pipeline"] = ({"n": len(g["order"]), "level": g["level"], "weakest": g["weakest"],
+                            "external": list(g["external"]), "dead": list(g["dead"]),
+                            "weak": list(g["weak"])} if g else None)
+        rows.append(row)
+    un = groups.get("")
+    return {
+        "project": project,
+        "name": name or project,
+        "declared": bool(ch.get("declared")),
+        "chapters": rows,
+        # 未分章那一组**不是一个章节**，所以不混进上面那份清单（core 也没给它算
+        # 等级和状态分布）。但它常常就是主实验，所以它有几步、有没有自己的成果
+        # 得说出来——否则按章节读这个项目的人会以为那些步骤不存在。
+        "unassigned": list(ch.get("unassigned") or []),
+        "unassigned_results": list(un["results"]) if un else [],
+        "crossings": list(ch.get("crossings") or []),
+        "diagnostics": list(ch.get("diagnostics") or []),
+        "titles": {s.get("id", ""): s.get("title", "") for s in (forest.get("steps") or [])},
+    }
+
+
+def fmt_chapters(payload: dict[str, Any]) -> str:
+    """章节清单的文本视图。MCP 的 trace_read(chapters=true) 和 CLI 的 `chapter` 共用。"""
+    project = payload.get("name") or payload["project"]
+    titles = payload.get("titles") or {}
+    if not payload["declared"]:
+        return (f"{project} · 还没有分章节。**这是常态，不是缺陷**——绝大多数项目"
+                "从头到尾就是一条线。\n\n" + CHAPTER_EMPTY_TIP)
+    rows = payload["chapters"]
+    lines = [f"{project} · {len(rows)} 个章节",
+             "（章节是同一个项目里**并列**的几块，主实验一块、消融一块，"
+             "**互不排斥，都要留着**；「同一个问题的几个互斥候选、只能选一条」是"
+             "**分叉**，那是 branch: alternative，不是章节。）",
+             ""]
+    for c in rows:
+        head = (f"  ▸ {chapter_label(c['name'])}   {c['n']} 步  "
+                f"done {c['status']['done']} / wip {c['status']['wip']} / dead {c['status']['dead']}"
+                f"  ·  {c['level']} {LEVELS.get(c['level'], '')}")
+        if c.get("weakest"):
+            head += f"（最弱一环 {c['weakest']}）"
+        lines.append(head)
+        if c.get("note"):
+            lines.append(f"      {c['note']}")
+        lines.append("      声明在 " + "、".join(c["declared_at"])
+                     + f"；入口 {'、'.join(c['roots'])}"
+                     + ("（横跨几棵树，所以不止一个）" if len(c["roots"]) > 1 else ""))
+        if c["results"]:
+            g = c["pipeline"] or {}
+            lines.append(f"      ★ 成果 {'、'.join(c['results'])} → 这一章自己的定稿流程 "
+                         f"{g.get('n', 0)} 步 · {g.get('level', '')} "
+                         f"{LEVELS.get(g.get('level') or '', '')}"
+                         + (f"（其中 {len(g['external'])} 步借自别的章节）"
+                            if g.get("external") else ""))
+        else:
+            lines.append("      ☆ 这一章还没有 `result:`，所以推不出它自己那段 Methods"
+                         "（用 trace_result 标一个，或者它本来就不该有成果）")
+        lines.append(f"      步骤 {' → '.join(c['steps'])}")
+        lines.append("")
+    if payload["unassigned"]:
+        lines.append(f"  ▸ {chapter_label('')}   {len(payload['unassigned'])} 步 —— "
+                     "没有哪个祖先声明过章节。**不是缺陷**，多数项目的主线本来就没起名字"
+                     + (f"；它自己也有成果：{'、'.join(payload['unassigned_results'])}"
+                        if payload["unassigned_results"] else "")
+                     + f"。按章节导它用 chapter=\"{CHAPTER_NONE}\"")
+        lines.append(f"      步骤 {' → '.join(payload['unassigned'])}")
+        lines.append("")
+    cross = payload["crossings"]
+    if cross:
+        lines.append(f"跨章节的边 {len(cross)} 条（**这不该藏起来**：它说的正是"
+                     "「消融是对着主结果测的」）：")
+        for x in cross:
+            what = ("读的是" if x["kind"] == "input" else "从这里分出去的：")
+            lines.append(f"  {x['to']} ← {x['from']}  "
+                         f"[{chapter_label(x['to_chapter'])} {what} "
+                         f"{chapter_label(x['from_chapter'])}]"
+                         + (f"  {x['note']}" if x.get("note") else "")
+                         + (f"  —— {titles.get(x['from'], '')}" if titles.get(x["from"]) else ""))
+        lines.append("")
+    diags = payload["diagnostics"]
+    if diags:
+        lines.append("诊断（**一条都不影响 L0–L4**）：")
+        for d in diags:
+            lines.append(("  ⓘ " if d.get("level") == "info" else "  ⚠ ") + str(d.get("message", "")))
+        lines.append("")
+    lines.append("按章节导出：trace_pipeline(chapter=\"<章节名>\")"
+                 "（Methods / 那张图 / 独立页面都跟着只出这一章）。"
+                 "章节名是人起的，`grep -r \"chapter: 消融实验\"` 原样捞得到。")
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def chapter_export_name(names: list[str], stem: str = "pipeline") -> dict[str, str]:
+    """按章节导出时每一章的**文件名**（不含扩展名）。`build` 用它。
+
+    章节名**不是路径安全的**，绝不能拿它直接拼文件名：它合法地可以是
+    `主实验/数据准备`（设计要求按 `/` 分组显示）、`CON`、`..`、`note.md`。
+    所以派生文件名要过三道：slugify（`/`、`..`、尾随点都被中和）、Windows 保留名、
+    **去重**——写入侧刻意不折叠大小写（`Ablation` / `ablation` 是两个章节），
+    于是两个不同章节能 slug 成同一个名字，用它在清单里的序号消歧，
+    绝不让后一份静默盖掉前一份。
+
+    slugify / WIN_RESERVED 都在 trace_write 里，这里**延迟 import**：这个文件
+    在只有 TRACE_URL 的机器上是单独拷过去的，那台机器上没有 trace_write，
+    而它也不会去写本地文件（导出到磁盘只发生在 CLI 的 `build` 那一侧）。
+    """
+    import trace_write as _W  # noqa: PLC0415
+
+    out: dict[str, str] = {}
+    used: set[str] = set()
+    for i, name in enumerate(names):
+        slug = _W.slugify(name) if name else "unassigned"
+        if slug in _W.WIN_RESERVED:
+            # `con.svg` 在 Windows 上打开的是设备不是文件——写出去不报错，读回来是空的。
+            slug += "-ch"
+        # 消歧要**一直加到真的没人占**为止。只试一次的话，序号本身能撞上另一个
+        # 章节的真名：`a` / `a-3` / `A` 三章 —— `A` 撞了 `a`，退到 `a-3`，
+        # 而 `a-3` 正是第二章的文件名，于是第三章静默盖掉第二章那份 Methods。
+        cand, k = f"{stem}-{slug}", i + 1
+        while cand in used:
+            cand = f"{stem}-{slug}-{k}"
+            k += 1
+        used.add(cand)
+        out[name] = cand
+    return out
 
 
 # ---------------------------------------------------------------- 定稿流程
@@ -1204,9 +1510,44 @@ WHY_LABEL = {
 }
 
 
+def _chapter_slice(pipe: dict[str, Any], group: dict[str, Any],
+                   of: dict[str, str]) -> dict[str, Any]:
+    """把整份定稿流程**切**成一章。切分，不是重算。
+
+    重算（对着这一章的成果再跑一遍闭包）会得到同一批步骤，但那是第二份实现——
+    N 章就 N 次闭包，而 N 个闭包必然相交（同一份清洗好的数据集既喂了主结果也喂了
+    消融）。core 已经在 `compute_pipeline` 里切好了（`pipeline["chapters"]`），
+    这里只把那一组的 id 拿去筛整张图的边、why、levels，于是**同一步在总图和分章图
+    里的位置逐字一致**——屏幕上讨论的和投出去的是同一张图。
+
+    `level` / `weakest` / `weak` / `dead` 一律取那一组自己算好的：整份流程的等级
+    是全项目最弱的一步，拿它当消融那一章的等级就是在替消融背别的章的锅。
+    """
+    keep = set(group["order"])
+    at = {r["step"]: r for r in (pipe.get("results") or [])}
+    out = dict(pipe)                       # 键序原样保留：静态导出要逐字节确定
+    out["results"] = [at[s] for s in group["results"] if s in at]
+    out["order"] = list(group["order"])
+    out["edges"] = [e for e in (pipe.get("edges") or [])
+                    if e.get("from") in keep and e.get("to") in keep]
+    out["why"] = {k: v for k, v in (pipe.get("why") or {}).items() if k in keep}
+    out["levels"] = {k: v for k, v in (pipe.get("levels") or {}).items() if k in keep}
+    out["level"] = group["level"]
+    out["weakest"] = group["weakest"]
+    out["weak"] = list(group["weak"])
+    out["dead"] = list(group["dead"])
+    # 被剔掉的 / 人手保留的：只留属于本章的。别的章自己判死的旁支不是这一章的事，
+    # 摆进消融那份 Methods 的「试过没走通」一节，读的人会以为那是消融试的。
+    out["excluded"] = [x for x in (pipe.get("excluded") or [])
+                       if of.get(x.get("step", ""), "") == group["name"]]
+    out["included"] = [s for s in (pipe.get("included") or [])
+                       if of.get(s, "") == group["name"]]
+    return out
+
+
 def pipeline_payload(forest: dict[str, Any], project: str,
                      fallback: dict[str, Any] | None = None,
-                     name: str = "") -> dict[str, Any]:
+                     name: str = "", chapter: str = "") -> dict[str, Any]:
     """两个门面（REST 的 /pipeline、MCP 的 LocalBackend.pipeline）共用的那份数据。
 
     和 step_context 同一个理由：各拼一遍的话，远端后端（照着 REST 拿数据）和本地
@@ -1219,14 +1560,53 @@ def pipeline_payload(forest: dict[str, Any], project: str,
     `project` 是**目录名**（slug，用来拼路由），`name` 是**显示名**。三样导出的
     抬头一律用 `name`：那是一份要进论文的产物，抬头写成 `pipeline-demo` 而不是
     课题名，收到的人只会以为拿错了文件。没给 `name` 就退回 slug。
+
+    `chapter` 给了就**只出那一章**（`CHAPTER_NONE` 指未分章那一组）。按章节导出的
+    入口**只有这一个**：三样导出、REST、CLI、build 全部拿这里切好的 payload，
+    谁都不许在自己那侧再筛一遍——其中一份产物会进论文，两份实现迟早不一致。
+    章节名不认识时抛 ToolError 并把有哪几章摆出来：章节名是人起的中文，
+    打错一个字是最常见的失败方式，而「没有这一章」和「这一章是空的」长得一模一样。
     """
     pipe = forest.get("pipeline")
     if pipe is None:
         pipe = dict(fallback) if fallback is not None else empty_pipeline()
+    ch_meta: dict[str, Any] | None = None
+    if chapter:
+        of = ((forest.get("chapters") or {}).get("of")) or {}
+        known = [c["name"] for c in ((forest.get("chapters") or {}).get("chapters") or [])]
+        group = _pick_chapter(pipe.get("chapters") or [], chapter)
+        if group is not None:
+            want = group["name"]        # 真名优先，所以这里不能反过来由记号推名字
+        elif chapter in known:
+            want = chapter              # 有这一章，只是它一条 `result:` 都没有
+        elif chapter == CHAPTER_NONE:
+            want = ""                   # 未分章那一组，而它也没有成果
+        else:
+            raise ToolError(
+                f"这个项目里没有叫「{chapter}」的章节。"
+                + (f"有的是：{'、'.join(chapter_label(k) for k in known)}"
+                   f"（未分章那一组用 \"{CHAPTER_NONE}\"）。章节名一个字符不同就是两个章节，"
+                   "这里**不做**大小写折叠或近似匹配——替你猜一次，导出的是哪一章就取决于猜法"
+                   if known else "它一个章节都还没分。" + CHAPTER_EMPTY_TIP))
+        ch_meta = {
+            "name": want,
+            "label": chapter_label(want),
+            # 这一章借来的上游（消融吃着主实验的 023）：不是本章的成员，但少了它们
+            # Methods 里就是一句断了的话。值是它**原本属于哪一章**，导出时照实标。
+            "external": {sid: of.get(sid, "") for sid in (group or {}).get("external", [])},
+            "known": known,
+            # 这一章一条 `result:` 都没有 → 推不出它自己那段 Methods。这不是错，
+            # 只是这一章还没有终点（core 那条 chapter_no_result 说的是同一件事）。
+            "no_result": group is None,
+        }
+        if group is None:
+            pipe = empty_pipeline()
+        else:
+            pipe = _chapter_slice(pipe, group, of)
     at = {sid: i for i, sid in enumerate(pipe.get("order") or [])}
     steps = sorted((s for s in (forest.get("steps") or []) if s.get("id") in at),
                    key=lambda s: at[s["id"]])
-    return {
+    out = {
         "project": project,
         "name": name or project,
         "declared": bool(pipe.get("declared")),
@@ -1237,6 +1617,11 @@ def pipeline_payload(forest: dict[str, Any], project: str,
         # 是哪一步的地方只剩一个光秃秃的 id。
         "titles": {s.get("id", ""): s.get("title", "") for s in (forest.get("steps") or [])},
     }
+    # 没按章节要就**整个键都不出现**：一个 `chapter:` 都没写的项目，它这份 payload
+    # 必须和这一轮改动之前逐字节一样（和 forest 里那两个键同一条规矩）。
+    if ch_meta is not None:
+        out["chapter"] = ch_meta
+    return out
 
 
 def _why_line(payload: dict[str, Any], sid: str) -> str:
@@ -1248,6 +1633,47 @@ def _why_line(payload: dict[str, Any], sid: str) -> str:
     return tpl.format(id=w.get("id") or "?")
 
 
+# ── 按章节导出时，三样导出（和文本视图）共用的这三小块 ────────────────────
+#
+# 它们只有这一份：抬头写哪个名字、空态说哪句话、借来的上游怎么标。三样导出各写
+# 一遍的话，同一条流程在图上、在 Methods 里、在那一页 HTML 上会用三种说法称呼
+# 同一件事——而收到它们的是同一个人。
+
+
+def _pipe_head(payload: dict[str, Any]) -> str:
+    """抬头。按章节导出时必须带上章节名，否则两份产物的抬头一模一样，
+    收到「主实验」和「消融」两份 Methods 的人分不出哪份是哪份。"""
+    project = payload.get("name") or payload["project"]
+    ch = payload.get("chapter")
+    return f"{project} · {ch['label']}" if ch else project
+
+
+def _pipe_empty_tip(payload: dict[str, Any]) -> str:
+    """空态那句话。按章节问的时候要说的是**这一章**没有成果，
+    而不是「这个项目还没声明成果」——后者在别的章有成果时是句假话。"""
+    ch = payload.get("chapter")
+    if not ch:
+        return PIPELINE_EMPTY_TIP
+    return (f"章节「{ch['label']}」里一条 `result:` 都没有，所以推不出它自己那段流程。"
+            "**这不是缺陷**——一章可以只是探索，成果在别的章。\n"
+            "论文里主实验和消融本来就是两段 Methods；想要这一段，"
+            "用 trace_result 把这一章的那一步标成成果（id 不按章节重编号，"
+            "写它在整个项目里的那个 id）。")
+
+
+def _external_tag(payload: dict[str, Any], sid: str) -> str:
+    """这一步是**借来的**（属于别的章节，但本章的流程够到了它）。
+
+    标出来而不是藏起来：消融当然要吃主实验的产物，那条跨章节的边说的正是
+    「消融是对着主结果测的」。不标的话，读消融那份 Methods 的人会以为
+    那几步是消融自己做的。
+    """
+    src = ((payload.get("chapter") or {}).get("external") or {}).get(sid)
+    if src is None:
+        return ""
+    return f"（借自 {chapter_label(src)}）"
+
+
 def _pipe_diag_lines(payload: dict[str, Any]) -> list[str]:
     """诊断，**按后果分栏**而不是按 level 字段分。
 
@@ -1255,10 +1681,36 @@ def _pipe_diag_lines(payload: dict[str, Any]) -> list[str]:
     而「你的结果依赖着一条自己已经放弃的路」是必须当场说出来的事。三种混成一栏打，
     人会以为它们一样严重，然后开始整体略过这一段——那正是警告失效的方式。
     """
+    chapter = payload.get("chapter")
+    # 按章节导出时，**先把只提到别章步骤的那几条筛掉**。
+    #
+    # 这不是重算（重算就是第二份判据，而它算的是等级和「谁踩着 dead」——
+    # 这两件事上出现两种说法，人会去怀疑推导本身）；这是从 core 算好的那一份里
+    # 挑出与本文档有关的。一句免责声明救不了实际发生的事：一份要递给合作者的
+    # 主实验 Methods，里面同时印着「L0，卡在 005」而 005 从头到尾不出现——
+    # 读的人只会以为这份文档漏了两步。
+    here = set(payload["pipeline"].get("order") or []) if chapter else None
+
+    def about_here(d: dict[str, Any]) -> bool:
+        if here is None:
+            return True
+        v = d.get("vars") or {}
+        named = {x.strip() for key in ("ids", "id") for x in str(v.get(key, "")).split(",")}
+        named.discard("")
+        return not named or bool(named & here)   # 不点名步骤的（比如"没声明成果"）照留
+
     out: list[str] = []
+    kept_wide = False
     for d in payload["pipeline"].get("diagnostics") or []:
+        if not about_here(d):
+            continue
         mark = "ⓘ " if d.get("level") == "info" else "⚠ "
         out.append(mark + str(d.get("message", "")))
+        kept_wide = True
+    # 留下来的那几条措辞仍是整张图的（"整条流程的等级"指的是全项目），说清这一点。
+    if kept_wide and chapter:
+        out.insert(0, "（下面这几条的措辞说的是**整个项目**这张流程图，"
+                      "只是已经筛掉了与本章无关的那些；本章自己的等级和最弱一环见上面那一行。）")
     return out
 
 
@@ -1270,12 +1722,12 @@ def fmt_pipeline(payload: dict[str, Any], *, with_diagnostics: bool = True) -> s
     同一批话说两次，而说两次的直接后果是人开始整段略过。
     """
     p = payload["pipeline"]
-    project = payload.get("name") or payload["project"]
+    project = _pipe_head(payload)
     if not payload["declared"]:
         # 这里**不**打 diagnostics：空态时那一条（pipeline_no_result）和上面这段话
         # 说的是同一件事，只是一个说给人听、一个说给 agent 听。两句都打出来，
         # 读者会以为自己犯了两个错。
-        return f"{project} · 定稿流程：还没有。\n\n" + PIPELINE_EMPTY_TIP
+        return f"{project} · 定稿流程：还没有。\n\n" + _pipe_empty_tip(payload)
 
     order = p.get("order") or []
     levels = p.get("levels") or {}
@@ -1285,9 +1737,18 @@ def fmt_pipeline(payload: dict[str, Any], *, with_diagnostics: bool = True) -> s
         f"{project} · 定稿流程 · {len(order)} 步",
         "（这是**给别人照着做**的那一条路：只有真正产出成果的步骤。"
         "全部记录——含走不通的、含还没决定的岔路口——在**开发路径**上，用 trace_read 看。）",
-        "",
-        "已声明的成果（**唯一写下来的事，其余全是算出来的**）：",
     ]
+    if payload.get("chapter"):
+        # 按章节看的时候第一句就得说清这是**一章**，不是整个项目的全部流程——
+        # 否则「这个项目的定稿流程只有 4 步」会被当成事实读走。
+        n_ext = len(payload["chapter"]["external"])
+        lines.append(f"（只有「{payload['chapter']['label']}」这一章。"
+                     "章节之间**不互斥**，别的章有它们自己的成果和自己那段 Methods；"
+                     "整个项目的一张总图去掉 chapter 参数就是。"
+                     + (f"其中 {n_ext} 步标着「借自…」：它们属于别的章节，"
+                        "本章的数据依赖够到了它们——那正是「这一章是对着那个结果测的」。）"
+                        if n_ext else "）"))
+    lines += ["", "已声明的成果（**唯一写下来的事，其余全是算出来的**）："]
     for r in p.get("results") or []:
         lines.append(f"  ★ {r['step']}  {titles.get(r['step'], '')}"
                      + (f"  —— {r['note']}" if r.get("note") else "")
@@ -1313,6 +1774,9 @@ def fmt_pipeline(payload: dict[str, Any], *, with_diagnostics: bool = True) -> s
             badge.append("▣dead")
         if (s.get("pipeline") or {}).get("rule") == "include":
             badge.append("人手保留")
+        ext = _external_tag(payload, sid)
+        if ext:
+            badge.append(ext)
         lines.append(f"  {i:>2}. {sid:<6} [{lv} {LEVELS.get(lv, '')}] {s.get('title', '')}"
                      + ("   " + " ".join(badge) if badge else ""))
         lines.append(f"        凭什么在流程里: {_why_line(payload, sid)}")
@@ -1323,7 +1787,8 @@ def fmt_pipeline(payload: dict[str, Any], *, with_diagnostics: bool = True) -> s
                          + (f"  {note}" if note else "")
                          + (f"   [中间经过 {' / '.join(via)}，那几步不算流程的一部分]" if via else ""))
 
-    lines += ["", f"整条流程的可溯源等级 = 最弱的一步 = {p.get('level')} "
+    scope = "这一章" if payload.get("chapter") else "整条流程"
+    lines += ["", f"{scope}的可溯源等级 = 最弱的一步 = {p.get('level')} "
                   f"{LEVELS.get(p.get('level') or '', '')}"
                   + (f"，卡在 {p.get('weakest')}（{titles.get(p.get('weakest') or '', '')}）"
                      if p.get("weakest") else ""),
@@ -1376,6 +1841,13 @@ def _methods_step(payload: dict[str, Any], sid: str, n: int) -> list[str]:
     p = payload["pipeline"]
     out = [f"### {n}. `{sid}` — {s.get('title', '')}", ""]
     meta = [f"凭什么在流程里：{_why_line(payload, sid)}"]
+    ext = _external_tag(payload, sid)
+    if ext:
+        # 借来的上游必须逐步标出来，不能只在抬头说一句「有几步是借的」：读 Methods
+        # 的人是一步一步读的，而「这一步是我们自己做的还是引用的主实验」正是
+        # 消融那一节最容易被读错的地方。
+        meta.append(f"**{ext}** —— 它不属于本章，是本章的数据依赖够到的上游"
+                    "（这正是「本章是对着那个结果测的」）。")
     if s.get("date"):
         meta.append(f"日期：{s['date']}")
     if s.get("author"):
@@ -1443,19 +1915,34 @@ def _methods_step(payload: dict[str, Any], sid: str, n: int) -> list[str]:
 def pipeline_methods(payload: dict[str, Any]) -> str:
     """Methods 草稿。**逐字节确定**（P3）：同样的记录永远得到同样的文本。"""
     p = payload["pipeline"]
-    project = payload.get("name") or payload["project"]
+    project = _pipe_head(payload)
     if not payload["declared"]:
         return (f"# Methods（草稿）\n\n{project} 还没有声明成果，推不出定稿流程。\n\n"
-                + PIPELINE_EMPTY_TIP + "\n")
+                + _pipe_empty_tip(payload) + "\n")
     titles = payload["titles"]
     order = p.get("order") or []
-    out = [f"# Methods（草稿） — {project}", "", METHODS_PREFACE, "",
-           "## 0. 这条流程能被追到多远", ""]
-    out.append(f"- 整条流程：**{p.get('level')} {LEVELS.get(p.get('level') or '', '')}** "
-               f"= 其中最弱的一步"
+    out = [f"# Methods（草稿） — {project}", "", METHODS_PREFACE, ""]
+    ch = payload.get("chapter")
+    if ch:
+        # 一份按章节导出的草稿会被直接贴进论文的某一节，所以它必须自己说清
+        # 「这是哪一节、别的节在别的文件里」——否则收到两份草稿的人会以为
+        # 后一份是前一份的修订版，然后只留一份。
+        out += [f"> **本文只是「{ch['label']}」这一章。** 章节之间**不互斥**，"
+                "别的章有它们自己的成果和自己那段 Methods（论文里本来就是两段），"
+                "各自单独导一份。步骤 id 是**整个项目**里的 id，不按章节重编号，"
+                "所以两段草稿里的编号可以直接对照。", ""]
+    out += ["## 0. 这条流程能被追到多远", ""]
+    out.append(f"- {'这一章' if ch else '整条流程'}：**{p.get('level')} "
+               f"{LEVELS.get(p.get('level') or '', '')}** = 其中最弱的一步"
                + (f"，也就是 `{p['weakest']}`（{titles.get(p['weakest'], '')}）"
                   if p.get("weakest") else "")
                + "。别人能不能照着做出来，由它决定。")
+    if ch and ch["external"]:
+        out.append("- **借自别的章节的步骤**："
+                   + "、".join(f"`{sid}`（{chapter_label(src)}）"
+                               for sid, src in ch["external"].items())
+                   + "。它们不属于本章，是本章的数据依赖够到的上游——"
+                   "这一条正是「本章是对着那个结果测的」，别把它们写成本章自己做的。")
     if p.get("weak"):
         out.append(f"- 别人跑不起来的步骤（L0/L1）：{'、'.join('`%s`' % x for x in p['weak'])}"
                    "。补记录要从这几步补起，不是从最新那一步补起。")
@@ -1533,9 +2020,11 @@ def pipeline_svg(payload: dict[str, Any]) -> str:
                 f'width="{_SVG_W}" height="{h}" font-family="ui-monospace, Menlo, Consolas, '
                 f'monospace" font-size="13">\n'
                 f'<rect width="{_SVG_W}" height="{h}" fill="#ffffff"/>\n'
-                f'<text x="24" y="44" font-size="16">{_x(payload.get("name") or payload["project"])} · 定稿流程</text>\n'
-                f'<text x="24" y="72" fill="#333333">还没有哪一步被声明成成果，'
-                f'所以推不出流程（这是常态，不是缺陷）。</text>\n</svg>\n')
+                f'<text x="24" y="44" font-size="16">{_x(_pipe_head(payload))} · 定稿流程</text>\n'
+                f'<text x="24" y="72" fill="#333333">'
+                + ('这一章里还没有哪一步被声明成成果，所以推不出它自己那段流程'
+                   if payload.get("chapter") else '还没有哪一步被声明成成果，所以推不出流程')
+                + f'（这是常态，不是缺陷）。</text>\n</svg>\n')
 
     levels = p.get("levels") or {}
     results = {r["step"] for r in (p.get("results") or [])}
@@ -1551,12 +2040,17 @@ def pipeline_svg(payload: dict[str, Any]) -> str:
            '<defs><marker id="tip" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" '
            'markerHeight="7" orient="auto-start-reverse">'
            '<path d="M 0 0 L 10 5 L 0 10 z" fill="#000000"/></marker></defs>',
-           f'<text x="24" y="32" font-size="17">{_x(payload.get("name") or payload["project"])} · 定稿流程 · '
+           f'<text x="24" y="32" font-size="17">{_x(_pipe_head(payload))} · 定稿流程 · '
            f'{len(order)} 步</text>',
-           f'<text x="24" y="54" fill="#333333">整条流程 {_x(p.get("level"))} '
+           f'<text x="24" y="54" fill="#333333">'
+           f'{"这一章" if payload.get("chapter") else "整条流程"} {_x(p.get("level"))} '
            f'{_x(LEVELS.get(p.get("level") or "", ""))}'
            + (f'，最弱的一步是 {_x(p.get("weakest"))}' if p.get("weakest") else "")
-           + '　·　★＝声明的成果　◆＝最弱一环</text>']
+           + '　·　★＝声明的成果　◆＝最弱一环'
+           # 借来的那几步在图上必须看得出来，否则一张消融的流程图会让人以为
+           # 前半截也是消融做的。灰底框，不靠颜色区分（黑白打印同样读得出）。
+           + ('　·　灰底＝借自别的章节' if (payload.get("chapter") or {}).get("external") else "")
+           + '</text>']
 
     # 边：相邻两步之间走正中的直箭头；跨步的绕到右边走一条折线，各占一条道，
     # 免得两条边叠在一起分不清谁连谁。虚线**只**表示「中间经过了被剔掉的步骤」。
@@ -1589,8 +2083,12 @@ def pipeline_svg(payload: dict[str, Any]) -> str:
         y = top[sid]
         # 成果用**双线框**而不是换个颜色：影印件上颜色全没了，框还在。
         width = "2.5" if sid in results else "1"
+        ext = _external_tag(payload, sid)
+        # 借来的那几步用灰底。灰度在影印件和黑白打印上照样在（硬约束 2 说的是
+        # 「不许只靠颜色」，不是「不许有底色」），而且文字标注同时也在框里。
+        fill = "#f0f0f0" if ext else "#ffffff"
         out.append(f'<rect x="{_SVG_BOX_X}" y="{y}" width="{_SVG_BOX_W}" height="{_SVG_BOX_H}" '
-                   f'rx="4" fill="#ffffff" stroke="#000000" stroke-width="{width}"/>')
+                   f'rx="4" fill="{fill}" stroke="#000000" stroke-width="{width}"/>')
         badge = ""
         if sid in results:
             badge += " ★成果"
@@ -1598,6 +2096,8 @@ def pipeline_svg(payload: dict[str, Any]) -> str:
             badge += " ◆最弱一环"
         if s.get("status") == "dead":
             badge += " ▣dead"
+        if ext:
+            badge += " " + ext
         out.append(f'<text x="{_SVG_BOX_X + 12}" y="{y + 21}" font-size="13">'
                    f'{i}. {_x(sid)}　[{_x(levels.get(sid, ""))} '
                    f'{_x(LEVELS.get(levels.get(sid, ""), ""))}]{_x(badge)}</text>')
@@ -1625,7 +2125,7 @@ def pipeline_page(payload: dict[str, Any], title: str = "") -> str:
     正文用 `<pre>` 原样摆着那份 markdown 而不是再渲染一遍：多一个渲染器就多一份
     会和 Methods 草稿分家的实现，而分家的那一份正好是合作者读到的那一份。
     """
-    head = title or f"{payload.get('name') or payload['project']} · 定稿流程"
+    head = title or f"{_pipe_head(payload)} · 定稿流程"
     return (
         '<!doctype html>\n<html lang="zh"><head><meta charset="utf-8">\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
@@ -1642,7 +2142,13 @@ def pipeline_page(payload: dict[str, Any], title: str = "") -> str:
         "</style></head><body>\n"
         f"<h1>{_x(head)}</h1>\n"
         '<p class="lead">这一页只有<strong>产出成果的那条链</strong>——给别人照着做用。'
-        "走不通的路、还没决定的岔路口都在开发路径上，不在这里。</p>\n"
+        "走不通的路、还没决定的岔路口都在开发路径上，不在这里。"
+        # 一页 HTML 是**发给合作者**的那一份，收到的人手上没有别的上下文。
+        # 不说这一句，他会把「消融那一章」读成「这个课题的全部方法」。
+        + (f"<br>本页只是<strong>{_x(payload['chapter']['label'])}</strong>这一章；"
+           "章节之间不互斥，别的章各有各的成果，各自单独导一份。"
+           if payload.get("chapter") else "")
+        + "</p>\n"
         + pipeline_svg(payload)
         + f"\n<pre>{_x(pipeline_methods(payload))}</pre>\n</body></html>\n"
     )
@@ -1778,7 +2284,11 @@ TOOLS: list[dict[str, Any]] = [
             "（`汇回→` / `汇回←`），那是某条支线的产物又参与了另一条线上的某一步。\n"
             "`forks=true` 只列**还没做决定的岔路口**（一组候选里还有两个以上没被标 dead）。"
             "**那是待办，不是缺陷**——同时开几条线是研究的常态；但隔了几天回到一个项目，"
-            "「我还有几个岔路口悬着」是最该先问的一句。"
+            "「我还有几个岔路口悬着」是最该先问的一句。\n"
+            "`chapters=true` 列**章节**：这个项目内部并列的几块（主实验 / 消融实验 / 数据准备），"
+            "各自多少步、能被追到哪一级、有没有自己的成果声明，以及跨章节的那几条边。"
+            "章节**互不排斥**（都要留着，论文里本来就是两段 Methods），"
+            "和「只能选一条」的分叉是两回事。"
         ),
         "inputSchema": {
             "type": "object",
@@ -1789,6 +2299,11 @@ TOOLS: list[dict[str, Any]] = [
                           "description": "只列岔路口（互斥候选组）：在决定什么、有哪些候选、"
                                          "定了没有。默认只列**未决**的那些；"
                                          "配 all=true 连已经定了的一起列。和 step 同时给时以 step 为准"},
+                "chapters": {"type": "boolean", "default": False,
+                             "description": "只列章节（同一个项目里并列的几块：主实验 / 消融 / 数据准备）："
+                                            "各自的步骤、入口、步数与 done/wip/dead、可溯源等级与最弱一步、"
+                                            "有没有自己的 `result:`，以及跨章节的边。"
+                                            "和 step / forks 同时给时以 step > forks > chapters 为准"},
                 "all": {"type": "boolean", "default": False,
                         "description": "配合 forks 用：连已经做完决定的岔路口一起列出来"},
             },
@@ -1840,6 +2355,7 @@ TOOLS: list[dict[str, Any]] = [
                 "branch": {"type": "string", "description": BRANCH_DESC},
                 "decision": {"type": "string", "description": DECISION_DESC},
                 "pipeline": {"type": "string", "description": PIPELINE_DESC},
+                "chapter": {"type": "string", "description": CHAPTER_DESC},
             },
             "required": ["project", "title"],
         },
@@ -1848,7 +2364,7 @@ TOOLS: list[dict[str, Any]] = [
         "name": "trace_update_step",
         "description": (
             "改一个已有步骤：status / title / body / date / commit / tags / paths / inputs / code / "
-            "branch / decision。\n"
+            "branch / decision / chapter。\n"
             "**「回头把两步标成互斥候选」是 branch 的主要用法**：两条路多半是各自建出来"
             "跑了几天之后，才想明白当初那是同一个问题的两个答案。对每个候选各调一次 "
             "`branch=\"alternative\"`，再对它们的**父节点**调一次 `decision=\"…\"` 说清在决定什么。"
@@ -1889,6 +2405,12 @@ TOOLS: list[dict[str, Any]] = [
                              "description": "空串＝撤回这句话。" + DECISION_DESC},
                 "pipeline": {"type": "string",
                              "description": "空串＝撤销这个例外，回到算出来的结论。" + PIPELINE_DESC},
+                "chapter": {"type": "string",
+                            "description": "空串＝撤销这条声明，回到沿 parent 继承"
+                                           "（整棵子树跟着回到上一章，磁盘上不留一行空的 `chapter:`）。"
+                                           "**回头补一句「这一整支其实是消融」是这个字段的主要用法**："
+                                           "只改那一支的**第一步**，底下几十步跟着换章，一个字都不用动。"
+                                           + CHAPTER_DESC},
                 "repro": {
                     "type": "string",
                     "description": (
@@ -2072,12 +2594,26 @@ TOOLS: list[dict[str, Any]] = [
             "`input:` 反向做闭包，一步没写 `input:` 时退回它的 parent，剔掉 dead 与 "
             "`pipeline: exclude`。所以移动一步、补一条 input:、把某支标 dead，"
             "流程下一次读就跟着变了。\n"
-            "一个成果都没声明时它会说明怎么办（用 trace_result 标）。"
+            "一个成果都没声明时它会说明怎么办（用 trace_result 标）。\n"
+            "**分了章节的项目：每一章各有一条自己的定稿流程**（`result:` 指的那一步在哪一章，"
+            "这条流程就属于哪一章）——论文里主实验一段 Methods、消融一段，本来就是两段。"
+            "给 chapter 参数就只出那一章；不给就是整个项目的一张总图（章节之间共用的准备步骤"
+            "只出现一次）。有哪几章用 trace_read(chapters=true) 看。"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "project": {"type": "string"},
+                "chapter": {
+                    "type": "string",
+                    "description": "只出这一章的流程（Methods 草稿也跟着只出这一章）。"
+                                   "章节名照抄记录里那个字符串，**不做大小写折叠或近似匹配**；"
+                                   f"未分章那一组写 \"{CHAPTER_NONE}\"（多数项目的主线没起过名字，"
+                                   "它常常就是主实验）。不给＝整个项目。\n"
+                                   "本章够到的、但属于别的章节的上游会标成「借自 <章节>」"
+                                   "——消融当然吃着主实验的产物，那句标注正是"
+                                   "「这一章是对着那个结果测的」，别把它们写成本章自己做的。",
+                },
                 "methods": {
                     "type": "boolean", "default": False,
                     "description": "输出 **Methods 草稿**（markdown）而不是流程概览："
@@ -2172,6 +2708,10 @@ def t_read(be, args) -> str:
         # 对外宣称的规格），所以做成 trace_read 的一种视角。
         return fmt_forks(be.forest(project), f"项目 {project} · 岔路口",
                          only_open=not args.get("all"))
+    if args.get("chapters"):
+        # 章节清单走同一条路、同一个理由：它是「消融那部分做到哪了、别人能不能
+        # 重做」的入口，而工具数是插件清单对外宣称的规格，不为一个视角多开一个工具。
+        return fmt_chapters(be.chapters(project))
     f = be.forest(project)
     out = _fmt_tree(f, f"项目 {project} · {len(f['steps'])} 步"
                        f"（● done / ○ wip / ▣ dead，缩进表示派生关系；"
@@ -2211,7 +2751,8 @@ def t_search(be, args) -> str:
         for s in be.forest(slug)["steps"]:
             tr = s.get("tr") or {}
             hay = " ".join([s["id"], s["title"], s["body"], " ".join(s["tags"]),
-                            _locations_haystack(s), _fork_haystack(s)]).lower()
+                            _locations_haystack(s), _fork_haystack(s),
+                            _chapter_haystack(s)]).lower()
             langs = [c for c in sorted(tr)
                      if q in ((tr[c].get("title") or "") + "\n" + (tr[c].get("body") or "")).lower()]
             if q not in hay and not langs:
@@ -2352,7 +2893,7 @@ def t_new_step(be, args) -> str:
 
     payload = {k: args[k] for k in ("parent", "title", "status", "body", "date", "commit", "key",
                                     "tags", "paths", "inputs", "code", "lang",
-                                    "branch", "decision", "pipeline")
+                                    "branch", "decision", "pipeline", "chapter")
                if k in args and args[k] not in (None, "")}
     payload.setdefault("status", "wip")
     payload["author"] = args.get("author") or DEFAULT_AUTHOR
@@ -2430,7 +2971,7 @@ def t_update_step(be, args) -> str:
                                   # 撤销那个例外），所以这里过滤的是 None 而不是假值。
                                   # 这张白名单是**按名字挑**的：漏一个不会报错，只会
                                   # 静默丢掉——agent 会以为改成功了，然后在导出里找不到。
-                                  "branch", "decision", "pipeline")
+                                  "branch", "decision", "pipeline", "chapter")
              if k in args and args[k] is not None}
     if args.get("repro"):
         patch["add_repro"] = [args["repro"]]
@@ -2458,6 +2999,30 @@ def t_update_step(be, args) -> str:
                       "include": f"{sid} 从此**留在**定稿流程里，连同它的上游一起。",
                       }.get(rule, f"{sid} 的 pipeline 例外已撤销，回到算出来的结论。"))
         lines.append("用 trace_pipeline 看一眼现在的流程——这个键唯一的作用就是改变它。")
+    if "chapter" in patch:
+        # 换章**磁盘上只动这一行**，而后果是**整棵子树**的归属跟着变（继承）。
+        # 不当场说清「带走了几步」，回执就是一句干净的「已更新」，而人要发现
+        # 二十步集体换了章，只能靠重新拉一遍森林。
+        try:
+            of = be.chapters(project)["chapters"]
+        except Exception:                   # 回执是加分项，拿不到就闭嘴，别把主操作说成失败
+            of = []
+        now = next((c for c in of if sid in c["steps"]), None)
+        if now:
+            # 「跟着继承过来的」只算**自己一个字都没写**的那些：同一个章节可以在
+            # 好几处各声明一次（它横跨几棵树时本来就该这样），把那几处也数进来，
+            # 后面半句「它们自己一个字都没写」就成了假话。
+            declared = set(now.get("declared_at") or ())
+            carried = [x for x in now["steps"] if x != sid and x not in declared]
+            lines.append(f"{sid} 起，这条线属于章节「{now['name']}」"
+                         + (f"，同章的还有 {len(carried)} 步（沿 parent 继承，"
+                            "它们自己一个字都没写）" if carried else
+                            "（现在只有它自己——一个章节刚被开启时本来就只有一步）"))
+            lines.append("按章节导出：trace_pipeline(chapter=\"%s\")；"
+                         "有哪几章：trace_read(chapters=true)。" % now["name"])
+        else:
+            lines.append(f"{sid} 现在**不属于任何章节**（这一行撤销了，"
+                         "它和它底下的子树回到沿 parent 继承的那一章，或者未分章）。")
     return "\n".join(lines)
 
 
@@ -2474,6 +3039,19 @@ def t_move_step(be, args) -> str:
         # 事后才发现的话，已经没有第二次机会说「我不是这个意思」了。
         out.append(f"⚠ 跟着一起走的还有 {len(info['subtree'])} 个后代："
                    + "、".join(info["subtree"]))
+    # 换章是移动的常见用意之一（「把这一支挪进消融」），而它**磁盘上一个字节都没变**：
+    # 二十步集体转章，diff 里只有一行 `moved:`。不当场说，事后只能靠重新拉一遍森林
+    # 才看得见。两头都没有章节时 move_step 给的是 None，那时一个字都不多说。
+    ch = info.get("chapter")
+    if ch:
+        # 「还有」说的是**这一步之外**的那些：`steps` 里第一个多半就是它自己
+        # （它也是靠继承换的章），照数会让「移一步」听起来像「带走了一支」。
+        others = [x for x in ch["steps"] if x != info["id"]]
+        out.append(f"章节：{chapter_label(ch['from'])} → {chapter_label(ch['to'])}"
+                   + (f"（跟着换章的还有 {len(others)} 步：{'、'.join(others)}"
+                      "——它们自己没写 chapter:，归属是继承来的）" if others else "")
+                   if ch["changed"] else
+                   f"章节没变：还在「{chapter_label(ch['to'])}」里。")
     out.append("id 没变，inputs 也没动——数据依赖是另一件事，要改用 trace_update_step 的 inputs。")
     return "\n".join(out)
 
@@ -2733,7 +3311,18 @@ def t_untranslated(be, args) -> str:
 
 
 def t_pipeline(be, args) -> str:
-    payload = be.pipeline(args["project"])
+    chapter = str(args.get("chapter") or "")
+    payload = be.pipeline(args["project"], chapter)
+    # 要了某一章，回执里却没有「我编的是这一章」那个键 —— 这台服务端还不认
+    # `?chapter=`，它忽略了参数、把**整个项目**那一份原样回了过来（本地后端不会
+    # 走到这里：名字不认识它当场就抛了）。这不能当成成功：agent 接着会把这份
+    # 草稿当成消融那一段 Methods 写进论文，而它里面有主实验的每一步。
+    # 症状本来是无声的，所以这里必须出声。
+    if chapter and not payload.get("chapter"):
+        raise ToolError(
+            f"这台服务端还不支持按章节导（要的是「{chapter_label(chapter)}」，"
+            "回来的是整个项目那一份）。升级服务端，或者去掉 chapter 参数拿整份流程"
+            "——把整份流程当成某一章的 Methods 交出去，读的人不会发现。")
     if args.get("methods"):
         return pipeline_methods(payload)
     out = fmt_pipeline(payload)
@@ -2743,6 +3332,12 @@ def t_pipeline(be, args) -> str:
         out += ("\n\n要写论文就加 methods=true（Methods 草稿）。"
                 "「当时有几个候选、为什么选了这一条」在**开发路径**上，用 trace_read 看"
                 "——那两条路径都留着，正是为了这个问题。")
+        if not chapter and len(payload["pipeline"].get("chapters") or []) > 1:
+            # 分了章而且不止一组时才说：一章的项目说这句是噪音。
+            names = [chapter_label(g["name"]) for g in payload["pipeline"]["chapters"]]
+            out += ("\n这个项目分了章节，上面是**合起来的一张图**（共用的准备步骤只出现一次）。"
+                    f"论文里要分段写就一章一章导：{'、'.join(names)}"
+                    f"——chapter=\"<章节名>\"（未分章那组是 \"{CHAPTER_NONE}\"）。")
     return out
 
 
@@ -2815,7 +3410,7 @@ def dispatch(backend, name: str, args: dict[str, Any]) -> str:
 # 的客户端连上来跑一遍互操作。
 
 SERVER_NAME = "trace"
-SERVER_VERSION = "1.7.0"
+SERVER_VERSION = "1.8.0"
 
 # 收到客户端要的版本就原样回它（前提是我们认识），否则回我们最新的。
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
@@ -2885,6 +3480,26 @@ FORMAT_ESSENTIALS = (
     "`fork_without_decision`（有候选却没写 decision）、`undecided_fork`（还有两个以上候选活着）、"
     "`decision_without_candidates`（写了 decision 却一个候选都没标 —— 那一行现在什么都不做，"
     "不成组、不进 forks 清单，看着像没保存上）。"
+    # ⑤d 章节。放在三种关系（⑤c）紧后面，因为 agent 在这里犯的错就是**把三样搞混**，
+    # 而三样里有两样已经在上一条讲完了。格式本身一行就说完，篇幅全花在分界上。
+    "⑤d **一个项目内部还能分章节**：主实验 / 消融实验 / 数据准备，各有独立的探索路径。"
+    "写法是在**开启那条线的第一步**上写一行 `chapter: 消融实验 | 逐个拿掉模块，对着主实验的 023 比`"
+    "（竖线右边是**这个章节**的说明，可选），底下整棵子树**沿 parent 自动继承**——"
+    "**不要给每一步各写一遍**：写满了的代价是改一次章节名要改二十个文件、"
+    "移走一支还带着一行过期的声明，而继承来的归属一个字都不用维护。"
+    "想让某一步脱离，让它自己声明一个新的章节名；一路到根都没写就是「未分章」（不是错，多数项目如此）。"
+    "**三样别混，选错了不报错、只会让记录说出你没打算说的话**："
+    "**项目**＝不同的研究（id 各自从 001 开始）；**章节**＝同一个研究里**并列**的几块，"
+    "**互不排斥、都要留着**（论文里主实验一段 Methods、消融一段）；"
+    "**分叉**（`branch: alternative`）＝同一个问题的**互斥候选**，**只能选一个**，其余标 dead。"
+    "「A 方案 / B 方案最后二选一」是分叉不是两个章节。"
+    "章节之间互相引用是正常的：消融当然吃主实验的产物，照常写 `input:`，那条**跨章节的边**"
+    "会被标出来——它说的正是「消融是对着主结果测的」。"
+    "两件**刻意不做**的事，别当成漏了去补：**id 不按章节重编号**（消融不从 001 重新开始，"
+    "`[[007]]` 和论文脚注要在整个项目里唯一）；**章节不嵌套**（名字里可以写 `主实验/数据准备`，"
+    "那只是显示时按 `/` 分组，语义上仍是一层）。"
+    "每个章节各有自己的**定稿流程**（`result:` 指的那一步在哪一章，流程就属于哪一章）和"
+    "自己的**可溯源等级**（本章成员里最弱的一步）。"
     "⑥ 可溯源性等级：L0 不可溯源（缺「为什么」/「做了什么」，或有图没图注，或 done/dead 没结论）；"
     "L1 可读；L2 可定位（L1 + 代码找得回来 + 记了产物位置）——代码找得回来指**任何一条** code 记录"
     "（commit / 有位置的 snapshot / container），快照目录加逐文件校验和一样算数，"
@@ -2915,8 +3530,10 @@ FORMAT_ESSENTIALS = (
     "写它只有 trace_translate 一条路，它碰不到原文；还欠哪些用 trace_untranslated 查。"
     "译文的 front-matter **只准有 `title:`**（项目笔记是 `name:`），其余结构一律不重复——"
     "id / parent / status / date / commit / author / tags / path / repro / key / input / code / "
-    "moved / branch / decision / result / pipeline "
+    "moved / branch / decision / result / pipeline / chapter "
     "写进去会被忽略并报一条警告，因为那些在原文里已经有了，写两份就是双真相源。"
+    "（`chapter` 尤其要留神：它**沿树继承**，译文里多写一行改的不是这一步，"
+    "是它底下整棵子树在那种语言的页面上的归属——同一个项目按两种分法各导出一份 Methods。）"
     "译文正文的小节名用目标语言那一套，和原文一一对应：为什么=Why、做了什么=What、"
     "结果=Result、结论=Conclusion、下一步=Next；项目洞察 核心想法=Ideas、有效=Works、"
     "无效=Doesn't work、坑=Pitfalls。"
@@ -2948,7 +3565,13 @@ INSTRUCTIONS = (
     "**定稿流程**（只有产出成果的那条链，回答「该怎么做」）。"
     "**要复现结果或写 Methods 时读 trace_pipeline，不要照着那棵树走**——"
     "树上有 dead 的步骤，照着它复现等于去重跑一条作者自己判定走不通的路。"
-    "流程是算出来的，唯一要写下来的是「哪一步是成果」（trace_result）。\n\n"
+    "流程是算出来的，唯一要写下来的是「哪一步是成果」（trace_result）；"
+    "⑪ **同一个项目里并列的几块用章节**（主实验 / 消融 / 数据准备）：只在**开启那条线的第一步**上"
+    "写一次 `chapter:`（trace_new_step / trace_update_step 的 chapter 参数），整棵子树自动继承，"
+    "**别给每一步各标一遍**。**项目 / 章节 / 分叉是三样东西**：项目＝不同的研究；"
+    "章节＝同一个研究里并列的几块，**互不排斥、都要留着**（论文里本来就是两段 Methods）；"
+    "分叉＝同一个问题的互斥候选，**只能选一个**。"
+    "有哪几章用 trace_read(chapters=true)，按章节导 Methods 用 trace_pipeline(chapter=…)。\n\n"
     + FORMAT_ESSENTIALS
 )
 

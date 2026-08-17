@@ -89,6 +89,10 @@
       "app.view.dev.title": "Everything that was recorded, dead ends and undecided forks included. The view for yourself: it answers how you ended up here.",
       "app.view.pipeline": "Final pipeline",
       "app.view.pipeline.title": "Only the chain that produced the results, traced back through the declared inputs. The view for everyone else: it answers what to do.",
+      /* ⑨ 章节的筛选器。只在项目里真有章节时才出现——一个 `chapter:` 都没写的
+         项目必须完全无感，多一个恒灰的下拉框就已经不是无感了。 */
+      "app.chapter.all": "All chapters",
+      "app.chapter.title": "Narrow the view to one part of the project. The chapters are read off the steps themselves — there is no list of them kept anywhere.",
       "app.new": "＋ New step",
       "app.new.title": "Branch a new step off the selected one (n)",
       "app.newproj": "＋ Project",
@@ -245,6 +249,13 @@
       "lint.level.error": "error",
       "lint.level.warn": "warning",
       "lint.level.hint": "hint",
+      /* core 发的这四条以前没有对应文案，于是在英文界面上原样漏出整句中文——
+         而它们恰恰是最该被读懂的：三条「记录里少了半年后补不回来的那部分」，
+         一条「这张图对文本读者是黑洞」。四条都不带变量，`where` 已经指明了文件。 */
+      "lint.missing.why": "Marked done or dead with no **Why**. This is the one field nothing can generate for you: logs save themselves, commits record themselves, but why you decided to try this is gone the moment you forget it.",
+      "lint.missing.what": "Marked done or dead with no **What**. Re-running depends on it — with only a title, the next reader (including you in six months) has nowhere to start.",
+      "lint.missing.conclusion": "Marked done or dead with no **Conclusion** — did the hypothesis hold or not. A step that ended without saying how it ended is the shape a dead end takes when nobody wrote it down.",
+      "lint.figure.nocaption": "An image with no caption. Write it as `![](… \"what this figure shows\")`. You and every agent reading this record see only that one line — without a caption, whatever the picture showed is lost to the text.",
       "lint.subheads": "`{section}` has no prose of its own, only sub-headings beneath it. That counts as written — this line is here so you know how it was read.",
       "lint.table.nodesc": "A table with nothing said about it. Someone handed only the numbers has to guess which direction is better.",
       "lint.pre.nodesc": "A code block with nothing said about it — say what it does, or what its output turned out to mean.",
@@ -442,6 +453,120 @@
       "export.page.note": "The pipeline as one page a collaborator can open with the network off. It holds the final pipeline only — the dead ends stay at home.",
       "export.draft.note": "A draft, deliberately. It sets down what the record actually says and leaves the prose to you: nothing here invents a sentence for a fact nobody wrote down, so read every line before this goes anywhere.",
 
+      /* ---- ⑨ 章节：一个项目内部并列的几块 ----
+         磁盘上只多了一行 `chapter:`，写在**开启那条线的那一步**上，沿树继承。
+         「这一章有谁」「这一章的定稿流程」「这一章的等级」全是扫出来现算的，一个字不存。
+         文案要挡的是同一个误会：**章节不是分叉**。分叉是互斥候选（只能选一条走下去），
+         章节是并列的几块（每一块都要留、都要写进论文）。两者混起来的后果是人拿章节
+         去表达「这条路我放弃了」，那会让一整块工作在图上看起来像被否掉了。
+
+         **占位符的规矩**：页面自己拼的那些文案里，`{chapter}` 永远是章节名——
+         `{name}` 已经被 toast.export.ready 占着当「导出的那样东西」了，两个意思
+         共用一个名字，接线时把哪个塞进哪个只能靠猜。
+         `lint.chapter.*` 那几条是**例外，而且必须是例外**：warnText 把 core 的
+         `w.vars` 原样喂进来（app.js 的 WARN_MAP.take 不改名），所以那里的占位符
+         只能逐字用 core 的变量名（name / names / ids / id / note）。改成 chapter
+         的后果不是少个词，是整条退回去显示服务端那句中文。 */
+      "chapter.name": "Chapter",
+      "chapter.lead": "A chapter is one of the parts a project is made of — the main experiment, the ablations, the data preparation. Each part gets its own line of work, its own results, and its own paragraph in the paper.",
+      /* 这一句是整块改动的关键。项目 / 章节 / 分叉是最容易混的三样，而混错的方向
+         是固定的：人会拿章节去表达分叉。所以「不互斥」这三个字必须出现。 */
+      "chapter.vs.note": "Three things that look alike and aren't. A **project** is a different piece of research. A **chapter** is one of several parts of the same research — and the parts do not compete: the ablations and the main experiment are both kept, and both get written up. An **alternative** is two answers to one question, and only one road is taken. Reach for a chapter when both roads stay; reach for an alternative when only one can.",
+      "chapter.head": { one: "Chapter · {n}", other: "Chapters · {n}" },
+      "chapter.entry": "{chapter} — {what}",
+      "chapter.entry.bare": "{chapter}",
+      "chapter.badge.title": "Which part of the project this step belongs to. A chapter is declared once, on the step that opens the line of work, and everything below inherits it — so this badge is usually read off an ancestor rather than written here.",
+      /* 「未分章」是绝大多数项目的状态，措辞绝对不能像缺了什么。人一旦觉得这里
+         有个洞，就会去给每一步都补一个章节名——那正是继承要省掉的事。 */
+      "chapter.none": "unchaptered",
+      "chapter.none.title": "Most projects are one line of work and never need dividing; these steps simply belong to the project. Chapters are for when two parts of the same research want paths of their own. Nothing is missing here.",
+      "chapter.steps": "{steps} · done {done} / wip {wip} / dead {dead}",
+      /* core 管这些叫 `roots`：章节的**入口**，也就是 parent 不在同一章的那些成员
+         （真正的树根算，从别的章分出来的第一步也算）。一个章节有好几个入口是常态，
+         因为它可以横跨好几棵树——所以这条不能说成「它有几个根」。 */
+      "chapter.roots": { one: "{n} way in", other: "{n} ways in" },
+      "chapter.roots.title": "A chapter is a set of steps, not a subtree. It can start in several places at once — a root of its own here, a step split off from another chapter there — and still be one chapter. What holds it together is the name, not the shape of the tree.",
+      "chapter.of.head": "Part of {chapter}",
+      "chapter.of.lead": "This step belongs to one part of the project, and the other parts carry on beside it. A chapter is a division of labour, not a road that wasn't taken.",
+
+      /* 继承是这套东西最省事的地方，也最需要被说出来：不说，人会给二十步各标一遍，
+         然后改一次章节名要动二十个文件。 */
+      "chapter.declared": "the chapter starts here",
+      "chapter.declared.title": "This is the step the chapter was declared on. Every step below it belongs to the same chapter without saying a word, which is why renaming a chapter is a one-line edit in one file.",
+      "chapter.inherited": "inherited from {id}",
+      "chapter.inherited.title": "Nothing about the chapter is written on this step. It comes down from {id}, where this line of work started — that is how twenty steps end up in one chapter without twenty lines saying so.",
+      "chapter.inherit.note": "Declare it once, on the step where a line of work **starts**, and everything growing out of it belongs there too. Twenty ablation steps need one line in one file — and renaming the chapter later means editing that line, not twenty.",
+      "chapter.leave.note": "To take a step and its subtree out of the chapter they inherited, declare a new one **on that step**. There is no way to say \"none\": belonging to no chapter is what happens when neither a step nor any of its ancestors ever declared one.",
+      "chapter.desc.label": "What this chapter is",
+      "chapter.desc.title": "The text after the pipe describes the chapter itself, not this step. Where several steps open the same chapter, the earliest one by id supplies the description that shows.",
+      "chapter.desc.missing": "Nobody has said what this chapter is. The name usually carries it, so the line is optional — worth writing when the name alone could be read two ways.",
+      /* 两件**故意没做**的事。不写出来，后来的人会以为是漏了，然后去实现它。 */
+      "chapter.ids.note": "Ids are not renumbered per chapter: the ablations do not start again at 001. An id records when a step was created, not where it sits — and a [[007]] in someone else's note, or a footnote in a paper, has to mean one step across the whole project.",
+      "chapter.nest.note": "Chapters do not nest. A slash in the name groups the display, so \"main/data prep\" sits under \"main\" on screen; underneath it is still one flat set of names, and nothing reads the slash as a parent.",
+      "chapter.group.title": "Grouped by the slash in the name. That is a convenience of the display only — underneath, the chapters are a flat set.",
+
+      /* 白拿的三处：各自的定稿流程、各自的等级、跨章节的边。 */
+      "chapter.pipeline.head": "Final pipeline · {chapter}",
+      "chapter.pipeline.note": "Every chapter compiles a pipeline of its own: a declared result names a step, that step sits in a chapter, and the chain is traced back from there. It is how a paper is built anyway — the main experiment is one Methods paragraph and the ablations are another.",
+      "chapter.pipeline.none": "No step in {chapter} is declared a result, so there is nothing to compile a pipeline from here yet. One line in the project note — `result: 031 | the ablation in figure 4` — gives this chapter a chain of its own, a weakest step of its own, and a Methods draft of its own.",
+      "chapter.level.head": "How far {chapter} can be followed",
+      "chapter.level.note": "Read for this chapter alone, and worth exactly what its weakest step is worth. It answers the question a reader actually has about one part of the work — could somebody else redo the ablations — without the rest of the project raising or lowering the answer.",
+      "chapter.level.weakest": "{link} {title} is what holds this chapter at its level",
+      /* 跨章节的边正是这块设计的收益：它说的是「消融是对着主结果测的」。
+         藏起来的话，两块工作在图上看着毫无关系，而它们的关系恰恰是重点。 */
+      "chapter.cross.head": { one: "Edge into another chapter · {n}", other: "Edges into another chapter · {n}" },
+      "chapter.cross.note": "These are drawn, not tidied away. An input reaching across chapters is the sentence \"the ablations were measured against the main result\" — the most telling edge in a project is often the one that leaves its own part of it.",
+      "chapter.cross.entry": "{link} · {chapter} — {what}",
+      "chapter.cross.entry.bare": "{link} · {chapter}",
+      "chapter.cross.input": "reads across from {chapter}",
+      "chapter.cross.input.title": "The bytes this step consumed were produced in another chapter, and that is usually the whole point: an ablation is an ablation because it eats the main experiment's artifacts and changes one thing about them.",
+      "chapter.cross.parent": "branched off {chapter}",
+      "chapter.cross.parent.title": "This line of work grew out of a step in another chapter. It says where the thinking was picked up — the ablations were not started from nothing, they were split off from the main experiment at a particular point.",
+      "chapter.cross.legend": "crosses chapters — an edge whose two ends sit in different parts of the project",
+
+      /* 章节的四条诊断。**一条都不影响可溯源等级**——它们问的是「这几块讲清楚了
+         没有」，不是「这个结果追不追得到」。所以每一条自己都要说一遍不影响等级：
+         lint.note 那句总说明会被当背景板略过，而这几条最容易被误读成「我判低了」。
+         key 名对着 core 的 code：chapter_note_conflict / chapter_no_result /
+         chapter_near_duplicate / bad_chapter。占位符也只用 core 结构化放进 vars 的
+         那几个名字（name / ids / id / names / note），绝不从中文句子里抠。 */
+      "lint.chapter.desc.conflict": "{name} is opened in more than one place — {ids} — and the descriptions given there don't agree. The one on {id} is shown, being the earliest by id; the others appear nowhere at all. Usually a typo, or two people each writing their own. Keep one of them, or give the other its own chapter name. The level is untouched.",
+      /* core 只在**项目里别处已经有成果**时才发这一条：一个 result: 都没有的项目，
+         pipeline_no_result 已经说过一遍了，再按章节念 N 遍就是让人从此不看诊断。
+         所以这句话可以直说「别的章节有」——它成立。 */
+      "lint.chapter.noresult": "Nothing in {name} is declared a result, so this part of the project can't compile a pipeline of its own, while the other parts can. Not a defect — a chapter is free to be exploratory. It is worth a line of its own in the project note if this part is ever meant to reach a Methods section: `result: 031 | the ablation in figure 4`. The level is untouched.",
+      /* 「只有一个步骤的章节 → 也许是笔误」**没有做**，这里也就没有它的文案。
+         一个章节被开启的那一刻必然只有一步（就是声明它的那一步），那条诊断会在
+         每一次正确使用时当场响一声，而人从会误报的诊断学到的是忽略整个诊断栏。
+         合法的单步章节本来也存在（一步就说完的「数据准备」）。真正想逮的那件事
+         由下面这条接手：只差大小写或空白的两个名字，那才是同一个章节被拆成两半。 */
+      "lint.chapter.nearduplicate": "{names} differ only in case or spacing, which almost certainly makes them one chapter split in two. Each half counts its own members and exports its own Methods paragraph, and both halves look right on screen. A chapter name is matched byte for byte, so settle on one spelling. The level is untouched.",
+      /* `chapter:` 写坏的唯一形状：只写了竖线右边的说明，没写名字。那一行看着像
+         声明了一个章节，实际一个字都不生效——这一步静静继承 parent 的章节，人却
+         以为自己开了一条新线。和 bad_branch / bad_pipeline 同一条路：报一声、
+         当没写、继续建树，那半句说明原样留在文件里。 */
+      "lint.chapter.unnamed": "This `chapter:` line has only the text after the pipe — \"{note}\" — and no chapter name, so it declares nothing and the step goes on inheriting whatever its parent belongs to. The form is `chapter: ablations | what this part of the project is for`. Your half-sentence is still in the file, untouched. The level is untouched.",
+
+      /* 详情面板上的三个动作。「开一个章节」这句话本身就在教人标在哪一步——
+         按钮叫「Start a chapter here」而不是「Set chapter」，是因为后者读起来
+         像每一步都该设一次。 */
+      "chapter.set.act": "Start a chapter here",
+      "chapter.set.act.title": "Name the part of the project this step opens. Everything that grows out of it belongs to the same part, so this is the only step that needs the line.",
+      "chapter.set.prompt": "What is this part of the project called? It covers this step and everything below it that doesn't name one of its own:",
+      "chapter.unset.act": "Don't start a chapter here",
+      "chapter.unset.act.title": "Takes the line back off this step. It goes back to belonging wherever its parent belongs, and so does everything below it that never named one of its own.",
+      "chapter.write.act": "✎ Say what this chapter is",
+      "chapter.write.act.title": "One line on what this part of the project is for. It travels with the chapter rather than with this step — it lives after the pipe on the chapter line.",
+      "chapter.write.prompt": "What is this chapter for? One line, describing the part of the project rather than this step:",
+
+      /* 按章节导出：论文里本来就是两段，导出跟着分开。 */
+      "export.chapter.head": "Export one chapter",
+      "export.chapter.note": "A paper gives the main experiment one Methods paragraph and the ablations another, so the exports come apart the same way. Each chapter is compiled from its own results — this is a different derivation, not a whole-project export with rows filtered out.",
+      "export.chapter.all": "The whole project",
+      "export.chapter.one": "{chapter} only",
+      "export.chapter.file": "Saved as {file}",
+      "export.chapter.file.title": "The chapter name is part of the filename, so exporting the ablations never lands on top of the main experiment's Methods draft.",
+
       /* ---- 可溯源性 · L0–L4 ---- */
       "trace.title": "Traceability · L0–L4",
       "trace.self": "this step",
@@ -557,6 +682,15 @@
          exclude、跳过这一栏、按保存，收到的是服务端一句中文报错——界面亲口许了一个
          它管不着的诺。理由必填是这个键和 `branch:` 唯一的分歧，原因就写在下面。 */
       "editor.pipeline.note.required": "This one is required. Unlike a candidate group, which is visible on the tree the moment it exists, this line leaves no trace anywhere except in what gets exported — without the half-sentence there is no telling a thought-through decision from a mis-click.",
+      /* ⑨ 章节。这一栏最要紧的事是**别让人每一步都填**：填二十遍，改一次名字就要
+         动二十个文件，而那正是继承想省掉的。所以 hint 第一句说的是「填在哪一步」，
+         不是「这一栏是什么」。 */
+      "editor.chapter.label": "The chapter this line of work belongs to",
+      "editor.chapter.placeholder": "ablations",
+      "editor.chapter.hint": "Fill this in on the step that **starts** a line of work, and leave it empty everywhere else — every step below inherits it. Twenty ablation steps need this line once, in one file, and renaming the chapter later touches that one file. Filling it in on a step that already inherits a chapter is how a new line splits off: the subtree under it follows the new name.",
+      "editor.chapter.inherited": "inheriting {chapter} from {id} — leave this empty to stay in it",
+      "editor.chapter.note.label": "What this chapter is · optional",
+      "editor.chapter.note.placeholder": "take the modules out one at a time and compare against 023",
       "editor.hint": "Paste a screenshot with **Ctrl+V** and it uploads and inserts itself; anything copied out of Excel or a web table turns into a markdown table; files can be dropped straight into the box. `id` never changes and is never handed out twice — a `[[003b]]` written down anywhere has to keep working forever. `parent` can be moved, but only with a reason, and the move gets written into the note.",
       "editor.status.uploading": "Uploading…",
       "editor.status.inserted": { one: "Inserted {n} file", other: "Inserted {n} files" },
@@ -638,6 +772,9 @@
          「命中在哪」都还说着内部字段名。 */
       "search.where.tr.title": "translated title",
       "search.where.tr.body": "translated text",
+      /* 章节名和它那句说明也是人写的散文，`grep -r "消融"` 找得到，站内搜索
+         就不能找不到——否则「消融那块当时是怎么想的」得靠人一个项目一个项目翻。 */
+      "search.where.chapter": "chapter name and what it is",
       "search.hit.where": "matched in {where}",
       "search.searching": "Searching…",
       "search.failed": "Search failed: {error}",
@@ -722,6 +859,11 @@
       "toast.moved.root": "{id} is a root of its own now — the move is recorded in the note",
       /* 移动一个候选的直接后果。事后看不出来：组是派生的，重新读一遍只告诉你
          「现在是什么样」。不说的话，下次见到的是一条来路不明的「只有一个候选」。 */
+      // 章节是继承来的，所以挪一步会把整条子树一起换章——屏幕上那几步算进
+      // 哪一份 Methods 全变了，而没有任何一行 `chapter:` 被写过。必须说出来。
+      "toast.moved.chapter": "chapter {from} → {to}",
+      "toast.moved.chapter.also": { one: " (and {n} step below it)",
+                                    other: " (and {n} steps below it)" },
       "toast.moved.fork": { one: "the fork at {at} is down to {n} candidate",
                             other: "the fork at {at} now holds {n} candidates" },
       "toast.moved.fork.roots": { one: "the candidates among the roots are down to {n}",
@@ -738,6 +880,15 @@
       "toast.pipeline.exclude": "{id} is out of the pipeline; on the development path it stays exactly where it was",
       "toast.pipeline.auto": "{id} is back to being worked out from the inputs",
       "toast.export.ready": "{name} is built — the same record always compiles to the same bytes",
+      "toast.export.chapter.ready": "{chapter} · {name} is built — the same record always compiles to the same bytes",
+      /* ⑨ 标一个章节的后果是**整棵子树**跟着改归属，而屏幕上一棵子树和一个光杆
+         节点长得一模一样（和 drag.carry 同一条理由）。所以带走了几步要说出来。 */
+      "toast.chapter.set": "{id} opens {chapter} — everything below it that doesn't name one of its own belongs there too",
+      "toast.chapter.carry": { one: "{n} step below comes with it", other: "{n} steps below come with it" },
+      "toast.chapter.cleared": "{id} no longer opens a chapter; it belongs wherever its parent does",
+      "toast.chapter.desc.saved": "Saved on {chapter} — the description belongs to the chapter, not to this step",
+      // 说明落在别的步骤上时要说出来：一次保存改的不是你选中的那个文件。
+      "toast.chapter.desc.saved.elsewhere": "Saved on {chapter} — the description lives on {id}, the step that opened the chapter, so that is the file that changed",
       "toast.copied.path": "Path copied",
       "toast.copy.failed": "Copy failed",
       "toast.draft.restored": "Draft restored",
@@ -785,6 +936,7 @@
       "count.consumers": { one: "{n} consumer", other: "{n} consumers" },
       "count.alternatives": { one: "{n} candidate", other: "{n} candidates" },
       "count.rejoins": { one: "{n} rejoin", other: "{n} rejoins" },
+      "count.chapters": { one: "{n} chapter", other: "{n} chapters" },
       "unit.b": "{n} B",
       "unit.kb": "{n} KB",
       "unit.mb": "{n} MB",
@@ -831,6 +983,10 @@
       "app.view.dev.title": "全部记录，含走不通的那些和还没决定的岔路口。这是给自己看的一档：它回答「我是怎么走到这儿的」。",
       "app.view.pipeline": "定稿流程",
       "app.view.pipeline.title": "只有真正产出成果的那条链，顺着声明的输入反推出来。这是给别人看的一档：它回答「该怎么做」。",
+      /* ⑨ 章节的筛选器。只在项目里真有章节时才出现——一个 `chapter:` 都没写的
+         项目必须完全无感，多一个恒灰的下拉框就已经不是无感了。 */
+      "app.chapter.all": "所有章节",
+      "app.chapter.title": "只看项目的其中一块。章节是从步骤上扫出来的，任何地方都没有一份章节清单。",
       "app.new": "＋ 新步骤",
       "app.new.title": "从选中节点派生新步骤（n）",
       "app.newproj": "＋ 项目",
@@ -982,6 +1138,10 @@
       "lint.level.error": "错误",
       "lint.level.warn": "警告",
       "lint.level.hint": "提示",
+      "lint.missing.why": "标了 done/dead 却没写「**为什么**」。这是唯一无法自动生成的字段——日志能自动存、commit 能自动记，只有「我当时为什么决定试这个」忘了就再也补不回来。",
+      "lint.missing.what": "标了 done/dead 却没写「**做了什么**」。重跑要靠它，只有一个标题的话，别人（和半年后的你）无从下手。",
+      "lint.missing.conclusion": "标了 done/dead 却没写「**结论**」——假设到底成不成立。一步走完了却没说怎么走完的，正是「死胡同没被记下来」的样子。",
+      "lint.figure.nocaption": "有一张图没有图注。写成 `![](…… \"这张图说明了什么\")`。你和任何读这条记录的 agent 都只看得见这一行——没有图注，图里的结论对文本读者就是丢失的。",
       "lint.subheads": "`{section}` 下面没有自己的正文，只有子标题。这算写了——写这一行只是让你知道它是怎么被读的。",
       "lint.table.nodesc": "表格没有一句说明。只拿到一堆数字的人，只能猜哪个方向算好。",
       "lint.pre.nodesc": "代码块没有一句说明——说清它做什么，或者它的输出后来说明了什么。",
@@ -1166,6 +1326,119 @@
       "export.page.note": "把流程做成一页，合作者断网也打得开。里面只有定稿流程——走不通的那些留在家里。",
       "export.draft.note": "它是初稿，而且是故意做成初稿的。它只把记录里确实写着的东西摆出来，句子留给你写：这里不会为一件没人记过的事凭空造一句话，所以发出去之前请把每一行都读一遍。",
 
+      /* ---- ⑨ 章节：一个项目内部并列的几块 ----
+         磁盘上只多了一行 `chapter:`，写在**开启那条线的那一步**上，沿树继承。
+         「这一章有谁」「这一章的定稿流程」「这一章的等级」全是扫出来现算的，一个字不存。
+         文案要挡的是同一个误会：**章节不是分叉**。分叉是互斥候选（只能选一条走下去），
+         章节是并列的几块（每一块都要留、都要写进论文）。两者混起来的后果是人拿章节
+         去表达「这条路我放弃了」，那会让一整块工作在图上看起来像被否掉了。
+
+         **占位符的规矩**：页面自己拼的那些文案里，`{chapter}` 永远是章节名——
+         `{name}` 已经被 toast.export.ready 占着当「导出的那样东西」了，两个意思
+         共用一个名字，接线时把哪个塞进哪个只能靠猜。
+         `lint.chapter.*` 那几条是**例外，而且必须是例外**：warnText 把 core 的
+         `w.vars` 原样喂进来（app.js 的 WARN_MAP.take 不改名），所以那里的占位符
+         只能逐字用 core 的变量名（name / names / ids / id / note）。改成 chapter
+         的后果不是少个词，是整条退回去显示服务端那句中文。 */
+      "chapter.name": "章节",
+      "chapter.lead": "章节是一个项目内部并列的几块：主实验、消融实验、数据准备。每一块有自己的探索路径、自己的成果，在论文里也各占一段。",
+      /* 这一句是整块改动的关键。项目 / 章节 / 分叉是最容易混的三样，而混错的方向
+         是固定的：人会拿章节去表达分叉。所以「不互斥」这三个字必须出现。 */
+      "chapter.vs.note": "三样长得像、其实不是一回事。**项目**是不同的研究；**章节**是同一个研究里并列的几块，它们**不互斥**——消融和主实验都要留着、都要写进论文；**分叉**（互斥候选）是同一个问题的两个答案，只能选一条走下去。两条路都要留的时候用章节，只能留一条的时候用候选。",
+      "chapter.head": "章节 · {n}",
+      "chapter.entry": "{chapter} —— {what}",
+      "chapter.entry.bare": "{chapter}",
+      "chapter.badge.title": "这一步属于项目的哪一块。章节只在开启那条线的那一步声明一次，底下整棵子树继承，所以这块牌子多半是从某个祖先读来的，不是写在这一步身上的。",
+      /* 「未分章」是绝大多数项目的状态，措辞绝对不能像缺了什么。人一旦觉得这里
+         有个洞，就会去给每一步都补一个章节名——那正是继承要省掉的事。 */
+      "chapter.none": "未分章",
+      "chapter.none.title": "绝大多数项目就是一条线走下来的，从来不需要分块，这些步骤直接属于这个项目。章节是给「同一个研究里两块各走各的」准备的。这里没有缺任何东西。",
+      "chapter.steps": "{steps} · done {done} / wip {wip} / dead {dead}",
+      /* core 管这些叫 `roots`：章节的**入口**，也就是 parent 不在同一章的那些成员
+         （真正的树根算，从别的章分出来的第一步也算）。一个章节有好几个入口是常态，
+         因为它可以横跨好几棵树——所以这条不能说成「它有几个根」。 */
+      "chapter.roots": "{n} 个入口",
+      "chapter.roots.title": "章节是一组步骤，不是一棵子树。它可以同时从好几个地方开始——这边一个自己的根，那边一步从别的章分出来的——照样是同一个章节。把它们绑在一起的是那个名字，不是树的形状。",
+      "chapter.of.head": "属于 {chapter}",
+      "chapter.of.lead": "这一步属于项目的其中一块，别的几块在旁边各走各的。章节是分工，不是没走的那条路。",
+
+      /* 继承是这套东西最省事的地方，也最需要被说出来：不说，人会给二十步各标一遍，
+         然后改一次章节名要动二十个文件。 */
+      "chapter.declared": "章节从这里开始",
+      "chapter.declared.title": "这一步就是声明章节的地方。它底下每一步不用写一个字就属于同一章，所以改章节名是改一个文件里的一行，不是改二十处。",
+      "chapter.inherited": "继承自 {id}",
+      "chapter.inherited.title": "这一步身上一个字都没写。章节是从 {id} 传下来的，那是开启这条线的地方——二十步归进同一章靠的就是这件事，而不是二十行声明。",
+      "chapter.inherit.note": "在**开启那条线的那一步**声明一次，长在它下面的整棵子树都属于它。二十步的消融只要一个文件里的一行；以后要改章节名，改的也是那一行，不是二十处。",
+      "chapter.leave.note": "想让某一步（连同它下面）脱离继承来的章节，就在**那一步身上**声明一个新的。没有「置空」这种写法：不属于任何章节，是它和它的祖先谁都没声明过时的那种状态。",
+      "chapter.desc.label": "这个章节是什么",
+      "chapter.desc.title": "竖线右边说的是这个章节本身，不是这一步。同一个章节可能被好几处声明，显示的是 id 序最早的那一处带的说明。",
+      "chapter.desc.missing": "没人说过这个章节是什么。名字本身多半已经够了，所以这一行是可选的——名字有两种读法的时候才值得补一句。",
+      /* 两件**故意没做**的事。不写出来，后来的人会以为是漏了，然后去实现它。 */
+      "chapter.ids.note": "id 不按章节重编号：消融不会从 001 重新开始。id 说的是这一步什么时候建的，不是它在哪一块里排第几——别人笔记里的 [[007]]、论文脚注里的引用，在整个项目里都只能指一步。",
+      "chapter.nest.note": "章节不嵌套。名字里的斜杠只影响显示分组，「主实验/数据准备」在屏幕上收在「主实验」下面；底下仍然是平的一层名字，没有谁把斜杠读成父子。",
+      "chapter.group.title": "按名字里的斜杠分的组。这只是显示上的方便，底下的章节是平的一层。",
+
+      /* 白拿的三处：各自的定稿流程、各自的等级、跨章节的边。 */
+      "chapter.pipeline.head": "定稿流程 · {chapter}",
+      "chapter.pipeline.note": "每个章节各编一条自己的定稿流程：一条 `result:` 指着某一步，那一步在哪一章，这条流程就属于哪一章，链子从那里往回追。论文里本来就是这样——主实验一段 Methods，消融另一段。",
+      "chapter.pipeline.none": "{chapter} 里还没有哪一步被声明成成果，所以这一章暂时编不出流程。在项目笔记里写一行 `result: 031 | 图 4 的消融`，这一章就有了自己的链子、自己最弱的那一步和自己的 Methods 草稿。",
+      "chapter.level.head": "{chapter} 能被别人追到哪一步",
+      "chapter.level.note": "只按这一章算，值多少全看它里面最弱的那一步。它回答的正是读者对某一块真正会问的问题——消融这部分别人能不能重做——而不被项目其余部分抬高或压低。",
+      "chapter.level.weakest": "{link} {title} 把这一章压在了这个等级上",
+      /* 跨章节的边正是这块设计的收益：它说的是「消融是对着主结果测的」。
+         藏起来的话，两块工作在图上看着毫无关系，而它们的关系恰恰是重点。 */
+      "chapter.cross.head": "跨章节的边 · {n}",
+      "chapter.cross.note": "这些边要画出来，不收起来。一条跨章节的输入说的正是「消融是对着主结果测的」——整个项目里最有话说的那条边，往往就是离开自己这一块的那条。",
+      "chapter.cross.entry": "{link} · {chapter} —— {what}",
+      "chapter.cross.entry.bare": "{link} · {chapter}",
+      "chapter.cross.input": "读的是 {chapter} 的产物",
+      "chapter.cross.input.title": "这一步吃进去的字节是另一章产出的，而这多半正是重点：消融之所以是消融，就是因为它吃着主实验的产物，只改一样东西。",
+      "chapter.cross.parent": "从 {chapter} 分出来的",
+      "chapter.cross.parent.title": "这条线是从另一章的某一步长出来的。它说的是想法从哪儿接过来的——消融不是从零起的，是在某个点上从主实验分出去的。",
+      "chapter.cross.legend": "跨章节 —— 两端分属项目里不同块的边",
+
+      /* 章节的四条诊断。**一条都不影响可溯源等级**——它们问的是「这几块讲清楚了
+         没有」，不是「这个结果追不追得到」。所以每一条自己都要说一遍不影响等级：
+         lint.note 那句总说明会被当背景板略过，而这几条最容易被误读成「我判低了」。
+         key 名对着 core 的 code：chapter_note_conflict / chapter_no_result /
+         chapter_near_duplicate / bad_chapter。占位符也只用 core 结构化放进 vars 的
+         那几个名字（name / ids / id / names / note），绝不从中文句子里抠。 */
+      "lint.chapter.desc.conflict": "{name} 在 {ids} 上各写了一句说明，彼此不一致。生效的是 id 序最早的那句（{id} 写的），其余几句在界面上一个字都不会出现。多半是笔误，或者两个人各写各的。留一句；本来就想说两个章节的话，把名字改开。不影响等级。",
+      /* core 只在**项目里别处已经有成果**时才发这一条：一个 result: 都没有的项目，
+         pipeline_no_result 已经说过一遍了，再按章节念 N 遍就是让人从此不看诊断。
+         所以这句话可以直说「别的章节有」——它成立。 */
+      "lint.chapter.noresult": "{name} 里一条 `result:` 都没有，所以这一块推不出自己的定稿流程，而项目里别的章节推得出。这不是缺陷，一个章节完全可以只是探索性的；列在这里，是因为想让这一块将来进 Methods 的话，它值得在项目笔记里有自己的一行：`result: 031 | 图 4 的消融`。不影响等级。",
+      /* 「只有一个步骤的章节 → 也许是笔误」**没有做**，这里也就没有它的文案。
+         一个章节被开启的那一刻必然只有一步（就是声明它的那一步），那条诊断会在
+         每一次正确使用时当场响一声，而人从会误报的诊断学到的是忽略整个诊断栏。
+         合法的单步章节本来也存在（一步就说完的「数据准备」）。真正想逮的那件事
+         由下面这条接手：只差大小写或空白的两个名字，那才是同一个章节被拆成两半。 */
+      "lint.chapter.nearduplicate": "{names} 只差大小写或空白，几乎肯定是同一个章节被拆成了两半。两半各算一份成员、各导出一段 Methods，而两边看着都像对的。章节名是逐字节比的，统一成一种写法。不影响等级。",
+      /* `chapter:` 写坏的唯一形状：只写了竖线右边的说明，没写名字。那一行看着像
+         声明了一个章节，实际一个字都不生效——这一步静静继承 parent 的章节，人却
+         以为自己开了一条新线。和 bad_branch / bad_pipeline 同一条路：报一声、
+         当没写、继续建树，那半句说明原样留在文件里。 */
+      "lint.chapter.unnamed": "这行 `chapter:` 只写了竖线右边的说明「{note}」，没写章节名，所以它不算声明——这一步仍然继承 parent 的章节。写法是 `chapter: 消融实验 | 这一块是干什么的`。你写的那半句话原样留在文件里，一个字没动。不影响等级。",
+
+      /* 详情面板上的三个动作。「从这里开一个章节」这句话本身就在教人标在哪一步——
+         叫「设置章节」的话，读起来像每一步都该设一次。 */
+      "chapter.set.act": "从这里开一个章节",
+      "chapter.set.act.title": "给这一步开启的那一块起个名字。长在它下面的东西都属于同一块，所以要写这一行的只有这一步。",
+      "chapter.set.prompt": "这一块叫什么？它管这一步，以及它底下所有没自己起名字的步骤：",
+      "chapter.unset.act": "这里不开章节",
+      "chapter.unset.act.title": "把这一行从这一步上拿掉。它回到「父步骤属于哪一块，它就属于哪一块」，底下那些自己没起过名字的步骤也跟着回去。",
+      "chapter.write.act": "✎ 写清这个章节是什么",
+      "chapter.write.act.title": "一句话说清这一块是干什么的。它跟着章节走，不跟着这一步走——它就写在那行章节的竖线右边。",
+      "chapter.write.prompt": "这个章节是干什么的？一句话，说的是这一块，不是这一步：",
+
+      /* 按章节导出：论文里本来就是两段，导出跟着分开。 */
+      "export.chapter.head": "按章节导出",
+      "export.chapter.note": "论文里主实验一段 Methods、消融另一段，导出就照这个分开。每一章各从自己的成果编一份——这是另一份派生，不是把整项目那份过滤掉几行。",
+      "export.chapter.all": "整个项目",
+      "export.chapter.one": "只要 {chapter}",
+      "export.chapter.file": "存成 {file}",
+      "export.chapter.file.title": "章节名是文件名的一部分，所以导出消融那一份，永远不会盖掉主实验的 Methods 草稿。",
+
       /* ---- 可溯源性 · L0–L4 ---- */
       "trace.title": "可溯源性 · L0–L4",
       "trace.self": "这一步自己",
@@ -1281,6 +1554,15 @@
          exclude、跳过这一栏、按保存，收到的是服务端一句中文报错——界面亲口许了一个
          它管不着的诺。理由必填是这个键和 `branch:` 唯一的分歧，原因就写在下面。 */
       "editor.pipeline.note.required": "这一栏必须写。候选组在树上一出现就看得见，而这一行除了改变一份导出之外不留任何痕迹——没有那半句话，分不清它是想清楚的决定还是一次误点。",
+      /* ⑨ 章节。这一栏最要紧的事是**别让人每一步都填**：填二十遍，改一次名字就要
+         动二十个文件，而那正是继承想省掉的。所以 hint 第一句说的是「填在哪一步」，
+         不是「这一栏是什么」。 */
+      "editor.chapter.label": "这条线属于哪个章节",
+      "editor.chapter.placeholder": "消融实验",
+      "editor.chapter.hint": "只在**开启一条线**的那一步填，别的步骤一律留空：底下每一步都继承。二十步的消融只要一个文件里的一行，以后改章节名也只动那一行。在一个已经继承了章节的步骤上填，就是从这里分出一条新线——它底下的子树跟着改名。",
+      "editor.chapter.inherited": "正在继承 {id} 的「{chapter}」，留空就留在这一章",
+      "editor.chapter.note.label": "这个章节是什么 · 可选",
+      "editor.chapter.note.placeholder": "逐个拿掉模块，对着主实验的 023 比",
       "editor.hint": "截图 **Ctrl+V** 直接粘贴会自动上传并插入；从 Excel / 网页表格复制的内容粘贴会自动转成 markdown 表格；文件也可以拖进编辑框。`id` 不可改、也不会重发——任何地方写下的 `[[003b]]` 都必须永远有效。`parent` 可以移动，但必须写原因，而且这次移动会被记进笔记。",
       "editor.status.uploading": "上传中…",
       "editor.status.inserted": "已插入 {n} 个文件",
@@ -1357,6 +1639,9 @@
       "search.where.fork": "当时在决定什么",
       "search.where.tr.title": "译文标题",
       "search.where.tr.body": "译文正文",
+      /* 章节名和它那句说明也是人写的散文，`grep -r "消融"` 找得到，站内搜索
+         就不能找不到——否则「消融那块当时是怎么想的」还得一个项目一个项目翻。 */
+      "search.where.chapter": "章节名与说明",
       "search.hit.where": "命中：{where}",
       "search.searching": "搜索中…",
       "search.failed": "搜索失败：{error}",
@@ -1437,6 +1722,8 @@
       "toast.insight.superseded": "{id} 取代了 {old}；{old} 折起来了，没有删",
       "toast.moved": "已把 {id} 挂到 {parent} 下——原来的父节点和你写的原因都进笔记了",
       "toast.moved.root": "{id} 现在自己是一棵树的根了——这次移动已记进笔记",
+      "toast.moved.chapter": "章节 {from} → {to}",
+      "toast.moved.chapter.also": "（跟着换章的还有 {n} 步）",
       "toast.moved.fork": "{at} 那个岔路口现在剩 {n} 个候选",
       "toast.moved.fork.roots": "森林的根之间那一组候选现在剩 {n} 个",
       "toast.branch.alternative": "{id} 现在是候选了——{parent} 下面共 {n} 条路，最后走一条",
@@ -1451,6 +1738,14 @@
       "toast.pipeline.exclude": "{id} 不算在流程里了；开发路径上它还在原来的位置，一点没动",
       "toast.pipeline.auto": "{id} 改回按输入算了",
       "toast.export.ready": "{name} 已生成——同一份记录每次编出来逐字节一致",
+      "toast.export.chapter.ready": "{chapter} · {name} 已生成——同一份记录每次编出来逐字节一致",
+      /* ⑨ 标一个章节的后果是**整棵子树**跟着改归属，而屏幕上一棵子树和一个光杆
+         节点长得一模一样（和 drag.carry 同一条理由）。所以带走了几步要说出来。 */
+      "toast.chapter.set": "{id} 开启了「{chapter}」——它底下没自己起名字的步骤都归这一章",
+      "toast.chapter.carry": "底下 {n} 步跟着一起归过去",
+      "toast.chapter.cleared": "{id} 不再开启章节；父步骤属于哪一章，它就属于哪一章",
+      "toast.chapter.desc.saved": "已记在「{chapter}」上——这句说明属于章节，不属于这一步",
+      "toast.chapter.desc.saved.elsewhere": "已记在「{chapter}」上——这句说明住在开启这一章的 {id} 那一步，所以改动落在那个文件里",
       "toast.copied.path": "已复制路径",
       "toast.copy.failed": "复制失败",
       "toast.draft.restored": "已恢复草稿",
@@ -1494,6 +1789,7 @@
       "count.consumers": "{n} 个下游",
       "count.alternatives": "{n} 个候选",
       "count.rejoins": "{n} 处汇回",
+      "count.chapters": "{n} 个章节",
       "unit.b": "{n} B",
       "unit.kb": "{n} KB",
       "unit.mb": "{n} MB",

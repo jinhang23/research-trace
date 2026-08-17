@@ -1436,3 +1436,283 @@ def test_the_translation_side_ignores_result_and_pipeline_too(be):
         assert k in M.TR_STRUCT_KEYS and k in core.TR_STRUCT_KEYS
     with pytest.raises(M.ToolError):
         M._reject_front_matter("---\npipeline: exclude\n---\n\n## Why\na\n")
+
+
+# ------------------------------------------------------------ 章节
+#
+# 这一组全部在防同一个坏结果：**agent 把「项目」「章节」「分叉」三样搞混**。
+# 三样都合法、都不报错，而选错的后果各不相同：
+#   · 该分章却开了新项目 → id 各自从 001 开始，两块记录再也拼不回一篇论文；
+#   · 该分叉却分了章     → 「只能选一条」这句话丢了，读侧给两块各导一段 Methods；
+#   · 该分章却分了叉     → 主实验和消融被当成互斥候选，其中一块迟早被标 dead。
+# 第二个要防的坏结果是**给每一步都标一遍 chapter**：那正好毁掉沿树继承的全部好处。
+
+
+def _chapter_fixture(be):
+    """001 清洗 → 002 主实验★（都未分章）；003 开消融（声明 chapter）→ 004 消融汇总★。
+
+    004 的 `input:` 同时指着 003 和主实验的 002 —— **那条跨章节的边就是「消融是
+    对着主结果测的」**，它必须被标出来而不是藏起来。
+    """
+    body = ("## 为什么\n要试\n\n## 做了什么\n跑了 `python train.py`\n\n"
+            "## 结果\nAUC 0.91\n\n## 结论\n成了\n")
+    call(be, "trace_new_step", project="alpha", title="清洗数据", status="done", body=body,
+         commit="c1d2e3f", paths=["/blue/lab/clean | output | 训练集 | size=12884901888"])
+    call(be, "trace_new_step", project="alpha", parent="001", title="主实验 AUC 0.91",
+         status="done", body=body, commit="c1d2e3f")
+    call(be, "trace_new_step", project="alpha", parent="002", title="拿掉注意力模块",
+         status="done", body=body, commit="c1d2e3f",
+         chapter="消融实验 | 逐个拿掉模块，对着主实验的 002 比")
+    call(be, "trace_new_step", project="alpha", parent="003", title="消融汇总表",
+         status="done", body=body, commit="c1d2e3f",
+         inputs=["003 | 逐个拿掉之后的数字", "002 | 主结果那一版权重"])
+    call(be, "trace_result", project="alpha", step="002", note="主结果")
+    call(be, "trace_result", project="alpha", step="004", note="图 4 的消融")
+
+
+def test_the_chapter_field_reaches_disk_from_both_step_tools(be):
+    """漏传的症状是**静默丢字段**：调用方填了 chapter，返回成功，磁盘上没有。"""
+    import trace_write as W  # noqa: PLC0415
+
+    call(be, "trace_new_step", project="alpha", title="开消融", chapter="消融实验 | 逐个拿掉模块")
+    assert W.load(be._sd("alpha"))["001"].chapter == "消融实验"
+    call(be, "trace_update_step", project="alpha", step="001", chapter="主实验")
+    assert W.load(be._sd("alpha"))["001"].chapter == "主实验"
+    call(be, "trace_update_step", project="alpha", step="001", chapter="")
+    assert W.load(be._sd("alpha"))["001"].chapter == "", "空串＝撤销，回到沿 parent 继承"
+
+
+def test_both_step_tools_advertise_chapter_and_keep_the_three_things_apart(be):
+    """schema 里没有的字段 agent 不会传；而这个字段**主要的错法是选错了那一样**。"""
+    for tool in ("trace_new_step", "trace_update_step"):
+        props = next(t for t in M.TOOLS if t["name"] == tool)["inputSchema"]["properties"]
+        assert "chapter" in props, f"{tool} 的 schema 少了 chapter —— 等于这个字段不存在"
+        d = props["chapter"]["description"]
+        assert "第一步" in d and "继承" in d, \
+            "不说「只标在第一步、往下继承」，agent 会给二十步各标一遍，继承的好处全没了"
+        assert "互不排斥" in d and "只能选一个" in d, \
+            "章节和分叉的分界要逐字写出来：拿章节表达分叉不报错，只会把「只能选一条」弄丢"
+        assert "不同的研究" in d, \
+            "章节和项目的分界同样要说：该分章却开了新项目，两块记录再也拼不回一篇论文"
+
+
+def test_updating_the_chapter_says_how_many_steps_came_along(be):
+    """换章**磁盘上只动一行**，后果却是整棵子树跟着换。回执不说，人就发现不了。"""
+    _chapter_fixture(be)
+    out = call(be, "trace_update_step", project="alpha", step="003", chapter="消融")
+    assert "消融" in out
+    assert "1 步" in out, "跟着换章的那几步要报出来 —— 它们自己一个字都没写"
+    assert "继承" in out
+
+
+def test_reading_one_step_tells_declared_apart_from_inherited(be):
+    """**归属**和**这一行写在哪**是两件事。混用会让继承来的整条子树看着像未分章。"""
+    _chapter_fixture(be)
+    at = call(be, "trace_read", project="alpha", step="003")
+    assert "章节: 消融实验" in at and "就写在这一步" in at
+    down = call(be, "trace_read", project="alpha", step="004")
+    assert "章节: 消融实验" in down, "继承来的一样要显示归属，否则它看着像未分章"
+    assert "继承" in down and "003" in down, "还要说清那一行写在哪 —— 改名要去改的是那一步"
+    main = call(be, "trace_read", project="alpha", step="001")
+    assert "章节:" not in main, "未分章的步骤不该多出一行 —— 那不是缺陷"
+
+
+def test_listing_chapters_answers_can_someone_redo_the_ablation(be):
+    """分章之后第一个要问的问题：消融那部分多少步、能被追到哪一级、有没有成果。"""
+    _chapter_fixture(be)
+    out = call(be, "trace_read", project="alpha", chapters=True)
+    assert "消融实验" in out and "逐个拿掉模块" in out
+    assert "2 步" in out, "步数是这份清单最基本的一列"
+    assert "004" in out and "★ 成果" in out, "有没有成果 = 能不能单独导一段 Methods"
+    assert "未分章" in out and "不是缺陷" in out, \
+        "多数项目的主线本来就没起名字，这一组要列出来且不带缺失感"
+    assert "互不排斥" in out and "分叉" in out, "清单本身也要把章节和分叉分开"
+
+
+def test_the_cross_chapter_edge_is_shown_not_hidden(be):
+    """消融吃主实验的产物，那条边说的正是「消融是对着主结果测的」。"""
+    _chapter_fixture(be)
+    out = call(be, "trace_read", project="alpha", chapters=True)
+    assert "跨章节的边" in out
+    assert "004 ← 002" in out, "input 那条跨章节的边要指名两头"
+
+
+def test_a_project_without_any_chapter_is_told_how_not_that_it_is_broken(be):
+    """没分章是**常态**。写成缺陷，人就会为了让输出干净随手分两块。"""
+    call(be, "trace_new_step", project="alpha", title="根")
+    out = call(be, "trace_read", project="alpha", chapters=True)
+    assert "不是缺陷" in out and "错误" not in out and "警告" not in out
+    assert "chapter:" in out, "得给出照抄就能用的那一行，不然这条提示落不了地"
+
+
+def test_each_chapter_has_its_own_pipeline_and_its_own_result(be):
+    """`result:` 指的那一步在哪一章，这条流程就属于哪一章 —— 论文里本来就是两段。"""
+    _chapter_fixture(be)
+    whole = be.pipeline("alpha")
+    ab = be.pipeline("alpha", "消融实验")
+    main = be.pipeline("alpha", M.CHAPTER_NONE)
+    assert whole["pipeline"]["order"] == ["001", "002", "003", "004"]
+    assert [r["step"] for r in ab["pipeline"]["results"]] == ["004"], "这一章只报它自己那个成果"
+    assert [r["step"] for r in main["pipeline"]["results"]] == ["002"]
+    assert main["pipeline"]["order"] == ["001", "002"], \
+        "主线那一章不该把消融的步骤算进自己的 Methods"
+    assert set(ab["chapter"]["external"]) == {"001", "002"}, \
+        "借来的上游要标出来，不能算成本章自己做的"
+
+
+def test_the_chapter_slice_is_a_subsequence_of_the_one_dag(be):
+    """**切分，不是重算。** 各算一遍就会出现「屏幕上讨论的图和投出去的图不是一张」。"""
+    _chapter_fixture(be)
+    whole = be.pipeline("alpha")["pipeline"]["order"]
+    for name in ("消融实验", M.CHAPTER_NONE):
+        part = be.pipeline("alpha", name)["pipeline"]["order"]
+        assert part == [s for s in whole if s in set(part)], \
+            f"{name} 这一章的顺序不是总图的子序列 —— 同一步在两张图上的位置就不一样了"
+
+
+def test_each_chapter_carries_its_own_level_not_the_projects(be):
+    """整份流程的等级是**全项目**最弱的一步；拿它当消融的等级就是让消融替别的章背锅。
+
+    「消融这部分别人能不能重做」是个要单独回答的问题。
+    """
+    _chapter_fixture(be)
+    # 一步记得很差的探索（L0），只有消融那一章够得到它。
+    made = call(be, "trace_new_step", project="alpha", parent="002", title="没记全的一步",
+                status="done", body="## 为什么\n试试\n")
+    weak = made.split("alpha/")[1].split()[0]
+    call(be, "trace_update_step", project="alpha", step="004",
+         add_inputs=[f"{weak} | 那一版的输出"])
+    whole = be.pipeline("alpha")["pipeline"]
+    ab = be.pipeline("alpha", "消融实验")["pipeline"]
+    main = be.pipeline("alpha", M.CHAPTER_NONE)["pipeline"]
+    assert whole["weakest"] == weak and ab["weakest"] == weak
+    assert main["weakest"] != weak, f"主线那一章够不到 {weak}，不该替它背锅"
+    assert main["level"] != whole["level"], "两个等级各回答各的问题"
+
+
+def test_a_chapter_really_named_dash_beats_the_sentinel(be):
+    """`-` 是「未分章那一组」的记号，而它**通过得了**写入侧的章节名校验。
+
+    取舍是真名优先：一个真叫 `-` 的章节存在时，记号绝不许把它抢走 —— 那会让
+    「导出的是哪一章」取决于一个巧合，而其中一份产物会进论文。
+    """
+    _chapter_fixture(be)
+    call(be, "trace_update_step", project="alpha", step="003", chapter=M.CHAPTER_NONE)
+    got = be.pipeline("alpha", M.CHAPTER_NONE)
+    assert got["chapter"]["name"] == M.CHAPTER_NONE, "真名优先，记号让路"
+    assert "004" in got["pipeline"]["order"], "拿到的是那个真章节，不是未分章那一组"
+
+
+def test_an_unknown_chapter_name_says_which_ones_exist(be):
+    """章节名是人起的中文，打错一个字是最常见的失败方式；
+    而「没有这一章」和「这一章是空的」在输出上长得一模一样。"""
+    _chapter_fixture(be)
+    with pytest.raises(M.ToolError) as e:
+        be.pipeline("alpha", "消融試驗")
+    assert "消融实验" in str(e.value), "必须把有哪几章摆出来"
+    assert "猜" in str(e.value), "还要说清这里不做近似匹配 —— 猜错一次，导出的就是另一章"
+
+
+def test_the_methods_draft_of_one_chapter_marks_what_it_borrowed(be):
+    """读 Methods 的人是一步一步读的：「这一步是我们做的还是引用的主实验」
+    正是消融那一节最容易被读错的地方。"""
+    _chapter_fixture(be)
+    md = call(be, "trace_pipeline", project="alpha", chapter="消融实验", methods=True)
+    assert "消融实验" in md.splitlines()[0], "抬头必须带章节名，否则两份草稿分不出哪份是哪份"
+    assert "借自" in md and "不互斥" in md
+    assert "不按章节重编号" in md, "两段草稿里的 id 能直接对照，这一句要说出来"
+
+
+def test_the_whole_project_pipeline_points_at_the_per_chapter_export(be):
+    """能按章节导这件事，不说就没人知道 —— 磁盘上分章只是一行 `chapter:`。"""
+    _chapter_fixture(be)
+    out = call(be, "trace_pipeline", project="alpha")
+    assert "chapter=" in out and "消融实验" in out
+
+
+def test_the_chapter_exports_stay_byte_identical(be):
+    """P3：三样导出是纯函数，按章节切开之后照样逐字节确定。"""
+    _chapter_fixture(be)
+    a, b = be.pipeline("alpha", "消融实验"), be.pipeline("alpha", "消融实验")
+    for fn in (M.pipeline_svg, M.pipeline_methods, M.pipeline_page):
+        assert fn(a) == fn(b), f"{fn.__name__} 按章节切开之后不再是纯函数"
+
+
+def test_the_figure_of_one_chapter_keeps_the_three_hard_constraints(be):
+    """无脚本、无外链、不靠色相 —— 一条都没有因为分章而松。"""
+    import re as _re  # noqa: PLC0415
+
+    _chapter_fixture(be)
+    svg = M.pipeline_svg(be.pipeline("alpha", "消融实验"))
+    assert "<script" not in svg and "onload" not in svg
+    bare = svg.replace("http://www.w3.org/2000/svg", "")
+    assert "http://" not in bare and "https://" not in bare
+    assert "消融实验" in svg and "借自" in svg, "借来的那几步在图上也要看得出来"
+    for hexcolor in sorted(set(_re.findall(r"#([0-9a-fA-F]{6})", svg))):
+        r, g, b = hexcolor[0:2], hexcolor[2:4], hexcolor[4:6]
+        assert r == g == b, f"#{hexcolor} 不是灰阶 —— 影印之后「借自」这条信息就没了"
+
+
+def test_the_standalone_page_of_one_chapter_says_it_is_only_one_chapter(be):
+    """发给合作者的那一页，收信人手上没有别的上下文：
+    不说这一句，他会把消融那一章读成这个课题的全部方法。"""
+    _chapter_fixture(be)
+    page = M.pipeline_page(be.pipeline("alpha", "消融实验"))
+    assert "<script" not in page
+    assert "消融实验" in page and "不互斥" in page
+
+
+def test_a_chapter_without_a_result_is_not_reported_as_broken(be):
+    """一章可以只是探索，成果在别的章。这不是缺陷，但得说清怎么办。"""
+    _chapter_fixture(be)
+    call(be, "trace_new_step", project="alpha", parent="001", title="另开一条",
+         status="done", chapter="数据准备")
+    out = call(be, "trace_pipeline", project="alpha", chapter="数据准备")
+    assert "不是缺陷" in out and "trace_result" in out
+    assert "数据准备" in out
+
+
+def test_a_payload_nobody_asked_a_chapter_of_has_no_chapter_key(be):
+    """现存项目必须完全无感：不问章节，这份 payload 一个键都不许多。"""
+    _pipeline_fixture(be)
+    call(be, "trace_result", project="alpha", step="003", note="主结果")
+    assert "chapter" not in be.pipeline("alpha"), \
+        "没按章节要就整个键不出现 —— 和 forest 里那两个键同一条规矩"
+
+
+def test_the_chapter_filenames_are_derived_not_pasted():
+    """章节名**不是路径安全的**：`主实验/数据准备` 合法、`CON` 合法、`..` 合法。
+
+    而且写入侧刻意不折叠大小写（`Ablation` / `ablation` 是两个章节），
+    于是两个不同章节能 slug 成同一个名字 —— 静默覆盖就等于少导出一章。
+    """
+    import trace_write as W  # noqa: PLC0415
+
+    got = M.chapter_export_name(["主实验/数据准备", "CON", "..", "Ablation", "ablation", ""])
+    for name, stem in got.items():
+        assert "/" not in stem and "\\" not in stem and ".." not in stem, (name, stem)
+        assert not stem.endswith("."), (name, stem)
+        assert stem.split("-", 1)[-1] not in W.WIN_RESERVED, \
+            f"{name} → {stem}：con.svg 在 Windows 上打开的是设备不是文件"
+    assert len(set(got.values())) == len(got), "撞名的两章必须消歧，不能后一份静默盖掉前一份"
+
+
+def test_the_instructions_and_the_format_summary_teach_the_three_way_split():
+    """pip 装的机器上没有任何文档，这两段是唯一一定送达的通道。"""
+    for text in (M.INSTRUCTIONS, M.FORMAT_ESSENTIALS):
+        assert "章节" in text
+        assert "互不排斥" in text and "只能选一个" in text, \
+            "项目 / 章节 / 分叉三样的分界必须并排说清 —— 选错了不报错"
+        assert "第一步" in text and "继承" in text, \
+            "不说「只标在第一步」，agent 会给每一步各标一遍"
+    assert "不按章节重编号" in M.FORMAT_ESSENTIALS and "不嵌套" in M.FORMAT_ESSENTIALS, \
+        "两件刻意不做的事要写出来，否则后来人会当成漏了去补"
+
+
+def test_the_translation_side_ignores_chapter_too(be):
+    """译文里多写一行 `chapter:` 改的不是这一步，是它底下**整棵子树**的归属。"""
+    import trace_core as core  # noqa: PLC0415
+
+    assert "chapter" in M.TR_STRUCT_KEYS and "chapter" in core.TR_STRUCT_KEYS
+    with pytest.raises(M.ToolError):
+        M._reject_front_matter("---\nchapter: Ablation\n---\n\n## Why\na\n")
