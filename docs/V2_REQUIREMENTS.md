@@ -3,7 +3,7 @@
 状态：已确认，可作为 v2 实现基线。
 日期：2026-08-18
 
-实现注：`2.0.0-alpha.3` 已提供 GitHub OAuth 网页登录、PKCE、HttpOnly 哈希会话、CSRF、
+实现注：`2.0.0-alpha.4` 已提供 GitHub OAuth 网页登录、PKCE、HttpOnly 哈希会话、CSRF、
 `reader/member/admin`、管理员用户管理，以及由 GitHub 账号批准的逐设备登录、撤销和自动凭证
 读取。原始 GitHub access token 不作为设备凭证。
 
@@ -38,7 +38,7 @@ Project
 │   ├── 当前假设、待确认问题、关键决定、经验与错误
 │   ├── 内联 Comments / Corrections
 │   └── revisions / milestones
-├── Chapters（语义主题，彼此没有时间顺序）
+├── Chapters（用户定义的并列研究线/实验组，彼此没有时间顺序）
 │   └── Nodes（Chapter 内按时间排列，可选 parent）
 │       ├── 内联 Comments / Corrections
 │       ├── Code Evidence
@@ -57,10 +57,12 @@ Project
 
 ### 3.2 Chapter
 
-- Chapter 是长期主题或工作区域，例如“数据理解”“RNA QC”“实现”“评估”。
+- Chapter 是用户定义的并列研究线或实验组，例如“主实验”“消融实验”“基线复现”“补充实验”。
+- Chapter 不是“数据理解”“实现”“评估”等内容类型，也不是线性 pipeline 阶段；这些内容仍是其所服务研究线中的 Node。
 - Chapter 之间没有时间、父子或 pipeline 顺序。
 - Chapter 有一份当前摘要；摘要是其 Nodes 的可编辑、带版本视图。
 - `Inbox` 是每个项目的内建 Chapter，用于 Recorder 暂时无法可靠分类的内容。
+- Chapter 的创建、改名和范围由人管理；Recorder 只能选择已有 `chapter_id`，不得自行发明 Chapter。
 
 ### 3.3 Node
 
@@ -87,6 +89,10 @@ Recorder 是后台编辑者，不是文件监控审计员。每个 batch 可以�
 - 更新 Chapter 当前摘要；
 - 在内容确实影响项目全局认识时更新 Overview；
 - 把无法可靠分类的内容放进 Inbox。
+
+Recorder 创建的 Node 一律为 `unreviewed`。确认同时表示人已确认内容和 Chapter 归属；人类移动、
+编辑、确认或纠正过 Node 后，Recorder 的旧幂等重试不得覆盖该版本。内容跨多个 Chapter 时可以
+拆成多个 Node；不能可靠拆分时放 Inbox，不猜测归属。
 
 Recorder 应记录：为什么做、关键方法、重要命令和参数、指标及口径、图片、产物位置、
 结论、失败原因、可复用实现和下一步。它不为普通文件读取、格式化、临时调试或每次工具调用建 Node。
@@ -137,6 +143,8 @@ Code Evidence 原文不可被 AI 注释覆盖。代码证据、Recorder 注释�
 - 每个主会话首次派发时创建一个 fork Recorder；它继承主会话当时的实际上下文和 prompt cache。
 - 后续恢复同一 recorder agent id，只发送增量 batch。
 - Recorder 不跨主会话常驻；中央服务保存长期状态。
+- fork 虽继承主会话工具，但 Hook 按 recorder agent id 强制只允许只读检查和 Research Trace MCP，
+  禁止 Bash、Edit、Write、Agent、外部搜索及无关 MCP。
 - Hook、fork、MCP 或网络故障不得阻断主任务；batch 留在 outbox 等待重放。
 - 正确性不能依赖 prompt cache、模型是否记得调用工具或一次派发是否成功。
 
@@ -155,7 +163,7 @@ Code Evidence 原文不可被 AI 注释覆盖。代码证据、Recorder 注释�
 
 1. `trace_context`：发现项目，返回 Overview、Chapters、最近 Nodes、人工 corrections 和同步游标。
 2. `trace_ingest`：幂等写入原始 events、sessions、agents 和 transcript chunks。
-3. `trace_record`：幂等创建或更新通用 Node 及 Code Evidence。
+3. `trace_record`：在已有 Chapter 中幂等创建/重试未确认的通用 Node 及 Code Evidence；省略 Chapter 时进入 Inbox。
 4. `trace_curate`：带版本更新 Overview 或 Chapter 当前摘要。
 5. `trace_attach`：上传小附件或登记外部 artifact reference。
 6. `trace_search`：跨项目搜索语义记录与原始历史。
@@ -170,7 +178,10 @@ Comments 的人工操作走网页 REST；不为每个网页动作增加 MCP 工�
 - 项目列表和 Overview 当前视图/编辑器。
 - Overview 内联评论、确认和纠正。
 - 无序 Chapter 导航；每章显示当前摘要和按时间排列的 Node。
-- Node 可选 parent 的树/时间线视图、代码证据、图片和产物引用。
+- 结构图与记录详情必须并存：桌面端使用 master-detail 分栏，选择节点只更新详情，不丢失图上的位置。
+- 项目视图把各 Chapter 显示为互不相连的独立图；Chapter 视图只画本章 Node。不得把 Chapter 之间画成时间或父子关系。
+- Node 可切换明确 parent 的树图与按发生时间排列的记录列表；没有 parent 的 Node 作为根保留，不根据时间或语义猜边。
+- 详情区显示代码证据、图片、产物引用、评论和纠正；移动端允许图与详情上下排列。
 - Node 内联评论和修订历史。
 - 原始 session/agent timeline 默认折叠，可从语义记录跳转。
 - 跨项目全文搜索。
@@ -224,6 +235,7 @@ Comments 的人工操作走网页 REST；不为每个网页动作增加 MCP 工�
 - 主 agent 和所有子 agent 的可见历史可永久检索。
 - Recorder 可以对无价值 batch 选择不建 Node。
 - 想法、论文、数据理解、实验、关键实现和失败都能用同一 Node 表达。
+- Recorder 不能创建 Chapter、不能自我确认，也不能用旧幂等重试覆盖人类移动或修改过的 Node。
 - Chapter 之间无虚假的时间顺序；Chapter 内节点按时间显示。
 - 人工 correction 会进入后续 Recorder 上下文且不会被自动摘要覆盖。
 - 多人并发编辑不会静默丢内容。

@@ -607,18 +607,9 @@ class Store:
             ).fetchone()
             if row:
                 return row
-            chapter_id = _id("ch")
-            timestamp = now_utc()
-            slug = self._unique_slug(db, "chapters", chapter_name, project_id)
-            db.execute(
-                "INSERT INTO chapters(id,project_id,slug,name,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-                (chapter_id, project_id, slug, chapter_name.strip(), timestamp, timestamp),
+            raise ValidationError(
+                "chapter_name must match an existing human-created Chapter; omit it to use Inbox"
             )
-            self._save_revision_locked(
-                db, project_id, "chapter", chapter_id, 1,
-                {"name": chapter_name.strip(), "summary": ""}, "recorder", None, [], False,
-            )
-            return db.execute("SELECT * FROM chapters WHERE id=?", (chapter_id,)).fetchone()
         return db.execute(
             "SELECT * FROM chapters WHERE project_id=? AND is_inbox=1", (project_id,)
         ).fetchone()
@@ -646,6 +637,9 @@ class Store:
             raise ValidationError("node title is required")
         if review_state not in REVIEW_STATES:
             raise ValidationError(f"invalid review_state: {review_state}")
+        # Recorder output is a proposal. Only a human update may confirm or correct it.
+        if created_by == "recorder":
+            review_state = "unreviewed"
         timestamp = now_utc()
         clean_labels = sorted({str(item).strip() for item in labels if str(item).strip()})
         source_ids = sorted({str(item) for item in source_event_ids if str(item)})
@@ -688,6 +682,16 @@ class Store:
                     and current_codes == desired_codes
                 ):
                     return self._expand_node_locked(db, existing)
+                if created_by == "recorder":
+                    latest = db.execute(
+                        "SELECT actor_type FROM semantic_revisions "
+                        "WHERE target_type='node' AND target_id=? ORDER BY version DESC LIMIT 1",
+                        (node_id,),
+                    ).fetchone()
+                    if latest and latest["actor_type"] != "recorder":
+                        raise Conflict(
+                            "node has a newer human revision; recorder cannot overwrite it"
+                        )
                 version = int(existing["version"]) + 1
                 db.execute(
                     "UPDATE nodes SET chapter_id=?,parent_id=?,title=?,body=?,labels_json=?,review_state=?,"
@@ -1003,12 +1007,13 @@ class Store:
                     body.strip(), author_type, author_id, timestamp,
                 ),
             )
-            if target_type == "node" and kind == "correction":
+            if target_type == "node" and kind in {"correction", "confirmation"}:
                 node = db.execute("SELECT * FROM nodes WHERE id=?", (actual_target,)).fetchone()
                 version = int(node["version"]) + 1
+                review_state = "corrected" if kind == "correction" else "confirmed"
                 db.execute(
-                    "UPDATE nodes SET review_state='corrected',version=?,updated_at=? WHERE id=?",
-                    (version, timestamp, actual_target),
+                    "UPDATE nodes SET review_state=?,version=?,updated_at=? WHERE id=?",
+                    (review_state, version, timestamp, actual_target),
                 )
                 updated = db.execute("SELECT * FROM nodes WHERE id=?", (actual_target,)).fetchone()
                 snapshot = self._node_snapshot(updated)

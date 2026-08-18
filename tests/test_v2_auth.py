@@ -192,6 +192,9 @@ def test_account_approved_device_login_is_independent_and_revocable(tmp_path):
         approval_page = client.get("/device", params={"code": started["user_code"]})
         assert "hipergator-login-01" in approval_page.text
         assert "GitHub access token" in approval_page.text
+        assert "backdrop-filter:blur(22px)" in approval_page.text
+        assert 'role="status" aria-live="polite"' in approval_page.text
+        assert "prefers-reduced-motion" in approval_page.text
         node = shutil.which("node")
         if node:
             script = approval_page.text.split("<script>", 1)[1].split("</script>", 1)[0]

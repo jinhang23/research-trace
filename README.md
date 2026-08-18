@@ -1,1053 +1,272 @@
-# Research Trace v2 — 团队研究与项目记忆
+# Research Trace
 
-> v2 alpha 已成为当前实现。它不再假设每次工作都是“实验”，也不把项目强制建成一棵
-> 全局步骤树。想法、论文阅读、数据理解、实验、失败和关键实现统一记录为 Node；完整
-> Claude Code 历史进入永久原始层。安装与部署见 [v2 快速开始](docs/V2_QUICKSTART.md)，
-> 完整约束见 [v2 需求](docs/V2_REQUIREMENTS.md)。
+Research Trace 是一个面向科研与长期项目开发的 **Agent 工作记忆系统**。
 
-v2 的结构是：Project 有一个可持续修订的 Overview；项目下有彼此无时间顺序的 Chapter；
-每个 Chapter 内的 Node 按时间排列，并可选 parent。Comments / Corrections 直接附在 Overview、
-Chapter 或 Node 上。中央服务使用 SQLite 和内容寻址附件；GitHub 只保存确定性、可校验、可恢复
-的备份，不保存运行中的 SQLite/WAL。团队成员用 GitHub OAuth 登录网页；Claude/Codex/HPC
-通过同一账号批准逐设备凭证，不需要共享机器 Token。
+它保存 Claude Code 能看到的完整对话、工具调用和子 Agent 历史，同时让一个受限的
+Recorder 只把真正有长期价值的内容整理成简洁、可纠正、可搜索的项目记录。
 
-下面原有的 v1 文档暂时保留，供旧数据只读迁移参考；它描述的 Step、Pipeline、分支与大量
-MCP 工具不是 v2 的模型。
+它记录的不只是“实验”。论文搜索、想法讨论、数据理解、失败方案、关键代码实现、指标、
+图片、产物路径和阶段性结论，都可以成为项目知识的一部分。
 
----
+> 当前主线是 v2 alpha。v1 的 Step/Pipeline 文件树模型已移入
+> [v1 归档参考](docs/V1_REFERENCE.md)，不再作为新用户的默认设计。
 
-# trace v1（旧版，只读迁移参考）
+## 为什么做这个项目
 
-把科研过程记录成一棵**只追加的步骤树**：每个节点自带代码、日志、产物，和一句
-"我为什么要做这一步"。从任何一个结果都能一路回溯到最初的问题。
+研究过程很少是一份整齐的实验表：一次对话可能先查论文，再检查数据，随后尝试代码，
+发现方向不成立，又回到新的假设。只保存最终结果，会丢掉大量以后仍然有价值的信息；
+完整保存所有聊天，又会迅速变成无法阅读的日志堆。
 
-多项目并行。人和 agent 都能写：人在网页上写，agent 走 REST API。
+Research Trace 同时保留两层信息：
 
----
+- **原始历史层**：完整保存可获得的主对话、子 Agent、工具调用和 transcript 增量，按需查询。
+- **语义记录层**：Recorder 只挑选值得长期记住的内容，整理成 Overview、Chapter 和 Node。
 
-## 30 秒上手
+原始历史负责“不丢”，语义记录负责“好读”。两者不互相替代。
+
+## 设计理念
+
+### 1. 项目工作不等于实验
+
+系统不为“论文阅读”“Idea”“数据处理”“实验”“代码实现”分别建立不同对象。它们统一使用
+Node 表达，避免 Agent 先猜内容类型，再决定该写到哪里。
+
+一个 Node 可以记录：
+
+- 为什么做这件事；
+- 使用的命令、参数和关键代码；
+- 指标、图片和产物路径；
+- 观察、推测、失败原因和结论；
+- 支撑这条记录的原始事件或附件。
+
+### 2. Chapter 表达研究线，不表达内容类型
+
+Chapter 由人创建，用来表示项目中的并列研究线或实验组，例如：
+
+- 主实验；
+- 消融实验；
+- 基线复现；
+- 补充实验。
+
+Chapter 之间没有时间先后关系。时间关系只存在于同一个 Chapter 的 Node 中，通过时间戳和
+可选的 `parent` 表达。数据理解、实现和评估不是三个 Chapter，而是它们所服务研究线中的节点。
+
+### 3. 人的判断高于 Recorder
+
+Recorder 是整理助手，不是项目结构的权威：
+
+- Recorder 不能创建 Chapter；
+- 只能选择已有 Chapter，不确定时写入 Inbox；
+- Recorder 创建的 Node 一律是“未确认”；
+- 人可以移动 Chapter、修改 parent、确认、纠正和评论；
+- 人工修改会形成新版本，Recorder 的重试不能覆盖更新的人类版本；
+- 观察、推测和假设必须保持原来的不确定性，不能在整理时升级成事实。
+
+这使 AI 可以大胆记录尚未证实的内容，同时不会把它伪装成最终结论。
+
+### 4. 代码溯源只保留关键证据
+
+Research Trace 不要求每次工作建立 Git branch，也不试图记录所有文件变化。并行子 Agent、
+未提交修改和大量无价值 diff 会让这种记录看起来精确，实际却容易误导。
+
+Recorder 只保存能解释研究结论的关键代码证据：文件路径、函数或符号、commit、必要的
+snippet/diff、参数说明，以及指标、图片和产物引用。Git 继续负责代码版本；Research Trace
+负责说明“哪一段实现为什么与这条结论有关”。
+
+### 5. 界面首先服务阅读
+
+项目主页只保留两个核心区域：左侧结构图或记录列表，右侧 Overview 或当前记录。搜索、原始
+历史、附件、评论、确认状态和结构编辑按需展开。半透明、阴影和颜色只用于建立层级，不作为
+装饰堆叠。
+
+### 6. 中央服务是真相源，GitHub 是灾备
+
+多台电脑、HPC 和团队成员都连接同一个中央 Research Trace 服务。服务端 SQLite 与对象目录是
+在线真相源；私有 GitHub 仓库保存确定性导出，用于审计和恢复。
+
+备份不会提交运行中的 SQLite/WAL、GitHub access token、网页 session、设备凭证原文或其它
+secret，也不会 force-push。
+
+## 整体架构
+
+```mermaid
+flowchart LR
+    Main["Claude Code 主会话"] --> Hook["Claude Code Hooks"]
+    Hook --> Outbox["本机持久 Outbox"]
+    Main --> Recorder["完整上下文 Fork Recorder"]
+    Outbox --> Recorder
+    Recorder --> MCP["Research Trace MCP"]
+    MCP --> Server["中央 Research Trace 服务"]
+    Server --> Store["SQLite + 内容寻址附件"]
+    Server --> UI["项目结构图 + 记录页面"]
+    Server --> Export["确定性备份导出"]
+    Export --> GitHub["私有 GitHub 仓库"]
+```
+
+Recorder 首次以 fork 方式继承主 Agent 当时的完整上下文；同一 Claude Code 会话中的后续批次
+发送给同一个 Recorder agent id。它不会跨主会话永久驻留，长期状态保存在中央服务中。
+
+Hook 根据 Recorder agent id 强制限制工具权限：Recorder 只能读取必要上下文，并调用 Research
+Trace MCP；不能执行 Bash、编辑项目文件、启动其它 Agent 或自行进行外部研究。
+
+## 信息模型
+
+```text
+Project
+├── Overview                项目当前认识、阶段结果、重要洞察与错误
+├── Comments / Corrections  人对 Overview 的评论、纠正和确认
+├── Chapter: 主实验         人定义的研究线，Chapter 间无时间顺序
+│   ├── Node 01
+│   ├── Node 02 ─ parent → Node 01
+│   └── Node 03 ─ parent → Node 02
+├── Chapter: 消融实验
+│   ├── Node 01
+│   └── Node 02 ─ parent → Node 01
+├── Inbox                   Recorder 无法可靠归类时的安全落点
+└── Raw history             Session / Agent / Event / Transcript 原始历史
+```
+
+- **Project**：长期项目容器，可绑定多个工作区或机器路径。
+- **Overview**：项目级的可持续修订认识，不承担完整时间线。
+- **Chapter**：由人定义的并列研究线。
+- **Node**：所有有长期价值的研究记录；在 Chapter 内按时间组织，可选 parent。
+- **Comment / Correction / Confirmation**：不覆盖原文的人工反馈与语义状态变更。
+- **Raw history**：完整底层证据，默认永久保留，页面按需加载。
+
+## 当前能力
+
+- Project、Overview、Chapter、Node 与 Inbox；
+- Chapter 内结构图和记录列表并存；
+- 评论、纠正、确认和版本冲突保护；
+- 关键代码证据、附件、图片和外部产物引用；
+- 跨项目全文搜索与原始历史查询；
+- Claude Code Hook、持久 outbox 和受限 Recorder；
+- GitHub OAuth 网页登录、团队白名单与角色；
+- GitHub 账号批准的逐设备凭证，不共享机器 Token；
+- 多机器连接一个中央服务；
+- 每日确定性 Git 备份、校验和空库恢复。
+
+## 快速开始
+
+需要 Python 3.10+。
 
 ```bash
-pip install -r requirements.txt
-python trace_cli.py init --project "我的课题"        # 生成 config.json（含访问路径与写入令牌）
-python trace_cli.py serve                           # 起服务，终端会打印访问地址
+git clone https://github.com/jinhang23/research-trace
+cd research-trace
+python -m pip install -e ".[server]"
+
+trace-v2-server --data-dir /srv/research-trace/data \
+  --host 127.0.0.1 --port 8765
 ```
 
-浏览器打开打印出来的地址，点右上角 🔒 把令牌存进浏览器，就能建步骤、改正文、拖文件了。
+本地打开 `http://127.0.0.1:8765/`。团队部署应使用 HTTPS 和 GitHub OAuth，完整配置见
+[v2 快速开始](docs/V2_QUICKSTART.md)。
 
-两个默认值值得知道，它们是为了让上面这三行**照抄也不会出事**：
+### 安装 Claude Code 插件
 
-- **数据放在 `../trace-data`**（`--data-dir` 的默认值），也就是这个代码仓的**外面**。
-  项目自己的不变量是"代码仓公开、数据仓私有"，默认值必须先满足它。
-- **自动 git 同步默认是关的。** 要开得显式 `--git`，而且数据仓和代码仓在同一个
-  git 工作区时会被直接拒绝——`git add -A && git commit && git push` 一旦跑在公开
-  代码仓上，未发表的实验记录 45 秒后就上了公网，而且推送成功时一个字都不打印。
-  上线时怎么开见 [deploy/README.md](deploy/README.md)。
+在 Claude Code 中运行：
 
-键盘：`↑↓` 移动 · `g` 依次切换图/列表/数据流 · `p` 在开发路径和定稿流程之间切 ·
-`n` 从选中节点派生 · `e` 编辑 · `/` 搜索
-编辑时：`Ctrl+B` 粗体 · `Ctrl+I` 斜体 · `Ctrl+Enter` 保存 · `Esc` 取消
-
-## 写：插图和表格的成本要足够低
-
-正文是 markdown + 实时预览，**不是所见即所得**——`note.md` 必须保持人能直接读、
-能 grep、能 diff，所以不引入会生成 HTML 的富文本编辑器。代价由这几件事补回来：
-
-- **截图直接 `Ctrl+V`** 粘贴到编辑框，自动上传到该步骤目录并在光标处插入。
-  光标会落在 `![|](图名)` 的方括号里，接着打字就是图注。
-  同一张图粘贴两次只存一份（按内容哈希命名）。
-- **从 Excel / Google Sheets / 网页表格复制**的内容直接粘贴，自动转成 markdown 表格。
-- 文件可以拖进编辑框（插在光标处）或拖到阅读页（追加到正文末尾）。
-- 工具栏 12 个按钮：粗体 / 斜体 / 行内代码 / 标题 / 列表 / 任务 / 引用 / 代码块 /
-  链接 / 图片 / 表格 / 分隔线。
-- 编辑时左边的图会让位，整个工作区变成「编辑 | 预览」两栏——写「为什么」是这个
-  系统的核心动作，值得一块像样的书写台。
-
-## 读：给人看的排版
-
-- **图**：独占一段的图片渲染成带图注的 `figure`（图注取 `![alt](src "图注")` 里的
-  引号内容，没写就用 alt）。点击放大看原图。
-- **表格**：`:---` / `---:` / `:---:` 控制列对齐；**没写对齐时，整列都是数字的列
-  自动右对齐并用等宽数字**，小数点自然成列。宽表格在自己的容器里横向滚动，
-  不会把版面撑坏。
-- **代码块**：显示语言标记，悬停出现复制按钮。
-- 正文行长限制在 76 字符——超过这个宽度人眼容易串行。
-- 正文用衬线体，id / 日期 / commit / 文件名 / 命令用等宽体：一眼分清哪些是机器
-  记录的、哪些是自己判断的。
-
-## 三个视图
-
-**图** —— 自上而下的树，节点是卡片。看结构：哪里分了叉、哪条是主线、哪条断了。
-三种边（普通延伸 / 互斥候选 / 汇回）各有颜色和形状，见下面「树上有三种边」。
-用 Reingold–Tilford 紧凑布局，父节点永远居中于它的子节点。卡片上会标出这一步有
-几张图、几个附件。树大了用底部的缩放条，或 `Ctrl` + 滚轮。
-
-**列表** —— git graph 那样的轨道图 + 定高行。看全貌：几百步时用它扫和搜最快。
-主线恒在轨道 0，选主线用的是"这一支还要往下延伸多远"——精确地说是**子树高度**
-（叶子记 0，父 = 1 + 子的最大值），平局取 id 序最小的那个。不是"哪个子节点 id 最小"
-（最早尝试的那条支往往是后来废掉的那条），也不是"哪个子树的节点最多"
-（一个死胡同下面挂五个快速小试验，节点数能压过真正走下去的那条深链）。
-
-**数据流** —— 画的是 `input:` 那张 DAG（"这些字节从哪来"），不是树。看的是
-"这个数字是从哪几步的产物算出来的"、"我改了这一步谁会跟着错"。图例分成三档：
-只有树边、只有数据边、两者重合——**重合的占绝大多数**，不给它单独一档的话，
-读者会以为数据流图画错了。
-
-窄屏（<760px）第一次打开默认走列表视图：图的画布是绝对像素，手机上等于一屏一个节点
-全靠拖；列表的轨道只有十几像素宽，窄屏上完整可读。切到图视图会自动缩放到适应宽度，
-选择会被记住。
-
-三个视图共用同一份数据和同一套选中逻辑（`g` 依次切换）。布局都是纯函数算好的，
-视图只负责画。
-
-图和列表上都能看到**可溯源性**：自身还停在 L0 的节点标一个 `L0`，最近一次复现失败的
-标一个 `↺✕`。详情面板里有完整的一栏——自身等级、整条链的等级、最弱的那一环
-（可点跳过去）、还缺什么的待办清单、从根到自己的等级链条、以及全部 `repro` 记录。
-最弱一环沿的是 **parent ∪ input** 这个依赖闭包，所以整链等级可能比面包屑里任何
-一环都低——面板会说明它是从哪条边找到的。
-
-这三个视图画的都是**开发路径**：全部记录，含走不通的、含还没决定的岔路口。
-给别人照着做、给论文 Methods 用的是另一条——顶栏的切换器分两级，上面一级是
-**开发路径 / 定稿流程**（`p` 键），下面一级才是图/列表/数据流（`g` 键）。
-两级不是四选一：`g` 换的是**画法**，`p` 换的是**看的是哪一份东西**。见下面「两条路径」。
-
-## 找得回来、写得不丢
-
-- **跨项目搜索**：顶栏的搜索框可以在「本项目 / 全部项目」之间切。
-  "之前好像在某个课题里试过对比学习，最后放弃了"——这是这套系统存在的理由之一，
-  人不该被迫一个项目一个项目点进去各搜一遍（agent 一次 `trace_search` 就跨全部项目了）。
-- **草稿**：正文、标题、外部路径边写边存进 localStorage。按 `Esc`、点面包屑、
-  点自己刚写的 `[[007]]`、按后退键、关标签页——都不会让写了十分钟的记录蒸发。
-  下次打开是一条"有草稿"的提示，恢复还是丢弃由你决定，不会自动替你套上。
-- **保存冲突**：见下面 P2 那段。409 时把服务器版本和你正在编辑的版本并排摆出来、
-  逐行标出差异，三个出口：回编辑器 / 保留服务器版本（你的留在草稿里）/ 用我的覆盖。
-- **同步状态**：顶栏一个 ⇅ 图标。自动 git 同步失败或者根本没配好时它会变红，
-  悬停给出原因和修法，点一下立刻重试一次。平时安静。
-
-## 双语
-
-两件不同的事，分开做：
-
-| | 是什么 | 默认 | 怎么切 |
-|---|---|---|---|
-| **界面文案** | 按钮、标签、提示、错误 toast、L0–L4 的说明 | **英文** | 顶栏的语言开关，选择记在浏览器里 |
-| **记录内容** | `note.md` 的标题和正文、项目洞察 | 你写的那种语言 | 有译文就显示译文，没有就回退到原文并说明 |
-
-界面文案两份都在 `web/i18n.js` 里（零依赖、无构建，`file://` 下照样能切）。
-中文保持不变的有：MCP 工具描述、Python 侧的报错、以及 `FORMAT.md` / `README.md` /
-`SKILL.md` 这些文档本身。
-
-### 记录内容怎么双语
-
-存储是**双文件**：结构只存一份，译文只带正文。
-
-```
-007_加入标题字段/
-├── note.md        ---  id: 007 · parent: 005 · status: done · title: 加入标题字段…
-│                  ##  为什么 / 做了什么 / 结果 / 结论 / 下一步
-└── note.en.md     ---  title: Add title field…            ← front-matter 里只准有 title
-                   ##  Why / What / Result / Conclusion / Next
-```
-
-**译文的 front-matter 里只准有 `title`**（项目笔记是 `name`）。
-`id` / `parent` / `status` / `commit` 这些结构键写进去会被读都不读地丢掉
-（步骤的译文还会报一条警告，项目笔记那一侧是静默的）。
-
-> 这条是硬的，因为它就是上一代系统的死因：同一个事实存在两处，写一处漏一处。
-> 允许 `note.en.md` 里的 `parent:` 生效，等于把双真相源请回来——而且更隐蔽，
-> 两份值平时看着都对，只有改了其中一份才炸。**`note.md` 永远赢。**
-
-小节名有一张封闭词表（`为什么`↔`Why`、`结论`↔`Conclusion`、洞察的 `无效`↔`Doesn't work`…），
-逐字对照表和完整规矩在 [FORMAT.md](FORMAT.md) 第 13 节。
-
-### 翻译怎么补
-
-翻译走**单独一个工具**，它永远不动原文：
-
-```
-trace_translate(project="我的课题", lang="en", step="007",
-                title="Add title field, accuracy 0.943 → 0.951",
-                body="## Why\nThe TF-IDF baseline discards word order.\n")
-
-trace_untranslated(project="我的课题", lang="en")     # 还欠哪些，现算
-```
-
-`trace_new_step` / `trace_update_step` 上**没有** `body_en` 这类参数，这是有意的：
-原文和译文各走各的写入路径，于是「建完步骤马上补翻译」和「过几天回来再补」是
-**同一条路径，只是时机不同**，不需要预先决定用哪一种。
-
-「还没翻译」是**派生状态**——`note.en.md` 在不在，扫一眼就知道，和「有几个子节点」
-一样绝不存储。所以缺翻译**不报警告、不加徽标、不算缺陷**：只写了中文的记录照样是
-可溯源的。它只在界面切到英文而这一步没有英文版时，由页面如实说明并回退到原文。
-
-同理，系统**不判断「翻译过时了」**：要判断就得把翻译当时 `note.md` 的指纹存进译文，
-那是把派生关系变成存储字段（P1 禁止），而且手改一次 `note.md` 那个指纹就变成谎话。
-理由见 [FORMAT.md](FORMAT.md) 第 13 节。
-
-### G4 在双语下仍然成立
-
-```bash
-grep -rn "放弃" projects/          # 中文版里的那句结论
-grep -rn "abandoned" projects/     # 英文版里的同一句
-```
-
-同一步的同一条结论，两种语言各有一份纯文本，各自都能回答「我当年为什么放弃了 X」。
-双语没有引入任何需要程序才能解开的东西——多的只是同一个目录里多一个 `.md`。
-
----
-
-## 四条范式（所有设计都从这里推出来）
-
-**P1 · 纯文件即数据库.** 一个项目 = 一个目录，一个 step = 一个目录，`note.md` 是唯一权威。
-没有数据库、没有中心索引、没有 manifest。
-
-> 于是不存在"索引和实际内容不一致"这种状态。新建一步就是新建一个目录——
-> 不需要注册。你可以直接 `mkdir` + `vim note.md`，页面五秒内自己跟上。
-
-**P2 · 只追加.**
-
-> **只追加的地基是"不丢历史"，不是"不能改结构"——记下来就不丢。**
-
-具体分成两半：
-
-- **`id` 不可改、不重编号。**改 `id` 的 API 请求一律 409。这是溯源能成立的前提：
-  笔记里写的"见 002b"、论文脚注里的引用，永远有效。项目的 slug 同理——
-  改显示名不动目录名，已经发出去的链接不会失效。
-- **`parent` 可以改，但必须留下审计。**`PATCH {"parent": "013b", "reason": "…"}`
-  **就是**那次移动——不另开路由，但它走的是另一条代码路径，返回的也不是步骤而是
-  一份移动审计。三条硬规矩：**原因必填**（不写是 400）；**不许和改正文/状态混在
-  一条请求里**（那会逼出「写两次盘」或者「悄悄丢掉一半」，也是 400，并点名多带了
-  哪些字段）；每移动一次就在 `note.md` 的 front-matter 里**追加**一行
-  `moved: 日期 | 原 parent | 新 parent | 谁 | 原因`。可以移动多次，顺序即历史，只追加。
-  把原样的 `parent` 跟着整份步骤 PATCH 回来（网页保存正文就是这么发的）不算移动，
-  不报错，也不会在历史里留一条什么都没改的审计。
-
-> **为什么这个改动是对的。**没有移动能力的时候，人被逼出来的是**更坏**的东西：
-> 一整条支挂错了父节点，于是把两个节点的**正文对调**。结果是创建日期和内容
-> 从此对不上号，`[[013b]]` 指向的东西悄悄换了一个，而这次修改**一条记录都没留**。
-> 能移动 + 强制写原因，历史反而完整。
-
-可变的是 `status` / `title` / `body` / `date` / `commit` / `author` / `tags` / `lang` /
-`paths` / `inputs` / `code`（`parent` 走移动那条路）。`repro` 复现记录**只能追加**，
-没有替换那条路；`moved` 只能由移动本身写，PATCH 碰不到它。
-
-"只追加"在**并发**下同样要成立，所以写接口有乐观并发控制：每一步都带一个
-`digest = sha256(note.md 原始字节)[:12]`，`PATCH` 时把它放进请求体的 `expect`
-或者 `If-Match` 头，对不上就 409 且一个字节都不写。409 的响应体里带着服务器
-当前那一份完整内容，网页会把两边并排摆出来让人自己挑，而不是只弹一句"冲突了"。
-不传 `expect` 就是不检查（agent 的追加式写入不受影响）。
-
-> 挡的是这个：你在网页里编辑 004 的正文，同一时间你自己的 Claude 会话跑完实验
-> 往 004 里追加了「结果」和产物路径。没有这道闸门的话，你一按保存，那份
-> **打开编辑器那一刻**的旧快照整组盖回去，agent 写的东西无声消失，两次请求都是 200。
-
-删除是这条原则**唯一的例外**，只用于"这条记录本身就不该存在"——误建、测试数据、
-不小心粘进去的令牌。它和 `dead` 是两回事：`dead` 是研究结论，删掉真实的失败
-等于抹掉后来人最需要的线索。删除必须写原因，原因记进项目的 `project.md`；
-代价（id 可能被重用、子步骤变孤儿、别的步骤的 `[[006]]` 和 `input: 006` 指空）
-每次都会明确报出来——最后那一条尤其要看：`input:` 是「这些字节从哪来」的声明，
-可溯源性正沿着它上溯，而 id 一旦被重用，那些边会**无声地**改指到别的步骤上。
-详见 [FORMAT.md](FORMAT.md) 第 8 节。
-
-**P3 · 编译，而不是同步.** 视图是文件系统的纯函数。构建无状态、幂等、可随时删掉重来。
-实时推送推的是"版本变了，重新编译"信号，不是增量 patch。
-
-**P4 · 失败是一等公民.** `dead` 不是错误状态，是一种结论。死胡同在图上必须可见，
-不能折叠、不能默认隐藏，而且不能只靠"变灰"表达——变灰的语义是"不相关"，不是"结论为否"。
-
-**最硬的约束是"没有这个工具也能读"。** 删掉全部程序后，`grep -r "放弃" projects/`
-仍然能查到你半年前为什么放弃了某条路。和这条冲突的设计一律否决。
-
----
-
-## 目录结构
-
-```
-research-trace/                     ← 仓库本身就是插件
-├── .claude-plugin/
-│   ├── plugin.json                 插件清单：skills / commands / agents / mcpServers / userConfig
-│   └── marketplace.json            市场目录，于是 /plugin marketplace add 就能装
-├── agents/                         子 agent
-│   ├── trace-auditor.md            查证：路径还在不在、代码找不找得回来（只读，不重跑）
-│   └── trace-reproducer.md         重跑：按商定范围复现并写回 repro 记录
-├── skills/
-│   ├── research-trace/SKILL.md     日常记录的规矩
-│   └── trace-audit/SKILL.md        溯源评估的对话流程（派 agent、问用户、写回）
-├── commands/doctor.md              /research-trace:doctor —— 诊断 MCP 接通没有
-│
-├── trace_core.py                   纯函数内核：scan/parse/validate/order/lanes/tree/traceability
-├── trace_write.py                  唯一写入路径 —— CLI / 网页 / MCP 全走这里
-├── trace_mcp.py                    MCP server（手写 JSON-RPC，零依赖）← 插件清单指向它
-├── trace_server.py                 FastAPI：路由 + SSE + 鉴权
-├── trace_git.py                    debounce 自动 commit + push（同步的是数据仓）
-├── trace_cli.py                    init / projects / new-project / new / rm / check / paths / build / serve / url
-├── web/                            无构建步骤，不引 CDN
-│   ├── index.html
-│   ├── style.css
-│   ├── app.js                      视图 + 编辑器 + 交互
-│   ├── md.js                       极简 markdown 渲染器（见 FORMAT.md 第 12 节）
-│   └── i18n.js                     界面文案的中英两份（默认英文，见「双语」一节）
-├── tests/                          pytest（内核 / 布局 / 写入 / 服务 / MCP / 插件 / 文档）+ node --test（markdown 与前端纯函数）
-├── FORMAT.md                       记录格式标准：note.md 和 project.md 写什么、怎么可视化、L0–L4 怎么判
-├── deploy/                         Caddyfile · systemd unit · 部署说明
-└── projects/                       ← 你的数据（上线时用 --data-dir 指到私有仓库）
-```
-
-数据那一侧长这样——**没有索引、没有 manifest，目录结构本身就是数据库**：
-
-```
-projects/
-└── 我的课题/
-    ├── project.md                  项目洞察 + 删除记录
-    ├── project.en.md               ← 可选：项目笔记的英文版
-    └── steps/
-        ├── 001_跑通基线/
-        │   └── note.md
-        └── 007_加入标题字段/
-            ├── note.md             结构 + 主语言正文（唯一权威）
-            ├── note.en.md          ← 可选：只有 title 和译文
-            └── loss_curve.png      附件
-```
-
-Python 模块留在仓库根，因为这个仓库同时也是一个 pip 包（`pyproject.toml` 在根，
-`trace-mcp` 是它的入口点）和一个能独立跑的服务；插件清单用
-`${CLAUDE_PLUGIN_ROOT}/trace_mcp.py` 指过去，装的时候整份都会进插件缓存。
-
-只有一个函数会创建 `note.md`。上一代系统的 bug 根源就是存在第二条写入路径
-（绕过 API 直接写库），导致父子关系只写进了一半的地方。这里用结构杜绝。
-
-**代码仓和数据仓建议分开。** `config.json` 里的 `data_dir` 指向哪，`projects/` 就在哪，
-自动 git 同步也就同步哪个目录。公开这份代码、把数据放进另一个私有仓库：
-
-```json
-{ "data_dir": "../trace-data", "git": { "enabled": true, "remote": "origin" } }
-```
-
-## note.md 格式
-
-```markdown
----
-id: 007
-parent: 005
-status: done
-title: 加入标题字段，准确率 0.943 → 0.951
-date: 2026-03-11
-commit: c1d2e3f
-author: agent:claude
-tags: features, transformer
-moved: 2026-03-12 | 004 | 005 | human | 标题字段是在 005 的清洗结果上做的，挂 004 是记错了
-input: 005 | agnews-clean/train.jsonl
-path: /blue/<组>/<用户>/data/agnews-clean | input | 去重后的训练集 | n=120000 size=12884901888 checked=2026-03-11
-path: /orange/<组>/<用户>/ckpt/run042/best.pt | output | 权重 | size=277872640 sha256=7d4e1a9c
-code: snapshot | /orange/<组>/<用户>/run_snapshots/20260311 | manifest=MANIFEST.md5 n=43
-repro: verified | 2026-08-08 | agent:claude | 干净 split 重跑 3 个种子，0.9506±0.0008
----
-
-## 为什么
-## 做了什么
-## 结果
-## 结论
-## 下一步
-```
-
-| 小节 | 写什么 |
-|---|---|
-| `## 为什么` | 承接上一步的什么发现，想验证什么假设 |
-| `## 做了什么` | 改了哪些文件，跑了什么命令 |
-| `## 结果` | 数字、图、观察 |
-| `## 结论` | 假设成立与否 |
-| `## 下一步` | 派生出哪些分支 |
-
-正文格式不强制，但这五个小节对应科研步骤的完整生命周期。
-**二级标题**要和上面**逐字一致**——评级和 `check` 就是按这几个名字去正文里找内容的，
-写成 `## 为什么（承接上一步）` 就等于没写。
-**下面可以自由用三级及更深的标题**：一节的内容包含它下面所有更深的标题及其内容，
-只有同级或更浅的标题才结束这一节。
-英文写的记录用 `## Why` / `## What` / `## Result` / `## Conclusion` / `## Next`
-这一套（可以顺手加一行 `lang: en` 声明正文是什么语言，不写也不影响解析）。
-完整的写法契约（每个键什么意思、指标表怎么写、图注怎么写、L0–L4 怎么判、
-渲染器认哪些 markdown）在 [FORMAT.md](FORMAT.md)。
-
-这几个键各自解决一个具体问题（后四个上面的示例里没有：`branch` / `decision` 只在分了叉
-时才写，`pipeline` 只在算出来的定稿流程需要被推翻时才写，`chapter` 只在开启并列的
-一块时写一次）：
-
-| 键 | 回答的问题 | 详见 |
-|---|---|---|
-| `input` | **这些字节从哪来**——数据依赖是 DAG，树上只挂得下一个 parent | [FORMAT.md](FORMAT.md) 第 6 节 |
-| `code` | 代码不在 git 里时（快照目录、容器镜像）它在哪 | [FORMAT.md](FORMAT.md) 第 7 节 |
-| `moved` | 这一步被挪过位置，谁挪的、为什么 | [FORMAT.md](FORMAT.md) 第 14 节 |
-| `branch` | **这一步和它 parent 之间那条边什么意思**：接着往下做，还是一个互斥候选 | [FORMAT.md](FORMAT.md) 第 15 节 |
-| `decision` | **这一步底下那个岔路口在决定什么**——和「为什么」一样只能人写 | [FORMAT.md](FORMAT.md) 第 15 节 |
-| `pipeline` | **这一步算不算定稿流程的一环**（`include` / `exclude`），用来推翻算出来的结论。理由必填 | [FORMAT.md](FORMAT.md) 第 16 节 |
-| `chapter` | **这一步开启了哪一块**（主实验 / 消融实验 / 数据准备）。只写在开启那条线的**那一步**上，整条子树沿 parent 继承 | [FORMAT.md](FORMAT.md) 第 17 节 |
-
-`path` / `repro` / `input` / `code` / `moved` 这五个键**可以重复多行**，其余的后写覆盖先写。
-
-每个项目还有一个 `project.md`，装**项目级**的沉淀——「回译在这个数据集上一直没用」
-是三次尝试之后的判断，挂在哪一步都不对。四个固定小节 `核心想法` / `有效` / `无效` /
-`坑`，外加一个由系统自己写的 `已删除`（删掉一步之后，「为什么删的」只剩那一行）。
-它的 front-matter 里还有 `result:`——**哪一步是成果**，全项目唯一推导不出来的一行，
-定稿流程从它长出来（见上面「两条路径」）。格式见 [FORMAT.md](FORMAT.md) 第 11 节。
-
-每条洞察有一个写在行首反引号里的 id，于是"当时以为是 1,099 个，查清楚是 944 个"
-不必再整段重贴：给 id 就地改那一行，或者新记一条并写上 `· 取代 p1`。
-**被取代的那条不删，只在界面上折叠**——"当时是这么以为的"本身是信息，
-删掉它，半年后的人会以为一开始就查清楚了，然后重走一遍那条弯路。
-"p1 已被取代"是**派生**的（只有取代者身上写着那半句），磁盘上永远只有一份。
-
-**「为什么」是整个系统里唯一无法自动生成的字段。** 日志能自动存，commit 能自动记，
-环境能自动 freeze，只有"我当时为什么决定试这个"必须人写。系统的全部设计目的，
-就是让写这一段的成本低到你愿意每次都写。
-
-front-matter 用手写解析器而不是 YAML：`title: 试了 3:1 采样` 在 YAML 里是语法错误，
-而这类标题在科研记录里很常见。规则就是"冒号左边是键、右边整行是值"。
-
-"右边**整行**"要当真：`status: done   # wip | done | dead` 里那段行尾注释是值的一部分，
-会让 status 变成未知值退回 `wip`。整行以 `#` 开头才是注释。
-
-正文里写 `[[003b]]` 会渲染成跳转链接，并在 003b 的页面显示"被这些步骤引用"。
-
-## `parent` 和 `input` 是两件事
-
-一句话：**`parent` 是"我当时接着哪一步想"，`input` 是"这些字节从哪来"。**
-
-森林是**单父树**（记录的派生关系），数据流是 **DAG**（谁吃了谁的产物）。多数时候
-两者一致，不一致的那些恰恰最该写清楚——016 树上挂在 013b 下面，实际读的是 013 的
-`pocket_composition.csv` 和 014 的 `rmscore_pairs.csv`：
-
-```
-parent: 013b
-input: 013 | pocket_composition.csv
-input: 014 | rmscore_pairs.csv
-```
-
-森林**没有**升级成多父 DAG（那会让行序变成拓扑排序、轨道分配要处理合并边，
-复杂度约翻三倍），图和列表画的仍然是树。`input` 是**另一张图**：反向边
-"谁消费了本步的产物"是扫描现算的，从不存储。
-
-可溯源性沿着数据依赖一起上溯——013 什么都没记，016 的整链等级就被它压住，
-**哪怕 013 根本不在 016 的面包屑里**。详情面板会说明最弱一环是从哪条边找到的。
-
-综合了 A 线和 B 线的**结论**（而不是产物）仍然写 `[[003b]]`；真的读了对方产出的
-文件，写 `input:`。完整规矩见 [FORMAT.md](FORMAT.md) 第 6 节。
-
-## 树上有三种边
-
-父子边画出来长得一模一样，但它们说的不是同一件事。**判别只要问一句
-「这两条能同时成立吗」**：
-
-| 关系 | 什么时候 | 怎么写 |
-|---|---|---|
-| **普通延伸** | 接着上一步往下做，各做各的 | 什么都不写（默认） |
-| **互斥候选** | 同一个问题的两个答案，**只能选一条走下去** | 每个候选各写一行 `branch: alternative` |
-| **汇回** | 一条支线的产物，后来参与了另一条线上更靠后的一步 | 一行 `input:`，**不是**第二条父子边 |
-
-```
-011  decision: 类别不平衡怎么处理？两条路只能选一条走下去
-├─ 012   branch: alternative | 先试最便宜的：只调采样权重      status: dead
-│  └─ 014  input: 013 | scores.csv        ← 汇回：读了另一支的产物
-└─ 012b  branch: alternative | 换 focal loss，改动大但可能更稳
-   └─ 013                                  ← 产出 scores.csv
-```
-
-这三样东西**只有 `branch:` 和 `decision:` 两行是新写下来的**，其余全是派生的：
-
-- **「这一组有谁」**是扫父节点的孩子现算的。父节点上绝不写候选清单，兄弟之间也
-  绝不互相登记（`alt: 012b` 那种写法就是双真相源，一个候选被移走它立刻过期）。
-- **「选了哪个」**就是**其余候选标 `dead`**。没有「选中了谁」这个字段，界面上也永远
-  不会有「标记赢家」那个按钮——那个按钮就是第二份真相。
-- 于是白拿一个最想要的信号：**一组里还有两个以上没标 `dead` ⇒ 这个岔路口还没决定**。
-  「我手上还有几个岔路口悬着」以前只能靠人记。同时开几条线是常态**不是错**，
-  所以那条提示的措辞是提醒，不是责备——把它写成错误，人就会为了让界面干净
-  随手标一个 `dead`，那是拿假结论换绿色。
-- **汇回**不需要任何新字段：它就是 `input:`。判据是「两端在同一棵树里，且谁都不是谁
-  的祖先」，连它们**分家的那个岔路口**都是算出来的。
-
-### 三种边的视觉编码
-
-原来的规矩是「颜色只作线型的补强，不单独承载信息」。**这一条被放宽了，但它的目的
-没有变**：不依赖颜色也要读得出来。放宽的是手段——颜色现在可以承载「这是哪一种边」，
-代价是**每一种关系必须再配一个非颜色的通道**：
-
-| 关系 | 颜色 | 非颜色的冗余通道 |
-|---|---|---|
-| 普通延伸 | 中性 | 正交折线（和以前一样） |
-| 互斥候选 | 强调色 | 分叉处一道**弧形括弧**把这一组括起来 + 「N 选 1」/「已定」/「都不行」标注 |
-| 汇回 | 第三种颜色 | **曲线 + 箭头**——树上的边从不弯，形状本身就说明「它不属于树」 |
-
-灰度打印出来、色觉障碍的人看，三种边仍然分得清：颜色负责一眼扫到，形状负责说得准。
-
-**另外两个通道一个都没有动，它们仍然是硬的**：
-
-- **线型 = `status`**（`done` 实线 / `wip` 虚线 / `dead` 点线）
-- **不透明度 = 是否在选中的祖先链上 / 是否命中搜索**
-
-所以新增的关系只能用颜色、边的走向形状（正交折线 vs 曲线）和叠加装饰（括弧、
-箭头、标注）这三样，**不许**借线型，**不许**借不透明度。一个通道一旦借出去，
-「这条边是虚的」就再也说不清是「还在跑」还是「它是个候选」了。
-
-写法和四条只提示不降级的诊断见 [FORMAT.md](FORMAT.md) 第 15 节。
-
-## 两条路径：开发路径（记录）与定稿流程（方法）
-
-十四步里真正产出那个数字的可能只有六步。其余八步是试过不行的、是画了一眼就没再用的
-图、是还没结掉的岔路口。**这两样东西都要留，但它们回答的不是同一个问题**，
-所以同一个项目给出两条路径：
-
-| | **开发路径** | **定稿流程** |
-|---|---|---|
-| 是什么 | 这棵树的**全部**，含 `dead`、含还没决定的岔路口 | 真正产出成果的那**一条链** |
-| 回答 | **我当初是怎么走到那儿的** | **别人该怎么做** |
-| 给谁 | 自己、查问题的人、半年后的自己 | 合作者、审稿人、论文的 Methods |
-
-**为什么两个都要留。**只留开发路径，别人拿到十四步，得自己猜哪六步是真流程——
-猜错一步复现出来的数字就对不上，而且不知道错在哪。只留定稿流程，半年后的你自己
-不知道**当初为什么排除了另一条路**：那句话只写在被剔掉的那几步的「结论」里，
-删掉它们就等于把「删掉全部程序后 `grep -r` 还能回答为什么放弃了 X」作废。
-
-> 定稿流程**不是**开发路径的精简版。一个说「怎么走到那儿的」，一个说「该怎么做」。
-
-### 只声明一件推导不出来的事
-
-`project.md` 的 front-matter 里，一个成果一行，可以写好几行：
-
-```
-result: 023 | 亲和力预测：AUC 0.91（论文图 3）
-result: 031 | 图 4 的消融
-```
-
-**其余全部是算出来的。**从每个成果出发沿 `input:` 反向做闭包，一步没写 `input:`
-时退回它的 `parent`（那是它事实上的前一步），剔掉 `dead`。**成员清单一个字都不存**
-——存了就是一份会漂移的中心索引（P1 禁止）：你移动一步、补一条 `input:`、把某支标
-`dead`，流程要自己跟着变，而一份落盘的清单只会理直气壮地列着已经不对的东西。
-所以界面上**永远不会有**一个「编辑流程成员」的输入框，和「标记赢家」那个按钮
-不存在是同一条理由。
-
-算出来的结论不总是对的（`parent` 是「我当时接着哪一步**想**」，不保证有字节流过来），
-所以每一步自己可以写一行例外——和 `branch:` 同一个套路，声明写在**那一步身上**，
-不在项目上：
-
-```
-pipeline: exclude | 探索性的，图很好看但没进最终流程
-pipeline: include | 流程的最后一环，可没有别的步骤吃它的产物，闭包够不到它
-```
-
-**理由必填。**这是它和 `branch:` 唯一的分歧：候选组在树上看得见，而 `pipeline:`
-除了改变一份导出之外不留任何痕迹，没有那半句话就分不清是想清楚的决定还是一次误点。
-
-### 三个白拿的判断
-
-1. **整条流程的可溯源等级 = 其中最弱的一步**，并指名是谁拖的后腿。一个数回答
-   「别人能不能照着做出来」——写论文该报的是这个，不是某一步自己的等级。
-2. **流程里出现了 `dead` 的一步**：你的结果依赖着一条你自己已经放弃的路。
-   这是**必须**说出来的（warn 级，且要点名）。剔除本身不会让它消失——被剔掉的步骤
-   上游照样接了过来，所以流程看着是完整的，正因为看着完整才必须点名。
-3. **流程里有 L0/L1 的步**：这几步别人跑不起来，投稿前就该补。
-
-### 导出：三样，同一份派生
-
-三样都从**同一份**算好的流程长出来（不许各算一遍），并且逐字节确定（P3）——
-同样的记录两次导出一致，所以该重新生成，不要把导出存进仓库。
-
-| 导出 | 什么场合 |
-|---|---|
-| **图**（自包含 SVG） | 直接放进论文。无外部资源、无脚本，**黑白打印可读**——这次不许只靠颜色 |
-| **Methods 草稿**（markdown） | 按流程顺序，每步写清做了什么、完整命令、代码位置、产物路径与校验和 |
-| **独立页面** | 发给合作者。沿用现有静态导出那套，只含定稿流程 |
-
-**Methods 草稿是初稿，不是成品。**它只把记录里**已有的事实**按 Methods 的骨架排好，
-**不生成论文腔的句子**——凭空生成的那种句子读起来最像成品，而它描述的是一件
-没有发生过的事。发出去之前自己读一遍。
-
-```bash
-python trace_cli.py result -P <项目> 023 --note "亲和力预测 AUC 0.91"   # 声明成果
-python trace_cli.py result -P <项目> 023 --drop                        # 撤销声明
-python trace_cli.py pipeline -P <项目>                                 # 看这条流程
-python trace_cli.py pipeline -P <项目> --methods > methods.md          # Methods 草稿
-python trace_cli.py pipeline -P <项目> --svg fig.svg --page share.html # 图 + 独立页面
-```
-
-`build` 也会给每个声明了成果的项目额外生成这三样：`p/<项目>/pipeline.svg` ·
-`pipeline.md` · `pipeline.html`——静态导出里那三个按钮就指向它们。
-
-**三样只有一份实现**（Python 侧那三个纯函数），CLI、REST、MCP、`build` 和网页
-全走它。网页上那张图不是页面自己画的：服务模式下它去取上面那条 `figure.svg`，
-静态模式下读 `build` 灌进页面的同一批字节。所以**屏幕上看到的就是发出去的那一份**
-——各画一遍的话，你会对着一张图讨论、把另一张投出去。
-网页上是顶栏「定稿流程」那一档，MCP 那边是 `trace_pipeline` / `trace_result`。
-
-**两条路径互相跳得过去。**「这一步当时有 3 个候选，为什么选了它」——那个岔路口
-只在开发路径上看得见，而它正是两条路径都留着的意义；反过来，开发路径上属于定稿
-流程的步骤带一个徽标，一点就跳进流程。
-
-完整的推导规则、七条诊断和写法见 [FORMAT.md](FORMAT.md) 第 16 节。
-
-## 一个项目里并列的几块：章节
-
-同一个项目内部本来就不是一条线：**主实验**、**消融实验**、**数据准备**各有各的探索
-路径，在论文里各占一段 Methods。森林（多个根）早就给了「独立的路径」，缺的只是给
-这几条线**起个名字**，好让「消融这一块」能被当成一个单元来看。
-
-一行就够，写在**开启那条线的那一步**上，整条子树沿 `parent` 继承：
-
-```
-chapter: 消融实验 | 逐个拿掉模块，对着主实验的 023 比
-```
-
-**只标开启那条线的第一步。**底下那二十步一个字都不用写——每一步各标一遍就成了二十份
-会漂移的拷贝：改一次章节名要改二十个文件，把一支挪走它还带着一行过期的声明。
-反过来，`moved:` 之后章节自己跟着走，改的是 `parent` 一个字。想让某一步脱离，
-它自己声明一个新名字即可；一路到根都没人声明就是**未分章**，
-**绝大多数项目就是这个状态，而它们一个字都不会多出来**（没有 `chapters` 那个键、
-没有多余的提示、布局一个数不变）。
-
-### 项目 / 章节 / 分叉是三样东西
-
-误用的方向是固定的：**人会拿章节去表达分叉**。各问一句话就分得开：
-
-| 问自己 | 是哪一种 | 怎么写 |
-|---|---|---|
-| 它们会写进**同一篇论文**吗？不会 | 两个**项目** | 各建一个项目 |
-| 这几块**要不要都留着、都写进论文**？要 | 几个**章节** | 开启那条线的第一步写一行 `chapter:` |
-| **这两条能同时成立吗**？不能，只能选一条 | 一组**互斥候选** | 各写一行 `branch: alternative`，定了把其余的标 `dead` |
-
-**章节之间不互斥**，这就是分界线：消融不是主实验的替代方案，两者同时成立、都要留。
-拿分叉去写章节，等主实验定下来你就得把消融那一支标 `dead`——而 `dead` 的意思是
-「这条路走不通」，等于把一整节 Methods 判了死刑。
-
-### 白拿的三样
-
-- **每个章节各有自己的定稿流程。**`result:` 指的那一步在哪一章，这条流程就属于哪一章
-  ——主实验一段 Methods、消融一段，论文里本来就是两段。三样导出因此可以**按章节导**。
-  两组会相交（消融当然吃着主实验的产物），所以那是把**同一张 DAG 切开**，
-  不是每章各算一遍闭包；借来的上游标成「借自哪一章」，不悄悄混进本章
-- **每个章节各有自己的可溯源等级**（本章最弱的那一步说了算，并点名是谁）。
-  「主实验能重做、消融不行」比一个项目级的总分有用得多——要补的记录从来不是均匀分布的
-- **跨章节的边要画出来，不是藏起来。**消融吃主实验的产物（`input:`）说的正是
-  **「消融是对着主结果测的」**，而 `parent` 跨过去说的是「消融这条线从主实验的哪一点
-  分出去的」。它是两章之间唯一的连接，藏起来两章就成了两个不相干的项目
-- **章节名和那句说明跟着一起能搜。**「消融那块当时是怎么想的」`grep -r 消融实验`
-  一秒就答得出，站内搜索答不出就等于比 grep 弱。判据也照着 grep 来：只命中**声明它
-  的那一步**，继承来的那二十步不算——它们文件里一个「消融」都没有，一起命中只会
-  把真正的答案（这条线从哪儿开始）埋掉
-
-**两件刻意不做的事**，免得后来人以为是漏了：**id 不按章节重编号**（消融不从 001 开始，
-`[[007]]` 和论文脚注要在整个项目里唯一，那是只追加的地基）；**章节不嵌套**
-（名字里可以写 `主实验/数据准备`，显示时按 `/` 分组，语义上仍然是一层）。
-
-写法、继承规则、四条诊断见 [FORMAT.md](FORMAT.md) 第 17 节。
-
-## 外部产物的位置（溯源的另一半）
-
-GB 级的东西——数据集、checkpoint、中间特征——不进仓库。仓库里只记**它在哪**：
-
-```
-path: /blue/<组>/<用户>/data/agnews-clean | 去重后的训练集，12 GB
-path: /orange/<组>/<用户>/ckpt/run042/best.pt | 权重，265 MB，sha256:7d4e1a9c…
-path: https://github.com/你/仓库/tree/9b7d112 | 跑这一步的代码
-path: s3://bucket/exports/run042.parquet | 导出的预测结果
-path: https://zenodo.org/record/1234567 | 论文附带的公开版本
-```
-
-最简写法就是 `path: <位置> | <说明>`，可以写任意多行，竖线右边是自由文本。
-**这个写法一个字都不用改**，下面说的一切都是在它之上**可选**地长出来的。
-
-需要让机器读的时候，同一行可以再分段——角色、说明、`k=v` 属性：
-
-```
-path: /orange/<组>/pockets | output | 纯 RNA 口袋 | n=4554 size=620756992 md5=7d4e1a9c checked=2026-08-09
-path: /blue/<组>/cif_files | input | 原始 CIF | size=61203283968 missing=2026-08-09
-```
-
-判定规则只有三条（第 0 段永远是位置）：整段**恰好**是 `input` / `script` /
-`output` / `evidence` 之一 → 它是角色；整段的空白 token **全部**形如 `k=v` → 它们是
-属性；**其余一律拼进说明**。所以 `| 去重后的训练集，12 GB` 和 `| lr=3e-4 的那次运行`
-都落进说明——**顺手在说明里写个等号不会被误当成机器字段**。
-
-已知属性：`size`（字节）· `n`（条目数）· `md5` / `sha256` · `checked`（最后一次确认
-**存在**的日期）· `missing`（最后一次确认**不存在**的日期）。认不出的属性照样保留。
-
-**第二行那个 `missing=` 是这一版最实在的收益。**用户上一次手工核对 164 条路径时
-发现三个目录已经被删了，其中一个 57 GB——那本该由机器自己发现。现在
-「东西还在不在」是从 `checked=` / `missing=` **派生**出来的（两个都写着时看日期，
-晚的说了算；同一天判不存在），路径没了的那一行**不删**：
-"这份数据当年在这儿，现在没了"是溯源结论，和 `dead` 一样有价值。
-
-> **够不着 ≠ 不存在。**`/blue/` 只有在超算上才看得见，S3 要凭证，NAS 会掉线。
-> 查不到的时候什么都不写——把"查不了"记成"没了"，得到的是一条**看起来像证据**的
-> 假结论，比没有结论有害得多。
-
-代码的位置走另一个键 `code:`（`git` / `snapshot` / `container` 三种），
-`commit:` 继续支持并等价于一条 `code: git`（派生，文件里只存一份）。
-详见 [FORMAT.md](FORMAT.md) 第 7 节。
-
-位置的类型自动识别（超算 `/blue//orange//red//scratch/` · GitHub · Dropbox ·
-Google Drive · S3/GCS · Zenodo/figshare/OSF · HuggingFace/W&B · 本机盘符），
-只是给个徽章，猜错也不影响任何东西。http(s) 的会渲染成可点链接，其余的一键复制。
-
-```bash
-python trace_cli.py paths                  # 列出所有产物在哪（含角色、大小、核对状态）
-python trace_cli.py paths --kind hpc        # 只看超算上的
-python trace_cli.py paths --missing         # 只看已确认不存在的那些
-python trace_cli.py paths --check [--count] # 逐条 stat 一遍，把结论写回 checked= / missing=
-grep -rn "^path:" projects/                 # 删掉全部程序之后照样能查
-grep -rn "missing=" projects/               # 哪些位置已经确认没了
-```
-
-`--check` **只在看得见那些路径的机器上跑才有意义**：`/blue/…` 多半挂在超算上，
-在笔记本上跑只会得到一屏「够不着」，而够不着的那些**一个字节都不会写**。
-服务端也会自己定期扫一遍（见 `config.json` 的 `paths` 段），判据是同一个
-`trace_mcp.probe_path`，所以「服务端说够不着」和「agent 说没了」不会互相打架。
-`trace_cli.py check` 末尾也会汇总一次「有几处位置已确认不存在」——那不是警告、
-不计入退出码，路径没了是溯源结论不是笔误。
-
-新建子步骤时会**继承父步骤的路径**（位置、角色、说明）——同一条线上数据和代码的
-位置多半没变，改比重打省事。但 `checked=` / `missing=` / `md5=` / `size=` / `n=`
-**不会跟着抄**：那些是「有人真去看过一眼」的结论和度量，抄进一个还没跑过的步骤
-就是凭空造一条看起来像证据的假记录。
-
-## id 规则
-
-三位数字，分叉时加字母后缀：`003` 派生出 `004` / `004b` / `004c`。
-兄弟共享数字，一眼看得出兄弟关系，而且**任何已有 id 都不会因为后来多出一个兄弟而改名**。
-每个项目的 id 各自从 001 开始，互不影响。
-
----
-
-## 装成 Claude Code 插件（推荐）
-
-```
+```text
 /plugin marketplace add jinhang23/research-trace
 /plugin install research-trace@research-trace
 ```
 
-装的时候会弹一个配置框，**第一项先问这台机器是什么角色**，装完随时可以在
-`/plugin` 里改：
+插件配置：
 
-| 角色 | 什么情况 | 要填 |
-|---|---|---|
-| **server** | 数据仓就在这台机器上，直接读写文件 | 数据仓目录 |
-| **client** | 数据在另一台机器的域名后面，你通过公网管理 | 远端服务地址 + 写入令牌 |
-| **auto**（默认） | 不确定就用它：填了地址走远端，只填了目录走本地 | 按需 |
+- `url`：中央服务地址；
+- `python`：Python 3.10+ 解释器的绝对路径；
+- `capture`：默认 `on`，处理敏感内容前可以临时设为 `off`；
+- `token`：只用于旧部署兼容；使用 GitHub 设备登录后留空。
 
-选定角色之后**配错会当场报出来**，不会悄悄退回另一种模式 ——
-「我选了客户端，怎么读到的是本地空目录」这种问题最难查。
+登录工作站或 HPC：
 
-| 配置项 | 填什么 |
+```bash
+trace-v2-login --url https://trace.example.org --device-name hipergator-login-01
+```
+
+也可以直接让 Claude 调用 `trace_login`。机器保存的是 Research Trace 设备凭证，不是 GitHub
+access token；凭证可从网页撤销。
+
+### 配置私有 GitHub 备份
+
+```bash
+trace-v2-server --data-dir /srv/research-trace/data \
+  --backup-repo /srv/research-trace/private-backup \
+  --backup-branch main --backup-interval-hours 24
+```
+
+服务器启动时先备份一次，之后按间隔导出、校验、仅在内容变化时 commit 并普通 push。
+
+## MCP 工具
+
+Recorder 使用六个研究工具，另有一个登录工具：
+
+| 工具 | 用途 |
 |---|---|
-| 这台机器的角色 | server / client / auto |
-| 数据仓目录 | **含有** `projects/` 的那一层，不是 `projects/` 本身（指错一层会造出 `projects/projects`）|
-| 远端服务地址 | `https://你的域名/t/<space>`，客户端才填 |
-| 写入令牌 | 多数人不用填，见下 |
-| Python 解释器 | 默认 `python3`。**Windows 上多半要改成绝对路径** |
+| `trace_context` | 确认项目身份，读取 Overview、Chapter 和近期上下文 |
+| `trace_ingest` | 把 outbox batch 的完整原始历史上传到中央服务 |
+| `trace_record` | 创建精选 Node；不能创建 Chapter，且始终未确认 |
+| `trace_curate` | 修订 Overview、Chapter 摘要或已有 Node |
+| `trace_attach` | 保存小附件，或登记大产物的机器与路径 |
+| `trace_search` | 搜索语义记录和原始历史 |
+| `trace_login` | 使用 GitHub 账号批准当前设备 |
 
-**装完先自检。** 一条命令，不需要 Claude、不需要网络（本地模式下）：
+一次 batch 创建零个 Node 完全正常。Recorder 的目标不是“每轮都写”，而是不遗漏以后可能值得
+回看的关键认识。
 
-```bash
-python <插件根>/trace_mcp.py --selfcheck
-```
+## 数据与备份
 
-它会报解释器版本、配置从哪读的、角色、后端、项目数，**试一次写**（远端打一个必然
-404 的请求：令牌不对是 401、令牌对是 404，两种回答都不写一个字节；本地是建一个点
-开头的探针文件再删掉），并**真跑一遍 JSON-RPC 握手**。通不通、哪一项要改，它自己会说。
-插件根目录可以用 `claude mcp list` 或在 `~/.claude/plugins/cache/` 下找 research-trace。
+中央数据目录包含：
 
-**一个必须知道的不对称**：`/plugin` 里填的那些值是灌给 **MCP 子进程**的环境变量
-（`TRACE_ROLE` / `TRACE_DATA` / `TRACE_URL` / `TRACE_TOKEN`），你在自己 shell 里跑
-`--selfcheck` 是**看不到**它们的——那不代表插件坏了。自检发现这四个一个都没有时
-会把这段说明打出来，并告诉你两条查真值的路：会话里直接调一次
-`mcp__plugin_research-trace_trace__trace_projects`，或者从 `/plugin` 里把值抄出来重跑：
+- `trace-v2.sqlite3`：在线数据库；
+- `objects/`：内容寻址附件；
+- transcript chunks、事件、版本和身份信息。
 
-```bash
-python <插件根>/trace_mcp.py --selfcheck --role client --url https://你的域名/t/<space> --token <令牌>
-```
-
-最后一项值得单说：`.mcp.json` 的 `command` 是静态字符串，而 `python` 在 Windows 上
-经常指向别的软件自带的 2.x（作者机器上就是 MGLTools 的 Python 2.7.11），`python3`
-又可能只是个没有扩展名的 shell 脚本、Claude Code 起子进程时用不了。所以它被做成
-用户配置项，默认 `python3`（Linux / macOS / 超算上直接可用），需要时填绝对路径。
-
-装完跑 `/research-trace:doctor` —— 它会实跑一遍 JSON-RPC 握手，通没通、
-哪一项要改，都会直接说。
-
-装了插件之后，把本地那份 `~/.claude/skills/research-trace/` 删掉，免得和插件里的重名。
-
-## MCP（推荐给 agent 用）
-
-`trace_mcp.py` 把 trace 暴露成 16 个 MCP 工具。比让 agent 自己拼 HTTP 请求好在：
-参数有 schema（不合法的调用先被拦下）、不用生成 requests/curl 代码、
-中文不会再撞上终端编码。
-
-**零依赖。** MCP 是一份开放协议规范，`mcp` 那个 pip 包只是它的官方 Python SDK 之一。
-stdio 侧要实现的就是换行分隔的 JSON-RPC 2.0 加四个方法（`initialize` / `tools/list` /
-`tools/call` / `ping`），所以这里直接说协议，不依赖 SDK：
-
-- 任何裸 Python 3.10+ 都能跑，HiperGator 上不用往 conda 环境里装东西
-- 不会被 SDK 的破坏性改版牵连（`mcp` 2.0 就删掉了 1.x 的整套装饰器 API，
-  协议本身一个字没变）
-
-代价是协议细节得自己守住，所以测试里除了自测，还会**拿官方 SDK 的客户端连上来跑一遍
-互操作**（`tests/test_mcp.py::test_interop_with_the_official_sdk_client`，
-SDK 只是测试期依赖，装了才跑）。
-
-### 装
-
-装完会得到一个真正的 `trace-mcp` 命令（Windows 上是 `Scripts/trace-mcp.exe`），
-配置里就不用写死某个 `.py` 的绝对路径了。
+Git 备份包含确定性 JSONL、压缩 transcript chunks、小附件、manifest 和 SHA-256。大产物只
+保存机器、路径、大小和校验和等引用，不复制大文件本体。
 
 ```bash
-# 只要 MCP：不用 clone，也不会拉任何依赖
-pip install "git+https://github.com/jinhang23/research-trace"
+trace-v2-backup verify \
+  --source /srv/research-trace/private-backup/research-trace-backup
 
-# 还要跑网页服务：clone 下来（web/ 和 projects/ 得在仓库里）
-git clone https://github.com/jinhang23/research-trace && cd research-trace
-pip install -e ".[server]"
+trace-v2-backup restore \
+  --source /srv/research-trace/private-backup/research-trace-backup \
+  --data-dir /srv/research-trace/restored-empty-data
 ```
 
-### 配
+## Alpha 边界
+
+- Claude Code 自动 Hook 已实现；Codex CLI / Desktop 的自动采集适配尚未实现。
+- outbox 不会自动删除；当前也不提供跨 Claude 会话的独立自动重放 worker。异常批次仍保留在
+  本机，可手动恢复或在后续版本处理。
+- 默认永久保存的原始历史可能包含命令、路径和对话中的敏感信息。可临时关闭采集，但管理员
+  emergency purge 与备份轮换流程尚未完成。
+- 这是 alpha；部署团队数据前应使用私有仓库、HTTPS、OAuth 白名单和独立数据目录。
+
+## 开发与验证
 
 ```bash
-# 本地模式：agent 和数据在同一台机器上，不需要起服务
-claude mcp add trace -s user -e TRACE_DATA=/path/to/数据仓 -- trace-mcp
-
-# 远端模式：agent 在 HPC 上，数据在你的域名后面
-claude mcp add trace -s user \
-  -e TRACE_URL=https://你的域名/t/<space> \
-  -e TRACE_TOKEN=<写入令牌> \
-  -- trace-mcp
+python trace_v2_mcp.py --selfcheck
+python -m pytest -q
 ```
 
-`-s user` 是全局生效；不加的话默认是 `local`（只在当前项目目录下生效）。
+主要目录：
 
-也可以直接写进 `~/.claude.json` 的 `mcpServers`：
-
-```json
-"trace": {
-  "type": "stdio",
-  "command": "trace-mcp",
-  "env": { "TRACE_DATA": "/path/to/数据仓" }
-}
+```text
+research_trace_v2/          v2 中央服务、存储、MCP、OAuth、备份与网页
+hooks/                      Claude Code Hook 清单与 Recorder 协议
+scripts/trace_hook.py       本机 outbox、批次和 Recorder 调度
+docs/V2_QUICKSTART.md       部署与登录
+docs/V2_REQUIREMENTS.md     完整需求、不变量和验收标准
+tests/                      Python 与前端回归测试
 ```
 
-> **Windows 上如果提示找不到 `trace-mcp`**，把 `command` 换成绝对路径。查路径：
-> `python -c "import shutil; print(shutil.which('trace-mcp'))"`
-> （通常是 `C:/ProgramData/anaconda3/Scripts/trace-mcp.exe` 这种）
+## 文档
 
-| 工具 | 干什么 |
-|---|---|
-| `trace_projects` | 列项目 + 步骤数与状态分布 |
-| `trace_read` | 读整棵树（缩进树，比 JSON 省 token），或读单步全文 + 溯源链 + L0–L4。缩进树上标出互斥候选、决策分叉点定了没有、以及「还有几个岔路口没决定」 |
-| `trace_search` | 在标题/正文/标签/**产物与代码的位置**/各语言译文里搜——回答"之前是不是试过 X""为什么放弃了 Y""`best.pt` 是哪一步产出的"。不给 `project` 就搜全部项目 |
-| `trace_flow` | 顺**数据依赖**看上下游（传递闭包）：这个数字是从哪几步算出来的、改了它谁会跟着错 |
-| `trace_new_project` | 建项目。数据仓为空时 `trace_new_step` 会自动建，不用先跑 init |
-| `trace_insight` | 往项目洞察里记一条：核心想法 / 有效 / 无效 / 坑。返回分配到的 id，可 `supersedes` 取代旧的一条 |
-| `trace_new_step` | 建步骤（支持幂等键、外部产物路径、`inputs`、`code`） |
-| `trace_update_step` | 改状态/正文/路径/`inputs`/`code`；`append` `add_paths` `add_inputs` `add_code` 追加比整组替换安全；`repro` 追加一条复现记录 |
-| `trace_move_step` | 改挂到另一个父节点（连同整棵子树）。**`reason` 必填**，会永久留在 `moved:` 那一行 |
-| `trace_check_paths` | **在这台机器上**逐条 stat 一遍外部路径，结果写回 `checked=` / `missing=`。够不着的什么都不写 |
-| `trace_delete_step` | **真删**一步，必须写原因。只用于误建/测试数据/粘进去的令牌——失败的实验请标 `dead` |
-| `trace_attach` | 传附件；**图片必须给 caption**，给了就自动在正文插入引用 |
-| `trace_translate` | 补一份译文（`note.<lang>.md` / `project.<lang>.md`）。**唯一碰翻译的写入口，永远不动原文** |
-| `trace_result` | 把某一步声明成**成果**（`result:`），或撤销。定稿流程唯一写下来的那件事，其余全是算出来的 |
-| `trace_pipeline` | 读**定稿流程**：产出成果的那一条链、整条链的等级、最弱的一步、必须说出来的几条诊断；`methods=true` 直接给 Methods 草稿 |
-| `trace_untranslated` | 还欠哪些翻译。「还没翻译」是文件不存在这个派生事实，没有待办表，现算 |
+- [v2 快速开始](docs/V2_QUICKSTART.md)
+- [v2 完整需求](docs/V2_REQUIREMENTS.md)
+- [Recorder 协议](hooks/RECORDER_PROTOCOL.md)
 
-规矩写在工具描述里，agent 调用时就能看到：先读后写、先建 wip 再开跑、
-必须写「为什么」、失败标 dead 并写清放弃理由、改 `id` 直接拒绝、
-改 `parent` 走 `trace_move_step` 并写清原因。
+## License
 
-**格式标准怎么送到 agent 手里。** `pip install git+…` 那条路只打包三个 `.py`，
-那台机器上根本不存在 `FORMAT.md`——所以 MCP 的 `initialize` 返回的 instructions 里
-**内联**了 FORMAT.md 的可执行摘要（五个小节、指标表规则、图注、`[[交叉引用]]`、
-`path` / `input` / `code` / `moved` 四个键的写法、L0–L4 判据、`repro` 三态，
-以及译文的小节名和「只准有 `title`」）。
-那是唯一无论怎么装都一定送达的通道。
-只有当 `FORMAT.md` 真的躺在 `trace_mcp.py` 旁边时，才会再追加一行指向它的**绝对路径**。
-
-MCP 和 REST API 是同一套后端的两个门面，可以混用。
-
-## agent 读到的是什么
-
-同一份 `note.md` 有两类读者，两边读到的东西**不一样**，这个差别值得说清楚：
-
-| | 人 | agent |
-|---|---|---|
-| 正文 | 渲染后的排版 | `GET /api/p/{项目}/steps/{id}` 返回的 markdown 原文 |
-| 表格 | 对齐好的表 | markdown 表格原文——LLM 读它比读 HTML 更省事 |
-| 结构 | 树图 / 面包屑 | `parent` `children` `lineage` `backlinks` 都是结构化字段 |
-| **图** | 看得见 | **只看得见 `![](loss_curve.png "……")` 这一行** |
-
-所以：**图注不是装饰，是这张图对 agent（以及半年后的你）唯一的信息来源。**
-把结论写进图注——"第 12 轮之后验证集回升，再往后是纯过拟合"——文本读者就拿到了
-图里的判断，不必看图。`trace_cli.py check` 会对没有图注的图报警告。
-
-有视觉能力的 agent 可以直接取原图（读是公开的，不需要令牌）：
-`GET {base}/p/{项目}/files/{id}/{文件名}` 返回原始字节。
-
-## API（给 agent）
-
-Base = `/t/<space>`。读公开，写要 `Authorization: Bearer <token>`。
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| GET | `/api/projects` | 项目列表 + 各自的步骤数与状态分布。分了章的项目多一个 `chapters: [{name, n}]`（**没分章就整个键不出现**，那些项目的卡片必须逐字节和从前一样） |
-| POST | `/api/projects` | 建项目 `{name}` |
-| PATCH | `/api/projects/{项目}` | 改显示名 `{name}` 和/或洞察：`{insights}` 整体替换那四个小节、`{add_insight: {kind, text, supersedes?, lang?}}` 追加一条（响应里的 `insight.id` 是分配到的 id）、`{add_insight: {id, text?, supersedes?}}` 就地改一条。slug 不动 |
-| GET | `/api/p/{项目}/forest` | 全量：steps（含 lane/row/children/backlinks/files/trace/digest）+ tree + warnings |
-| GET | `/api/p/{项目}/steps/{id}` | 单步 + `lineage`（到根的完整路径） |
-| GET | `/api/search` | 跨项目搜索。`?q=` 或 `?query=`，不给 `project` 就搜全部；回 `hits/total/truncated`。搜的是标题/正文/标签/`path:` 与 `code:` 的位置/`decision:` 与候选说明/`chapter:` 的名字与说明/各语言译文 —— 判据一律和 `grep -r` 对齐 |
-| GET | `/api/p/{项目}/untranslated` | 还欠哪些译文。`?lang=en`（默认 `en`）。回 `missing/translated/native/project_note`。**读，所以公开** |
-| GET | `/api/p/{项目}/forks` | 还有哪几个岔路口没做决定。`?scope=any` 连已定的一起给。回 `forks/total/open/titles`。**读，所以公开** |
-| POST | `/api/p/{项目}/forks` | 把一组**同父**的兄弟成组标成互斥候选：`{ids: [...], decision?, notes?: {id: 说明}}`。相对逐个 PATCH `branch` 的增量只有同父校验和原子性 |
-| GET | `/api/p/{项目}/pipeline` | **定稿流程**：产出成果的那条链、顺序、边、每步凭什么在里面、整链等级与最弱的一步、诊断。一个 `result:` 都没声明时回的是「怎么声明」那条提示。`?chapter=<章节名>` 只出那一章（未分章那一组是 `?chapter=-`）。**读，所以公开** |
-| GET | `/api/p/{项目}/chapters` | **章节清单**：每一章几步、状态分布、等级与最弱的一步、自己的成果、跨章节的边、诊断。一个 `chapter:` 都没写的项目回 `declared: false` 和一份空清单，**不报任何警告**。**读，所以公开** |
-| GET | `/api/p/{项目}/pipeline/figure.svg` | 那张图，自包含 SVG（无外部资源、无脚本、黑白可读）。三样导出都收 `?chapter=` |
-| GET | `/api/p/{项目}/pipeline/methods.md` | Methods 草稿（markdown）。**是初稿不是成品** |
-| GET | `/api/p/{项目}/pipeline/page.html` | 能发给合作者的那一页（单文件、无脚本、无外部资源） |
-| PUT | `/api/p/{项目}/results/{id}` | 把这一步声明成成果 `{note}`。新建回 201、就地改写回 200。指向不存在的步骤或 `dead` 的步骤直接拒绝 |
-| DELETE | `/api/p/{项目}/results/{id}` | 撤销一条成果声明。**不要求写原因**——`result:` 不是一段历史，是一个当前指针 |
-| GET | `/api/status` | 标题、版本、项目数、步骤数、git 同步状态、`write_protected` |
-| GET | `/api/git` | 自动 git 同步的状态：`ok/state/summary/hint/last_ok_at/pending`。带令牌多给 `detail`（git 原文，含服务器路径） |
-| GET | `/api/events` | SSE，推 `{version}` |
-| POST | `/api/p/{项目}/steps` | 建步骤。带 `key` 则幂等——重试不会产生重复 |
-| PATCH | `/api/p/{项目}/steps/{id}` | 改 status/title/body/date/commit/author/tags/lang/paths/inputs/code；`add_paths` `add_repro` `add_inputs` `add_code` 是追加。带 `expect` 或 `If-Match` 做冲突检测 |
-| PATCH | `/api/p/{项目}/steps/{id}` | **移动**：`{parent, reason}`，`reason` 必填、单独发一次。返回移动审计（含 `moved` 那一行原文和跟着走的 `subtree`） |
-| POST | `/api/p/{项目}/steps/{id}/paths/check` | 记一次路径核对：`{loc, exists, date?, size?, n?}`。`exists` **必须显式给 true/false**——够不着就别发这个请求 |
-| PUT | `/api/p/{项目}/steps/{id}/tr/{lang}` | 写这一步的译文 `{title, body}`。**碰不到 `note.md`**；`expect` / `If-Match` 对的是译文自己的 digest |
-| DELETE | `/api/p/{项目}/steps/{id}/tr/{lang}` | 撤掉一个语言版本。原文不受影响，所以不要求写原因 |
-| PUT | `/api/p/{项目}/tr/{lang}` | 写项目笔记的译文 `{name, body}`。`body` 只替换那四个洞察小节，`## Deleted` 逐字保留 |
-| DELETE | `/api/p/{项目}/tr/{lang}` | 撤掉项目笔记的一个语言版本。`project.md` 不受影响 |
-| DELETE | `/api/p/{项目}/steps/{id}` | 真删目录。`{reason}` 必填 —— 只追加原则的唯一例外 |
-| PUT | `/api/p/{项目}/steps/{id}/files/{path}` | 上传附件到指定文件名（raw body） |
-| POST | `/api/p/{项目}/steps/{id}/files` | 上传附件，服务端定名（`X-Filename` 可选；没给就按内容哈希命名，重复内容自动复用） |
-| DELETE | `/api/p/{项目}/steps/{id}/files/{path}` | 删掉一个附件 |
-| POST | `/api/sync` | 立刻跑一次 git commit + push，返回和 `/api/git` 同样的结构 |
-
-读接口一律公开（和 `forest` 一致），写接口一律要 `Bearer`。
-另外两条不在 API 命名空间下、给人和有视觉能力的 agent 用的路径：
-`{base}/p/{项目}/` 是网页，`{base}/p/{项目}/files/{id}/{文件名}` 直接返回附件原始字节（公开）。
-
-**错误是可分支的，不是一坨 500。** 文件系统层的失败会带上 `kind` 和 `written: false`：
-
-| `kind` | 状态码 | 什么时候 |
-|---|---|---|
-| `name_too_long` | 400 | 文件名/路径超长（Windows 整条路径 260，Linux 单个文件名 255 **字节**） |
-| `locked` | 409 | 文件被别的程序占用 |
-| `permission` | 403 | 权限不足、目录只读 |
-| `disk_full` | 507 | 磁盘满 |
-| `missing` | 404 | 路径上有一段不存在 |
-| `unavailable` | 503 | NAS / 网络盘掉线 |
-| `io_error` | 500 | 其余 |
-
-`written: false` 是可以信的：记录本体和附件的写入都是「同目录临时文件 → fsync →
-`os.replace`」，失败时磁盘上的原文一个字节都没动过。
-令牌不对是 401，和上面这些**不共用**异常处理——以前共用一个，于是"文件被占用"
-会被报成"需要写入令牌"，agent 拿到 401 会去重找令牌，而真正的问题在磁盘上。
-
-```python
-import json, urllib.request
-req = urllib.request.Request(
-    f"{BASE}/api/p/{PROJECT}/steps", method="POST",
-    data=json.dumps({
-        "parent": "004", "title": "去重后重训所有模型", "status": "wip",
-        "author": "agent:claude", "key": "dedup-rerun-v1",   # 幂等键，重试不会产生重复步骤
-        "body": "## 为什么\n上一步发现测试集有 2.3% 近重复样本，历史数字都要重新算……",
-    }, ensure_ascii=False).encode("utf-8"),
-    headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"})
-step = json.load(urllib.request.urlopen(req))
-```
-
-Claude Code 用户：[`skills/research-trace/SKILL.md`](skills/research-trace/SKILL.md)
-已写好接入规则（装插件时随插件一起分发）。走 REST 这条退路时设好 `TRACE_URL`、
-`TRACE_TOKEN`、`TRACE_PROJECT` 三个环境变量即可；有 MCP 工具就直接用工具。
-怎么写记录的契约在 [FORMAT.md](FORMAT.md)。
-
-## 命令
-
-```bash
-python trace_cli.py projects                      # 列出项目
-python trace_cli.py new-project --name "课题名"
-python trace_cli.py new -P <项目> --title "..."    # 新建一步
-python trace_cli.py rm -P <项目> <id> --reason "…" # 真删一步（原因必填）
-python trace_cli.py mv -P <项目> <id> --parent <新父> --reason "…"   # 移动一步连同整棵子树（原因必填）
-python trace_cli.py fork -P <项目> <id> <id> --decision "…"          # 把几个兄弟标成互斥候选（只能选一条走下去）
-python trace_cli.py forks -P <项目>                # 还有几个岔路口没做决定（加 --all 连已定的一起列）
-python trace_cli.py check [-P <项目>] [--strict]   # 校验不变量 + 打印 L0–L4 与最弱一环
-python trace_cli.py paths [-P <项目>] [--kind hpc] # 列出所有外部产物的位置
-python trace_cli.py paths --missing               # 只看已确认不存在的那些
-python trace_cli.py paths --check [--count]       # 逐条 stat 一遍并写回 checked= / missing=
-python trace_cli.py result -P <项目> <id> --note "…"  # 声明「这一步是成果」（--drop 撤销）
-python trace_cli.py pipeline -P <项目>            # 定稿流程：产出成果的那条链 + 整链等级
-python trace_cli.py pipeline -P <项目> --methods  # Methods 草稿（`> methods.md` 收走）
-python trace_cli.py pipeline -P <项目> --svg fig.svg --page share.html  # 图 + 独立页面
-python trace_cli.py chapter -P <项目>             # 章节清单：各几步、各自的等级和最弱一步
-python trace_cli.py pipeline -P <项目> --chapter 消融实验   # 只出那一章（未分章那组写 -）
-python trace_cli.py tr -P <项目> --lang en        # 还欠哪些英文版
-python trace_cli.py tr -P <项目> --lang en --step 007 --file note.en.md   # 补一份译文
-python trace_cli.py build --out dist              # 静态导出，file:// 可直接打开，断网可用
-python trace_cli.py url                           # 打印访问地址与令牌
-python trace_mcp.py --selfcheck                   # 自检：解释器 / 角色 / 后端 / 读 / 写 / JSON-RPC 握手
-python -m pytest tests                            # 内核 / 布局 / 写入 / 服务 / MCP 协议 / 插件 / 文档
-node --test "tests/**/*.test.js"                  # markdown 渲染 + 前端纯函数
-```
-
-`check` 的退出码默认只看结构性错误（重复 id、环这类逼着构建改动数据的问题）。
-`--strict` 把内容层缺陷（`dead` 没写结论、图没图注、链卡在 L0/L1）也算成失败——
-给 CI 用。默认不算，是因为 `wip` 天天红一片只会训练大家忽略警告。
-
-声明了成果的项目，`check` 还会多一栏 `⇉ 定稿流程 N 步 · 整链 LX`——**只在真的声明了
-成果时才出现一个字**。它和上面那两份等级分布不是一回事：分布算的是全部记录（含
-探索性的、含 `dead`），而这一栏算的是「别人能不能重做出这个结果」。
-
-`check` 末尾另有一栏 `⑂ 还有 N 个岔路口没做决定`。它**既不是错误也不是提示，是待办**，
-`--strict` 也不拦——同时开几条线是研究的常态。措辞刻意不带责备：一带责备，人就会
-为了让输出干净随手把一条支标成 `dead`，那是拿假结论换绿色。
-
-`build` 的产物是确定性的：同样的输入两次构建逐字节一致，所以 `dist/` 直接 gitignore。
-声明了成果的项目还会多出 `p/<项目>/pipeline.svg` · `pipeline.md` · `pipeline.html`
-——只含定稿流程，`pipeline.html` 能直接发给合作者。
-
-旧的单项目布局（根目录下的 `steps/`）会在第一次运行时自动迁移到
-`projects/default/steps/`，一次性完成，之后只有一条代码路径。
-
-## 残缺输入
-
-十年后的日志一定是残缺的，构建器必须能在残缺输入上产出**部分结果**，而不是拒绝工作：
-
-| 情况 | 处理 |
-|---|---|
-| `parent` 指向不存在的 id | 降级为根 + 警告 |
-| `input` 指向不存在的 id / 指向自己 / 数据依赖成环 | 警告，那一行文本一个字不改，只是不参与数据流图 |
-| 检测到环 | 报错、指出环上节点、断开一条边继续构建 |
-| 重复 id | 警告，重复的那个改挂 `id~dup2` 仍然显示，不丢数据 |
-| 缺 `status` / 未知 `status` | 回退 `wip` + 警告 |
-| 目录名 id ≠ front-matter id | 以 front-matter 为准 + 警告 |
-| 目录里没有 `note.md` | 静默跳过（允许临时目录共存） |
-| 项目目录里没有 `project.md` | 用目录名当项目名——目录就是项目 |
-| `note.md` 不是 UTF-8（GBK / UTF-16） | 读得下来（非法字节变 `�`）+ 一条 `not_utf8` **错误**级警告；**写入直接拒绝**，让你先转码 |
-
-警告显示在页面顶栏，从不阻塞构建。
-
-最后那一条值得单说：以前是静默 `errors="replace"`，于是 Windows 中文环境下
-`cmd.exe` 的 `echo … > note.md`（GBK）或 PowerShell 5.1 的 `>`（UTF-16LE）写出来的笔记
-一声不吭地显示成乱码，你在网页上点一下状态按钮，那份 `�` 就落盘了，原始字节不可逆丢失。
-现在写入侧会拦住并告诉你哪个字节解不开。
-
-## 部署
-
-见 [deploy/README.md](deploy/README.md)。
-
-## 刻意不做的
-
-多人协作（账号、权限分级、评论、@提醒）· 实时协同编辑（OT / CRDT，两个人同时敲一段
-正文）· 自动捕获（不 hook shell / git / 文件系统）· 重跑与复现执行 ·
-大文件版本管理 · 全文索引服务（`grep` 就够）· 拖拽自由布局（布局一旦手工摆放，
-就不再是文件系统的纯函数了）· 自动机器翻译（译文是内容，谁写谁负责）·
-「翻译过时了」的标记（要算它就得把原文的指纹存进译文，那是把派生关系变成存储字段）。
-
-它们都会把"没有这个工具也能读"变成一句空话。
-
-要和上面 P2 那段区分开：**并发写入的冲突检测是做了的**（`expect` / `If-Match` → 409 +
-把两边内容摆出来）。做的是"别让后一次保存无声地吃掉前一次"，不做的是"两个人
-同时编辑同一段正文还能自动合并"。前者是数据完整性，后者是协作产品。
+[MIT](LICENSE)

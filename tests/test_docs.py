@@ -25,7 +25,7 @@ import trace_mcp as M
 import trace_write as W
 
 ROOT = Path(__file__).resolve().parent.parent
-README = ROOT / "README.md"
+README = ROOT / "docs" / "V1_REFERENCE.md"
 FORMAT = ROOT / "FORMAT.md"
 SKILL = ROOT / "skills" / "research-trace" / "SKILL.md"
 DEPLOY = ROOT / "deploy" / "README.md"

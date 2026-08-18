@@ -490,7 +490,7 @@ def test_the_mutable_field_list_is_reachable_from_the_mcp_tool():
 
 
 def _readme() -> str:
-    return (REPO / "README.md").read_text(encoding="utf-8")
+    return (REPO / "docs" / "V1_REFERENCE.md").read_text(encoding="utf-8")
 
 
 def _cli_subcommands() -> list[str]:
@@ -528,7 +528,7 @@ def test_the_readme_does_not_still_claim_patching_parent_is_a_409():
     文档和实现三方不一致时，人会按最吓人的那一处理解，然后回去用对调正文的老办法
     ——而那正是这一轮要堵的。
     """
-    for f in ("README.md", "skills/research-trace/SKILL.md"):
+    for f in ("docs/V1_REFERENCE.md", "skills/research-trace/SKILL.md"):
         text = (REPO / f).read_text(encoding="utf-8")
         for line in text.splitlines():
             if "parent" in line and "409" in line:

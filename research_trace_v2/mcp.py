@@ -28,12 +28,15 @@ from .device_login import (
 
 
 PROTOCOL_VERSION = "2025-03-26"
-SERVER_INFO = {"name": "research-trace-v2", "version": "2.0.0-alpha.3"}
+SERVER_INFO = {"name": "research-trace-v2", "version": "2.0.0-alpha.4"}
 INSTRUCTIONS = (
     "Research Trace has a raw-history layer and a selective semantic layer. "
     "Use trace_ingest for immutable hook batches. Use trace_record only for work worth understanding "
     "or reusing later; a batch may legitimately create no node. Experiments, ideas, papers, data "
-    "understanding, failures and implementations all use the same Node. Use trace_curate for the current "
+    "understanding, failures and implementations all use the same Node. Chapters are human-defined "
+    "parallel research tracks such as main and ablation experiments, not content types or pipeline stages. "
+    "Recorder-created Nodes must use an existing chapter_id or omit it for Inbox, and always remain "
+    "unreviewed until a human confirms them. Use trace_curate for the current "
     "Overview or Chapter summary, and never overwrite unresolved human corrections. Do not record every "
     "file edit or infer per-agent authorship from a shared working tree. "
     "Use trace_login only when the user explicitly asks to connect this machine or authentication is missing."
@@ -74,7 +77,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "trace_record",
-        "description": "Idempotently create or update one valuable general-purpose Node, optionally with selected code evidence.",
+        "description": "Create or retry one valuable unreviewed Node in an existing human-defined Chapter; omit chapter_id for Inbox.",
         "inputSchema": {
             "type": "object",
             "required": ["project_id", "idempotency_key", "title"],
@@ -84,11 +87,9 @@ TOOLS: list[dict[str, Any]] = [
                 "title": {"type": "string"},
                 "body": {"type": "string"},
                 "chapter_id": {"type": "string"},
-                "chapter_name": {"type": "string"},
                 "parent_id": {"type": "string"},
                 "labels": {"type": "array", "items": {"type": "string"}},
                 "occurred_at": {"type": "string"},
-                "review_state": {"type": "string", "enum": ["unreviewed", "confirmed", "corrected"]},
                 "source_event_ids": {"type": "array", "items": {"type": "string"}},
                 "code_evidence": {
                     "type": "array",
@@ -332,7 +333,9 @@ def call_tool(remote: Remote, name: str, args: dict[str, Any]) -> Any:
         return remote.request("POST", "/api/v2/ingest", value)
     if name == "trace_record":
         value = dict(args)
-        value.setdefault("created_by", "recorder")
+        value.pop("chapter_name", None)
+        value["created_by"] = "recorder"
+        value["review_state"] = "unreviewed"
         return remote.request("POST", "/api/v2/record", value)
     if name == "trace_curate":
         return remote.request("POST", "/api/v2/curate", args)

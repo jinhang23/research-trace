@@ -49,7 +49,7 @@ REPO = Path(__file__).resolve().parent.parent
 APP = (REPO / "web" / "app.js").read_text(encoding="utf-8")
 CSS = (REPO / "web" / "style.css").read_text(encoding="utf-8")
 I18N = (REPO / "web" / "i18n.js").read_text(encoding="utf-8")
-README = (REPO / "README.md").read_text(encoding="utf-8")
+README = (REPO / "docs" / "V1_REFERENCE.md").read_text(encoding="utf-8")
 FORMAT = (REPO / "FORMAT.md").read_text(encoding="utf-8")
 
 NODE = shutil.which("node")

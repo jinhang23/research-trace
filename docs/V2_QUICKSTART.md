@@ -128,10 +128,13 @@ python trace_v2_mcp.py --selfcheck
 Hook 会把 event 与 transcript 增量先复制到 `${CLAUDE_PLUGIN_DATA}/outbox/`。`pending/` 和
 `awaiting_upload/` 不自动清理；只有中央服务确认的数据才能进入 `sent/`。Recorder 是当前
 Claude Code 主会话的 fork：首次继承当时上下文，之后按 agent id 恢复并只接收增量 batch；
-它不跨主会话常驻，长期状态在中央服务里。
+它不跨主会话常驻，长期状态在中央服务里。Hook 会根据 recorder agent id 拒绝 Bash、Edit、
+Write、Agent、外部搜索和无关 MCP，只允许只读检查与 Research Trace MCP。
 
 Recorder 先调用 `trace_ingest(manifest_path=...)` 上传原始 batch，再按价值判断是否创建
-语义 Node。一次 batch 创建零个 Node 完全正常。插件暴露的工具固定为：
+语义 Node。一次 batch 创建零个 Node 完全正常。Chapter 由人创建并定义为“主实验”“消融实验”
+等并列研究线；Recorder 只能选择已有 Chapter，不确定时进入 Inbox，且所建 Node 一律未确认。
+插件暴露的工具固定为：
 `trace_context`、`trace_ingest`、`trace_record`、`trace_curate`、`trace_attach`、
 `trace_search`；另有只用于账号绑定的 `trace_login`。
 
@@ -177,8 +180,8 @@ Restore 只接受空数据目录，并在事务内检查外键。恢复成功后
 ## 7. 当前 alpha 边界
 
 - Claude Code 已接入；Codex CLI / Desktop 适配尚未接入自动 Hook。
-- 网页已有 Project、Overview、Comment/Correction、Chapter、Node、附件显示、全文搜索、GitHub
-  OAuth 与团队角色；raw timeline 专页与可视化树仍待后续迭代。
+- 网页已有 Project、Overview、Comment/Correction、Chapter、Node、Chapter 内结构图/记录列表、
+  附件显示、原始历史按需展开、全文搜索、GitHub OAuth 与团队角色。
 - 网页 OAuth 与设备凭证均来自同一 GitHub 白名单和实时角色；旧的共享 `TRACE_V2_TOKEN`
   只为迁移兼容，建议新部署不再配置。
 - 默认永久保存可能包含命令、路径或 transcript 中的敏感信息。alpha 已支持暂停采集，但管理员

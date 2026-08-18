@@ -43,7 +43,7 @@ APP = (REPO / "web" / "app.js").read_text(encoding="utf-8")
 CSS = (REPO / "web" / "style.css").read_text(encoding="utf-8")
 I18N = (REPO / "web" / "i18n.js").read_text(encoding="utf-8")
 HTML = (REPO / "web" / "index.html").read_text(encoding="utf-8")
-README = (REPO / "README.md").read_text(encoding="utf-8")
+README = (REPO / "docs" / "V1_REFERENCE.md").read_text(encoding="utf-8")
 MCP_SRC = (REPO / "trace_mcp.py").read_text(encoding="utf-8")
 
 TOKEN = "t0ken"

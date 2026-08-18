@@ -28,6 +28,10 @@ RECORDER_MARKER = "[research-trace-recorder]"
 BATCH_MARKER = "[research-trace-batch:"
 FINAL_RECEIPT_STATUSES = {"stored", "local", "ignored"}
 RECEIPT_RE = re.compile(r"^TRACE_RECEIPT\s+(\{.*\})\s*$", re.MULTILINE)
+RECORDER_READ_TOOLS = {"Read", "Grep", "Glob"}
+RECORDER_TRACE_TOOLS = {
+    "trace_context", "trace_ingest", "trace_record", "trace_curate", "trace_attach", "trace_search",
+}
 
 
 def _now() -> str:
@@ -426,6 +430,36 @@ def _recorder_running(payload: dict[str, Any], recorder_id: str | None) -> bool:
     return False
 
 
+def _recorder_tool_guard(
+    payload: dict[str, Any], state: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Deny mutation and unrelated tools inside the full-context Recorder fork.
+
+    A fork intentionally inherits the main agent's tools for context/cache parity. The hook is
+    therefore the enforcement boundary: the Recorder may inspect existing material and write only
+    through the Research Trace MCP tools.
+    """
+    if payload.get("hook_event_name") != "PreToolUse":
+        return None
+    recorder_id = str(state.get("recorder_agent_id") or "")
+    if not recorder_id or str(payload.get("agent_id") or "") != recorder_id:
+        return None
+    tool = str(payload.get("tool_name") or "")
+    tool_basename = tool.rsplit("__", 1)[-1]
+    if tool in RECORDER_READ_TOOLS or tool_basename in RECORDER_TRACE_TOOLS:
+        return None
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": (
+                "Research Trace Recorder is read-only outside the trace MCP; "
+                f"tool {tool or '<unknown>'} is not allowed"
+            ),
+        }
+    }
+
+
 def _nudge(
     manifest_path: Path,
     manifest: dict[str, Any],
@@ -479,8 +513,8 @@ def handle(payload: dict[str, Any], data_dir: Path, protocol_path: Path) -> dict
             _write_event(root, payload)
         _reconcile_receipts(root)
 
-        result = None
-        if payload.get("hook_event_name") == "Stop" and not payload.get("stop_hook_active"):
+        result = _recorder_tool_guard(payload, state)
+        if result is None and payload.get("hook_event_name") == "Stop" and not payload.get("stop_hook_active"):
             selected = _ensure_batch(root, payload)
             recorder_id = state.get("recorder_agent_id")
             if selected and not _recorder_running(payload, recorder_id):

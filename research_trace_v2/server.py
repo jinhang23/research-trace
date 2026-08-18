@@ -126,7 +126,7 @@ def create_app(
                 await task
             store.close()
 
-    app = FastAPI(title="Research Trace v2", version="2.0.0-alpha.3", lifespan=lifespan)
+    app = FastAPI(title="Research Trace v2", version="2.0.0-alpha.4", lifespan=lifespan)
     app.state.store = store
     app.state.write_token = write_token
     app.state.backup_status = backup_state
@@ -364,15 +364,41 @@ def create_app(
         safe_login = html.escape(str(user["login"]))
         page = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>批准设备 · Research Trace</title>
-<style>body{{margin:0;background:#f4f3ef;color:#23251f;font:15px/1.55 system-ui,sans-serif}}
-.box{{max-width:520px;margin:10vh auto;background:#fffefb;border:1px solid #dedfd8;border-radius:14px;padding:28px;box-shadow:0 10px 32px #23251f14}}
-h1{{margin-top:0}}code{{font-size:20px}}button{{border:0;border-radius:8px;background:#376a52;color:white;padding:10px 16px;font:inherit;cursor:pointer}}.meta{{color:#72766b}}.danger{{color:#9b3e43}}</style></head>
-<body><main class="box"><h1>批准 Research Trace 设备</h1><p>设备：<b>{safe_name}</b></p>
-<p>验证码：<code>{safe_code}</code></p><p class="meta">登录账号：@{safe_login}</p>
-<p>批准后，这台设备会获得仅能访问 Research Trace 的独立凭证。它不会获得你的 GitHub access token。</p>
-<button id="approve">批准此设备</button><p id="status" class="meta"></p></main>
+<meta name="theme-color" content="#edf5f3"><style>
+:root{{--ink:#142421;--soft:#536a64;--accent:#147765;--line:rgba(54,83,76,.13)}}
+*{{box-sizing:border-box}}body{{min-height:100vh;margin:0;display:grid;place-items:center;padding:24px;color:var(--ink);
+background:radial-gradient(circle at 10% 0,rgba(105,207,174,.27),transparent 31rem),
+radial-gradient(circle at 96% 8%,rgba(116,145,224,.2),transparent 32rem),
+linear-gradient(145deg,#f2f7f6,#e7eff0);font:15px/1.6 Inter,ui-sans-serif,system-ui,"PingFang SC","Microsoft YaHei",sans-serif}}
+.box{{width:min(560px,100%);padding:clamp(24px,6vw,42px);border:1px solid rgba(255,255,255,.86);border-radius:26px;
+background:rgba(255,255,255,.74);box-shadow:0 28px 72px rgba(25,47,42,.15);backdrop-filter:blur(22px) saturate(145%)}}
+.brand{{display:flex;align-items:center;gap:10px;margin-bottom:30px;font-weight:750}}.mark{{display:grid;width:40px;height:40px;
+place-items:center;border-radius:13px;color:white;background:linear-gradient(145deg,#20947e,#0e6255);box-shadow:0 8px 18px rgba(14,98,85,.24)}}
+.mark svg{{width:21px;height:21px;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}}
+.eyebrow{{margin:0 0 8px;color:#0d5d50;font-size:10px;font-weight:800;letter-spacing:.15em;text-transform:uppercase}}
+h1{{margin:0;font-size:clamp(28px,7vw,42px);line-height:1.12;letter-spacing:-.04em}}.lead{{margin:14px 0 22px;color:var(--soft)}}
+.device{{display:grid;gap:13px;padding:17px;border:1px solid var(--line);border-radius:16px;background:rgba(255,255,255,.62)}}
+.row{{display:flex;align-items:center;justify-content:space-between;gap:14px}}.label{{color:var(--soft);font-size:12px}}
+code{{padding:5px 9px;border-radius:9px;color:#0d5d50;background:rgba(20,119,101,.1);font-size:18px;font-weight:750;letter-spacing:.08em}}
+.notice{{margin:20px 0;color:var(--soft);font-size:13px}}button{{display:inline-flex;min-height:48px;align-items:center;justify-content:center;
+gap:8px;border:0;border-radius:13px;padding:11px 17px;color:white;background:linear-gradient(145deg,#1a8a74,#0f6758);
+box-shadow:0 10px 22px rgba(15,103,88,.2);font:inherit;font-weight:650;cursor:pointer;touch-action:manipulation}}
+button:hover{{background:linear-gradient(145deg,#18806d,#0d5b4e)}}button:disabled{{cursor:wait;opacity:.62;box-shadow:none}}
+button:focus-visible{{outline:3px solid rgba(20,119,101,.35);outline-offset:3px}}.meta{{color:var(--soft)}}#status{{min-height:24px;margin:13px 0 0}}
+.danger{{color:#a23f4c}}@media(prefers-reduced-motion:reduce){{*{{transition-duration:.01ms!important}}}}
+</style></head>
+<body><main class="box"><div class="brand"><span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2.2"/>
+<circle cx="18" cy="7" r="2.2"/><circle cx="9" cy="18" r="2.2"/><path d="M8 7.2l7.8-.2M7.2 8l1.2 7.7M16.6 8.8l-5.8 7.4"/></svg></span>
+Research Trace</div><p class="eyebrow">Secure device authorization</p><h1>批准设备登录</h1>
+<p class="lead">确认这是你正在连接的机器。批准后，你可以随时在账户页面撤销它。</p>
+<div class="device"><div class="row"><span class="label">设备</span><strong>{safe_name}</strong></div>
+<div class="row"><span class="label">验证码</span><code>{safe_code}</code></div>
+<div class="row"><span class="label">登录账号</span><strong>@{safe_login}</strong></div></div>
+<p class="notice">这台设备只会获得 Research Trace 的独立凭证，不会获得你的 GitHub access token。</p>
+<button id="approve">批准此设备</button><p id="status" class="meta" role="status" aria-live="polite"></p></main>
 <script>document.querySelector('#approve').onclick=async()=>{{const out=document.querySelector('#status');
-try{{const me=await fetch('/api/v2/auth/me').then(r=>r.json());const r=await fetch('/api/v2/device/approve',{{method:'POST',headers:{{'Content-Type':'application/json','X-CSRF-Token':me.csrf_token}},body:JSON.stringify({{user_code:{normalized_code!r}}})}});const v=await r.json();if(!r.ok)throw Error(v.error||v.detail||r.statusText);out.textContent='已批准。可以返回终端，登录会自动完成。';document.querySelector('#approve').disabled=true}}catch(e){{out.className='danger';out.textContent=e.message}}}};</script></body></html>"""
+const button=document.querySelector('#approve');button.disabled=true;button.textContent='批准中…';out.className='meta';
+try{{const me=await fetch('/api/v2/auth/me').then(r=>r.json());const r=await fetch('/api/v2/device/approve',{{method:'POST',headers:{{'Content-Type':'application/json','X-CSRF-Token':me.csrf_token}},body:JSON.stringify({{user_code:{normalized_code!r}}})}});const v=await r.json();if(!r.ok)throw Error(v.error||v.detail||r.statusText);out.textContent='已批准。可以返回终端，登录会自动完成。';button.textContent='已批准'}}catch(e){{button.disabled=false;button.textContent='批准此设备';out.className='danger';out.textContent=e.message}}}};</script></body></html>"""
         return HTMLResponse(page)
 
     @app.post("/api/v2/device/approve")

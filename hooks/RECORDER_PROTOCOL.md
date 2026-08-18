@@ -9,6 +9,10 @@ the local outbox are the verbatim operational source.
 Keep this Recorder agent for later batches in the same parent session. Subsequent `SendMessage`
 tasks contain only a new manifest path and must resume the same Recorder transcript.
 
+This full-context fork is read-only outside Research Trace. Use only `Read`, `Grep`, `Glob` and the
+six Research Trace MCP tools. Do not use Bash, Edit, Write, Agent, web research or unrelated MCP
+tools. The hook enforces this boundary even though the fork can see the parent's tool definitions.
+
 ## Process one batch
 
 1. Read the named manifest. You may inspect its event and transcript files when needed, but never
@@ -25,13 +29,19 @@ tasks contain only a new manifest path and must resume the same Recorder transcr
    already obvious from code and Git.
 5. Use the one general Node model for valuable ideas, paper findings, data understanding,
    experiments, failures, decisions, results and important implementations. A conversation can
-   create zero, one or several Nodes or update a Node previously created with the same idempotency
-   key. Use `Inbox` when Chapter placement is uncertain.
-6. Chapter names are semantic topics, not a time-ordered pipeline. Nodes inside a Chapter are
-   ordered by occurrence time. Set `parent_id` only for an actual continuation; a new idea can be
-   a root.
+   create zero, one or several Nodes. Preserve epistemic status: observations, user decisions,
+   hypotheses and Recorder inferences must not be rewritten as one another.
+6. Chapters are human-defined parallel research tracks or experiment groups, for example `主实验`
+   and `消融实验`. They are not content types such as data understanding, implementation or
+   evaluation, and they are not time-ordered pipeline stages. Use only an existing `chapter_id`
+   returned by `trace_context`; never invent or create a Chapter. Put the Node in `Inbox` by omitting
+   `chapter_id` whenever placement is uncertain or the material cannot be cleanly split by track.
+   All Recorder-created Nodes remain `unreviewed` until a human confirms their content and placement.
+   Set `parent_id` only for an actual continuation inside the same Chapter; a new idea can be a root.
 7. Use `trace_record` idempotency keys derived from `batch_id`, such as
-   `semantic:<batch_id>:0`. A retry must reuse the same keys.
+   `semantic:<batch_id>:0`. A retry must reuse the same keys. Never reuse a key in a later batch to
+   revise a Node. If a human has edited, moved, confirmed or corrected the Node, a conflicting retry
+   must preserve the human revision; do not evade the conflict with a new key.
 8. For key implementations, record purpose, method, design reason, validation and limitations.
    Add selected Code Evidence: repo/commit when available, file path, symbol, a short diff or
    snippet, and a separate annotation. Do not attach every changed file. If parallel agents shared

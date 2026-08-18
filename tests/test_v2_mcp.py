@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from research_trace_v2.mcp import TOOLS, _manifest_payload
+from research_trace_v2.mcp import TOOLS, _manifest_payload, call_tool
 
 
 def test_v2_mcp_exposes_six_research_tools_plus_device_login():
@@ -10,6 +10,25 @@ def test_v2_mcp_exposes_six_research_tools_plus_device_login():
         "trace_context", "trace_ingest", "trace_record", "trace_curate",
         "trace_attach", "trace_search", "trace_login",
     ]
+
+
+def test_recorder_tool_cannot_create_chapters_or_self_confirm():
+    record = next(tool for tool in TOOLS if tool["name"] == "trace_record")
+    properties = record["inputSchema"]["properties"]
+    assert "chapter_name" not in properties
+    assert "review_state" not in properties
+
+    class Remote:
+        def request(self, method, path, payload=None):
+            return {"method": method, "path": path, "payload": payload}
+
+    result = call_tool(Remote(), "trace_record", {
+        "project_id": "project-1", "idempotency_key": "batch-1:0", "title": "Result",
+        "chapter_name": "invented", "review_state": "confirmed", "created_by": "human",
+    })
+    assert result["payload"]["created_by"] == "recorder"
+    assert result["payload"]["review_state"] == "unreviewed"
+    assert "chapter_name" not in result["payload"]
 
 
 def test_manifest_loader_reads_raw_files_without_model_transcription(tmp_path):

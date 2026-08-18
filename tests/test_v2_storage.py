@@ -20,7 +20,7 @@ def test_project_chapters_general_nodes_and_idempotency(tmp_path):
     assert context["matched"] is True
     assert context["project"]["id"] == project["id"]
 
-    chapter = store.create_chapter(project["id"], "数据理解")
+    chapter = store.create_chapter(project["id"], "主实验")
     evidence = [{
         "file_path": "src/qc.py",
         "symbol": "detect_batch",
@@ -117,6 +117,53 @@ def test_version_conflict_prevents_silent_human_overwrite(tmp_path):
         store.update_node(node["id"], {"body": "stale"}, expect_version=1)
 
 
+def test_recorder_uses_only_human_created_chapters_and_cannot_self_confirm(tmp_path):
+    store = Store(tmp_path)
+    project = store.create_project("Project")
+    main = store.create_chapter(project["id"], "主实验")
+
+    with pytest.raises(ValidationError, match="human-created"):
+        store.record_node(
+            project["id"], idempotency_key="n-unknown", title="Ablation result",
+            chapter_name="AI 自己发明的章节",
+        )
+
+    node = store.record_node(
+        project["id"], idempotency_key="n-main", title="Primary result",
+        chapter_id=main["id"], review_state="confirmed", created_by="recorder",
+    )
+    assert node["chapter_id"] == main["id"]
+    assert node["review_state"] == "unreviewed"
+
+
+def test_recorder_retry_cannot_undo_a_human_chapter_move_or_confirmation(tmp_path):
+    store = Store(tmp_path)
+    project = store.create_project("Project")
+    main = store.create_chapter(project["id"], "主实验")
+    ablation = store.create_chapter(project["id"], "消融实验")
+    node = store.record_node(
+        project["id"], idempotency_key="semantic:batch:0", title="Remove correction module",
+        chapter_id=main["id"], body="Initial recorder placement.",
+    )
+    moved = store.update_node(
+        node["id"], {"chapter_id": ablation["id"], "review_state": "confirmed"},
+        expect_version=node["version"], actor_type="human", actor_id="researcher",
+    )
+    assert moved["chapter_id"] == ablation["id"]
+    assert moved["review_state"] == "confirmed"
+
+    with pytest.raises(Conflict, match="human revision"):
+        store.record_node(
+            project["id"], idempotency_key="semantic:batch:0", title="Remove correction module",
+            chapter_id=main["id"], body="Initial recorder placement.",
+            occurred_at=node["occurred_at"], created_by="recorder",
+        )
+
+    current = next(item for item in store.get_project(project["id"])["nodes"] if item["id"] == node["id"])
+    assert current["chapter_id"] == ablation["id"]
+    assert current["review_state"] == "confirmed"
+
+
 def test_parent_relationship_cannot_form_a_cycle(tmp_path):
     store = Store(tmp_path)
     project = store.create_project("Project")
@@ -139,6 +186,28 @@ def test_node_correction_is_itself_a_versioned_semantic_change(tmp_path):
     changed = next(item for item in store.get_project(project["id"])["nodes"] if item["id"] == node["id"])
     assert changed["review_state"] == "corrected"
     assert changed["version"] == 2
+
+
+def test_node_confirmation_is_a_human_revision_and_blocks_recorder_retry(tmp_path):
+    store = Store(tmp_path)
+    project = store.create_project("Project")
+    main = store.create_chapter(project["id"], "主实验")
+    node = store.record_node(
+        project["id"], idempotency_key="semantic:confirm:0", chapter_id=main["id"],
+        title="Primary result", body="AUC = 0.91",
+    )
+    store.add_comment(
+        project["id"], target_type="node", target_id=node["id"], body="结果与原始输出一致。",
+        kind="confirmation", author_id="human",
+    )
+    confirmed = next(item for item in store.get_project(project["id"])["nodes"] if item["id"] == node["id"])
+    assert confirmed["review_state"] == "confirmed"
+    assert confirmed["version"] == 2
+    with pytest.raises(Conflict, match="human revision"):
+        store.record_node(
+            project["id"], idempotency_key="semantic:confirm:0", chapter_id=main["id"],
+            title="Primary result", body="AUC = 0.91", occurred_at=node["occurred_at"],
+        )
     assert len(store.revisions("node", node["id"])) == 2
 
 

@@ -179,6 +179,21 @@ def test_recorder_internal_tools_are_not_recorded_but_other_subagents_are(tmp_pa
     ), tmp_path, PROTOCOL)
     assert len(pending(tmp_path)) == before
 
+    denied = H.handle(event(
+        "PreToolUse", agent_id="rec-1", agent_type="fork", tool_name="Bash",
+        tool_use_id="recorder-shell", tool_input={"command": "git status"},
+    ), tmp_path, PROTOCOL)
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "read-only" in denied["hookSpecificOutput"]["permissionDecisionReason"]
+    assert len(pending(tmp_path)) == before
+
+    assert H.handle(event(
+        "PreToolUse", agent_id="rec-1", agent_type="fork",
+        tool_name="mcp__plugin_research-trace_trace__trace_record",
+        tool_use_id="recorder-trace", tool_input={"title": "safe"},
+    ), tmp_path, PROTOCOL) is None
+    assert len(pending(tmp_path)) == before
+
     H.handle(event(
         "PostToolUse", agent_id="worker-2", agent_type="Explore", tool_name="Read",
         tool_use_id="inside-worker", tool_input={"file_path": "/work/data.csv"},
