@@ -1,68 +1,46 @@
 {
   "name": "research-trace",
-  "displayName": "科研溯源 trace",
-  "version": "1.8.0",
-  "description": "把科研过程记录成一棵只追加的步骤树：每一步自带代码、日志、产物和一句「我为什么要做这一步」，从任何结果都能回溯到最初的问题。带 16 个 MCP 工具（零依赖，手写 JSON-RPC）、多项目、图/列表/数据流三视图、外部产物路径溯源（结构化 path 与失效核对）、L0–L4 可溯源性评级、项目级洞察沉淀。",
-  "author": {
-    "name": "Jinhang Wei"
-  },
+  "displayName": "Research Trace v2",
+  "version": "2.0.0-alpha.3",
+  "description": "团队研究与项目记忆：永久保存可见的 agent 历史，由 Recorder 精选想法、论文、数据理解、实验、失败和关键实现为 Project / Overview / Chapter / Node。提供 7 个 MCP 工具：6 个研究工具和 trace_login 账号设备登录。",
+  "author": {"name": "Jinhang Wei"},
   "homepage": "https://github.com/jinhang23/research-trace",
   "repository": "https://github.com/jinhang23/research-trace",
-  "keywords": [
-    "research",
-    "provenance",
-    "lab-notebook",
-    "reproducibility",
-    "科研",
-    "溯源"
-  ],
-  "skills": "./skills",
-  "commands": "./commands",
-  "agents": [
-    "./agents/trace-auditor.md",
-    "./agents/trace-reproducer.md"
-  ],
+  "keywords": ["research", "provenance", "agent-memory", "lab-notebook", "科研", "溯源"],
+  "hooks": "./hooks/hooks.json",
   "userConfig": {
-    "role": {
-      "type": "string",
-      "title": "这台机器的角色",
-      "description": "三选一，装完随时可以在 /plugin 里改：\n  server —— 服务端。数据仓在这台机器上，直接读写文件。只填下面的「数据仓目录」。\n  client —— 客户端。数据在另一台机器的域名后面，通过公网管理。填「远端服务地址」和「写入令牌」。\n  auto   —— 不确定就用它：填了地址走远端，只填了目录走本地。\n填错了不会静默退回另一种模式，会当场报出来。",
-      "default": "auto"
-    },
-    "data_dir": {
-      "type": "directory",
-      "title": "数据仓目录",
-      "description": "步骤树所在的目录 —— 是**含有** projects/ 的那一层，不是 projects/ 本身（指错一层会造出 projects/projects）。目录不存在会自动建出来。服务端 / auto 角色填这个；客户端留空。"
-    },
     "url": {
       "type": "string",
-      "title": "远端服务地址（多数人不用填）",
-      "description": "只在数据放在另一台机器上时才需要。形如 https://你的域名/t/<space> ，含那段不可猜的 space。填了它就优先于上面的本地目录。"
+      "title": "中央 Research Trace 地址",
+      "description": "所有机器连接同一中央服务，例如 https://trace.example.org。未配置或离线时，原始 batch 仍留在插件持久 outbox。",
+      "default": "http://127.0.0.1:8765"
     },
     "token": {
       "type": "string",
-      "title": "写入令牌（多数人不用填）",
-      "description": "你不需要自己想一个——它在建服务时就随机生成好了，写在服务器的 config.json 里，跑 python trace_cli.py url 能查到。三种情况下都可以留空：① 只填了本地目录（不走网络，没有鉴权）；② 服务就跑在本机，程序会自己从 config.json 读；③ 只读不写。只有「写远端服务器」这一种情况才要把它从服务器复制过来。",
+      "title": "机器写入 Token",
+      "description": "旧部署兼容项，可留空。推荐通过 trace_login 或 trace-v2-login 用 GitHub 账号绑定设备，凭证会自动保存和读取。",
       "sensitive": true
+    },
+    "capture": {
+      "type": "string",
+      "title": "原始历史采集",
+      "description": "on 开启；off 暂停。暂停期间不会补采，适合临时处理令牌或其它敏感内容。",
+      "default": "on"
     },
     "python": {
       "type": "string",
       "title": "Python 解释器",
-      "description": "跑 MCP server 用的 Python，要 3.10 以上（server 本身零依赖，不需要装任何包）。\n最省事也最不会错的填法：在你平时跑实验的那个终端/环境里执行 `python -c \"import sys; print(sys.executable)\"`，把打印出来的绝对路径原样贴进来 —— 那就是「当前环境下的 Python」，一定跑得起来。\nLinux / macOS / 超算上如果 `python3` 已经指向对的那个，保持默认也行。\nWindows 上默认值多半是错的，请务必填绝对路径（形如 C:/ProgramData/anaconda3/python.exe）：PATH 上的 `python3` 常常是应用商店的占位程序，`python` 又可能指向别的软件自带的旧版本，两者都不会报「缺包」，只会让 trace 这个 MCP server 连不上。\n填错的症状就是工具列表里没有 trace_*。装完先跑 /research-trace:doctor，或在同一个终端里跑 `<你填的这个解释器> <插件根>/trace_mcp.py --selfcheck` 验一下。",
+      "description": "Python 3.10+ 的绝对路径最可靠。Windows/conda/HPC 上运行 `python -c \"import sys; print(sys.executable)\"` 获取当前环境的绝对路径；配置后可运行 trace_v2_mcp.py --selfcheck 验证。",
       "default": "python3"
     }
   },
   "mcpServers": {
     "trace": {
       "command": "${user_config.python}",
-      "args": [
-        "${CLAUDE_PLUGIN_ROOT}/trace_mcp.py"
-      ],
+      "args": ["${CLAUDE_PLUGIN_ROOT}/trace_v2_mcp.py"],
       "env": {
-        "TRACE_ROLE": "${user_config.role}",
-        "TRACE_DATA": "${user_config.data_dir}",
-        "TRACE_URL": "${user_config.url}",
-        "TRACE_TOKEN": "${user_config.token}"
+        "TRACE_V2_URL": "${user_config.url}",
+        "TRACE_V2_TOKEN": "${user_config.token}"
       }
     }
   },

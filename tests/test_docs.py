@@ -239,7 +239,8 @@ def test_the_node_test_command_in_the_readme_actually_runs_the_js_tests():
     p = subprocess.run(m.group(1), shell=True, cwd=ROOT, capture_output=True,
                        text=True, encoding="utf-8", errors="replace", timeout=180)
     assert p.returncode == 0, f"README 的 `{m.group(1)}` 跑不通:\n{(p.stdout + p.stderr)[-1500:]}"
-    assert re.search(r"^# pass (\d+)", p.stdout, re.M), "没跑出任何断言，命令选不中测试文件"
+    # Node 22 uses TAP's `# pass N`; newer Node releases render `ℹ pass N`.
+    assert re.search(r"^(?:#|ℹ) pass (\d+)", p.stdout, re.M), "没跑出任何断言，命令选不中测试文件"
 
 
 def test_the_selfcheck_switches_in_the_readme_exist():

@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 import trace_mcp as M
+from research_trace_v2 import mcp as M2
 
 ROOT = Path(__file__).resolve().parent.parent
 PLUGIN = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
@@ -27,10 +28,13 @@ def test_manifests_are_valid_and_named_consistently():
 def test_declared_component_directories_exist_and_are_not_empty():
     """指着空目录会让 Claude Code 在加载时报警告。"""
     for key in ("skills", "commands"):
+        if key not in PLUGIN:
+            continue
         d = ROOT / PLUGIN[key].lstrip("./")
         assert d.is_dir(), f"{key} 指向的 {d} 不存在"
         assert any(d.iterdir()), f"{key} 指向的 {d} 是空的"
-    assert (ROOT / "skills" / "research-trace" / "SKILL.md").is_file()
+    if "skills" in PLUGIN:
+        assert (ROOT / "skills" / "research-trace" / "SKILL.md").is_file()
 
 
 def test_plugin_never_points_at_something_that_is_not_there():
@@ -60,15 +64,20 @@ def test_mcp_server_points_at_a_file_that_exists():
 def test_mcp_server_only_sets_env_vars_the_code_actually_reads():
     """清单和 make_backend() 之间的耦合：改了一边忘了另一边，插件就会静默失灵。"""
     declared = set(PLUGIN["mcpServers"]["trace"]["env"])
-    src = (ROOT / "trace_mcp.py").read_text(encoding="utf-8")
-    read = set(re.findall(r'os\.environ(?:\.get)?[\(\[]"(TRACE_[A-Z_]+)"', src))
+    rel = PLUGIN["mcpServers"]["trace"]["args"][0].replace("${CLAUDE_PLUGIN_ROOT}/", "")
+    src = (ROOT / rel).read_text(encoding="utf-8")
+    if "from research_trace_v2.mcp import main" in src:
+        src += (ROOT / "research_trace_v2" / "mcp.py").read_text(encoding="utf-8")
+    read = set(re.findall(r'os\.environ(?:\.get)?[\(\[]"(TRACE_[A-Z0-9_]+)"', src))
     assert declared <= read, f"清单设了但代码不读: {declared - read}"
 
 
 def test_every_user_config_key_is_actually_substituted_somewhere():
     """声明了却没人用的配置项＝白问用户一次。"""
     keys = set(PLUGIN["userConfig"])
-    blob = json.dumps(PLUGIN["mcpServers"], ensure_ascii=False)
+    blob = json.dumps({"mcp": PLUGIN["mcpServers"], "hooks": PLUGIN.get("hooks")}, ensure_ascii=False)
+    if PLUGIN.get("hooks"):
+        blob += (ROOT / PLUGIN["hooks"].lstrip("./")).read_text(encoding="utf-8")
     used = set(re.findall(r"\$\{user_config\.([A-Za-z_][A-Za-z0-9_]*)\}", blob))
     assert keys == used, f"声明了没用: {keys - used}；用了没声明: {used - keys}"
 
@@ -104,7 +113,7 @@ def test_the_python_field_tells_the_user_how_to_find_the_right_interpreter():
 
 def test_the_advertised_tool_count_matches_reality():
     """清单里的「N 个 MCP 工具」是用户装之前唯一看得到的规格，对不上就是虚标。"""
-    n = len(M.TOOLS)
+    n = len(M2.TOOLS) if PLUGIN["version"].startswith("2.") else len(M.TOOLS)
     for label, text in (("plugin.json", PLUGIN["description"]),
                         ("marketplace.json", MARKET["plugins"][0]["description"])):
         counts = {int(x) for x in re.findall(r"(\d+)\s*个 MCP 工具", text)}
@@ -323,7 +332,7 @@ def _reachable_trace_tools(fm: dict) -> set:
 
 
 def test_every_declared_agent_file_exists():
-    for rel in PLUGIN["agents"]:
+    for rel in PLUGIN.get("agents", []):
         assert (ROOT / rel.lstrip("./")).is_file(), f"清单声明了 {rel} 但文件不在"
 
 
@@ -438,6 +447,9 @@ def test_subagents_never_try_to_ask_the_user_themselves():
 
 
 def test_every_agent_file_is_declared_in_the_manifest():
+    if PLUGIN["version"].startswith("2."):
+        assert "agents" not in PLUGIN, "v2 Recorder is a conversation fork, not a fresh named agent"
+        return
     declared = {Path(r).name for r in PLUGIN["agents"]}
     on_disk = {p.name for p in AGENT_DIR.glob("*.md")}
     assert declared == on_disk, f"清单少了: {on_disk - declared}；多了: {declared - on_disk}"
@@ -575,6 +587,10 @@ def clean_env(monkeypatch, tmp_path):
 
 
 def test_role_is_offered_at_install_time():
+    if PLUGIN["version"].startswith("2."):
+        assert {"url", "token", "capture", "python"} <= set(PLUGIN["userConfig"])
+        assert "TRACE_V2_URL" in PLUGIN["mcpServers"]["trace"]["env"]
+        return
     spec = PLUGIN["userConfig"]["role"]
     assert spec["default"] == "auto"
     for v in ("server", "client", "auto"):

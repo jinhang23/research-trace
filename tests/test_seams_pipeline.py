@@ -542,7 +542,12 @@ def test_the_figure_uses_no_hue_and_the_screen_shows_that_same_figure(data: Path
 
 def test_the_advertised_tool_count_is_not_a_hand_written_number_that_drifted():
     """`.claude-plugin` 里的描述是**用户装之前唯一看得到的规格**，对不上就是虚标。"""
-    n = len(M.TOOLS)
+    plugin = json.loads((REPO / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+    if plugin["version"].startswith("2."):
+        from research_trace_v2.mcp import TOOLS as registered_tools
+        n = len(registered_tools)
+    else:
+        n = len(M.TOOLS)
     for name in ("plugin.json", "marketplace.json"):
         text = json.loads((REPO / ".claude-plugin" / name).read_text(encoding="utf-8"))
         desc = text.get("description") or text["plugins"][0]["description"]

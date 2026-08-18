@@ -1,4 +1,22 @@
-# trace — 科研记录与溯源
+# Research Trace v2 — 团队研究与项目记忆
+
+> v2 alpha 已成为当前实现。它不再假设每次工作都是“实验”，也不把项目强制建成一棵
+> 全局步骤树。想法、论文阅读、数据理解、实验、失败和关键实现统一记录为 Node；完整
+> Claude Code 历史进入永久原始层。安装与部署见 [v2 快速开始](docs/V2_QUICKSTART.md)，
+> 完整约束见 [v2 需求](docs/V2_REQUIREMENTS.md)。
+
+v2 的结构是：Project 有一个可持续修订的 Overview；项目下有彼此无时间顺序的 Chapter；
+每个 Chapter 内的 Node 按时间排列，并可选 parent。Comments / Corrections 直接附在 Overview、
+Chapter 或 Node 上。中央服务使用 SQLite 和内容寻址附件；GitHub 只保存确定性、可校验、可恢复
+的备份，不保存运行中的 SQLite/WAL。团队成员用 GitHub OAuth 登录网页；Claude/Codex/HPC
+通过同一账号批准逐设备凭证，不需要共享机器 Token。
+
+下面原有的 v1 文档暂时保留，供旧数据只读迁移参考；它描述的 Step、Pipeline、分支与大量
+MCP 工具不是 v2 的模型。
+
+---
+
+# trace v1（旧版，只读迁移参考）
 
 把科研过程记录成一棵**只追加的步骤树**：每个节点自带代码、日志、产物，和一句
 "我为什么要做这一步"。从任何一个结果都能一路回溯到最初的问题。
