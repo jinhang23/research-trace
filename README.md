@@ -187,6 +187,20 @@ trace-server --data-dir /srv/research-trace/data \
 /plugin install research-trace@research-trace
 ```
 
+**工作站还要装一次 pip 包。** 插件提供 hook、MCP 工具和自动投递；`trace-login` 和
+`trace-project` 是命令行程序，来自 pip 包。而 `trace-project bind` 是必经的一步——
+不装这个包，就没有任何东西会被记录。客户端这侧零第三方依赖：
+
+```bash
+python -m pip install "research-trace @ git+https://github.com/jinhang23/research-trace"
+```
+
+装完应当有 `trace-login`、`trace-project`、`trace-deliver` 三个命令。只有中央服务需要
+`[server]` extra（fastapi/uvicorn）；在客户端误跑 `trace-server` 会直接告诉你缺什么。
+
+装在 venv 或 conda 环境里时，这些命令只在该环境激活后才在 PATH 上。插件配置里的
+`python` 填这个环境的解释器绝对路径最省事。
+
 插件配置：
 
 - `url`：中央服务地址；
@@ -210,13 +224,24 @@ token；凭证有到期时间（默认 90 天，`trace-login --renew` 续期）�
 
 ```bash
 cd /path/to/my-project
-trace-project bind --url https://trace.example.org   # 写入 .research-trace.json
-trace-project status                                  # 查看绑定与项目归属
-trace-project disable                                 # 项目排除：保留 marker，停止采集
+
+# 这个目录第一次记录，中央也还没有对应项目 —— 必须显式说明是新建
+trace-project bind --url https://trace.example.org --create --name "口袋亲和力"
+
+# 换机器、或同一项目的另一个 Git worktree —— 接到已有项目上
+trace-project bind --url https://trace.example.org --project-id prj_xxxxxxxx
+
+trace-project status     # 查看绑定与项目归属
+trace-project disable    # 项目排除：保留 marker，停止采集
 ```
 
-marker 跟着目录走，所以不同机器的路径和 Git worktree 会解析到同一个中央项目。中央匹配不到
-workspace key 时命令会拒绝静默新建项目，要求你指定已有 `--project-id` 或明确 `--create`。
+两个子命令都要给出 `--create` 或 `--project-id`：中央匹配不到这个目录的 workspace key 时，
+命令会**拒绝静默新建项目**并直接报错。这是有意的——静默新建的代价是同一个项目在中央裂成
+好几份，而且往往几周后才被发现。
+
+marker（`.research-trace.json`）跟着目录走，所以不同机器上的不同路径、以及同一仓库的多个
+worktree，都会解析到同一个中央项目。第二次在别的机器上绑定时，用 `trace-project status`
+在原机器上读出 `project_id`，再用 `--project-id` 接过去。
 
 ### 投递
 
