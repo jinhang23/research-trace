@@ -228,8 +228,8 @@ def create_app(
             "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
         )
         if (
-            request.url.path.startswith("/auth/") or request.url.path.startswith("/api/v2/auth/")
-            or request.url.path.startswith("/api/v2/device/")
+            request.url.path.startswith("/auth/") or request.url.path.startswith("/api/auth/")
+            or request.url.path.startswith("/api/device/")
         ):
             response.headers["Cache-Control"] = "no-store"
         return response
@@ -243,7 +243,7 @@ def create_app(
         """配置里删掉一个人之后，他手上的会话和设备凭证必须立刻失效。
 
         原来只在 OAuth 回调那一次检查白名单，所以把人从 TRACE_GITHUB_ADMINS
-        删掉并重启，他既有的 cookie 和 rtv2d_ 凭证照常能用。这里在每次请求上
+        删掉并重启，他既有的 cookie 和 rtd_ 凭证照常能用。这里在每次请求上
         重新判一次。org / allow_all 需要联网问 GitHub，离线判不了，那两种配置
         本来就是宽授权，跳过。
         """
@@ -384,7 +384,7 @@ def create_app(
         label = (request.headers.get("X-Trace-Actor") or "").strip()[:200]
         return "recorder", label or "machine"
 
-    @app.get("/api/v2/auth/config")
+    @app.get("/api/auth/config")
     def auth_config():
         return {"enabled": bool(oauth_config), "login_url": "/auth/github/login" if oauth_config else None}
 
@@ -446,7 +446,7 @@ def create_app(
         response.delete_cookie(OAUTH_NONCE_COOKIE, path="/", secure=oauth_config.secure_cookies, samesite="lax")
         return response
 
-    @app.get("/api/v2/auth/me")
+    @app.get("/api/auth/me")
     def auth_me(request: Request):
         if not oauth_config:
             raise HTTPException(status_code=404, detail="GitHub OAuth is not enabled")
@@ -459,7 +459,7 @@ def create_app(
         return {"user": public_user,
                 "csrf_token": csrf_token(oauth_config.session_secret, request.cookies[SESSION_COOKIE])}
 
-    @app.post("/api/v2/auth/logout")
+    @app.post("/api/auth/logout")
     def auth_logout(request: Request):
         if not oauth_config:
             raise HTTPException(status_code=404, detail="GitHub OAuth is not enabled")
@@ -497,7 +497,7 @@ def create_app(
                 value["expires_at"] = value["device"]["expires_at"]
         return value
 
-    @app.post("/api/v2/device/start")
+    @app.post("/api/device/start")
     async def device_start(request: Request):
         if not oauth_config:
             raise HTTPException(status_code=404, detail="GitHub OAuth is not enabled")
@@ -521,7 +521,7 @@ def create_app(
             "credential_days": oauth_config.device_credential_days,
         }
 
-    @app.post("/api/v2/device/token")
+    @app.post("/api/device/token")
     async def device_token(request: Request):
         if not oauth_config:
             raise HTTPException(status_code=404, detail="GitHub OAuth is not enabled")
@@ -535,7 +535,7 @@ def create_app(
             return JSONResponse(value, status_code=400)
         return issued_credential_payload(value)
 
-    @app.post("/api/v2/device/renew")
+    @app.post("/api/device/renew")
     def device_renew(request: Request, identity: dict[str, Any] = Depends(require_device)):
         """用一份还没过期的设备凭证换一份新的，不需要人再批准一次。
 
@@ -565,7 +565,7 @@ def create_app(
         store.revoke_device_credential(identity["device"]["id"], requester_user_id=user_id)
         return issued_credential_payload(issued)
 
-    @app.get("/api/v2/device/authorization")
+    @app.get("/api/device/authorization")
     def device_authorization_lookup(user_code: str, request: Request):
         if not oauth_config:
             raise HTTPException(status_code=404, detail="GitHub OAuth is not enabled")
@@ -650,7 +650,7 @@ $('lookupForm').onsubmit=async event=>{{
   const normalized=typed.slice(0,4)+'-'+typed.slice(4);
   const button=$('lookup');button.disabled=true;
   try{{
-    const response=await fetch('/api/v2/device/authorization?user_code='+encodeURIComponent(normalized));
+    const response=await fetch('/api/device/authorization?user_code='+encodeURIComponent(normalized));
     const value=await response.json();
     if(!response.ok)throw Error(value.error||value.detail||response.statusText);
     pendingCode=value.user_code;
@@ -662,8 +662,8 @@ $('lookupForm').onsubmit=async event=>{{
 $('approve').onclick=async()=>{{
   const button=$('approve');button.disabled=true;button.textContent='批准中…';out.className='meta';
   try{{
-    const me=await fetch('/api/v2/auth/me').then(r=>r.json());
-    const response=await fetch('/api/v2/device/approve',{{method:'POST',
+    const me=await fetch('/api/auth/me').then(r=>r.json());
+    const response=await fetch('/api/device/approve',{{method:'POST',
       headers:{{'Content-Type':'application/json','X-CSRF-Token':me.csrf_token}},
       body:JSON.stringify({{user_code:pendingCode}})}});
     const value=await response.json();
@@ -674,12 +674,12 @@ $('approve').onclick=async()=>{{
 </script></body></html>"""
         return HTMLResponse(page)
 
-    @app.post("/api/v2/device/approve")
+    @app.post("/api/device/approve")
     async def device_approve(request: Request, identity: dict[str, Any] = Depends(require_user_csrf)):
         body = await request.json()
         return store.approve_device_authorization(body.get("user_code"), identity["user"]["id"])
 
-    @app.get("/api/v2/auth/devices")
+    @app.get("/api/auth/devices")
     def auth_devices(request: Request):
         if not oauth_config:
             raise HTTPException(status_code=404, detail="GitHub OAuth is not enabled")
@@ -697,30 +697,30 @@ $('approve').onclick=async()=>{{
                 ).isoformat(timespec="milliseconds")
         return {"devices": devices}
 
-    @app.delete("/api/v2/auth/devices/{device_id}")
+    @app.delete("/api/auth/devices/{device_id}")
     def auth_revoke_device(device_id: str, identity: dict[str, Any] = Depends(require_user_csrf)):
         user = identity["user"]
         return store.revoke_device_credential(
             device_id, requester_user_id=user["id"], is_admin=user["role"] == "admin"
         )
 
-    @app.delete("/api/v2/device/self")
+    @app.delete("/api/device/self")
     def device_revoke_self(identity: dict[str, Any] = Depends(require_device)):
         return store.revoke_device_credential(
             identity["device"]["id"], requester_user_id=identity["user"]["id"]
         )
 
-    @app.get("/api/v2/admin/users")
+    @app.get("/api/admin/users")
     def admin_users(_identity: dict[str, Any] = Depends(require_admin)):
         return {"users": store.list_auth_users()}
 
-    @app.patch("/api/v2/admin/users/{user_id}")
+    @app.patch("/api/admin/users/{user_id}")
     async def admin_update_user(user_id: str, request: Request,
                                 _identity: dict[str, Any] = Depends(require_admin)):
         body = await request.json()
         return store.update_auth_user(user_id, role=body.get("role"), disabled=body.get("disabled"))
 
-    @app.post("/api/v2/admin/purge")
+    @app.post("/api/admin/purge")
     async def admin_purge(request: Request, identity: dict[str, Any] = Depends(require_admin)):
         """§13 要求的管理员紧急 purge。此前只有 CLI 入口，运维必须能登到服务器上。
 
@@ -738,11 +738,11 @@ $('approve').onclick=async()=>{{
             transcript_chunk_ids=body.get("transcript_chunk_ids") or (),
         )
 
-    @app.get("/api/v2/admin/purges")
+    @app.get("/api/admin/purges")
     def admin_purges(limit: int = 50, _identity: dict[str, Any] = Depends(require_admin)):
         return {"purges": store.purge_log(limit=limit)}
 
-    @app.post("/api/v2/telemetry/outbox", dependencies=[Depends(require_write)])
+    @app.post("/api/telemetry/outbox", dependencies=[Depends(require_write)])
     async def telemetry_outbox(request: Request):
         """投递器每轮上报一次本机 outbox 健康（§10、§11）。
 
@@ -766,7 +766,7 @@ $('approve').onclick=async()=>{{
             outbox_reports.pop(next(iter(outbox_reports)))
         return {"ok": True, "machines": len(outbox_reports)}
 
-    @app.get("/api/v2/health")
+    @app.get("/api/health")
     def health(request: Request):
         if oauth_config and not (bearer_identity(request) or browser_user(request)):
             return {
@@ -794,25 +794,25 @@ $('approve').onclick=async()=>{{
             }
         return value
 
-    @app.get("/api/v2/projects", dependencies=[Depends(require_read)])
+    @app.get("/api/projects", dependencies=[Depends(require_read)])
     def projects():
         return {"projects": store.list_projects()}
 
-    @app.post("/api/v2/projects", dependencies=[Depends(require_write)])
+    @app.post("/api/projects", dependencies=[Depends(require_write)])
     async def create_project(request: Request):
         body = await request.json()
         return store.create_project(body.get("name"), workspace_keys=body.get("workspace_keys") or [],
                                     overview=body.get("overview") or "")
 
-    @app.get("/api/v2/projects/{project_id}", dependencies=[Depends(require_read)])
+    @app.get("/api/projects/{project_id}", dependencies=[Depends(require_read)])
     def project(project_id: str):
         return store.get_project(project_id)
 
-    @app.get("/api/v2/projects/{project_id}/raw", dependencies=[Depends(require_read)])
+    @app.get("/api/projects/{project_id}/raw", dependencies=[Depends(require_read)])
     def raw_timeline(project_id: str, limit: int = 100):
         return {"items": store.raw_timeline(project_id, limit=limit)}
 
-    @app.post("/api/v2/context", dependencies=[Depends(require_write)])
+    @app.post("/api/context", dependencies=[Depends(require_write)])
     async def context(request: Request):
         body = await request.json()
         return store.context(
@@ -821,12 +821,12 @@ $('approve').onclick=async()=>{{
             recent_limit=body.get("recent_limit", 20),
         )
 
-    @app.post("/api/v2/projects/{project_id}/chapters", dependencies=[Depends(require_write)])
+    @app.post("/api/projects/{project_id}/chapters", dependencies=[Depends(require_write)])
     async def create_chapter(project_id: str, request: Request):
         body = await request.json()
         return store.create_chapter(project_id, body.get("name"), body.get("summary") or "")
 
-    @app.post("/api/v2/record")
+    @app.post("/api/record")
     async def record(request: Request, identity: dict[str, Any] = Depends(require_write)):
         body = await request.json()
         actor_type, _actor_id = principal(identity, request)
@@ -842,7 +842,7 @@ $('approve').onclick=async()=>{{
             source_event_ids=body.get("source_event_ids") or [], code_evidence=body.get("code_evidence") or [],
         )
 
-    @app.patch("/api/v2/nodes/{node_id}")
+    @app.patch("/api/nodes/{node_id}")
     async def update_node(node_id: str, request: Request,
                           identity: dict[str, Any] = Depends(require_write)):
         body = await request.json()
@@ -859,7 +859,7 @@ $('approve').onclick=async()=>{{
             actor_type=actor_type, actor_id=actor_id,
         )
 
-    @app.post("/api/v2/curate")
+    @app.post("/api/curate")
     async def curate(request: Request, identity: dict[str, Any] = Depends(require_write)):
         body = await request.json()
         actor_type, actor_id = principal(identity, request)
@@ -871,11 +871,11 @@ $('approve').onclick=async()=>{{
             milestone=bool(body.get("milestone")), resolve_comment_ids=body.get("resolve_comment_ids") or [],
         )
 
-    @app.get("/api/v2/revisions/{target_type}/{target_id}", dependencies=[Depends(require_read)])
+    @app.get("/api/revisions/{target_type}/{target_id}", dependencies=[Depends(require_read)])
     def revisions(target_type: str, target_id: str):
         return {"revisions": store.revisions(target_type, target_id)}
 
-    @app.post("/api/v2/comments")
+    @app.post("/api/comments")
     async def add_comment(request: Request, identity: dict[str, Any] = Depends(require_write)):
         body = await request.json()
         author_type, author_id = principal(identity, request)
@@ -893,7 +893,7 @@ $('approve').onclick=async()=>{{
             author_type=author_type, author_id=author_id,
         )
 
-    @app.post("/api/v2/comments/{comment_id}/resolve")
+    @app.post("/api/comments/{comment_id}/resolve")
     def resolve_comment(comment_id: str, request: Request,
                         identity: dict[str, Any] = Depends(require_write)):
         actor_type, actor_id = principal(identity, request)
@@ -906,7 +906,7 @@ $('approve').onclick=async()=>{{
             )
         return store.resolve_comment(comment_id, actor_id)
 
-    @app.post("/api/v2/ingest")
+    @app.post("/api/ingest")
     async def ingest(request: Request, identity: dict[str, Any] = Depends(require_write)):
         body = await request.json()
         # 投递已经和产生事件的那个 session 解耦了，所以「哪台机器推的这批」
@@ -918,7 +918,7 @@ $('approve').onclick=async()=>{{
             delivered_by=principal(identity, request)[1],
         )
 
-    @app.post("/api/v2/attach", dependencies=[Depends(require_write)])
+    @app.post("/api/attach", dependencies=[Depends(require_write)])
     async def attach(request: Request):
         body = await request.json()
         return store.attach(
@@ -929,12 +929,12 @@ $('approve').onclick=async()=>{{
             sha256=body.get("sha256"), metadata=body.get("metadata") or {},
         )
 
-    @app.get("/api/v2/attachments/{attachment_id}/content", dependencies=[Depends(require_read)])
+    @app.get("/api/attachments/{attachment_id}/content", dependencies=[Depends(require_read)])
     def attachment_content(attachment_id: str):
         path, mime, name = store.attachment_content(attachment_id)
         return FileResponse(path, media_type=mime or "application/octet-stream", filename=name)
 
-    @app.get("/api/v2/search", dependencies=[Depends(require_read)])
+    @app.get("/api/search", dependencies=[Depends(require_read)])
     def search(q: str, project_id: str | None = None, scope: str = "all", limit: int = 50):
         # as_dict() 是旧结构的超集（仍带 hits），额外带 totals / returned / omitted /
         # truncated。存储层早就算出"还有多少条没显示"，以前在这一行被丢掉，

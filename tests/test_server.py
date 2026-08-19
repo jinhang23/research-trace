@@ -13,22 +13,22 @@ from research_trace.webapp import INDEX_HTML
 def test_http_flow_and_write_auth(tmp_path):
     app = create_app(tmp_path, token="secret")
     with TestClient(app) as client:
-        assert client.get("/api/v2/health").json()["write_protected"] is True
-        denied = client.post("/api/v2/projects", json={"name": "RNA"})
+        assert client.get("/api/health").json()["write_protected"] is True
+        denied = client.post("/api/projects", json={"name": "RNA"})
         assert denied.status_code == 401
         headers = {"Authorization": "Bearer secret", "X-Trace-Actor": "tester"}
         project = client.post(
-            "/api/v2/projects",
+            "/api/projects",
             headers=headers,
             json={"name": "RNA", "workspace_keys": ["https://github.com/lab/rna"]},
         ).json()
         chapter = client.post(
-            f"/api/v2/projects/{project['id']}/chapters",
+            f"/api/projects/{project['id']}/chapters",
             headers=headers,
             json={"name": "主实验"},
         ).json()
         node = client.post(
-            "/api/v2/record",
+            "/api/record",
             headers=headers,
             json={
                 "project_id": project["id"],
@@ -40,12 +40,12 @@ def test_http_flow_and_write_auth(tmp_path):
         ).json()
         assert node["chapter_id"] == chapter["id"]
         invalid = client.patch(
-            f"/api/v2/nodes/{node['id']}", headers=headers,
+            f"/api/nodes/{node['id']}", headers=headers,
             json={"patch": {"body": "missing version"}},
         )
         assert invalid.status_code == 400
         comment = client.post(
-            "/api/v2/comments",
+            "/api/comments",
             headers=headers,
             json={
                 "project_id": project["id"],
@@ -58,10 +58,10 @@ def test_http_flow_and_write_auth(tmp_path):
         assert comment["author_id"] == "tester"
         # 共享机器 token 背后没有可认证的人，所以只能是 recorder。
         assert comment["author_type"] == "recorder"
-        detail = client.get(f"/api/v2/projects/{project['id']}").json()
+        detail = client.get(f"/api/projects/{project['id']}").json()
         assert detail["nodes"][0]["review_state"] == "unreviewed"
         client.post(
-            "/api/v2/ingest", headers=headers,
+            "/api/ingest", headers=headers,
             json={
                 "batch_id": "http-batch", "project_id": project["id"],
                 "session": {"id": "http-session", "source": "claude-code"},
@@ -69,7 +69,7 @@ def test_http_flow_and_write_auth(tmp_path):
                 "events": [{"event_id": "http-event", "event_type": "Stop", "payload": {"ok": True}}],
             },
         ).raise_for_status()
-        raw = client.get(f"/api/v2/projects/{project['id']}/raw").json()
+        raw = client.get(f"/api/projects/{project['id']}/raw").json()
         assert raw["items"][0]["id"] == "http-event"
         page = client.get("/").text
         assert "Research Trace" in page
@@ -82,9 +82,9 @@ def test_machine_token_cannot_confirm_or_correct_and_cannot_claim_a_human_identi
     app = create_app(tmp_path, token="secret")
     with TestClient(app) as client:
         headers = {"Authorization": "Bearer secret", "X-Trace-Actor": "tester"}
-        project = client.post("/api/v2/projects", headers=headers, json={"name": "RNA"}).json()
+        project = client.post("/api/projects", headers=headers, json={"name": "RNA"}).json()
         node = client.post(
-            "/api/v2/record", headers=headers,
+            "/api/record", headers=headers,
             json={
                 "project_id": project["id"], "idempotency_key": "k1", "title": "t",
                 # 请求体自称是人、自称已确认，都必须被忽略。
@@ -96,7 +96,7 @@ def test_machine_token_cannot_confirm_or_correct_and_cannot_claim_a_human_identi
 
         for kind in ("confirmation", "correction"):
             denied = client.post(
-                "/api/v2/comments", headers=headers,
+                "/api/comments", headers=headers,
                 json={
                     "project_id": project["id"], "target_type": "node", "target_id": node["id"],
                     "kind": kind, "body": "self service", "author_type": "human",
@@ -106,12 +106,12 @@ def test_machine_token_cannot_confirm_or_correct_and_cannot_claim_a_human_identi
             assert denied.status_code == 403, kind
 
         denied_patch = client.patch(
-            f"/api/v2/nodes/{node['id']}", headers=headers,
+            f"/api/nodes/{node['id']}", headers=headers,
             json={"expect_version": node["version"], "actor_type": "human",
                   "patch": {"review_state": "confirmed"}},
         )
         assert denied_patch.status_code == 403
-        detail = client.get(f"/api/v2/projects/{project['id']}").json()
+        detail = client.get(f"/api/projects/{project['id']}").json()
         assert detail["nodes"][0]["review_state"] == "unreviewed"
 
 
@@ -121,7 +121,7 @@ def test_anonymous_read_is_announced_loudly_when_oauth_is_not_configured(tmp_pat
     assert "GitHub OAuth is NOT configured" in warning
     assert "open to" in warning
     with TestClient(app) as client:
-        assert client.get("/api/v2/health").json()["anonymous_read"] is True
+        assert client.get("/api/health").json()["anonymous_read"] is True
 
 
 def test_web_ui_is_accessible_and_content_first(tmp_path):
@@ -218,7 +218,7 @@ def test_web_fmt_escapes_hostile_timestamps():
     start = INDEX_HTML.index("const esc = value =>")
     source = INDEX_HTML[start:INDEX_HTML.index("function file64", start)]
     check = r"""
-const attack = '<img src=x onerror="fetch(\'/api/v2/search\')">';
+const attack = '<img src=x onerror="fetch(\'/api/search\')">';
 if (fmt(attack).includes('<')) throw Error('hostile timestamp reached innerHTML unescaped');
 if (!fmt(attack).includes('&lt;img')) throw Error('the raw value must still be readable, escaped');
 if (fmt('2026-08-18T02:03:04Z').includes('<')) throw Error('a valid date must not produce markup');
@@ -236,7 +236,7 @@ def test_web_shows_outbox_recorder_and_backup_health():
     assert 'id="healthBtn"' in INDEX_HTML
     assert "$('#healthBtn').onclick" in INDEX_HTML
     assert "async function showHealth()" in INDEX_HTML
-    assert "await api('/api/v2/health')" in INDEX_HTML
+    assert "await api('/api/health')" in INDEX_HTML
     for name in ("outboxHealthHtml", "recorderHealthHtml", "backupHealthHtml"):
         assert f"function {name}(" in INDEX_HTML
     # 投递器还没上报时必须说"未上报"，不能画一个绿灯
@@ -245,9 +245,9 @@ def test_web_shows_outbox_recorder_and_backup_health():
 
 
 def test_web_revision_history_is_reachable_from_overview_chapter_and_node():
-    """§3.4：被纠正的原文必须保留；/api/v2/revisions 以前从未被调用过。"""
+    """§3.4：被纠正的原文必须保留；/api/revisions 以前从未被调用过。"""
     assert "async function showRevisions(" in INDEX_HTML
-    assert "'/api/v2/revisions/' + encodeURIComponent(targetType)" in INDEX_HTML
+    assert "'/api/revisions/' + encodeURIComponent(targetType)" in INDEX_HTML
     for target in ("overview", "chapter", "node"):
         assert f'data-history-type="{target}"' in INDEX_HTML
     assert "document.querySelectorAll('[data-history-type]')" in INDEX_HTML
@@ -278,18 +278,18 @@ def test_search_no_longer_drops_the_truncation_report(tmp_path):
     app = create_app(tmp_path, token="t")
     headers = {"Authorization": "Bearer t"}
     with TestClient(app) as client:
-        project = client.post("/api/v2/projects", headers=headers, json={"name": "P"}).json()
-        client.post("/api/v2/record", headers=headers, json={
+        project = client.post("/api/projects", headers=headers, json={"name": "P"}).json()
+        client.post("/api/record", headers=headers, json={
             "project_id": project["id"], "idempotency_key": "k", "title": "alpha", "body": "alpha",
         }).raise_for_status()
         for index in range(60):
-            client.post("/api/v2/ingest", headers=headers, json={
+            client.post("/api/ingest", headers=headers, json={
                 "batch_id": f"b{index}", "project_id": project["id"],
                 "session": {"id": "s", "source": "claude-code"},
                 "events": [{"event_id": f"e{index}", "event_type": "Stop",
                             "payload": {"x": "alpha"}}],
             }).raise_for_status()
-        value = client.get("/api/v2/search", params={"q": "alpha", "limit": 10}).json()
+        value = client.get("/api/search", params={"q": "alpha", "limit": 10}).json()
     assert value["hits"], "旧结构必须还在，网页和 MCP 都在读 hits"
     assert value["truncated"] is True
     assert value["omitted"]["event"] > 0
@@ -302,16 +302,16 @@ def test_the_deliverer_can_report_outbox_health_and_health_shows_it(tmp_path):
     app = create_app(tmp_path, token="t")
     headers = {"Authorization": "Bearer t"}
     with TestClient(app) as client:
-        assert "outbox" not in client.get("/api/v2/health", headers=headers).json()
-        assert client.post("/api/v2/telemetry/outbox", json={
+        assert "outbox" not in client.get("/api/health", headers=headers).json()
+        assert client.post("/api/telemetry/outbox", json={
             "machine": "hpg-node-7", "pending": 3, "sent": 41,
             "oldest_pending_at": "2026-08-19T00:00:00Z", "last_error": None,
         }).status_code == 401, "遥测也要写权限，否则谁都能往健康页上写字"
-        client.post("/api/v2/telemetry/outbox", headers=headers, json={
+        client.post("/api/telemetry/outbox", headers=headers, json={
             "machine": "hpg-node-7", "pending": 3, "sent": 41,
             "oldest_pending_at": "2026-08-19T00:00:00Z",
         }).raise_for_status()
-        health = client.get("/api/v2/health", headers=headers).json()
+        health = client.get("/api/health", headers=headers).json()
     machine = health["outbox"]["machines"][0]
     assert machine["machine"] == "hpg-node-7"
     assert machine["pending"] == 3 and machine["sent"] == 41
@@ -321,7 +321,7 @@ def test_a_raw_batch_records_which_credential_delivered_it(tmp_path):
     """投递已经和产生事件的 session 解耦，所以「哪台机器推的」只能来自凭证。"""
     app = create_app(tmp_path, token="t")
     with TestClient(app) as client:
-        client.post("/api/v2/ingest", json={
+        client.post("/api/ingest", json={
             "batch_id": "b1", "session": {"id": "s", "source": "claude-code"},
             "events": [{"event_id": "e1", "event_type": "Stop", "payload": {}}],
         }, headers={"Authorization": "Bearer t", "X-Trace-Actor": "alice@hpg-node-7"}).raise_for_status()

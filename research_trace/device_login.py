@@ -74,7 +74,7 @@ def load_device_credential(path: str | os.PathLike[str] | None, url: str) -> dic
     target = Path(path).expanduser().resolve() if path else default_credential_file()
     key = normalize_server_url(url)
     value = _read_store(target).get("credentials", {}).get(key)
-    if not isinstance(value, dict) or not str(value.get("credential") or "").startswith("rtv2d_"):
+    if not isinstance(value, dict) or not str(value.get("credential") or "").startswith("rtd_"):
         return None
     return dict(value)
 
@@ -85,7 +85,7 @@ def save_device_credential(
     target = Path(path).expanduser().resolve() if path else default_credential_file()
     key = normalize_server_url(url)
     credential = str(response.get("credential") or "")
-    if not credential.startswith("rtv2d_"):
+    if not credential.startswith("rtd_"):
         raise DeviceLoginError("server did not return a Research Trace device credential")
     store = _read_store(target)
     device = response.get("device") or {}
@@ -163,7 +163,7 @@ def request_json(
 
 
 def start_login(url: str, device_name: str) -> dict[str, Any]:
-    status, value = request_json(url, "POST", "/api/v2/device/start", {"device_name": device_name})
+    status, value = request_json(url, "POST", "/api/device/start", {"device_name": device_name})
     if status == 429:
         raise DeviceLoginError(
             "Research Trace is rate limiting device logins from this machine; wait and retry"
@@ -177,7 +177,7 @@ def start_login(url: str, device_name: str) -> dict[str, Any]:
 
 def renew_login(url: str, credential: str) -> dict[str, Any]:
     """用还没过期的凭证换一份新的，不需要人再批准一次。"""
-    status, value = request_json(url, "POST", "/api/v2/device/renew", {}, credential=credential)
+    status, value = request_json(url, "POST", "/api/device/renew", {}, credential=credential)
     if status != 200:
         raise DeviceLoginError(str(value.get("error") or value.get("detail") or value))
     return value
@@ -185,7 +185,7 @@ def renew_login(url: str, credential: str) -> dict[str, Any]:
 
 def poll_login(url: str, device_code: str) -> dict[str, Any]:
     status, value = request_json(
-        url, "POST", "/api/v2/device/token", {"device_code": device_code}
+        url, "POST", "/api/device/token", {"device_code": device_code}
     )
     if status in {200, 202}:
         return value
@@ -217,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
             current = load_device_credential(args.credential_file, url)
             if current:
                 status, value = request_json(
-                    url, "DELETE", "/api/v2/device/self",
+                    url, "DELETE", "/api/device/self",
                     credential=current["credential"],
                 )
                 if status not in {200, 401}:

@@ -263,7 +263,7 @@ outbox 的状态只有两个：`pending/`（等待投递，永不自动删除）
 
 每轮投递的统计写在 `${CLAUDE_PLUGIN_DATA}/outbox/delivery-status.json`（`pending`、`sent`、
 `delivered_batches`、`failed_batches`、`conflicts`、`reclaimed`、`last_error` 等），
-同一份统计还会 `POST /api/v2/telemetry/outbox` 上报给中央，出现在网页“状态”面板的
+同一份统计还会 `POST /api/telemetry/outbox` 上报给中央，出现在网页“状态”面板的
 outbox 与 Recorder 两格里。
 
 回收与告警：每轮结束时按 mtime 删除 `sent/` 与 `transcripts/sent/` 里超过保留期的文件——
@@ -285,7 +285,7 @@ trace-server --data-dir /srv/research-trace/data \
 ```
 
 服务启动后会先执行一次，随后按间隔导出、校验、仅在内容变化时 commit，并用普通 push
-上传；不会 force-push。失败不会阻断记录服务，状态可在 `/api/v2/health` 查看。
+上传；不会 force-push。失败不会阻断记录服务，状态可在 `/api/health` 查看。
 
 也可以交给 cron/SLURM 定时任务单独执行：
 
@@ -359,6 +359,6 @@ trace-backup rewrite-history --data-dir /srv/research-trace/data \
   此时网页自身的写入也只能算 `recorder`，无法产生 `human` 记录或确认。
 - 默认永久保存可能包含命令、路径或 transcript 中的敏感信息。现在已经有三层控制（不绑定、
   `trace-project disable`、`capture=off`）、`sent/` 的保留期与磁盘告警，以及管理员紧急 purge
-  （CLI 与 `POST /api/v2/admin/purge`）；备份仍然是一棵全量树，按年份/容量分卷尚未实现。
+  （CLI 与 `POST /api/admin/purge`）；备份仍然是一棵全量树，按年份/容量分卷尚未实现。
 - 数据流视图尚未实现：它要求登记产物时给出 `sha256` 或规范化 `uri` 作为可 join 的键。
   协议里已经这么要求了，但存量数据还没有，画出来只会是空图。

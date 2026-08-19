@@ -171,7 +171,7 @@ Hook 的任何失败都 fail-open：退出码恒为 0，不输出会阻断主任
 
 - 它扫 outbox 根下**所有** workspace 目录和**所有** session 目录，不只是当前活着的那个；
   被杀掉或已正常退出的 session 留在磁盘上的 `pending/` 因此有确定的重放路径；
-- 按大小/条数分批 POST 到中央 `/api/v2/ingest`；**只有 2xx 才**把文件搬进 `sent/`
+- 按大小/条数分批 POST 到中央 `/api/ingest`；**只有 2xx 才**把文件搬进 `sent/`
   （transcript chunk 进 `transcripts/sent/`），其余情况原样留在 `pending/`；
 - 触发方式：手动 `trace-deliver`、常驻 `trace-deliver --watch`、外部定时任务，
   以及 hook 在 SessionStart / SessionEnd 分离启动的一次性投递（fire-and-forget，绝不等待）。
@@ -260,8 +260,8 @@ Comments 的人工操作走网页 REST；不为每个网页动作增加 MCP 工�
 - 原始 session/agent timeline 默认折叠，可从语义记录跳转。
 - 跨项目全文搜索。
 - outbox、Recorder 和 GitHub backup 健康状态。三格都有数据源：投递器每轮结束时
-  `POST /api/v2/telemetry/outbox` 上报本机的 pending/sent 计数、最老一条 pending 的时间、
-  最近一次错误和 Recorder 未处理的 batch 数；`GET /api/v2/health` 把最近一次结果放在
+  `POST /api/telemetry/outbox` 上报本机的 pending/sent 计数、最老一条 pending 的时间、
+  最近一次错误和 Recorder 未处理的 batch 数；`GET /api/health` 把最近一次结果放在
   `outbox.machines[]` 与 `recorder` 里。没有任何机器上报过时界面显示「未上报」，不画假绿灯。
   同一份统计也写在本机 `outbox/delivery-status.json`，`trace-deliver --status` 不联网就能读。
   备份卡片额外显示 `unpushed_commits`，「本地 commit 成功但远端落后几周」因此看得见。
@@ -334,7 +334,7 @@ outbox/
 purge 只保证中央库、下一次导出和被重写后的备份分支里不再有原文；远端托管方的旧对象要等它自己
 GC，别的机器已经克隆的备份副本管不到，涉及令牌时仍必须轮换密钥。网页侧的管理员 purge 入口
 有两条入口：CLI（`trace-backup purge` / `rewrite-history`）与管理员 REST
-（`POST /api/v2/admin/purge`、`GET /api/v2/admin/purges`，两者都要 admin 凭证，理由必填，
+（`POST /api/admin/purge`、`GET /api/admin/purges`，两者都要 admin 凭证，理由必填，
 操作者取自凭证而不是请求体）。界面提示命令与 transcript 可能含令牌和敏感路径。
 
 ## 14. 明确不做
@@ -372,13 +372,13 @@ GC，别的机器已经克隆的备份副本管不到，涉及令牌时仍必须
 - 【已实现】多人并发编辑不会静默丢内容（版本号 + revisions）。
 - 【已实现】关键代码记录包含可独立理解的 snippet/diff，而不是依赖可能消失的 branch。
 - 【已实现】GitHub 备份可以从空数据库恢复并通过 manifest/hash 校验；备份格式版本为 2。
-- 【已实现】搜索不被原始事件淹没：存储层给语义层保底名额并算出截断信息，`/api/v2/search`
+- 【已实现】搜索不被原始事件淹没：存储层给语义层保底名额并算出截断信息，`/api/search`
   返回 `SearchResult.as_dict()`（旧的 `hits` 键仍在，另带 `totals` / `returned` / `omitted` /
   `truncated`），搜索下拉在结果末尾写出「还有 N 条未显示」。
-- 【已实现】管理员可以紧急 purge 并留下不含原文的审计记录（CLI 与 `POST /api/v2/admin/purge`）。
+- 【已实现】管理员可以紧急 purge 并留下不含原文的审计记录（CLI 与 `POST /api/admin/purge`）。
 - 【已实现】`sent/` 的 30 天保留、磁盘阈值告警、`trace-deliver --status` 的未同步计数（§12）。
-- 【已实现】网页显示 outbox 与 Recorder 健康状态：投递器 `POST /api/v2/telemetry/outbox`
-  上报，`/api/v2/health` 返回 `outbox` 与 `recorder`（§10、§11）。
+- 【已实现】网页显示 outbox 与 Recorder 健康状态：投递器 `POST /api/telemetry/outbox`
+  上报，`/api/health` 返回 `outbox` 与 `recorder`（§10、§11）。
 - 【已实现】人工 correction 不会被机器悄悄了结：Recorder 在 `resolve_comment_ids` 里回填的
   id 只记为 acknowledgement（解开 curate 闸门，不再被同一条永久挡住），`resolved_at` 只有
   真人能写，纠正在界面与后续 `trace_context` 里保持未处理直到有人关掉它。
@@ -392,12 +392,15 @@ GC，别的机器已经克隆的备份副本管不到，涉及令牌时仍必须
 旧的 v1 实现已从仓库删除，`_v2` 后缀也已去掉：现在只有一套系统，包名是 `research_trace`，
 环境变量前缀是 `TRACE_*`，不再存在「v1 / v2」两套东西，也不提供 v1 importer。
 
-仍然保留的两个 `v2` 字符串是跨文件契约，不能单方面改名：
+最后两个 `v2` 字符串也已经改掉——**趁还没有任何凭证被发出去**：
 
-- HTTP 路由前缀 `/api/v2/*`（服务端、网页、MCP、投递器、hook 与全部测试共同引用）；
-- 设备凭证前缀 `rtv2d_`（改名会让所有工作站上已有的凭证立即失效，需要「同时接受新旧前缀」的
-  过渡期或强制重新登录）。
+- HTTP 路由前缀 `/api/v2/*` → `/api/*`；
+- 设备凭证前缀 `rtv2d_` → `rtd_`。
 
-改动它们需要一次跨 `storage.py`、`server.py`、`webapp.py`、`mcp.py`、`device_login.py`、
-`deliver.py`、`scripts/trace_hook.py` 与文档的协调修改；在那之前，文档里出现的这两个字符串
-是准确的实现事实，不是漏网的旧命名。
+这两处是跨文件契约（`storage.py` / `server.py` / `webapp.py` / `mcp.py` /
+`device_login.py` / `deliver.py` / `scripts/trace_hook.py` 与全部测试共同引用），
+改名的代价随部署规模上升：凭证前缀一动，所有工作站上已有的凭证立即失效，
+之后要么留一个「同时接受新旧前缀」的过渡期，要么强制全员重新登录。
+现在没有任何已发凭证，所以这是成本最低的时刻；再往后就不是了。
+
+于是仓库里不再有任何 `v1` / `v2` 命名。

@@ -2441,7 +2441,7 @@ function setModal(title, html, onSave = null) {
 }
 
 async function loadProjects() {
-  const value = await api('/api/v2/projects');
+  const value = await api('/api/projects');
   S.projects = value.projects;
   if (S.project && !S.projects.some(project => project.id === S.project.id)) {
     S.project = null;
@@ -2452,7 +2452,7 @@ async function loadProjects() {
 }
 
 async function openProject(id) {
-  S.project = await api('/api/v2/projects/' + encodeURIComponent(id));
+  S.project = await api('/api/projects/' + encodeURIComponent(id));
   S.chapter = null;
   S.selectedNodeId = null;
   renderSide();
@@ -2461,7 +2461,7 @@ async function openProject(id) {
 
 async function refreshProject(chapterId = S.chapter && S.chapter.id) {
   if (!S.project) return;
-  S.project = await api('/api/v2/projects/' + encodeURIComponent(S.project.id));
+  S.project = await api('/api/projects/' + encodeURIComponent(S.project.id));
   S.chapter = chapterId
     ? S.project.chapters.find(chapter => chapter.id === chapterId) || null
     : null;
@@ -2634,7 +2634,7 @@ function nodeHtml(node) {
     <div class="artifact">
       ${icon('file')}
       <div><strong>${esc(directionLabels[artifact.direction] || artifact.direction)}</strong> ·
-        ${artifact.object_path ? `<a href="/api/v2/attachments/${encodeURIComponent(artifact.id)}/content">${esc(artifact.name)}</a>` : esc(artifact.name)}
+        ${artifact.object_path ? `<a href="/api/attachments/${encodeURIComponent(artifact.id)}/content">${esc(artifact.name)}</a>` : esc(artifact.name)}
         ${artifact.external_path ? ' · ' + esc(artifact.machine || '') + ':' + esc(artifact.external_path) : ''}
         ${artifact.uri ? ' · ' + esc(artifact.uri) : ''}
       </div>
@@ -2936,7 +2936,7 @@ async function loadRaw() {
   const box = $('#rawItems');
   box.innerHTML = '<div class="meta">加载中…</div>';
   try {
-    const value = await api('/api/v2/projects/' + encodeURIComponent(S.project.id) + '/raw?limit=60');
+    const value = await api('/api/projects/' + encodeURIComponent(S.project.id) + '/raw?limit=60');
     box.innerHTML = value.items.map(rawRowHtml).join('')
       || '<div class="meta">还没有已上传的原始历史。</div>';
   } catch (error) {
@@ -2952,7 +2952,7 @@ async function showNodeRaw(nodeId) {
   const sources = (node && node.source_event_ids) || [];
   setModal('原始历史 · ' + label, '<div class="meta">加载中…</div>');
   try {
-    const value = await api('/api/v2/projects/' + encodeURIComponent(S.project.id) + '/raw?limit=200');
+    const value = await api('/api/projects/' + encodeURIComponent(S.project.id) + '/raw?limit=200');
     const matched = sources.length
       ? value.items.filter(item => sources.includes(item.id))
       : [];
@@ -2971,12 +2971,12 @@ async function showNodeRaw(nodeId) {
   }
 }
 
-/* §3.4：被纠正的原文必须保留。/api/v2/revisions 一直有数据，界面上却没有落点。 */
+/* §3.4：被纠正的原文必须保留。/api/revisions 一直有数据，界面上却没有落点。 */
 async function showRevisions(targetType, targetId, label) {
   setModal('修订历史 · ' + label, '<div class="meta">加载中…</div>');
   try {
     const value = await api(
-      '/api/v2/revisions/' + encodeURIComponent(targetType) + '/' + encodeURIComponent(targetId)
+      '/api/revisions/' + encodeURIComponent(targetType) + '/' + encodeURIComponent(targetId)
     );
     const rows = (value.revisions || []).map(revision => {
       const snapshot = revision.snapshot && typeof revision.snapshot === 'object' ? revision.snapshot : {};
@@ -3125,7 +3125,7 @@ function bindMain() {
     '编辑 Overview',
     `<label for="fieldBody">项目当前认识</label><textarea id="fieldBody">${esc(S.project.overview)}</textarea>`,
     async () => {
-      await api('/api/v2/curate', {
+      await api('/api/curate', {
         method: 'POST',
         body: JSON.stringify({
           project_id: S.project.id,
@@ -3142,7 +3142,7 @@ function bindMain() {
     '编辑 Chapter 摘要',
     `<label for="fieldBody">当前摘要</label><textarea id="fieldBody">${esc(S.chapter.summary)}</textarea>`,
     async () => {
-      await api('/api/v2/curate', {
+      await api('/api/curate', {
         method: 'POST',
         body: JSON.stringify({
           project_id: S.project.id,
@@ -3169,7 +3169,7 @@ function bindMain() {
       <select id="fieldParent">${parentOptionsHtml(S.chapter.id)}</select>
     `,
     async () => {
-      await api('/api/v2/record', {
+      await api('/api/record', {
         method: 'POST',
         body: JSON.stringify({
           project_id: S.project.id,
@@ -3197,7 +3197,7 @@ function bindMain() {
       }
       await withBusy(button, async () => {
         try {
-          await api('/api/v2/comments', {
+          await api('/api/comments', {
             method: 'POST',
             body: JSON.stringify({
               project_id: S.project.id,
@@ -3217,7 +3217,7 @@ function bindMain() {
   document.querySelectorAll('[data-resolve-comment]').forEach(button => {
     button.onclick = () => withBusy(button, async () => {
       try {
-        await api('/api/v2/comments/' + encodeURIComponent(button.dataset.resolveComment) +
+        await api('/api/comments/' + encodeURIComponent(button.dataset.resolveComment) +
                   '/resolve', {method: 'POST'});
         await refreshProject();
       } catch (error) {
@@ -3255,7 +3255,7 @@ function bindNodeActions() {
         `,
         async () => {
           const destinationChapterId = $('#fieldChapter').value;
-          await api('/api/v2/nodes/' + encodeURIComponent(node.id), {
+          await api('/api/nodes/' + encodeURIComponent(node.id), {
             method: 'PATCH',
             body: JSON.stringify({
               expect_version: node.version,
@@ -3309,7 +3309,7 @@ function bindNodeActions() {
             value.mime_type = file.type || undefined;
             value.size = file.size;
           }
-          await api('/api/v2/attach', {method: 'POST', body: JSON.stringify(value)});
+          await api('/api/attach', {method: 'POST', body: JSON.stringify(value)});
           await refreshProject();
         }
       );
@@ -3325,7 +3325,7 @@ function showNewProject() {
       <label for="fieldKey">Workspace key（可空，建议填 Git remote）</label><input id="fieldKey" autocomplete="off">
     `,
     async () => {
-      const project = await api('/api/v2/projects', {
+      const project = await api('/api/projects', {
         method: 'POST',
         body: JSON.stringify({
           name: $('#fieldName').value,
@@ -3347,7 +3347,7 @@ function showNewChapter() {
     `,
     async () => {
       const chapter = await api(
-        '/api/v2/projects/' + encodeURIComponent(S.project.id) + '/chapters',
+        '/api/projects/' + encodeURIComponent(S.project.id) + '/chapters',
         {
           method: 'POST',
           body: JSON.stringify({name: $('#fieldName').value, summary: $('#fieldBody').value})
@@ -3433,7 +3433,7 @@ function backupHealthHtml(value) {
 async function showHealth() {
   setModal('采集与备份状态', '<div class="meta">加载中…</div>');
   try {
-    const value = await api('/api/v2/health');
+    const value = await api('/api/health');
     setModal('采集与备份状态', [
       outboxHealthHtml(value),
       recorderHealthHtml(value),
@@ -3453,7 +3453,7 @@ async function showHealth() {
 }
 
 async function showUsers() {
-  const value = await api('/api/v2/admin/users');
+  const value = await api('/api/admin/users');
   setModal(
     '团队用户',
     value.users.map(user => `
@@ -3478,7 +3478,7 @@ async function showUsers() {
     button.onclick = () => withBusy(button, async () => {
       const id = button.dataset.saveUser;
       try {
-        await api('/api/v2/admin/users/' + encodeURIComponent(id), {
+        await api('/api/admin/users/' + encodeURIComponent(id), {
           method: 'PATCH',
           body: JSON.stringify({
             role: document.querySelector(`[data-role="${id}"]`).value,
@@ -3502,7 +3502,7 @@ function deviceExpiringSoon(device, days = 14) {
 }
 
 async function showDevices() {
-  const value = await api('/api/v2/auth/devices');
+  const value = await api('/api/auth/devices');
   setModal(
     '已登录设备',
     value.devices.map(device => `
@@ -3519,7 +3519,7 @@ async function showDevices() {
       if (!confirm('撤销这台设备？它的 Hook/MCP 将立即失效。')) return;
       await withBusy(button, async () => {
         try {
-          await api('/api/v2/auth/devices/' + encodeURIComponent(button.dataset.revokeDevice), {
+          await api('/api/auth/devices/' + encodeURIComponent(button.dataset.revokeDevice), {
             method: 'DELETE'
           });
           await showDevices();
@@ -3569,7 +3569,7 @@ function showAccount() {
   if (manageUsers) manageUsers.onclick = () => showUsers().catch(error => notify(error.message));
   $('#logoutBtn').onclick = async () => {
     try {
-      await api('/api/v2/auth/logout', {method: 'POST'});
+      await api('/api/auth/logout', {method: 'POST'});
       location.reload();
     } catch (error) {
       notify(error.message);
@@ -3670,7 +3670,7 @@ $('#search').oninput = event => {
   }
   searchTimer = setTimeout(async () => {
     try {
-      const value = await api('/api/v2/search?q=' + encodeURIComponent(query) + '&scope=all&limit=30');
+      const value = await api('/api/search?q=' + encodeURIComponent(query) + '&scope=all&limit=30');
       $('#searchResults').innerHTML = (value.hits.map(searchHitHtml).join('')
         || '<div class="hit"><b>没有结果</b><div>换一个更具体的关键词试试。</div></div>')
         + searchTruncationHtml(value);
@@ -3709,10 +3709,10 @@ document.addEventListener('keydown', event => {
 });
 
 async function bootstrap() {
-  const config = await api('/api/v2/auth/config');
+  const config = await api('/api/auth/config');
   S.authEnabled = config.enabled;
   if (S.authEnabled) {
-    const response = await fetch('/api/v2/auth/me', {headers: {Accept: 'application/json'}});
+    const response = await fetch('/api/auth/me', {headers: {Accept: 'application/json'}});
     if (!response.ok) {
       setAccountLabel('GitHub 登录');
       $('#tokenBtn').onclick = () => {

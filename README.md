@@ -288,7 +288,7 @@ trace-backup restore \
   outbox 与 Recorder 未处理量；从没有机器上报过时显示“未上报”，不画假绿灯。
 - 默认永久保存的原始历史可能包含命令、路径和对话中的敏感信息。现在有三层控制（不绑定项目、
   `trace-project disable`、`capture=off`），管理员紧急 purge 与备份历史重写都已实现，
-  入口有命令行（`trace-backup purge` / `rewrite-history`）与 REST（`POST /api/v2/admin/purge`）。
+  入口有命令行（`trace-backup purge` / `rewrite-history`）与 REST（`POST /api/admin/purge`）。
 - 未配置 GitHub OAuth 时读取完全公开（含原始 transcript 与附件），启动会打印警告，
   网页“状态”面板也会红字提示；该模式下网页写入只算 `recorder`，不能产生 `human` 记录或确认。
 - 备份仍然是一棵全量树：按年份/容量分卷与容量告警尚未实现。

@@ -83,9 +83,9 @@ def test_oauth_flow_roles_csrf_machine_access_and_one_use_state(tmp_path):
     fake = FakeGitHub()
     app = oauth_app(tmp_path, fake)
     with TestClient(app, base_url="https://trace.example") as client:
-        assert client.get("/api/v2/auth/config").json()["enabled"] is True
-        assert client.get("/api/v2/projects").status_code == 401
-        minimal_health = client.get("/api/v2/health").json()
+        assert client.get("/api/auth/config").json()["enabled"] is True
+        assert client.get("/api/projects").status_code == 401
+        minimal_health = client.get("/api/health").json()
         assert "data_dir" not in minimal_health
 
         state, callback = login(
@@ -104,26 +104,26 @@ def test_oauth_flow_roles_csrf_machine_access_and_one_use_state(tmp_path):
         )
         assert replay.status_code == 403
 
-        me = client.get("/api/v2/auth/me").json()
+        me = client.get("/api/auth/me").json()
         assert me["user"]["login"] == "alice"
         assert me["user"]["role"] == "admin"
         csrf = me["csrf_token"]
-        assert client.post("/api/v2/projects", json={"name": "Denied"}).status_code == 403
+        assert client.post("/api/projects", json={"name": "Denied"}).status_code == 403
         project = client.post(
-            "/api/v2/projects", json={"name": "OAuth project"},
+            "/api/projects", json={"name": "OAuth project"},
             headers={"X-CSRF-Token": csrf},
         )
         assert project.status_code == 200
-        assert client.get("/api/v2/projects").json()["projects"][0]["name"] == "OAuth project"
+        assert client.get("/api/projects").json()["projects"][0]["name"] == "OAuth project"
 
         machine = {"Authorization": "Bearer machine-secret", "X-Trace-Actor": "claude-worker"}
-        assert client.get("/api/v2/projects", headers=machine).status_code == 200
-        assert client.post("/api/v2/projects", headers=machine, json={"name": "MCP"}).status_code == 200
+        assert client.get("/api/projects", headers=machine).status_code == 200
+        assert client.post("/api/projects", headers=machine, json={"name": "MCP"}).status_code == 200
 
-        users = client.get("/api/v2/admin/users").json()["users"]
+        users = client.get("/api/admin/users").json()["users"]
         assert users[0]["login"] == "alice"
         assert client.patch(
-            f"/api/v2/admin/users/{users[0]['id']}",
+            f"/api/admin/users/{users[0]['id']}",
             headers={"X-CSRF-Token": csrf}, json={"role": "reader"},
         ).status_code == 409
 
@@ -145,11 +145,11 @@ def test_oauth_flow_roles_csrf_machine_access_and_one_use_state(tmp_path):
         assert restored._db.execute("SELECT COUNT(*) FROM web_sessions").fetchone()[0] == 0
         restored.close()
 
-        assert client.post("/api/v2/auth/logout").status_code == 403
+        assert client.post("/api/auth/logout").status_code == 403
         assert client.post(
-            "/api/v2/auth/logout", headers={"X-CSRF-Token": csrf}
+            "/api/auth/logout", headers={"X-CSRF-Token": csrf}
         ).json() == {"logged_out": True}
-        assert client.get("/api/v2/auth/me").status_code == 401
+        assert client.get("/api/auth/me").status_code == 401
 
 
 def test_allowed_member_and_reader_permissions(tmp_path):
@@ -161,18 +161,18 @@ def test_allowed_member_and_reader_permissions(tmp_path):
             {"id": 202, "login": "bob", "name": "Bob", "avatar_url": None},
         )
         assert done.status_code == 303
-        me = client.get("/api/v2/auth/me").json()
+        me = client.get("/api/auth/me").json()
         assert me["user"]["role"] == "member"
         csrf = me["csrf_token"]
         assert client.post(
-            "/api/v2/projects", headers={"X-CSRF-Token": csrf}, json={"name": "Bob project"}
+            "/api/projects", headers={"X-CSRF-Token": csrf}, json={"name": "Bob project"}
         ).status_code == 200
         app.state.store.update_auth_user(me["user"]["id"], role="reader")
-        assert client.get("/api/v2/projects").status_code == 200
+        assert client.get("/api/projects").status_code == 200
         assert client.post(
-            "/api/v2/projects", headers={"X-CSRF-Token": csrf}, json={"name": "No"}
+            "/api/projects", headers={"X-CSRF-Token": csrf}, json={"name": "No"}
         ).status_code == 403
-        assert client.get("/api/v2/admin/users").status_code == 403
+        assert client.get("/api/admin/users").status_code == 403
 
 
 def test_account_approved_device_login_is_independent_and_revocable(tmp_path):
@@ -184,17 +184,17 @@ def test_account_approved_device_login_is_independent_and_revocable(tmp_path):
             {"id": 101, "login": "alice", "name": "Alice", "avatar_url": None},
         )
         assert done.status_code == 303
-        me = client.get("/api/v2/auth/me").json()
+        me = client.get("/api/auth/me").json()
         csrf = me["csrf_token"]
 
         started = client.post(
-            "/api/v2/device/start", json={"device_name": "hipergator-login-01"}
+            "/api/device/start", json={"device_name": "hipergator-login-01"}
         ).json()
         # 一键批准链接是钓鱼入口，服务端不再产出它。
         assert "verification_uri_complete" not in started
         assert started["verification_uri"] == "https://trace.example/device"
         assert client.post(
-            "/api/v2/device/token", json={"device_code": started["device_code"]}
+            "/api/device/token", json={"device_code": started["device_code"]}
         ).status_code == 202
         approval_page = client.get("/device", params={"code": started["user_code"]})
         # 批准页不接受链接里带来的验证码，必须手工输入。
@@ -204,7 +204,7 @@ def test_account_approved_device_login_is_independent_and_revocable(tmp_path):
         assert "trace-login" in approval_page.text
         assert "GitHub access token" in approval_page.text
         looked_up = client.get(
-            "/api/v2/device/authorization", params={"user_code": started["user_code"]}
+            "/api/device/authorization", params={"user_code": started["user_code"]}
         ).json()
         assert looked_up["device_name"] == "hipergator-login-01"
         assert "backdrop-filter:blur(22px)" in approval_page.text
@@ -216,31 +216,31 @@ def test_account_approved_device_login_is_independent_and_revocable(tmp_path):
             checked = subprocess.run([node, "--check"], input=script.encode("utf-8"), capture_output=True)
             assert checked.returncode == 0, checked.stderr.decode("utf-8", errors="replace")
         assert client.post(
-            "/api/v2/device/approve", json={"user_code": started["user_code"]}
+            "/api/device/approve", json={"user_code": started["user_code"]}
         ).status_code == 403
         approved = client.post(
-            "/api/v2/device/approve", json={"user_code": started["user_code"]},
+            "/api/device/approve", json={"user_code": started["user_code"]},
             headers={"X-CSRF-Token": csrf},
         )
         assert approved.status_code == 200
 
         issued = client.post(
-            "/api/v2/device/token", json={"device_code": started["device_code"]}
+            "/api/device/token", json={"device_code": started["device_code"]}
         ).json()
         credential = issued["credential"]
-        assert credential.startswith("rtv2d_")
+        assert credential.startswith("rtd_")
         assert issued["user"]["login"] == "alice"
         assert client.post(
-            "/api/v2/device/token", json={"device_code": started["device_code"]}
+            "/api/device/token", json={"device_code": started["device_code"]}
         ).status_code == 400
 
         device_headers = {"Authorization": "Bearer " + credential}
-        assert client.get("/api/v2/projects", headers=device_headers).status_code == 200
+        assert client.get("/api/projects", headers=device_headers).status_code == 200
         created = client.post(
-            "/api/v2/projects", headers=device_headers, json={"name": "From HiperGator"}
+            "/api/projects", headers=device_headers, json={"name": "From HiperGator"}
         )
         assert created.status_code == 200
-        devices = client.get("/api/v2/auth/devices").json()["devices"]
+        devices = client.get("/api/auth/devices").json()["devices"]
         assert devices[0]["name"] == "hipergator-login-01"
 
         dump = "\n".join(app.state.store._db.iterdump())
@@ -258,22 +258,22 @@ def test_account_approved_device_login_is_independent_and_revocable(tmp_path):
         restored.close()
 
         revoked = client.delete(
-            f"/api/v2/auth/devices/{issued['device']['id']}",
+            f"/api/auth/devices/{issued['device']['id']}",
             headers={"X-CSRF-Token": csrf},
         )
         assert revoked.status_code == 200
         client.cookies.clear()
-        assert client.get("/api/v2/projects", headers=device_headers).status_code == 401
+        assert client.get("/api/projects", headers=device_headers).status_code == 401
 
 
 def approved_device(client, csrf, name="worker-01"):
-    started = client.post("/api/v2/device/start", json={"device_name": name}).json()
+    started = client.post("/api/device/start", json={"device_name": name}).json()
     client.post(
-        "/api/v2/device/approve", json={"user_code": started["user_code"]},
+        "/api/device/approve", json={"user_code": started["user_code"]},
         headers={"X-CSRF-Token": csrf},
     ).raise_for_status()
     return client.post(
-        "/api/v2/device/token", json={"device_code": started["device_code"]}
+        "/api/device/token", json={"device_code": started["device_code"]}
     ).json()
 
 
@@ -283,15 +283,15 @@ def test_device_credential_write_identity_comes_from_the_credential_not_the_body
     app = oauth_app(tmp_path, fake)
     with TestClient(app, base_url="https://trace.example") as client:
         login(client, fake, {"id": 101, "login": "alice", "name": "Alice", "avatar_url": None})
-        csrf = client.get("/api/v2/auth/me").json()["csrf_token"]
+        csrf = client.get("/api/auth/me").json()["csrf_token"]
         credential = approved_device(client, csrf, "hpg-node-7")["credential"]
         machine = {"Authorization": "Bearer " + credential}
         project = client.post(
-            "/api/v2/projects", headers={"X-CSRF-Token": csrf}, json={"name": "Identity"}
+            "/api/projects", headers={"X-CSRF-Token": csrf}, json={"name": "Identity"}
         ).json()
 
         comment = client.post(
-            "/api/v2/comments", headers=machine,
+            "/api/comments", headers=machine,
             json={
                 "project_id": project["id"], "target_type": "overview", "kind": "comment",
                 "body": "from the machine", "author_id": "alice", "author_type": "human",
@@ -303,14 +303,14 @@ def test_device_credential_write_identity_comes_from_the_credential_not_the_body
         # 人留下一条未处理的 correction，recorder 就不能再改写 Overview，
         # 哪怕它在请求体里自称 actor_type=human。
         client.post(
-            "/api/v2/comments", headers={"X-CSRF-Token": csrf},
+            "/api/comments", headers={"X-CSRF-Token": csrf},
             json={
                 "project_id": project["id"], "target_type": "overview",
                 "kind": "correction", "body": "这里的结论不对",
             },
         ).raise_for_status()
         blocked = client.post(
-            "/api/v2/curate", headers=machine,
+            "/api/curate", headers=machine,
             json={
                 "project_id": project["id"], "target_type": "overview", "body": "recorder rewrite",
                 "expect_version": 1, "actor_type": "human", "actor_id": "alice",
@@ -326,24 +326,24 @@ def test_signed_in_member_cannot_sign_a_write_as_somebody_else(tmp_path):
     app = oauth_app(tmp_path, fake)
     with TestClient(app, base_url="https://trace.example") as client:
         login(client, fake, {"id": 202, "login": "bob", "name": "Bob", "avatar_url": None})
-        csrf = {"X-CSRF-Token": client.get("/api/v2/auth/me").json()["csrf_token"]}
+        csrf = {"X-CSRF-Token": client.get("/api/auth/me").json()["csrf_token"]}
         project = client.post(
-            "/api/v2/projects", headers=csrf, json={"name": "Impersonation"}
+            "/api/projects", headers=csrf, json={"name": "Impersonation"}
         ).json()
         node = client.post(
-            "/api/v2/record", headers=csrf,
+            "/api/record", headers=csrf,
             json={"project_id": project["id"], "idempotency_key": "k", "title": "t",
                   "created_by": "recorder"},
         ).json()
         assert node["created_by"] == "human"
         comment = client.post(
-            "/api/v2/comments", headers=csrf,
+            "/api/comments", headers=csrf,
             json={"project_id": project["id"], "target_type": "node", "target_id": node["id"],
                   "kind": "confirmation", "body": "looks right",
                   "author_id": "alice", "author_type": "human"},
         ).json()
         assert comment["author_id"] == "bob"
-        revision = client.get(f"/api/v2/revisions/node/{node['id']}").json()["revisions"][0]
+        revision = client.get(f"/api/revisions/node/{node['id']}").json()["revisions"][0]
         assert revision["actor_id"] == "bob"
 
 
@@ -352,19 +352,19 @@ def test_device_credential_expires_and_can_be_renewed_before_it_does(tmp_path):
     app = oauth_app(tmp_path, fake, device_credential_days=1)
     with TestClient(app, base_url="https://trace.example") as client:
         login(client, fake, {"id": 101, "login": "alice", "name": "Alice", "avatar_url": None})
-        csrf = client.get("/api/v2/auth/me").json()["csrf_token"]
+        csrf = client.get("/api/auth/me").json()["csrf_token"]
         issued = approved_device(client, csrf, "laptop")
         assert issued["expires_at"] > issued["device"]["created_at"]
         machine = {"Authorization": "Bearer " + issued["credential"]}
 
-        renewed = client.post("/api/v2/device/renew", headers=machine).json()
+        renewed = client.post("/api/device/renew", headers=machine).json()
         assert renewed["credential"] != issued["credential"]
         client.cookies.clear()  # 只看 Bearer 凭证，别让浏览器会话兜底
         assert client.get(
-            "/api/v2/projects", headers={"Authorization": "Bearer " + renewed["credential"]}
+            "/api/projects", headers={"Authorization": "Bearer " + renewed["credential"]}
         ).status_code == 200
         # 换发之后旧凭证立刻作废，不留下第二把长期钥匙。
-        assert client.get("/api/v2/projects", headers=machine).status_code == 401
+        assert client.get("/api/projects", headers=machine).status_code == 401
 
         store = app.state.store
         device_id = renewed["device"]["id"]
@@ -376,7 +376,7 @@ def test_device_credential_expires_and_can_be_renewed_before_it_does(tmp_path):
         )
         store._db.commit()
         stale = {"Authorization": "Bearer " + renewed["credential"]}
-        assert client.get("/api/v2/projects", headers=stale).status_code == 401
+        assert client.get("/api/projects", headers=stale).status_code == 401
 
 
 def test_a_lowered_then_raised_credential_lifetime_does_not_resurrect_dead_credentials(tmp_path):
@@ -389,7 +389,7 @@ def test_a_lowered_then_raised_credential_lifetime_does_not_resurrect_dead_crede
     app = oauth_app(tmp_path, fake, device_credential_days=1)
     with TestClient(app, base_url="https://trace.example") as client:
         login(client, fake, {"id": 101, "login": "alice", "name": "Alice", "avatar_url": None})
-        csrf = client.get("/api/v2/auth/me").json()["csrf_token"]
+        csrf = client.get("/api/auth/me").json()["csrf_token"]
         issued = approved_device(client, csrf, "laptop")
     data_dir = tmp_path
 
@@ -402,7 +402,7 @@ def test_a_lowered_then_raised_credential_lifetime_does_not_resurrect_dead_crede
     relaxed.state.store._db.commit()
     with TestClient(relaxed, base_url="https://trace.example") as client:
         assert client.get(
-            "/api/v2/projects", headers={"Authorization": "Bearer " + issued["credential"]}
+            "/api/projects", headers={"Authorization": "Bearer " + issued["credential"]}
         ).status_code == 401
 
 
@@ -411,11 +411,11 @@ def test_device_start_is_rate_limited_per_client(tmp_path):
     app = oauth_app(tmp_path, fake, device_start_limit=3, device_start_window_seconds=600)
     with TestClient(app, base_url="https://trace.example") as client:
         codes = [
-            client.post("/api/v2/device/start", json={"device_name": f"flood-{index}"})
+            client.post("/api/device/start", json={"device_name": f"flood-{index}"})
             for index in range(3)
         ]
         assert all(response.status_code == 200 for response in codes)
-        flooded = client.post("/api/v2/device/start", json={"device_name": "flood-4"})
+        flooded = client.post("/api/device/start", json={"device_name": "flood-4"})
         assert flooded.status_code == 429
         assert int(flooded.headers["Retry-After"]) > 0
 
@@ -441,7 +441,7 @@ def test_admin_whitelist_is_anchored_on_github_id_after_first_resolution(tmp_pat
     app = oauth_app(tmp_path, fake)
     with TestClient(app, base_url="https://trace.example") as client:
         login(client, fake, {"id": 101, "login": "alice", "name": "Alice", "avatar_url": None})
-        assert client.get("/api/v2/auth/me").json()["user"]["role"] == "admin"
+        assert client.get("/api/auth/me").json()["user"]["role"] == "admin"
         client.cookies.clear()
 
         # 抢注者拿到了被释放的用户名 alice，但 github_id 不同。
@@ -465,7 +465,7 @@ def test_admin_whitelist_is_anchored_on_github_id_after_first_resolution(tmp_pat
     renamed_app = oauth_app(tmp_path, fake)
     with TestClient(renamed_app, base_url="https://trace.example") as client:
         login(client, fake, {"id": 101, "login": "alice-new", "name": "Alice", "avatar_url": None})
-        assert client.get("/api/v2/auth/me").json()["user"]["role"] == "admin"
+        assert client.get("/api/auth/me").json()["user"]["role"] == "admin"
 
 
 def test_config_admins_accept_an_explicit_github_id():
@@ -489,18 +489,18 @@ def test_removing_a_user_from_the_whitelist_invalidates_live_sessions_and_device
     app = oauth_app(tmp_path, fake, github_admins="alice", github_allowed_users="bob")
     with TestClient(app, base_url="https://trace.example") as client:
         login(client, fake, {"id": 202, "login": "bob", "name": "Bob", "avatar_url": None})
-        csrf = client.get("/api/v2/auth/me").json()["csrf_token"]
+        csrf = client.get("/api/auth/me").json()["csrf_token"]
         credential = approved_device(client, csrf, "bob-laptop")["credential"]
         machine = {"Authorization": "Bearer " + credential}
-        assert client.get("/api/v2/projects", headers=machine).status_code == 200
+        assert client.get("/api/projects", headers=machine).status_code == 200
         session_cookie = client.cookies.get(SESSION_COOKIE)
 
     # 管理员把 bob 从白名单删掉并重启服务；他既有的 cookie 和设备凭证必须立刻失效。
     restarted = oauth_app(tmp_path, fake, github_admins="alice", github_allowed_users="")
     with TestClient(restarted, base_url="https://trace.example") as client:
         client.cookies.set(SESSION_COOKIE, session_cookie, domain="trace.example")
-        assert client.get("/api/v2/auth/me").status_code == 401
-        assert client.get("/api/v2/projects", headers=machine).status_code == 401
+        assert client.get("/api/auth/me").status_code == 401
+        assert client.get("/api/projects", headers=machine).status_code == 401
 
 
 def test_oauth_config_rejects_partial_or_insecure_production_settings():
@@ -556,25 +556,25 @@ def test_admin_can_purge_and_read_the_audit_over_http(tmp_path):
     app = oauth_app(tmp_path, fake)
     with TestClient(app, base_url="https://trace.example") as client:
         login(client, fake, {"id": 101, "login": "alice", "name": "Alice", "avatar_url": None})
-        csrf = {"X-CSRF-Token": client.get("/api/v2/auth/me").json()["csrf_token"]}
-        project = client.post("/api/v2/projects", headers=csrf, json={"name": "Leaky"}).json()
-        client.post("/api/v2/ingest", headers=csrf, json={
+        csrf = {"X-CSRF-Token": client.get("/api/auth/me").json()["csrf_token"]}
+        project = client.post("/api/projects", headers=csrf, json={"name": "Leaky"}).json()
+        client.post("/api/ingest", headers=csrf, json={
             "batch_id": "b1", "project_id": project["id"],
             "session": {"id": "s1", "source": "claude-code"},
             "events": [{"event_id": "e1", "event_type": "PreToolUse",
                         "payload": {"command": "export TOKEN=ghp_realsecret"}}],
         }).raise_for_status()
-        assert client.get("/api/v2/search", params={"q": "ghp_realsecret"}).json()["hits"]
+        assert client.get("/api/search", params={"q": "ghp_realsecret"}).json()["hits"]
 
-        assert client.post("/api/v2/admin/purge", headers=csrf,
+        assert client.post("/api/admin/purge", headers=csrf,
                            json={"project_ids": [project["id"]]}).status_code == 400
-        done = client.post("/api/v2/admin/purge", headers=csrf, json={
+        done = client.post("/api/admin/purge", headers=csrf, json={
             "reason": "token leaked into a tool call", "project_ids": [project["id"]],
         }).json()
         assert done["removed"]["events"] == 1
-        assert client.get("/api/v2/search", params={"q": "ghp_realsecret"}).json()["hits"] == []
+        assert client.get("/api/search", params={"q": "ghp_realsecret"}).json()["hits"] == []
 
-        audit = client.get("/api/v2/admin/purges", headers=csrf).json()["purges"][0]
+        audit = client.get("/api/admin/purges", headers=csrf).json()["purges"][0]
         assert audit["actor_id"] == "alice"  # 操作者来自凭证，不是请求体
         assert audit["reason"] == "token leaked into a tool call"
         assert "ghp_realsecret" not in json.dumps(audit), "审计记录里不能有原文"
@@ -585,10 +585,10 @@ def test_a_member_cannot_purge(tmp_path):
     app = oauth_app(tmp_path, fake)
     with TestClient(app, base_url="https://trace.example") as client:
         login(client, fake, {"id": 202, "login": "bob", "name": "Bob", "avatar_url": None})
-        csrf = {"X-CSRF-Token": client.get("/api/v2/auth/me").json()["csrf_token"]}
-        assert client.post("/api/v2/admin/purge", headers=csrf,
+        csrf = {"X-CSRF-Token": client.get("/api/auth/me").json()["csrf_token"]}
+        assert client.post("/api/admin/purge", headers=csrf,
                            json={"reason": "r", "project_ids": ["p"]}).status_code == 403
-        assert client.get("/api/v2/admin/purges", headers=csrf).status_code == 403
+        assert client.get("/api/admin/purges", headers=csrf).status_code == 403
 
 
 def test_a_machine_credential_cannot_close_a_human_correction_by_any_route(tmp_path):
@@ -598,11 +598,11 @@ def test_a_machine_credential_cannot_close_a_human_correction_by_any_route(tmp_p
     app = oauth_app(tmp_path, fake)
     with TestClient(app, base_url="https://trace.example") as client:
         login(client, fake, {"id": 101, "login": "alice", "name": "A", "avatar_url": None})
-        csrf = {"X-CSRF-Token": client.get("/api/v2/auth/me").json()["csrf_token"]}
+        csrf = {"X-CSRF-Token": client.get("/api/auth/me").json()["csrf_token"]}
         issued = approved_device(client, csrf["X-CSRF-Token"], "hpg")
-        project = client.post("/api/v2/projects", headers=csrf,
+        project = client.post("/api/projects", headers=csrf,
                               json={"name": "P", "overview": "v1"}).json()
-        correction = client.post("/api/v2/comments", headers=csrf, json={
+        correction = client.post("/api/comments", headers=csrf, json={
             "project_id": project["id"], "target_type": "overview",
             "kind": "correction", "body": "这个结论不成立",
         }).json()
@@ -610,21 +610,21 @@ def test_a_machine_credential_cannot_close_a_human_correction_by_any_route(tmp_p
         machine = {"Authorization": "Bearer " + issued["credential"]}
         client.cookies.clear()
         assert client.post(
-            f"/api/v2/comments/{correction['id']}/resolve", headers=machine
+            f"/api/comments/{correction['id']}/resolve", headers=machine
         ).status_code == 403
 
         # acknowledge 之后 curate 通得过，但纠正对人仍然是未处理的
-        assert client.post("/api/v2/curate", headers=machine, json={
+        assert client.post("/api/curate", headers=machine, json={
             "project_id": project["id"], "target_type": "overview", "body": "v2",
             "expect_version": 1, "resolve_comment_ids": [correction["id"]],
             "actor_type": "human", "actor_id": "alice",
         }).status_code == 200
-        context = client.post("/api/v2/context", headers=machine,
+        context = client.post("/api/context", headers=machine,
                               json={"project_id": project["id"]}).json()
         assert [item["id"] for item in context["project"]["unresolved_corrections"]] == [
             correction["id"]
         ]
         revision = client.get(
-            f"/api/v2/revisions/overview/{project['id']}", headers=machine
+            f"/api/revisions/overview/{project['id']}", headers=machine
         ).json()["revisions"][0]
         assert revision["actor_type"] == "recorder", "请求体里的 actor_type 不算数"

@@ -552,7 +552,7 @@ def test_the_deliverer_can_see_what_the_hook_wrote_at_the_same_depth(tmp_path: P
     sent: list[dict] = []
 
     def accept(url, path, value, token, timeout):
-        if path == "/api/v2/ingest":
+        if path == "/api/ingest":
             sent.append(value)
         return 200, {"ok": True}
 

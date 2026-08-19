@@ -30,13 +30,13 @@ def make_session(data: Path, workspace: str, session: str, events: int = 1, chun
 def recorder(status: int = 200):
     """Fake central. `.calls` holds ingest POSTs only.
 
-    投递器每轮还会 POST 一次 /api/v2/telemetry/outbox（纯遥测，不影响任何文件去向），
+    投递器每轮还会 POST 一次 /api/telemetry/outbox（纯遥测，不影响任何文件去向），
     把它混进 calls 会让「第几个 batch」这类断言变得看运气。
     """
     calls: list[dict] = []
 
     def fake(url, path, value, token, timeout):
-        if path != "/api/v2/ingest":
+        if path != "/api/ingest":
             return 200, {"ok": True}
         calls.append({"url": url, "path": path, "value": value, "token": token})
         return status, {"batch_id": value.get("batch_id")}
@@ -64,7 +64,7 @@ def test_only_a_central_2xx_moves_files_into_sent(tmp_path: Path, monkeypatch):
     assert len(list((root / "sent").glob("*.json"))) == 2
     assert len(list((root / "transcripts" / "sent").glob("*.jsonl"))) == 1
     assert accept.calls[0]["token"] == "t"
-    assert accept.calls[0]["path"] == "/api/v2/ingest"
+    assert accept.calls[0]["path"] == "/api/ingest"
     payload = accept.calls[0]["value"]
     assert payload["project_id"] == "prj_1"
     assert payload["session"]["id"] == "session-1"
@@ -132,7 +132,7 @@ def test_a_stale_project_id_falls_back_to_unassigned_instead_of_blocking_forever
     seen: list[str | None] = []
 
     def picky(url, path, value, token, timeout):
-        if path != "/api/v2/ingest":
+        if path != "/api/ingest":
             return 200, {"ok": True}
         seen.append(value.get("project_id"))
         if value.get("project_id"):
@@ -250,7 +250,7 @@ def test_a_2xx_that_reports_reused_ids_is_not_a_clean_success(tmp_path: Path, mo
     make_session(data, "ws-a", "session-1", events=1)
 
     def conflicting(url, path, value, token, timeout):
-        if path != "/api/v2/ingest":
+        if path != "/api/ingest":
             return 200, {"ok": True}
         return 200, {"batch_id": value["batch_id"], "conflicting_event_ids": ["claude-session-1-0"]}
 
@@ -303,7 +303,7 @@ def test_status_answers_without_the_network_and_deliver_reports_health(
     telemetry: list[dict] = []
 
     def fake(url, path, payload, token, timeout):
-        if path == "/api/v2/telemetry/outbox":
+        if path == "/api/telemetry/outbox":
             telemetry.append(payload)
         return 200, {"ok": True}
 

@@ -533,7 +533,7 @@ def deliver_session(
             continue
         names = [p.name for p in good_events] + [p.name for p in good_chunks]
         payload = _batch_payload(session_dir, loaded_events, loaded_chunks, names, identity)
-        status, body = _post_json(url, "/api/v2/ingest", payload, token, timeout)
+        status, body = _post_json(url, "/api/ingest", payload, token, timeout)
         if status in {401, 403}:
             raise DeliveryError(
                 f"Research Trace rejected this device ({status}); run trace-login and retry"
@@ -542,7 +542,7 @@ def deliver_session(
             # marker 里的 project_id 可能已经在中央被删除/改名。原始历史不能因此永久卡住，
             # 所以退一步以未归属的形式送达；归属可以事后由人或 Recorder 修。
             payload = dict(payload, project_id=None)
-            status, body = _post_json(url, "/api/v2/ingest", payload, token, timeout)
+            status, body = _post_json(url, "/api/ingest", payload, token, timeout)
         if not (200 <= status < 300):
             report["failed_batches"] += 1
             report["last_error"] = f"HTTP {status}: {str(body)[:200]}"
@@ -741,7 +741,7 @@ def report_outbox_status(
         "recorder_pending_batches": stats.get("recorder_pending_batches"),
     }
     try:
-        status, _ = _post_json(url, "/api/v2/telemetry/outbox", payload, token, timeout)
+        status, _ = _post_json(url, "/api/telemetry/outbox", payload, token, timeout)
     except DeliveryError:
         return False
     return 200 <= status < 300
@@ -890,7 +890,7 @@ def _resolve_project(
 ) -> dict[str, Any]:
     bearer = auth_token(url, token, credential_file)
     status, body = _post_json(
-        url, "/api/v2/context",
+        url, "/api/context",
         {"workspace_keys": keys, "create_if_missing": create, "project_name": name},
         bearer, timeout,
     )

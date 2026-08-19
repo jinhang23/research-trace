@@ -1765,7 +1765,7 @@ class Store:
             if not user:
                 db.execute("DELETE FROM device_authorizations WHERE device_code_hash=?", (code_hash,))
                 return {"status": "denied"}
-            raw_credential = "rtv2d_" + secrets.token_urlsafe(48)
+            raw_credential = "rtd_" + secrets.token_urlsafe(48)
             token_hash = hashlib.sha256(raw_credential.encode("utf-8")).hexdigest()
             device_id = _id("dev")
             # 到期时间在铸造时钉死并落库。之前是服务端每次请求用 created_at + 环境变量
@@ -1795,7 +1795,7 @@ class Store:
 
     def device_credential_identity(self, raw_credential: str | None) -> dict[str, Any] | None:
         value = str(raw_credential or "")
-        if not value.startswith("rtv2d_") or len(value) < 40:
+        if not value.startswith("rtd_") or len(value) < 40:
             return None
         token_hash = hashlib.sha256(value.encode("utf-8")).hexdigest()
         timestamp = now_utc()

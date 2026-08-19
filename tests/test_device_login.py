@@ -11,7 +11,7 @@ from research_trace.device_login import (
 )
 
 
-def issued(credential: str = "rtv2d_" + "x" * 64):
+def issued(credential: str = "rtd_" + "x" * 64):
     return {
         "status": "authorized",
         "credential": credential,
@@ -27,7 +27,7 @@ def test_credential_store_is_bound_to_server_url_and_removable(tmp_path):
     save_device_credential(path, "https://trace.example/", issued())
     assert load_device_credential(path, "https://trace.example")["user"]["login"] == "alice"
     assert load_device_credential(path, "https://other.example") is None
-    assert "rtv2d_" in path.read_text(encoding="utf-8")
+    assert "rtd_" in path.read_text(encoding="utf-8")
     remove_device_credential(path, "https://trace.example")
     assert load_device_credential(path, "https://trace.example") is None
 
@@ -58,7 +58,7 @@ def test_mcp_login_never_returns_the_raw_device_credential_to_model(tmp_path, mo
     complete = remote.device_login("status")
     assert complete["status"] == "connected"
     assert issued()["credential"] not in json.dumps(complete)
-    assert remote.auth_token().startswith("rtv2d_")
+    assert remote.auth_token().startswith("rtd_")
 
 
 def test_login_cli_never_offers_a_one_click_approval_link(tmp_path, monkeypatch, capsys):
@@ -94,7 +94,7 @@ def test_login_cli_never_offers_a_one_click_approval_link(tmp_path, monkeypatch,
 def test_login_cli_renews_an_existing_credential_in_place(tmp_path, monkeypatch, capsys):
     path = tmp_path / "credentials.json"
     save_device_credential(path, "https://trace.example", issued())
-    fresh = issued("rtv2d_" + "y" * 64)
+    fresh = issued("rtd_" + "y" * 64)
     fresh["expires_at"] = "2027-01-01T00:00:00.000+00:00"
     seen: list[str] = []
 
@@ -106,6 +106,6 @@ def test_login_cli_renews_an_existing_credential_in_place(tmp_path, monkeypatch,
     assert device_login.main([
         "--url", "https://trace.example", "--renew", "--credential-file", str(path),
     ]) == 0
-    assert seen == ["rtv2d_" + "x" * 64]
+    assert seen == ["rtd_" + "x" * 64]
     assert load_device_credential(path, "https://trace.example")["credential"].endswith("y" * 64)
     assert "2027-01-01" in capsys.readouterr().out

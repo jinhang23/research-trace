@@ -237,7 +237,7 @@ class Remote:
             current = load_device_credential(self.credential_file, self.url)
             if current:
                 status, health = request_json(
-                    self.url, "GET", "/api/v2/health", credential=current["credential"]
+                    self.url, "GET", "/api/health", credential=current["credential"]
                 )
                 if status == 200 and not health.get("authentication_required"):
                     return {
@@ -267,7 +267,7 @@ class Remote:
             current = load_device_credential(self.credential_file, self.url)
             if current:
                 status, health = request_json(
-                    self.url, "GET", "/api/v2/health", credential=current["credential"]
+                    self.url, "GET", "/api/health", credential=current["credential"]
                 )
                 if status == 200 and not health.get("authentication_required"):
                     return {
@@ -434,7 +434,7 @@ def call_tool(remote: Remote, name: str, args: dict[str, Any]) -> Any:
     if name == "trace_context":
         value = dict(args)
         bind_path = str(value.pop("bind_path", "") or "").strip()
-        result = remote.request("POST", "/api/v2/context", value)
+        result = remote.request("POST", "/api/context", value)
         if bind_path and isinstance(result, dict) and result.get("matched") is not False:
             result = dict(result)
             result["bound"] = _bind_marker(
@@ -443,14 +443,14 @@ def call_tool(remote: Remote, name: str, args: dict[str, Any]) -> Any:
         return result
     if name == "trace_ingest":
         value = _manifest_payload(args["manifest_path"], args.get("project_id")) if args.get("manifest_path") else args
-        return remote.request("POST", "/api/v2/ingest", value)
+        return remote.request("POST", "/api/ingest", value)
     if name == "trace_record":
         # created_by / review_state 不再由这里写：服务端只从凭证推身份，请求体被忽略。
         value = dict(args)
         value.pop("chapter_name", None)
-        return remote.request("POST", "/api/v2/record", value)
+        return remote.request("POST", "/api/record", value)
     if name == "trace_curate":
-        return remote.request("POST", "/api/v2/curate", args)
+        return remote.request("POST", "/api/curate", args)
     if name == "trace_attach":
         value = dict(args)
         local_path = value.pop("local_path", None)
@@ -459,7 +459,7 @@ def call_tool(remote: Remote, name: str, args: dict[str, Any]) -> Any:
             value["data_base64"] = base64.b64encode(raw).decode("ascii")
             value.setdefault("name", Path(local_path).name)
             value.setdefault("size", len(raw))
-        return remote.request("POST", "/api/v2/attach", value)
+        return remote.request("POST", "/api/attach", value)
     if name == "trace_search":
         query = urllib.parse.urlencode({
             key: value for key, value in {
@@ -469,7 +469,7 @@ def call_tool(remote: Remote, name: str, args: dict[str, Any]) -> Any:
                 "limit": args.get("limit", 50),
             }.items() if value is not None
         })
-        return remote.request("GET", "/api/v2/search?" + query)
+        return remote.request("GET", "/api/search?" + query)
     if name == "trace_login":
         return remote.device_login(args.get("action") or "start", args.get("device_name"))
     raise RuntimeError(f"unknown tool: {name}")
@@ -625,7 +625,7 @@ def main(argv: list[str] | None = None) -> int:
     remote = Remote(args.url, args.token, args.credential_file)
     if args.selfcheck:
         try:
-            health = remote.request("GET", "/api/v2/health")
+            health = remote.request("GET", "/api/health")
             print(json.dumps(health, ensure_ascii=False, indent=2))
             if (health.get("write_protected") or health.get("authentication_required")) and not remote.auth_token():
                 print("device login or legacy write token is required", file=sys.stderr)
