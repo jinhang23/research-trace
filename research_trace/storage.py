@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Iterator, Sequence
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 REVIEW_STATES = {"unreviewed", "confirmed", "corrected"}
 COMMENT_KINDS = {"comment", "confirmation", "correction"}
 TARGET_TYPES = {"overview", "chapter", "node"}
@@ -106,6 +106,114 @@ def normalize_user_code(value: str) -> str:
 
 def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
+
+
+def _like_escape(value: str) -> str:
+    """LIKE 里 % 和 _ 是通配符。搜 "50%" 或 "batch_id" 时用户要的是字面量，
+    不转义会让这两个查询退化成"匹配任何东西"，命中越多越像正常结果，最难被发现。"""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _hit_time(item: dict[str, Any]) -> str:
+    return (
+        item.get("occurred_at")
+        or item.get("captured_at")
+        or item.get("created_at")
+        or item.get("updated_at")
+        or ""
+    )
+
+
+# 每个搜索来源的取数说明。project_column 单列出来是因为 projects 表的项目主键叫 id，
+# 其余表叫 project_id。
+_SEARCH_SOURCES: tuple[dict[str, Any], ...] = (
+    {
+        "scope": "node", "layer": "semantic", "table": "nodes",
+        "columns": "id,project_id,chapter_id,title,body,occurred_at",
+        "where": "(lower(title) LIKE ? ESCAPE '\\' OR lower(body) LIKE ? ESCAPE '\\')",
+        "patterns": 2, "project_column": "project_id", "time_column": "occurred_at",
+    },
+    {
+        "scope": "comment", "layer": "semantic", "table": "comments",
+        "columns": "id,project_id,target_type,target_id,kind,body,created_at",
+        "where": "lower(body) LIKE ? ESCAPE '\\'",
+        "patterns": 1, "project_column": "project_id", "time_column": "created_at",
+    },
+    {
+        "scope": "overview", "layer": "semantic", "table": "projects",
+        "columns": "id project_id,id,name,overview,updated_at",
+        "where": "lower(overview) LIKE ? ESCAPE '\\'",
+        "patterns": 1, "project_column": "id", "time_column": "updated_at",
+    },
+    {
+        "scope": "event", "layer": "raw", "table": "events",
+        "columns": "event_id id,project_id,session_id,agent_id,event_type,payload_json body,captured_at",
+        "where": "lower(payload_json) LIKE ? ESCAPE '\\'",
+        "patterns": 1, "project_column": "project_id", "time_column": "captured_at",
+    },
+    {
+        "scope": "transcript", "layer": "raw", "table": "transcript_chunks",
+        "columns": "chunk_id id,project_id,session_id,agent_id,search_text body,created_at",
+        "where": "lower(search_text) LIKE ? ESCAPE '\\'",
+        "patterns": 1, "project_column": "project_id", "time_column": "created_at",
+    },
+)
+
+SEMANTIC_SEARCH_SCOPES = tuple(s["scope"] for s in _SEARCH_SOURCES if s["layer"] == "semantic")
+RAW_SEARCH_SCOPES = tuple(s["scope"] for s in _SEARCH_SOURCES if s["layer"] == "raw")
+
+
+class SearchResult(list):
+    """搜索结果既是 hits 列表（旧调用方原样可用），又带着"还有多少没给你"的说明。
+
+    做成 list 子类而不是 dict，是为了让已经在消费数组的 REST/MCP/网页调用方
+    不需要同步改动；想说清截断的调用方读 `.truncated` / `.totals` 或 `as_dict()`。
+    """
+
+    def __init__(
+        self,
+        hits: Sequence[dict[str, Any]],
+        *,
+        totals: dict[str, int],
+        limit: int,
+        scope: str,
+    ) -> None:
+        super().__init__(hits)
+        self.totals = dict(totals)
+        self.limit = int(limit)
+        self.scope = scope
+
+    @property
+    def returned(self) -> dict[str, int]:
+        counts = {key: 0 for key in self.totals}
+        for hit in self:
+            counts[hit["scope"]] = counts.get(hit["scope"], 0) + 1
+        return counts
+
+    @property
+    def total(self) -> int:
+        return sum(self.totals.values())
+
+    @property
+    def truncated(self) -> bool:
+        return self.total > len(self)
+
+    @property
+    def omitted(self) -> dict[str, int]:
+        returned = self.returned
+        return {key: value - returned.get(key, 0) for key, value in self.totals.items()}
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "hits": list(self),
+            "scope": self.scope,
+            "limit": self.limit,
+            "totals": self.totals,
+            "returned": self.returned,
+            "omitted": self.omitted,
+            "total": self.total,
+            "truncated": self.truncated,
+        }
 
 
 def _code_signature(item: dict[str, Any]) -> dict[str, Any]:
@@ -248,7 +356,12 @@ class Store:
                     author_id TEXT,
                     created_at TEXT NOT NULL,
                     resolved_at TEXT,
-                    resolved_by TEXT
+                    resolved_by TEXT,
+                    -- Recorder 的「我读过并已并入」与人的「这条了结了」是两件事。
+                    -- 合并成 resolved_at 会让机器一次 curate 就把人的纠正从界面和
+                    -- 后续 Recorder 上下文里抹掉（§3.4 / §4）。
+                    acknowledged_at TEXT,
+                    acknowledged_by TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS code_evidence (
@@ -343,7 +456,8 @@ class Store:
                     project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
                     event_count INTEGER NOT NULL,
                     transcript_chunk_count INTEGER NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    delivered_by TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS auth_users (
@@ -374,7 +488,8 @@ class Store:
                     token_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL,
                     last_used_at TEXT,
-                    revoked_at TEXT
+                    revoked_at TEXT,
+                    expires_at TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS device_authorizations (
@@ -386,6 +501,17 @@ class Store:
                     expires_at TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     approved_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS purge_audit (
+                    id TEXT PRIMARY KEY,
+                    actor_id TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    selector_json TEXT NOT NULL,
+                    removed_json TEXT NOT NULL,
+                    objects_removed INTEGER NOT NULL DEFAULT 0,
+                    generation INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_chapters_project ON chapters(project_id);
@@ -401,10 +527,25 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_device_authorizations_expiry ON device_authorizations(expires_at);
                 """
             )
+            # CREATE TABLE IF NOT EXISTS 对已经存在的表什么也不做，所以新增列必须显式补。
+            # 每一条都是可空的追加列，老库补上之后语义与新库一致，不需要数据迁移。
+            for table, column, definition in (
+                ("comments", "acknowledged_at", "TEXT"),
+                ("comments", "acknowledged_by", "TEXT"),
+                ("device_credentials", "expires_at", "TEXT"),
+                ("ingest_batches", "delivered_by", "TEXT"),
+            ):
+                self._add_column_locked(table, column, definition)
             self._db.execute(
                 "INSERT OR REPLACE INTO schema_meta(key,value) VALUES('schema_version',?)",
                 (str(SCHEMA_VERSION),),
             )
+
+    def _add_column_locked(self, table: str, column: str, definition: str) -> None:
+        existing = {row["name"] for row in self._db.execute(f"PRAGMA table_info({table})")}
+        if column in existing:
+            return
+        self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def _unique_slug(self, db: sqlite3.Connection, table: str, base: str, project_id: str | None = None) -> str:
         slug = slugify(base)
@@ -743,6 +884,19 @@ class Store:
                 raise NotFound(f"node not found: {node_id}")
             if int(current["version"]) != expected:
                 raise Conflict(f"node version changed: expected {expect_version}, current {current['version']}")
+            if actor_type != "human":
+                # record_node 早就有这道闸，PATCH 没有——于是任何持有设备凭证的机器
+                # 只要给出正确的 expect_version，就能覆盖人刚改过的 Node（§15）。
+                # 版本号只防"并发丢更新"，防不住"机器有权改人的定稿"。
+                latest = db.execute(
+                    "SELECT actor_type FROM semantic_revisions "
+                    "WHERE target_type='node' AND target_id=? ORDER BY version DESC LIMIT 1",
+                    (node_id,),
+                ).fetchone()
+                if latest and latest["actor_type"] == "human":
+                    raise Conflict(
+                        "node has a newer human revision; a machine credential cannot overwrite it"
+                    )
             values = dict(current)
             for key, value in patch.items():
                 if key == "labels":
@@ -914,7 +1068,7 @@ class Store:
                 raise Conflict(f"curation version changed: expected {expect_version}, current {current_version}")
             unresolved = db.execute(
                 "SELECT id FROM comments WHERE project_id=? AND target_type=? AND target_id=? "
-                "AND kind='correction' AND resolved_at IS NULL",
+                "AND kind='correction' AND resolved_at IS NULL AND acknowledged_at IS NULL",
                 (pid, target_type, actual_target),
             ).fetchall()
             unresolved_ids = {row["id"] for row in unresolved}
@@ -937,11 +1091,22 @@ class Store:
                 snapshot = {"name": current["name"], "summary": str(body or "")}
             if acknowledged:
                 placeholders = ",".join("?" for _ in acknowledged)
-                db.execute(
-                    f"UPDATE comments SET resolved_at=?,resolved_by=? WHERE id IN ({placeholders}) "
-                    "AND project_id=? AND kind='correction'",
-                    (timestamp, actor_id or actor_type, *sorted(acknowledged), pid),
-                )
+                # 只有真人的 curate 才能了结一条纠正。机器说「我读过了」只记 acknowledged_*：
+                # 它足以解开这道闸（不至于每轮都被同一条挡住），但纠正在界面和后续 Recorder
+                # 上下文里仍然是未处理的，直到有人在网页上按下 resolve。
+                # 旧实现让机器直接写 resolved_at，人的纠正一次 curate 之后就再也看不见了。
+                if actor_type == "human":
+                    db.execute(
+                        f"UPDATE comments SET resolved_at=?,resolved_by=? WHERE id IN ({placeholders}) "
+                        "AND project_id=? AND kind='correction'",
+                        (timestamp, actor_id or actor_type, *sorted(acknowledged), pid),
+                    )
+                else:
+                    db.execute(
+                        f"UPDATE comments SET acknowledged_at=?,acknowledged_by=? "
+                        f"WHERE id IN ({placeholders}) AND project_id=? AND kind='correction'",
+                        (timestamp, actor_id or actor_type, *sorted(acknowledged), pid),
+                    )
             self._save_revision_locked(
                 db, pid, target_type, actual_target, version, snapshot, actor_type, actor_id,
                 source_event_ids, milestone,
@@ -1067,6 +1232,7 @@ class Store:
         agents: Sequence[dict[str, Any]],
         events: Sequence[dict[str, Any]],
         transcript_chunks: Sequence[dict[str, Any]] = (),
+        delivered_by: str | None = None,
     ) -> dict[str, Any]:
         batch_id = str(batch_id or "").strip()
         if not batch_id:
@@ -1115,6 +1281,8 @@ class Store:
                     ),
                 )
             inserted_events = 0
+            duplicate_events = 0
+            conflicting_event_ids: list[str] = []
             for event in events:
                 event_id = str(event.get("event_id") or "").strip()
                 if not event_id:
@@ -1129,8 +1297,20 @@ class Store:
                         event.get("captured_at") or timestamp, _json(payload), timestamp,
                     ),
                 )
-                inserted_events += max(cursor.rowcount, 0)
+                if cursor.rowcount > 0:
+                    inserted_events += 1
+                    continue
+                # 同一个 event_id 再来一次是 at-least-once 的正常重放，静默去重即可；
+                # 但内容变了说明发送端在复用 id，那是数据丢失而不是去重——必须报出来。
+                duplicate_events += 1
+                stored = db.execute(
+                    "SELECT payload_json FROM events WHERE event_id=?", (event_id,)
+                ).fetchone()
+                if stored and stored["payload_json"] != _json(payload):
+                    conflicting_event_ids.append(event_id)
             inserted_chunks = 0
+            duplicate_chunks = 0
+            conflicting_chunk_ids: list[str] = []
             for chunk in transcript_chunks:
                 content = chunk.get("content", "")
                 if not isinstance(content, str):
@@ -1148,11 +1328,21 @@ class Store:
                         sqlite3.Binary(zlib.compress(raw, level=9)), content, timestamp,
                     ),
                 )
-                inserted_chunks += max(cursor.rowcount, 0)
+                if cursor.rowcount > 0:
+                    inserted_chunks += 1
+                else:
+                    duplicate_chunks += 1
+                    stored = db.execute(
+                        "SELECT sha256 FROM transcript_chunks WHERE chunk_id=?", (chunk_id,)
+                    ).fetchone()
+                    if stored and stored["sha256"] != digest:
+                        conflicting_chunk_ids.append(chunk_id)
             db.execute(
-                "INSERT INTO ingest_batches(batch_id,project_id,event_count,transcript_chunk_count,created_at) "
-                "VALUES(?,?,?,?,?)",
-                (batch_id, pid, inserted_events, inserted_chunks, timestamp),
+                "INSERT INTO ingest_batches"
+                "(batch_id,project_id,event_count,transcript_chunk_count,created_at,delivered_by) "
+                "VALUES(?,?,?,?,?,?)",
+                (batch_id, pid, inserted_events, inserted_chunks, timestamp,
+                 str(delivered_by)[:200] if delivered_by else None),
             )
             return {
                 "batch_id": batch_id,
@@ -1160,6 +1350,10 @@ class Store:
                 "project_id": pid,
                 "event_count": inserted_events,
                 "transcript_chunk_count": inserted_chunks,
+                "duplicate_event_count": duplicate_events,
+                "duplicate_transcript_chunk_count": duplicate_chunks,
+                "conflicting_event_ids": conflicting_event_ids,
+                "conflicting_transcript_chunk_ids": conflicting_chunk_ids,
                 "created_at": timestamp,
             }
 
@@ -1256,61 +1450,63 @@ class Store:
         project_id: str | None = None,
         scope: str = "all",
         limit: int = 50,
-    ) -> list[dict[str, Any]]:
+    ) -> SearchResult:
+        """跨层搜索。语义层有独立配额，原始事件再多也挤不掉它。
+
+        原来的做法是"每个来源各取 limit 条、合并、按时间倒序、截到 limit"。
+        原始事件的时间戳总是最新、条数比 Node 高几个数量级，于是几周前的结论
+        永远排在几万条 event 后面——接口还什么都不说。现在语义层先拿走一半名额，
+        用不完的名额才让给原始层，反之亦然；截断多少条如实记在 totals/omitted 里。
+        """
         query = str(query or "").strip()
         if not query:
             raise ValidationError("search query is required")
         if scope not in {"all", "semantic", "raw"}:
             raise ValidationError("scope must be all, semantic, or raw")
         limit = max(1, min(int(limit), 200))
-        pattern = f"%{query.lower()}%"
-        project_filter = " AND project_id=?" if project_id else ""
-        args: list[Any]
-        hits: list[dict[str, Any]] = []
+        pattern = f"%{_like_escape(query.lower())}%"
+        semantic: list[dict[str, Any]] = []
+        raw: list[dict[str, Any]] = []
+        totals: dict[str, int] = {}
         with self._lock:
             pid = self._project_row(self._db, project_id)["id"] if project_id else None
-            if scope in {"all", "semantic"}:
-                args = [pattern, pattern] + ([pid] if pid else [])
-                for row in self._db.execute(
-                    "SELECT id,project_id,chapter_id,title,body,occurred_at FROM nodes "
-                    "WHERE (lower(title) LIKE ? OR lower(body) LIKE ?)" + project_filter +
-                    " ORDER BY occurred_at DESC LIMIT ?",
-                    (*args, limit),
-                ).fetchall():
-                    hits.append({"scope": "node", **dict(row)})
-                args = [pattern] + ([pid] if pid else [])
-                for row in self._db.execute(
-                    "SELECT id,project_id,target_type,target_id,kind,body,created_at FROM comments "
-                    "WHERE lower(body) LIKE ?" + project_filter + " ORDER BY created_at DESC LIMIT ?",
-                    (*args, limit),
-                ).fetchall():
-                    hits.append({"scope": "comment", **dict(row)})
-                project_sql = "SELECT id project_id,id,name,overview,updated_at FROM projects WHERE lower(overview) LIKE ?"
-                project_args: list[Any] = [pattern]
+            for source in _SEARCH_SOURCES:
+                if scope != "all" and source["layer"] != scope:
+                    continue
+                where = source["where"]
+                args: list[Any] = [pattern] * source["patterns"]
                 if pid:
-                    project_sql += " AND id=?"
-                    project_args.append(pid)
-                for row in self._db.execute(project_sql + " ORDER BY updated_at DESC LIMIT ?", (*project_args, limit)).fetchall():
-                    hits.append({"scope": "overview", **dict(row)})
-            if scope in {"all", "raw"}:
-                args = [pattern] + ([pid] if pid else [])
-                for row in self._db.execute(
-                    "SELECT event_id id,project_id,session_id,agent_id,event_type,payload_json body,captured_at "
-                    "FROM events WHERE lower(payload_json) LIKE ?" + project_filter +
-                    " ORDER BY captured_at DESC LIMIT ?",
+                    where += f" AND {source['project_column']}=?"
+                    args.append(pid)
+                totals[source["scope"]] = self._db.execute(
+                    f"SELECT COUNT(*) FROM {source['table']} WHERE {where}", args
+                ).fetchone()[0]
+                rows = self._db.execute(
+                    f"SELECT {source['columns']} FROM {source['table']} WHERE {where} "
+                    f"ORDER BY {source['time_column']} DESC LIMIT ?",
                     (*args, limit),
-                ).fetchall():
-                    hits.append({"scope": "event", **dict(row)})
-                args = [pattern] + ([pid] if pid else [])
-                for row in self._db.execute(
-                    "SELECT chunk_id id,project_id,session_id,agent_id,search_text body,created_at "
-                    "FROM transcript_chunks WHERE lower(search_text) LIKE ?" + project_filter +
-                    " ORDER BY created_at DESC LIMIT ?",
-                    (*args, limit),
-                ).fetchall():
-                    hits.append({"scope": "transcript", **dict(row)})
-        hits.sort(key=lambda item: item.get("occurred_at") or item.get("captured_at") or item.get("created_at") or item.get("updated_at") or "", reverse=True)
-        return hits[:limit]
+                ).fetchall()
+                bucket = semantic if source["layer"] == "semantic" else raw
+                bucket.extend({"scope": source["scope"], **dict(row)} for row in rows)
+
+        order = lambda item: (_hit_time(item), str(item.get("id") or ""))  # noqa: E731
+        semantic.sort(key=order, reverse=True)
+        raw.sort(key=order, reverse=True)
+
+        if not semantic or not raw:
+            selected = (semantic or raw)[:limit]
+        else:
+            semantic_quota = (limit + 1) // 2
+            take_semantic = min(len(semantic), semantic_quota)
+            take_raw = min(len(raw), limit - semantic_quota)
+            spare = limit - take_semantic - take_raw
+            if spare > 0:  # 一边没用满的名额让给另一边，总条数不因分区变少
+                extra = min(len(semantic) - take_semantic, spare)
+                take_semantic += extra
+                take_raw += min(len(raw) - take_raw, spare - extra)
+            selected = semantic[:take_semantic] + raw[:take_raw]
+        selected.sort(key=order, reverse=True)
+        return SearchResult(selected, totals=totals, limit=limit, scope=scope)
 
     def raw_timeline(self, project_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
         """Return a bounded, newest-first session/agent timeline without inflating full transcripts."""
@@ -1544,7 +1740,9 @@ class Store:
             ).fetchone()
         return _row(value) or {}
 
-    def exchange_device_authorization(self, raw_device_code: str) -> dict[str, Any]:
+    def exchange_device_authorization(
+        self, raw_device_code: str, *, credential_days: int = 90
+    ) -> dict[str, Any]:
         code = str(raw_device_code or "")
         if len(code) < 32:
             return {"status": "invalid"}
@@ -1570,16 +1768,28 @@ class Store:
             raw_credential = "rtv2d_" + secrets.token_urlsafe(48)
             token_hash = hashlib.sha256(raw_credential.encode("utf-8")).hexdigest()
             device_id = _id("dev")
+            # 到期时间在铸造时钉死并落库。之前是服务端每次请求用 created_at + 环境变量
+            # 现算的，于是运维把 TRACE_DEVICE_CREDENTIAL_DAYS 调小再调回去，
+            # 已经"过期"的凭证会集体复活。
+            days = max(1, min(int(credential_days or 90), 3650))
+            expires_at = (
+                datetime.now(timezone.utc) + timedelta(days=days)
+            ).isoformat(timespec="milliseconds")
             db.execute(
-                "INSERT INTO device_credentials(id,user_id,name,token_hash,created_at) VALUES(?,?,?,?,?)",
-                (device_id, row["user_id"], row["device_name"], token_hash, timestamp),
+                "INSERT INTO device_credentials(id,user_id,name,token_hash,created_at,expires_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (device_id, row["user_id"], row["device_name"], token_hash, timestamp, expires_at),
             )
             db.execute("DELETE FROM device_authorizations WHERE device_code_hash=?", (code_hash,))
         public_user = self._auth_user_value(user) or {}
         return {
             "status": "authorized",
             "credential": raw_credential,
-            "device": {"id": device_id, "name": row["device_name"], "created_at": timestamp},
+            "device": {
+                "id": device_id, "name": row["device_name"], "created_at": timestamp,
+                "expires_at": expires_at,
+            },
+            "expires_at": expires_at,
             "user": {key: public_user.get(key) for key in ("id", "github_id", "login", "role")},
         }
 
@@ -1593,10 +1803,12 @@ class Store:
         with self.transaction() as db:
             row = db.execute(
                 "SELECT d.id device_id,d.user_id,d.name device_name,d.created_at device_created_at,"
-                "d.last_used_at,d.revoked_at,u.* FROM device_credentials d "
+                "d.last_used_at,d.revoked_at,d.expires_at device_expires_at,u.* "
+                "FROM device_credentials d "
                 "JOIN auth_users u ON u.id=d.user_id "
-                "WHERE d.token_hash=? AND d.revoked_at IS NULL AND u.disabled=0",
-                (token_hash,),
+                "WHERE d.token_hash=? AND d.revoked_at IS NULL AND u.disabled=0 "
+                "AND (d.expires_at IS NULL OR d.expires_at > ?)",
+                (token_hash, timestamp),
             ).fetchone()
             if row and (not row["last_used_at"] or row["last_used_at"] < cutoff):
                 db.execute(
@@ -1616,6 +1828,7 @@ class Store:
             "device": {
                 "id": row["device_id"], "user_id": row["user_id"], "name": row["device_name"],
                 "created_at": row["device_created_at"], "last_used_at": row["last_used_at"],
+                "expires_at": row["device_expires_at"],
             },
         }
 
@@ -1623,7 +1836,8 @@ class Store:
         self, *, user_id: str | None = None, include_all: bool = False
     ) -> list[dict[str, Any]]:
         query = (
-            "SELECT d.id,d.user_id,d.name,d.created_at,d.last_used_at,d.revoked_at,u.login "
+            "SELECT d.id,d.user_id,d.name,d.created_at,d.last_used_at,d.revoked_at,"
+            "d.expires_at,u.login "
             "FROM device_credentials d JOIN auth_users u ON u.id=d.user_id"
         )
         parameters: tuple[Any, ...] = ()
@@ -1650,10 +1864,30 @@ class Store:
                     "UPDATE device_credentials SET revoked_at=? WHERE id=?", (timestamp, device_id)
                 )
             value = db.execute(
-                "SELECT id,user_id,name,created_at,last_used_at,revoked_at "
+                "SELECT id,user_id,name,created_at,last_used_at,revoked_at,expires_at "
                 "FROM device_credentials WHERE id=?", (device_id,),
             ).fetchone()
         return _row(value) or {}
+
+    def revoke_user_credentials(self, user_id: str) -> dict[str, Any]:
+        """撤掉一个人的全部会话与设备凭证，但不动 `disabled`。
+
+        以前唯一的全撤手段是 update_auth_user(disabled=True)，它同时翻转禁用标志，
+        并且对最后一个活跃管理员会抛 Conflict。移出白名单的人在请求时已经被
+        server.still_whitelisted 挡住了，但数据库里的行会一直躺到自然过期为止。
+        """
+        timestamp = now_utc()
+        with self.transaction() as db:
+            sessions = db.execute(
+                "DELETE FROM web_sessions WHERE user_id=?", (str(user_id),)
+            ).rowcount
+            devices = db.execute(
+                "UPDATE device_credentials SET revoked_at=COALESCE(revoked_at,?) "
+                "WHERE user_id=? AND revoked_at IS NULL",
+                (timestamp, str(user_id)),
+            ).rowcount
+        return {"user_id": str(user_id), "sessions_removed": max(0, sessions),
+                "devices_revoked": max(0, devices)}
 
     def list_auth_users(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -1700,6 +1934,190 @@ class Store:
             row = db.execute("SELECT * FROM auth_users WHERE id=?", (user_id,)).fetchone()
         return self._auth_user_value(row) or {}
 
+    def purge_generation(self) -> int:
+        """每次紧急 purge +1。备份用它判断"这份导出是在第几次清除之后做的"。"""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT value FROM schema_meta WHERE key='purge_generation'"
+            ).fetchone()
+        try:
+            return int(row["value"]) if row else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def purge_log(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        """审计记录只有"谁、为什么、删了哪些 id、各表几行"，永远不含被删内容原文。"""
+        limit = max(1, min(int(limit), 500))
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM purge_audit ORDER BY created_at DESC,id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        entries = []
+        for row in rows:
+            value = dict(row)
+            value["selector"] = _loads(value.pop("selector_json"), {})
+            value["removed"] = _loads(value.pop("removed_json"), {})
+            entries.append(value)
+        return entries
+
+    def purge(
+        self,
+        *,
+        actor_id: str,
+        reason: str,
+        project_ids: Sequence[str] = (),
+        session_ids: Sequence[str] = (),
+        node_ids: Sequence[str] = (),
+        event_ids: Sequence[str] = (),
+        transcript_chunk_ids: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        """管理员紧急清除（REQUIREMENTS §13）。
+
+        默认永久保存的前提是"进去的东西也能被拿出来"：令牌、密钥、病人数据一旦被
+        transcript 抄进来，没有 purge 就永远删不掉。这里做真删除而不是打标记，
+        并且连内容寻址的附件文件一起回收；只留下不含原文的审计行。
+        备份仓库里的历史副本要另外用 backup.rewrite_backup_history 处理。
+        """
+        actor_id = str(actor_id or "").strip()
+        reason = str(reason or "").strip()
+        if not actor_id:
+            raise ValidationError("purge requires actor_id")
+        if len(reason) < 4:
+            raise ValidationError("purge requires a written reason")
+        selector = {
+            "project_ids": [str(v) for v in project_ids if str(v or "").strip()],
+            "session_ids": [str(v) for v in session_ids if str(v or "").strip()],
+            "node_ids": [str(v) for v in node_ids if str(v or "").strip()],
+            "event_ids": [str(v) for v in event_ids if str(v or "").strip()],
+            "transcript_chunk_ids": [str(v) for v in transcript_chunk_ids if str(v or "").strip()],
+        }
+        if not any(selector.values()):
+            raise ValidationError("purge requires at least one selector")
+
+        removed: dict[str, int] = {}
+        objects: set[str] = set()
+        timestamp = now_utc()
+
+        def marks(values: Sequence[str]) -> str:
+            return ",".join("?" for _ in values)
+
+        with self.transaction() as db:
+            def drop(table: str, where: str, args: Sequence[Any]) -> None:
+                cursor = db.execute(f"DELETE FROM {table} WHERE {where}", list(args))
+                if cursor.rowcount > 0:
+                    removed[table] = removed.get(table, 0) + cursor.rowcount
+
+            def collect_objects(where: str, args: Sequence[Any]) -> None:
+                for row in db.execute(
+                    f"SELECT object_path FROM attachments WHERE object_path IS NOT NULL AND {where}",
+                    list(args),
+                ).fetchall():
+                    objects.add(row["object_path"])
+
+            projects = selector["project_ids"]
+            nodes = list(selector["node_ids"])
+            sessions = list(selector["session_ids"])
+            if projects:
+                placeholders = marks(projects)
+                nodes += [
+                    row["id"] for row in db.execute(
+                        f"SELECT id FROM nodes WHERE project_id IN ({placeholders})", projects
+                    ).fetchall()
+                ]
+                sessions += [
+                    row["id"] for row in db.execute(
+                        f"SELECT id FROM sessions WHERE project_id IN ({placeholders})", projects
+                    ).fetchall()
+                ]
+                collect_objects(f"project_id IN ({placeholders})", projects)
+            nodes = list(dict.fromkeys(nodes))
+            sessions = list(dict.fromkeys(sessions))
+
+            if nodes:
+                placeholders = marks(nodes)
+                collect_objects(f"target_type='node' AND target_id IN ({placeholders})", nodes)
+                drop("code_evidence", f"node_id IN ({placeholders})", nodes)
+                drop("attachments", f"target_type='node' AND target_id IN ({placeholders})", nodes)
+                drop("comments", f"target_type='node' AND target_id IN ({placeholders})", nodes)
+                drop("semantic_revisions", f"target_type='node' AND target_id IN ({placeholders})", nodes)
+                # 子节点的 parent_id 由外键 SET NULL 处理，不能因为删父节点连坐子节点。
+                drop("nodes", f"id IN ({placeholders})", nodes)
+            if projects:
+                placeholders = marks(projects)
+                drop("attachments", f"project_id IN ({placeholders})", projects)
+                drop("comments", f"project_id IN ({placeholders})", projects)
+                drop("semantic_revisions", f"project_id IN ({placeholders})", projects)
+                drop("chapters", f"project_id IN ({placeholders})", projects)
+                drop("workspace_keys", f"project_id IN ({placeholders})", projects)
+                drop("events", f"project_id IN ({placeholders})", projects)
+                drop("transcript_chunks", f"project_id IN ({placeholders})", projects)
+                drop("ingest_batches", f"project_id IN ({placeholders})", projects)
+            if sessions:
+                placeholders = marks(sessions)
+                drop("events", f"session_id IN ({placeholders})", sessions)
+                drop("transcript_chunks", f"session_id IN ({placeholders})", sessions)
+                drop("agents", f"session_id IN ({placeholders})", sessions)
+                drop("sessions", f"id IN ({placeholders})", sessions)
+            if selector["event_ids"]:
+                drop("events", f"event_id IN ({marks(selector['event_ids'])})", selector["event_ids"])
+            if selector["transcript_chunk_ids"]:
+                chunks = selector["transcript_chunk_ids"]
+                drop("transcript_chunks", f"chunk_id IN ({marks(chunks)})", chunks)
+            if projects:
+                drop("projects", f"id IN ({marks(projects)})", projects)
+
+            orphaned = []
+            for path in sorted(objects):
+                still_used = db.execute(
+                    "SELECT 1 FROM attachments WHERE object_path=? LIMIT 1", (path,)
+                ).fetchone()
+                if not still_used:
+                    orphaned.append(path)
+
+            generation = 0
+            row = db.execute("SELECT value FROM schema_meta WHERE key='purge_generation'").fetchone()
+            if row:
+                try:
+                    generation = int(row["value"])
+                except (TypeError, ValueError):
+                    generation = 0
+            generation += 1
+            db.execute(
+                "INSERT OR REPLACE INTO schema_meta(key,value) VALUES('purge_generation',?)",
+                (str(generation),),
+            )
+            purge_id = _id("purge")
+            db.execute(
+                "INSERT INTO purge_audit(id,actor_id,reason,selector_json,removed_json,objects_removed,"
+                "generation,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    purge_id, actor_id, reason, _json(selector), _json(removed),
+                    len(orphaned), generation, timestamp,
+                ),
+            )
+
+        # 文件在事务提交后才删：事务回滚了还能重放，文件删了就回不来。
+        objects_removed = 0
+        for path in orphaned:
+            target = (self.objects_dir / path).resolve()
+            try:
+                target.relative_to(self.objects_dir.resolve())
+            except ValueError:
+                continue
+            if target.is_file():
+                target.unlink()
+                objects_removed += 1
+        return {
+            "purge_id": purge_id,
+            "actor_id": actor_id,
+            "reason": reason,
+            "selector": selector,
+            "removed": removed,
+            "objects_removed": objects_removed,
+            "purge_generation": generation,
+            "created_at": timestamp,
+        }
+
     def health(self) -> dict[str, Any]:
         with self._lock:
             counts = {}
@@ -1711,10 +2129,13 @@ class Store:
             last_batch = _row(self._db.execute(
                 "SELECT * FROM ingest_batches ORDER BY created_at DESC LIMIT 1"
             ).fetchone())
+        purges = self.purge_log(limit=1)
         return {
             "ok": True,
             "schema_version": SCHEMA_VERSION,
             "data_dir": str(self.data_dir),
             "counts": counts,
             "last_batch": last_batch,
+            "purge_generation": self.purge_generation(),
+            "last_purge": purges[0] if purges else None,
         }

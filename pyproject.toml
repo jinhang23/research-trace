@@ -25,6 +25,10 @@ trace-mcp = "research_trace.mcp:main"
 trace-server = "research_trace.server:main"
 trace-backup = "research_trace.backup:main"
 trace-login = "research_trace.device_login:main"
+# 投递权威是这个独立进程，不是 hook、也不是 Recorder：它扫 outbox 全部 session，
+# 只有中央返回 2xx 才把文件搬进 sent/。trace-project 是采集的 opt-in 绑定入口。
+trace-deliver = "research_trace.deliver:main"
+trace-project = "research_trace.deliver:project_main"
 
 [project.optional-dependencies]
 server = ["fastapi>=0.110", "uvicorn>=0.27"]

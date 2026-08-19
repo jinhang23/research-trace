@@ -1,4 +1,8 @@
-"""Minimal stdio MCP client for the Research Trace v2 central HTTP service."""
+"""Minimal stdio MCP client for the Research Trace central HTTP service.
+
+stdio 传输下 stdout 是协议通道：任何诊断输出都必须走 stderr，两端的编码都必须钉死
+UTF-8，否则 Windows 的默认 code page 会在协议层就把中文改掉。
+"""
 
 from __future__ import annotations
 
@@ -28,10 +32,25 @@ from .device_login import (
 
 
 PROTOCOL_VERSION = "2025-03-26"
+# initialize 必须做版本协商。客户端报的版本我们支持就原样回；不支持就回自己偏好的那个，
+# 由客户端决定是否继续握手。无条件回一个固定字符串会让老客户端误以为握手成功，
+# 然后在第一次 tools/call 上以看不懂的方式失败。
+SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
+
+# JSON-RPC 2.0 错误码。客户端按码分流：解析失败报成 -32603 会被当成服务端内部崩溃，
+# 而不是"这一行坏了、重发即可"。
+PARSE_ERROR = -32700
+INVALID_REQUEST = -32600
+METHOD_NOT_FOUND = -32601
+INVALID_PARAMS = -32602
+INTERNAL_ERROR = -32603
+
 SERVER_INFO = {"name": "research-trace", "version": "2.0.0-alpha.4"}
 INSTRUCTIONS = (
     "Research Trace has a raw-history layer and a selective semantic layer. "
-    "Use trace_ingest for immutable hook batches. Use trace_record only for work worth understanding "
+    "Raw batches are delivered by the independent trace-deliver process; do not call trace_ingest "
+    "for hook manifests — durability never depends on a model remembering to call a tool. "
+    "Use trace_record only for work worth understanding "
     "or reusing later; a batch may legitimately create no node. Experiments, ideas, papers, data "
     "understanding, failures and implementations all use the same Node. Chapters are human-defined "
     "parallel research tracks such as main and ablation experiments, not content types or pipeline stages. "
@@ -55,12 +74,21 @@ TOOLS: list[dict[str, Any]] = [
                 "create_if_missing": {"type": "boolean", "default": False},
                 "project_name": {"type": "string"},
                 "recent_limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                "bind_path": {
+                    "type": "string",
+                    "description": (
+                        "Only when the user explicitly asked to bind this directory: write the "
+                        ".research-trace.json capture marker there after resolving the project. "
+                        "Never pass it on your own initiative — capture is opt-in and binding is "
+                        "the human's decision."
+                    ),
+                },
             },
         },
     },
     {
         "name": "trace_ingest",
-        "description": "Idempotently upload one raw hook batch. Prefer manifest_path so raw events do not pass through model context.",
+        "description": "Manual backfill / non-Claude hosts only. Claude Code hook batches are delivered by the independent trace-deliver process; never call this for a hook manifest.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -127,8 +155,8 @@ TOOLS: list[dict[str, Any]] = [
                 "target_id": {"type": "string"},
                 "body": {"type": "string"},
                 "expect_version": {"type": "integer"},
-                "actor_type": {"type": "string", "default": "recorder"},
-                "actor_id": {"type": "string"},
+                # actor_type / actor_id 不在这里：写入身份只来自凭证，请求体里的这两个字段
+                # 服务端一律忽略。留着它们等于告诉模型有一个它其实没有的旋钮。
                 "source_event_ids": {"type": "array", "items": {"type": "string"}},
                 "milestone": {"type": "boolean"},
                 "resolve_comment_ids": {"type": "array", "items": {"type": "string"}},
@@ -161,7 +189,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "trace_search",
-        "description": "Search semantic records and/or permanent raw history across projects.",
+        "description": "Search semantic records and/or permanent raw history across projects. Use scope=semantic when looking for conclusions or existing records; scope=all also dredges up raw events.",
         "inputSchema": {
             "type": "object",
             "required": ["query"],
@@ -218,14 +246,21 @@ class Remote:
                     }
             value = start_login(self.url, device_name or socket.gethostname())
             save_pending_login(self.credential_file, self.url, value)
+            # 服务端刻意不再返回 verification_uri_complete：能被转发的一键批准链接
+            # 就能被用来钓鱼（RFC 8628 §5.4）。这里只给裸 URI 和验证码，
+            # 由本人手工输入。以前这行是硬取，服务端去掉该键之后每次 start 都 KeyError。
             return {
                 "status": "approval_required",
                 "verification_uri": value["verification_uri"],
-                "verification_uri_complete": value["verification_uri_complete"],
                 "user_code": value["user_code"],
-                "device_name": value["device_name"],
-                "expires_in": value["expires_in"],
-                "next": "Open the URL, approve with GitHub, then call trace_login with action=status.",
+                "device_name": value.get("device_name"),
+                "expires_in": value.get("expires_in"),
+                "next": (
+                    f"Tell the user to open {value['verification_uri']} and type the code "
+                    f"{value['user_code']} there by hand. There is no clickable approval link; "
+                    "never approve a code somebody else sent you. Then call trace_login with "
+                    "action=status."
+                ),
             }
         pending = load_pending_login(self.credential_file, self.url)
         if not pending:
@@ -238,6 +273,7 @@ class Remote:
                     return {
                         "status": "connected", "user": current.get("user"),
                         "device": current.get("device"),
+                        "expires_at": current.get("expires_at"),
                     }
                 return {"status": "disconnected", "next": "Call trace_login with action=start."}
             return {"status": "not_started", "next": "Call trace_login with action=start."}
@@ -245,12 +281,20 @@ class Remote:
         if value.get("status") == "authorized":
             save_device_credential(self.credential_file, self.url, value)
             clear_pending_login(self.credential_file, self.url)
+            expires_at = value.get("expires_at") or (value.get("device") or {}).get("expires_at")
             return {
                 "status": "connected", "user": value.get("user"), "device": value.get("device"),
+                "expires_at": expires_at,
+                "next": (
+                    "This credential expires; renew it on the command line with "
+                    "`trace-login --renew` before then."
+                ) if expires_at else None,
             }
         return {
-            "status": "pending", "user_code": pending.get("user_code"),
-            "verification_uri_complete": pending.get("verification_uri_complete"),
+            "status": "pending",
+            "user_code": pending.get("user_code"),
+            "verification_uri": pending.get("verification_uri"),
+            "next": "The user still has to type the code at the verification URI.",
         }
 
     def request(self, method: str, path: str, value: dict[str, Any] | None = None) -> Any:
@@ -275,17 +319,43 @@ class Remote:
             raise RuntimeError(f"Research Trace unavailable at {self.url}: {exc.reason}") from exc
 
 
+def _manifest_source(root: Path, rel: str, alternates: tuple[str, ...]) -> Path | None:
+    """把 manifest 里的相对路径解析成 session 目录下的一个真实文件。
+
+    manifest 写的是 `pending/x.json`，但投递器随时可能在这之后把同一个文件搬进
+    `sent/`——它按中央 2xx 决定去向，跟语义层无关。所以解析不到时按 basename 在
+    `sent/` 与 `transcripts/sent/` 里回退找一次；两边都没有才算真的缺失。
+    session 目录之外的路径任何时候都拒绝（manifest 里的路径不可信）。
+    """
+    candidates = [root / rel] + [root / alt / Path(rel).name for alt in alternates]
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if root in resolved.parents and resolved.is_file():
+            return resolved
+    return None
+
+
 def _manifest_payload(path_value: str, project_id: str | None = None) -> dict[str, Any]:
     path = Path(path_value).expanduser().resolve()
     manifest = json.loads(path.read_text(encoding="utf-8"))
     root = path.parent.parent
+    if path.parent.name == "done":  # batches/done/<id>.json 比 batches/<id>.json 深一层
+        root = root.parent
+    root = root.resolve()
+    missing: list[str] = []
     events = []
     for item in manifest.get("events") or []:
         rel = item.get("path") if isinstance(item, dict) else item
-        source = (root / str(rel)).resolve()
-        if root not in source.parents or not source.is_file():
-            raise RuntimeError(f"unsafe or missing event path in manifest: {rel}")
-        events.append(json.loads(source.read_text(encoding="utf-8")))
+        source = _manifest_source(root, str(rel), ("sent",))
+        if source is None:
+            # 缺一条不该让整批重投失败：这个工具现在只用于事后手工补录，
+            # 抛异常等于让归档的 manifest 永远不可重投（旧实现就是这样）。
+            missing.append(str(rel))
+            continue
+        try:
+            events.append(json.loads(source.read_text(encoding="utf-8")))
+        except ValueError:
+            missing.append(str(rel))
     chunks = []
     for item in manifest.get("transcript_chunks") or []:
         if isinstance(item, dict):
@@ -294,9 +364,10 @@ def _manifest_payload(path_value: str, project_id: str | None = None) -> dict[st
         else:
             rel = item
             metadata = {}
-        source = (root / str(rel)).resolve()
-        if root not in source.parents or not source.is_file():
-            raise RuntimeError(f"unsafe or missing transcript path in manifest: {rel}")
+        source = _manifest_source(root, str(rel), ("transcripts/sent", "transcripts/pending"))
+        if source is None:
+            missing.append(str(rel))
+            continue
         metadata.pop("path", None)
         metadata["content"] = source.read_text(encoding="utf-8", errors="replace")
         chunks.append(metadata)
@@ -310,6 +381,11 @@ def _manifest_payload(path_value: str, project_id: str | None = None) -> dict[st
                 "session_id": event.get("session_id") or session_id,
                 "agent_type": event.get("agent_type"),
             }
+    if not events and not chunks and missing:
+        raise RuntimeError(
+            f"manifest {path} references {len(missing)} file(s) that no longer exist: "
+            + ", ".join(missing[:5])
+        )
     return {
         "batch_id": manifest.get("batch_id"),
         "project_id": project_id or manifest.get("project_id"),
@@ -317,7 +393,8 @@ def _manifest_payload(path_value: str, project_id: str | None = None) -> dict[st
             "id": session_id,
             "source": "claude-code",
             "cwd": manifest.get("project_dir"),
-            "metadata": {"manifest": str(path)},
+            "metadata": {"manifest": str(path), "missing_files": missing} if missing
+            else {"manifest": str(path)},
         } if session_id else None,
         "agents": list(agents.values()),
         "events": events,
@@ -325,17 +402,52 @@ def _manifest_payload(path_value: str, project_id: str | None = None) -> dict[st
     }
 
 
+def _bind_marker(bind_path: str, result: dict[str, Any], requested_keys: list[str]) -> dict[str, Any]:
+    """把解析出来的项目写成目录里的 opt-in marker（§7）。
+
+    marker 同时是采集开关和项目身份，所以只在用户明确要求绑定时才写：agent 不得
+    替用户决定录哪个目录。写入是合并式的，不会覆盖 marker 里别人放的键。
+    """
+    from .deliver import git_remote_key, new_workspace_key, read_marker, write_marker
+
+    project = result.get("project") if isinstance(result.get("project"), dict) else result
+    existing = read_marker(Path(bind_path).expanduser() / ".research-trace.json")
+    key = str(existing.get("workspace_key") or "").strip()
+    if not key:
+        key = next((item for item in requested_keys if str(item).startswith("rt-ws-")), "")
+    extra = [item for item in requested_keys if item != key]
+    remote_key = git_remote_key(bind_path)
+    if remote_key and remote_key != key and remote_key not in extra:
+        extra.append(remote_key)
+    target = write_marker(
+        bind_path,
+        workspace_key=key or new_workspace_key(),
+        workspace_keys=extra,
+        project_id=str(project.get("id") or "") or None,
+        project_name=str(project.get("name") or "") or None,
+        capture=True,
+    )
+    return {"marker_path": str(target), "marker": read_marker(target)}
+
+
 def call_tool(remote: Remote, name: str, args: dict[str, Any]) -> Any:
     if name == "trace_context":
-        return remote.request("POST", "/api/v2/context", args)
+        value = dict(args)
+        bind_path = str(value.pop("bind_path", "") or "").strip()
+        result = remote.request("POST", "/api/v2/context", value)
+        if bind_path and isinstance(result, dict) and result.get("matched") is not False:
+            result = dict(result)
+            result["bound"] = _bind_marker(
+                bind_path, result, [str(k) for k in (value.get("workspace_keys") or [])]
+            )
+        return result
     if name == "trace_ingest":
         value = _manifest_payload(args["manifest_path"], args.get("project_id")) if args.get("manifest_path") else args
         return remote.request("POST", "/api/v2/ingest", value)
     if name == "trace_record":
+        # created_by / review_state 不再由这里写：服务端只从凭证推身份，请求体被忽略。
         value = dict(args)
         value.pop("chapter_name", None)
-        value["created_by"] = "recorder"
-        value["review_state"] = "unreviewed"
         return remote.request("POST", "/api/v2/record", value)
     if name == "trace_curate":
         return remote.request("POST", "/api/v2/curate", args)
@@ -372,52 +484,144 @@ def _response(request_id: Any, result: Any = None, error: dict[str, Any] | None 
     return value
 
 
-def serve(remote: Remote) -> int:
-    for line in sys.stdin:
+def force_utf8_stdio() -> None:
+    """把协议通道两端钉死在 UTF-8。
+
+    Claude Code 按 UTF-8 写 stdin，但 Windows 上的 Python 默认按本地 code page
+    (cp936/cp1252) 解码，于是中文 Node 标题在进入 call_tool 之前就已经是乱码，
+    再被原样 POST 进中央库——落库之后没有任何办法还原。stdout 侧顺便关掉
+    \\n → \\r\\n 转换，免得协议行尾多出一个字节。
+    """
+    for stream, extra in (
+        (sys.stdin, {"errors": "replace"}),
+        (sys.stdout, {"newline": "\n"}),
+        (sys.stderr, {"errors": "replace"}),
+    ):
         try:
-            request = json.loads(line)
-            method = request.get("method")
-            request_id = request.get("id")
-            if method == "initialize":
-                result = {
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": SERVER_INFO,
-                    "instructions": INSTRUCTIONS,
-                }
-            elif method == "tools/list":
-                result = {"tools": TOOLS}
-            elif method == "tools/call":
-                params = request.get("params") or {}
-                try:
-                    value = call_tool(remote, params.get("name"), params.get("arguments") or {})
-                    result = {
-                        "content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False, indent=2)}],
-                        "isError": False,
-                    }
-                except Exception as exc:
-                    result = {"content": [{"type": "text", "text": str(exc)}], "isError": True}
-            elif method in {"notifications/initialized", "notifications/cancelled"}:
-                continue
-            elif request_id is None:
-                continue
-            else:
-                print(json.dumps(_response(request_id, error={"code": -32601, "message": f"method not found: {method}"})), flush=True)
-                continue
-            if request_id is not None:
-                print(json.dumps(_response(request_id, result=result), ensure_ascii=False), flush=True)
+            stream.reconfigure(encoding="utf-8", **extra)
+        except (AttributeError, OSError, ValueError):  # 被替换成非文本流时忽略
+            pass
+
+
+def _is_request_id(value: Any) -> bool:
+    # JSON-RPC 允许 string/number；MCP 在其上收紧，禁止 null。bool 是 int 的子类，单独挡掉。
+    return isinstance(value, str) or (isinstance(value, int) and not isinstance(value, bool))
+
+
+def handle(remote: Remote, message: Any) -> dict[str, Any] | None:
+    """处理一条消息，返回要发回去的响应；通知返回 None。"""
+    if not isinstance(message, dict):
+        return _response(None, error={"code": INVALID_REQUEST, "message": "request must be a JSON object"})
+    has_id = "id" in message
+    request_id = message.get("id")
+    if has_id and not _is_request_id(request_id):
+        # id 为 null 的"请求"官方客户端解析不了；只有错误响应可以带 id: null。
+        return _response(None, error={"code": INVALID_REQUEST, "message": "request id must be a string or integer"})
+    if not has_id:
+        # JSON-RPC §4.1：通知不回复。更重要的是不执行——一条没有 id 的 tools/call
+        # 曾经会照常写入中央库，调用方却拿不到任何回执。
+        return None
+    method = message.get("method")
+    if not isinstance(method, str) or not method:
+        return _response(request_id, error={"code": INVALID_REQUEST, "message": "method must be a non-empty string"})
+    params = message.get("params")
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        return _response(request_id, error={"code": INVALID_PARAMS, "message": "params must be an object"})
+
+    if method == "initialize":
+        requested = params.get("protocolVersion")
+        version = requested if requested in SUPPORTED_PROTOCOL_VERSIONS else PROTOCOL_VERSION
+        return _response(request_id, result={
+            "protocolVersion": version,
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": SERVER_INFO,
+            "instructions": INSTRUCTIONS,
+        })
+    if method == "ping":
+        # 客户端用 ping 判断进程还活着；缺了它这个连接会被当成挂死然后重启。
+        return _response(request_id, result={})
+    if method == "tools/list":
+        return _response(request_id, result={"tools": TOOLS})
+    if method == "tools/call":
+        name = params.get("name")
+        args = params.get("arguments")
+        if args is None:
+            args = {}
+        if not isinstance(name, str) or not name:
+            return _response(request_id, error={"code": INVALID_PARAMS, "message": "tools/call requires a tool name"})
+        if not isinstance(args, dict):
+            return _response(request_id, error={"code": INVALID_PARAMS, "message": "tools/call arguments must be an object"})
+        try:
+            value = call_tool(remote, name, args)
         except Exception as exc:
-            print(json.dumps(_response(None, error={"code": -32603, "message": str(exc)})), flush=True)
+            # 工具内部的失败一律 isError。回成 JSON-RPC error 会被客户端当成传输故障
+            # 抛给上层，模型既看不到原因也没法自己纠正。
+            return _response(request_id, result={
+                "content": [{"type": "text", "text": f"{type(exc).__name__}: {exc}"}],
+                "isError": True,
+            })
+        return _response(request_id, result={
+            "content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False, indent=2)}],
+            "isError": False,
+        })
+    return _response(request_id, error={"code": METHOD_NOT_FOUND, "message": f"method not found: {method}"})
+
+
+def serve(remote: Remote, stream_in: Any = None, stream_out: Any = None) -> int:
+    if stream_in is None and stream_out is None:
+        force_utf8_stdio()
+    source = stream_in if stream_in is not None else sys.stdin
+    sink = stream_out if stream_out is not None else sys.stdout
+
+    def emit(value: Any) -> None:
+        # ensure_ascii=True：输出行全是 ASCII，任何控制台/管道编码都改不了它的内容。
+        sink.write(json.dumps(value, ensure_ascii=True) + "\n")
+        sink.flush()
+
+    def dispatch(message: Any) -> dict[str, Any] | None:
+        try:
+            return handle(remote, message)
+        except Exception as exc:  # handle 自己不该抛，抛了也不能让连接断掉
+            request_id = message.get("id") if isinstance(message, dict) else None
+            return _response(
+                request_id if _is_request_id(request_id) else None,
+                error={"code": INTERNAL_ERROR, "message": f"{type(exc).__name__}: {exc}"},
+            )
+
+    for line in source:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            message = json.loads(line)
+        except (ValueError, RecursionError):
+            # RecursionError 不是 ValueError 的子类：嵌套上万层的数组会逃出去掀翻整个循环。
+            emit(_response(None, error={"code": PARSE_ERROR, "message": "invalid JSON"}))
+            continue
+        if isinstance(message, list):
+            if not message:
+                emit(_response(None, error={"code": INVALID_REQUEST, "message": "batch must not be empty"}))
+                continue
+            responses = [value for value in (dispatch(item) for item in message) if value is not None]
+            if responses:  # 整批都是通知时不回任何东西
+                emit(responses)
+            continue
+        response = dispatch(message)
+        if response is not None:
+            emit(response)
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Research Trace v2 MCP server")
+    parser = argparse.ArgumentParser(description="Research Trace MCP server")
     parser.add_argument("--url", default=os.environ.get("TRACE_URL", "http://127.0.0.1:8765"))
     parser.add_argument("--token", default=os.environ.get("TRACE_TOKEN", ""))
     parser.add_argument("--credential-file", default=os.environ.get("TRACE_CREDENTIAL_FILE"))
     parser.add_argument("--selfcheck", action="store_true")
     args = parser.parse_args(argv)
+    force_utf8_stdio()
     remote = Remote(args.url, args.token, args.credential_file)
     if args.selfcheck:
         try:

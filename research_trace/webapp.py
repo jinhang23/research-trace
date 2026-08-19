@@ -1,4 +1,4 @@
-"""Dependency-free Research Trace v2 web client embedded by the service."""
+"""Dependency-free Research Trace web client embedded by the service."""
 
 INDEX_HTML = r'''<!doctype html>
 <html lang="zh-CN">
@@ -270,7 +270,29 @@ a:hover { color: var(--accent); }
   -webkit-line-clamp: 2;
 }
 .hit small { display: block; margin-top: 6px; color: var(--muted); }
+/* 搜索命中是可点击的：跨项目搜到的记录必须能直接跳过去，否则数据在但够不着。 */
+button.hit {
+  display: block;
+  width: 100%;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+}
+button.hit:hover,
+button.hit:focus-visible { background: rgba(238, 243, 242, .72); }
+.hit-project { color: var(--accent-strong); font-weight: 600; }
 
+.top-actions {
+  display: flex;
+  align-items: center;
+  justify-self: end;
+  gap: 8px;
+}
 .account-btn {
   display: inline-flex;
   min-height: 46px;
@@ -1100,6 +1122,18 @@ dialog::backdrop {
 .management-card .toolbar { margin-top: 11px; }
 .management-card .field-inline { min-width: 130px; flex: 1 1 150px; }
 .management-card .field-inline .field-label { margin-top: 0; }
+.management-card pre {
+  max-height: 220px;
+  margin: 9px 0 0;
+  padding: 10px;
+  overflow: auto;
+  border-radius: 10px;
+  color: #41544f;
+  background: rgba(238, 243, 242, .74);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 11px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
 .check-row {
   display: inline-flex !important;
   min-height: 44px;
@@ -2191,10 +2225,16 @@ main.workspace-mode {
       <span class="search-key" aria-hidden="true">/</span>
       <div id="searchResults" class="search-results" role="region" aria-label="搜索结果" hidden></div>
     </div>
-    <button class="account-btn" id="tokenBtn" type="button" aria-haspopup="dialog" aria-label="账户与连接设置">
-      <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"></circle><path d="M4.5 20a7.5 7.5 0 0 1 15 0"></path></svg>
-      <span>连接设置</span>
-    </button>
+    <div class="top-actions">
+      <button class="account-btn" id="healthBtn" type="button" aria-haspopup="dialog" aria-label="采集、Recorder 与备份状态">
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l2-5 3 10 2.5-5H21"></path></svg>
+        <span>状态</span>
+      </button>
+      <button class="account-btn" id="tokenBtn" type="button" aria-haspopup="dialog" aria-label="账户与连接设置">
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"></circle><path d="M4.5 20a7.5 7.5 0 0 1 15 0"></path></svg>
+        <span>连接设置</span>
+      </button>
+    </div>
   </div>
 </header>
 
@@ -2237,14 +2277,20 @@ main.workspace-mode {
 <div class="toast-region" id="toastRegion" aria-live="polite" aria-atomic="true"></div>
 
 <script>
+/* 本地偏好的 key 已经去掉 v2 后缀；旧 key 仍然读一次，免得升级把别人存的
+   旧写入 token 和显示名悄悄弄丢。 */
+function stored(name) {
+  return localStorage.getItem('trace.' + name) || localStorage.getItem('trace.v2.' + name) || '';
+}
+
 const S = {
   projects: [],
   project: null,
   chapter: null,
   selectedNodeId: null,
-  workView: localStorage.getItem('trace.v2.workView') || 'graph',
-  token: localStorage.getItem('trace.v2.token') || '',
-  actor: localStorage.getItem('trace.v2.actor') || 'human',
+  workView: stored('workView') || 'graph',
+  token: stored('token'),
+  actor: stored('actor') || 'human',
   authEnabled: false,
   user: null,
   csrf: ''
@@ -2310,15 +2356,22 @@ function canWrite() {
   return !S.authEnabled || Boolean(S.user && ['member', 'admin'].includes(S.user.role));
 }
 
+/* fmt 的返回值在每一个调用点都是未转义地插进 innerHTML 的。occurred_at / created_at
+   这些时间戳是 Recorder 或任何持凭证的机器能写的自由字符串，解析失败时把原文原样
+   交回去，等于让团队里每个打开这个项目的人在自己的会话下执行它。
+   所以这个函数的每一条返回路径都必须已经转义——包括异常分支。 */
 function fmt(value) {
   if (!value) return '';
+  const text = String(value);
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return esc(text);
   try {
-    return new Intl.DateTimeFormat('zh-CN', {
+    return esc(new Intl.DateTimeFormat('zh-CN', {
       year: 'numeric', month: 'short', day: 'numeric',
       hour: '2-digit', minute: '2-digit'
-    }).format(new Date(value));
+    }).format(date));
   } catch {
-    return value;
+    return esc(text);
   }
 }
 
@@ -2477,7 +2530,16 @@ function commentHtml(comments, targetType, targetId) {
   const entries = comments.map(comment => `
     <div class="comment ${esc(comment.kind)} ${comment.resolved_at ? 'resolved' : ''}">
       <div>${esc(comment.body)}</div>
-      <div class="who">${esc(comment.kind)} · ${esc(comment.author_id || comment.author_type)} · ${fmt(comment.created_at)}${comment.resolved_at ? ' · 已处理' : ''}</div>
+      <div class="who">${esc(comment.kind)} · ${esc(comment.author_id || comment.author_type)} · ${fmt(comment.created_at)}${comment.resolved_at ? ` · 已处理（${esc(comment.resolved_by || '')}）` : ''}${
+        !comment.resolved_at && comment.acknowledged_at
+          ? ` · Recorder 已读入（${esc(comment.acknowledged_by || '')}），仍待你确认`
+          : ''
+      }</div>
+      ${/* 了结一条纠正只有人能做：服务端对机器凭证返回 403。以前界面上根本没有这个按钮，
+            所以唯一会写 resolved_at 的反而是 Recorder。 */''}
+      ${comment.kind === 'correction' && !comment.resolved_at && canWrite()
+        ? `<button class="btn" type="button" data-resolve-comment="${esc(comment.id)}">标记为已处理</button>`
+        : ''}
     </div>
   `).join('');
   return `
@@ -2518,6 +2580,8 @@ function overviewHtml() {
         <div class="section-heading"><h2>Overview</h2></div>
         <div class="toolbar">
           <span class="version-badge">v${project.overview_version}</span>
+          <button class="btn" type="button" data-history-type="overview" data-history-id="${esc(project.id)}"
+            data-history-label="Overview">${icon('history')}修订历史</button>
           ${canWrite() ? `<button class="btn" id="editOverview" type="button">${icon('edit')}编辑</button>` : ''}
         </div>
       </div>
@@ -2537,6 +2601,8 @@ function summaryHtml(chapter) {
         <div class="section-heading"><h2>${esc(chapter.name)}</h2></div>
         <div class="toolbar">
           <span class="version-badge">摘要 v${chapter.summary_version}</span>
+          <button class="btn" type="button" data-history-type="chapter" data-history-id="${esc(chapter.id)}"
+            data-history-label="${esc(chapter.name)}">${icon('history')}修订历史</button>
           ${canWrite() ? `
             <button class="btn" id="editSummary" type="button">${icon('edit')}编辑</button>
           ` : ''}
@@ -2580,12 +2646,15 @@ function nodeHtml(node) {
         <div class="meta"><time datetime="${esc(node.occurred_at)}">${fmt(node.occurred_at)}</time>${node.parent_id ? ' · 延续 ' + esc(node.parent_id) : ''}</div>
         <div class="chapter-head">
           <h3>${esc(node.title)}</h3>
-          ${canWrite() ? `
-            <div class="toolbar node-actions">
+          <div class="toolbar node-actions">
+            <button class="btn" type="button" data-history-type="node" data-history-id="${esc(node.id)}"
+              data-history-label="${esc(node.title)}">${icon('history')}修订历史</button>
+            <button class="btn" type="button" data-raw-node="${esc(node.id)}">${icon('database')}原始历史</button>
+            ${canWrite() ? `
               <button class="btn" type="button" data-edit-node="${esc(node.id)}">${icon('edit')}编辑</button>
               <button class="btn" type="button" data-attach-node="${esc(node.id)}">${icon('paperclip')}附件 / 产物</button>
-            </div>
-          ` : ''}
+            ` : ''}
+          </div>
         </div>
         <div>
           ${(node.labels || []).map(label => `<span class="pill">${esc(label)}</span>`).join('')}
@@ -2785,9 +2854,12 @@ function detailContentHtml() {
         <span>/</span><span>${esc(chapter ? chapter.name : 'Unknown Chapter')}</span>
       </div>
       <div class="record-detail">${nodeHtml(selected)}</div>
+      ${rawHistoryHtml()}
     `;
   }
-  if (S.chapter) return summaryHtml(S.chapter);
+  /* 原始 timeline 在每种详情下都必须留一个入口。以前它只挂在"项目 Overview"那一支，
+     选中 Chapter 或某条记录之后整段原始历史就再也点不到了。 */
+  if (S.chapter) return summaryHtml(S.chapter) + rawHistoryHtml();
   return overviewHtml() + rawHistoryHtml();
 }
 
@@ -2846,21 +2918,86 @@ function rawHistoryHtml() {
   `;
 }
 
+function rawRowHtml(item) {
+  const body = item.kind === 'event'
+    ? JSON.stringify(item.payload, null, 2)
+    : String(item.preview || '');
+  return `
+    <div class="raw-row">
+      <div><strong>${esc(item.kind === 'event' ? item.event_type : 'transcript')}</strong>
+        <span class="meta">${fmt(item.at)} · session ${esc(item.session_id || '—')} · agent ${esc(item.agent_id || 'main')}</span>
+      </div>
+      <pre>${esc(body)}</pre>
+    </div>
+  `;
+}
+
 async function loadRaw() {
   const box = $('#rawItems');
   box.innerHTML = '<div class="meta">加载中…</div>';
   try {
     const value = await api('/api/v2/projects/' + encodeURIComponent(S.project.id) + '/raw?limit=60');
-    box.innerHTML = value.items.map(item => `
-      <div class="raw-row">
-        <div><strong>${esc(item.kind === 'event' ? item.event_type : 'transcript')}</strong>
-          <span class="meta">${fmt(item.at)} · session ${esc(item.session_id || '—')} · agent ${esc(item.agent_id || 'main')}</span>
-        </div>
-        <pre>${esc(item.kind === 'event' ? JSON.stringify(item.payload, null, 2) : item.preview)}</pre>
-      </div>
-    `).join('') || '<div class="meta">还没有已上传的原始历史。</div>';
+    box.innerHTML = value.items.map(rawRowHtml).join('')
+      || '<div class="meta">还没有已上传的原始历史。</div>';
   } catch (error) {
     box.innerHTML = `<div class="danger">${esc(error.message)}</div>`;
+  }
+}
+
+/* 从语义记录跳到它的来源原始历史。Node 上登记的 source_event_ids 就是这条边，
+   没有登记时退回项目最近的原始历史，而不是给一个死按钮。 */
+async function showNodeRaw(nodeId) {
+  const node = S.project.nodes.find(item => item.id === nodeId);
+  const label = node ? node.title : nodeId;
+  const sources = (node && node.source_event_ids) || [];
+  setModal('原始历史 · ' + label, '<div class="meta">加载中…</div>');
+  try {
+    const value = await api('/api/v2/projects/' + encodeURIComponent(S.project.id) + '/raw?limit=200');
+    const matched = sources.length
+      ? value.items.filter(item => sources.includes(item.id))
+      : [];
+    const items = matched.length ? matched : value.items;
+    const note = !sources.length
+      ? '这条记录没有登记来源 event，下面是项目最近的原始历史。'
+      : (matched.length
+        ? `这条记录登记了 ${sources.length} 条来源 event，其中 ${matched.length} 条已在中央。`
+        : `这条记录登记的 ${sources.length} 条来源 event 还没有出现在中央，先显示项目最近的原始历史。`);
+    setModal('原始历史 · ' + label, `
+      <div class="meta">${esc(note)}</div>
+      <div class="raw-list">${items.map(rawRowHtml).join('') || '<div class="meta">还没有已上传的原始历史。</div>'}</div>
+    `);
+  } catch (error) {
+    setModal('原始历史 · ' + label, `<div class="danger">${esc(error.message)}</div>`);
+  }
+}
+
+/* §3.4：被纠正的原文必须保留。/api/v2/revisions 一直有数据，界面上却没有落点。 */
+async function showRevisions(targetType, targetId, label) {
+  setModal('修订历史 · ' + label, '<div class="meta">加载中…</div>');
+  try {
+    const value = await api(
+      '/api/v2/revisions/' + encodeURIComponent(targetType) + '/' + encodeURIComponent(targetId)
+    );
+    const rows = (value.revisions || []).map(revision => {
+      const snapshot = revision.snapshot && typeof revision.snapshot === 'object' ? revision.snapshot : {};
+      const text = snapshot.body ?? snapshot.summary ?? snapshot.overview ?? JSON.stringify(snapshot, null, 2);
+      const sources = revision.source_event_ids || [];
+      return `
+        <div class="management-card">
+          <strong>v${esc(revision.version)}${revision.milestone ? ' · milestone' : ''}</strong>
+          <div class="meta">${esc(revision.actor_type || 'unknown')}${revision.actor_id ? ' · ' + esc(revision.actor_id) : ''} · ${fmt(revision.created_at)}</div>
+          ${snapshot.title ? `<div class="body">${esc(snapshot.title)}</div>` : ''}
+          <pre>${esc(String(text ?? ''))}</pre>
+          ${sources.length ? `<div class="meta">来源 event：${esc(sources.join(', '))}</div>` : ''}
+        </div>
+      `;
+    }).join('');
+    setModal(
+      '修订历史 · ' + label,
+      rows || '<div class="empty"><div class="empty-inner">还没有更早的版本。</div></div>'
+    );
+  } catch (error) {
+    setModal('修订历史 · ' + label, `<div class="danger">${esc(error.message)}</div>`);
   }
 }
 
@@ -2936,7 +3073,7 @@ function bindWorkspace() {
   document.querySelectorAll('[data-work-view]').forEach(button => {
     button.onclick = () => {
       S.workView = button.dataset.workView;
-      localStorage.setItem('trace.v2.workView', S.workView);
+      localStorage.setItem('trace.workView', S.workView);
       renderMain();
     };
   });
@@ -2978,6 +3115,11 @@ function bindMain() {
       $('#main').focus({preventScroll: true});
     };
   });
+  document.querySelectorAll('[data-history-type]').forEach(button => {
+    button.onclick = () => showRevisions(
+      button.dataset.historyType, button.dataset.historyId, button.dataset.historyLabel || ''
+    );
+  });
   const editOverview = $('#editOverview');
   if (editOverview) editOverview.onclick = () => setModal(
     '编辑 Overview',
@@ -2989,8 +3131,7 @@ function bindMain() {
           project_id: S.project.id,
           target_type: 'overview',
           body: $('#fieldBody').value,
-          expect_version: S.project.overview_version,
-          actor_type: 'human'
+          expect_version: S.project.overview_version
         })
       });
       await refreshProject();
@@ -3008,8 +3149,7 @@ function bindMain() {
           target_type: 'chapter',
           target_id: S.chapter.id,
           body: $('#fieldBody').value,
-          expect_version: S.chapter.summary_version,
-          actor_type: 'human'
+          expect_version: S.chapter.summary_version
         })
       });
       await refreshProject();
@@ -3041,8 +3181,7 @@ function bindMain() {
             ? new Date($('#fieldTime').value).toISOString()
             : undefined,
           labels: $('#fieldLabels').value.split(',').map(value => value.trim()).filter(Boolean),
-          parent_id: $('#fieldParent').value || undefined,
-          created_by: 'human'
+          parent_id: $('#fieldParent').value || undefined
         })
       });
       await refreshProject();
@@ -3075,9 +3214,23 @@ function bindMain() {
       }, '添加中…');
     };
   });
+  document.querySelectorAll('[data-resolve-comment]').forEach(button => {
+    button.onclick = () => withBusy(button, async () => {
+      try {
+        await api('/api/v2/comments/' + encodeURIComponent(button.dataset.resolveComment) +
+                  '/resolve', {method: 'POST'});
+        await refreshProject();
+      } catch (error) {
+        notify(error.message);
+      }
+    }, '处理中…');
+  });
 }
 
 function bindNodeActions() {
+  document.querySelectorAll('[data-raw-node]').forEach(button => {
+    button.onclick = () => showNodeRaw(button.dataset.rawNode);
+  });
   document.querySelectorAll('[data-edit-node]').forEach(button => {
     button.onclick = () => {
       const node = S.project.nodes.find(item => item.id === button.dataset.editNode);
@@ -3106,7 +3259,6 @@ function bindNodeActions() {
             method: 'PATCH',
             body: JSON.stringify({
               expect_version: node.version,
-              actor_type: 'human',
               patch: {
                 title: $('#fieldTitle').value,
                 body: $('#fieldBody').value,
@@ -3206,6 +3358,100 @@ function showNewChapter() {
   );
 }
 
+/* §10 要求的健康状态。这是用户判断"我这台机器的东西到底传上去没有"的唯一入口：
+   投递器把本机 outbox 报上来之前，中央能证明的只有"最近一次被确认存下的 batch"，
+   所以未上报要显式说出来，不能画一个绿灯糊弄过去。 */
+const HEALTH_STATE_PILL = {ok: 'confirmed', warn: 'corrected', unknown: 'muted'};
+const HEALTH_STATE_LABEL = {ok: '正常', warn: '需要注意', unknown: '未上报'};
+
+function healthCardHtml(title, state, lines) {
+  return `
+    <div class="management-card">
+      <strong>${esc(title)}</strong>
+      <span class="pill ${HEALTH_STATE_PILL[state] || 'muted'}">${esc(HEALTH_STATE_LABEL[state] || state)}</span>
+      <div class="meta">${lines.filter(Boolean).join('<br>')}</div>
+    </div>
+  `;
+}
+
+function outboxHealthHtml(value) {
+  const outbox = value.outbox;
+  const machines = (outbox && outbox.machines) || (Array.isArray(outbox) ? outbox : null);
+  if (!machines || !machines.length) {
+    return healthCardHtml('本机 outbox 投递', 'unknown', [
+      '还没有投递器上报 outbox 状态。',
+      'hook 只写 pending/，投递成功才搬进 sent/；中央这边只能看到已确认的 batch。'
+    ]);
+  }
+  const stuck = machines.some(machine => Number(machine.pending || 0) > 0 || machine.last_error);
+  return healthCardHtml('本机 outbox 投递', stuck ? 'warn' : 'ok', machines.map(machine => [
+    `<strong>${esc(machine.machine || machine.host || '未知机器')}</strong>`,
+    `pending ${esc(machine.pending ?? '—')} · sent ${esc(machine.sent ?? '—')}`,
+    machine.oldest_pending_at ? `最早未投递 ${fmt(machine.oldest_pending_at)}` : '',
+    machine.last_delivered_at ? `最近投递 ${fmt(machine.last_delivered_at)}` : '',
+    machine.last_error ? `<span class="danger">${esc(machine.last_error)}</span>` : ''
+  ].filter(Boolean).join(' · ')));
+}
+
+function recorderHealthHtml(value) {
+  const counts = value.counts || {};
+  const batch = value.last_batch;
+  const recorder = value.recorder;
+  const lines = [
+    `原始 event ${esc(counts.events ?? '—')} 条 · transcript ${esc(counts.transcript_chunks ?? '—')} 段 · 语义 Node ${esc(counts.nodes ?? '—')} 条`,
+    batch
+      ? `最近一次被中央确认的 batch：${esc(batch.batch_id || '')} · ${esc(batch.event_count ?? 0)} 条 event · ${fmt(batch.created_at)}`
+      : '中央还没有确认过任何 batch。'
+  ];
+  if (!recorder) {
+    lines.push('Recorder 未处理游标尚未上报；一批 batch 不产生 Node 本身是正常的。');
+    return healthCardHtml('Recorder', 'unknown', lines);
+  }
+  lines.push(`未处理 batch ${esc(recorder.pending_batches ?? '—')} · 最近处理 ${fmt(recorder.last_processed_at)}`);
+  if (recorder.last_error) lines.push(`<span class="danger">${esc(recorder.last_error)}</span>`);
+  return healthCardHtml('Recorder', recorder.last_error || Number(recorder.pending_batches || 0) > 0 ? 'warn' : 'ok', lines);
+}
+
+function backupHealthHtml(value) {
+  const backup = value.backup || {};
+  if (!backup.enabled) {
+    return healthCardHtml('GitHub 每日备份', 'unknown', ['服务没有配置 --backup-repo，没有灾备副本。']);
+  }
+  /* 本地 commit 成功但 push 失败时远端会静静落后好几周，而 last_success_at
+     照样在往前走。unpushed_commits 是唯一能把这件事说出来的字段。 */
+  const behind = Number(backup.unpushed_commits || 0);
+  const state = (backup.error || behind) ? 'warn' : (backup.last_success_at ? 'ok' : 'unknown');
+  return healthCardHtml('GitHub 每日备份', state, [
+    backup.running ? '正在导出…' : '',
+    `最近尝试 ${fmt(backup.last_attempt_at) || '—'} · 最近成功 ${fmt(backup.last_success_at) || '—'}`,
+    backup.changed === null || backup.changed === undefined ? '' : `上次导出${backup.changed ? '有变化并已 commit' : '内容未变化'}${backup.pushed ? ' · 已 push' : ''}`,
+    behind ? `<span class="danger">远端落后 ${esc(behind)} 个 commit：上一轮 push 没成功，下一轮会补推。</span>` : '',
+    backup.error ? `<span class="danger">${esc(backup.error)}</span>` : ''
+  ]);
+}
+
+async function showHealth() {
+  setModal('采集与备份状态', '<div class="meta">加载中…</div>');
+  try {
+    const value = await api('/api/v2/health');
+    setModal('采集与备份状态', [
+      outboxHealthHtml(value),
+      recorderHealthHtml(value),
+      backupHealthHtml(value),
+      healthCardHtml('中央存储', (value.ok && !value.anonymous_read) ? 'ok' : 'warn', [
+        `schema v${esc(value.schema_version ?? '—')} · 项目 ${esc((value.counts || {}).projects ?? '—')} 个 · 附件 ${esc((value.counts || {}).attachments ?? '—')} 个`,
+        value.write_protected ? '写入需要设备凭证或登录。' : '写入未受保护（仅限本机开发）。',
+        /* 未配 OAuth 时读取是完全公开的，包括原始 transcript 和附件下载。
+           这件事只在服务端启动横幅里说过，用的人看不到。 */
+        value.anonymous_read ? '<span class="danger">未配置 GitHub OAuth：任何能连到这个端口的人都能读取全部原始历史与附件。</span>' : '',
+        value.purge_generation ? `已执行 ${esc(value.purge_generation)} 次紧急 purge · 最近一次 ${fmt((value.last_purge || {}).created_at) || '—'}` : ''
+      ])
+    ].join(''));
+  } catch (error) {
+    setModal('采集与备份状态', `<div class="danger">${esc(error.message)}</div>`);
+  }
+}
+
 async function showUsers() {
   const value = await api('/api/v2/admin/users');
   setModal(
@@ -3247,6 +3493,14 @@ async function showUsers() {
   });
 }
 
+/* 凭证到期是静默的：那台机器上的 hook 与 MCP 会突然开始 401，而人只会看到
+   "传不上去"。所以到期日必须摆在设备面板上，并且提前提醒。 */
+function deviceExpiringSoon(device, days = 14) {
+  const at = new Date(device.expires_at);
+  if (Number.isNaN(at.getTime())) return false;
+  return at.getTime() - Date.now() < days * 86400000;
+}
+
 async function showDevices() {
   const value = await api('/api/v2/auth/devices');
   setModal(
@@ -3255,6 +3509,7 @@ async function showDevices() {
       <div class="management-card">
         <strong>${esc(device.name)}</strong>
         <div class="meta">${device.revoked_at ? '已撤销' : '有效'} · 创建 ${fmt(device.created_at)} · 最近使用 ${fmt(device.last_used_at) || '尚未使用'}</div>
+        ${device.revoked_at || !device.expires_at ? '' : `<div class="meta">有效期至 ${fmt(device.expires_at)}${deviceExpiringSoon(device) ? '<span class="danger"> · 即将过期，在那台机器上运行 <code>trace-login --renew</code></span>' : ' · 到期后自动失效，用 <code>trace-login --renew</code> 续期'}</div>`}
         ${device.revoked_at ? '' : `<button class="btn warn" type="button" data-revoke-device="${esc(device.id)}">${icon('logout')}撤销设备</button>`}
       </div>
     `).join('') || '<div class="empty"><div class="empty-inner">还没有通过账号绑定的设备。</div></div>'
@@ -3288,8 +3543,8 @@ function showAccount() {
       async () => {
         S.token = $('#fieldToken').value;
         S.actor = $('#fieldActor').value || 'human';
-        localStorage.setItem('trace.v2.token', S.token);
-        localStorage.setItem('trace.v2.actor', S.actor);
+        localStorage.setItem('trace.token', S.token);
+        localStorage.setItem('trace.actor', S.actor);
       }
     );
     return;
@@ -3337,6 +3592,69 @@ $('#chapters').onclick = event => {
 $('#addProject').onclick = showNewProject;
 $('#addChapter').onclick = showNewChapter;
 $('#tokenBtn').onclick = showAccount;
+$('#healthBtn').onclick = () => showHealth();
+
+/* 跨项目搜索必须说清"这条命中属于哪个项目"，并且点得进去。
+   只显示 scope 和时间时，搜到别的项目的记录等于知道它存在却打不开。 */
+function projectName(id) {
+  const project = S.projects.find(item => item.id === id);
+  return project ? project.name : '未知项目';
+}
+
+const SEARCH_SCOPE_LABEL = {
+  node: '记录', comment: '评论', overview: 'Overview', event: '原始 event', transcript: 'transcript'
+};
+
+function searchHitHtml(hit) {
+  const title = hit.title || hit.name || hit.event_type || hit.kind || hit.scope;
+  const when = hit.occurred_at || hit.captured_at || hit.created_at || hit.updated_at;
+  const isRaw = hit.scope === 'event' || hit.scope === 'transcript';
+  // 命中评论时跳到它挂着的那条记录，而不是只把项目打开。
+  const nodeId = hit.scope === 'node' ? hit.id : (hit.target_type === 'node' ? hit.target_id : '');
+  return `
+    <button class="hit" type="button" data-hit-project="${esc(hit.project_id || '')}"
+      data-hit-node="${esc(nodeId || '')}" data-hit-raw="${isRaw ? '1' : ''}">
+      <b>${esc(title)}</b>
+      <div>${esc(String(hit.body || hit.overview || '').slice(0, 260))}</div>
+      <small><span class="hit-project">${esc(projectName(hit.project_id))}</span> · ${esc(SEARCH_SCOPE_LABEL[hit.scope] || hit.scope)} · ${fmt(when)}</small>
+    </button>
+  `;
+}
+
+async function openHit(button) {
+  const projectId = button.dataset.hitProject;
+  if (!projectId) {
+    notify('这条命中没有所属项目，无法跳转');
+    return;
+  }
+  hideSearch();
+  if (!S.project || S.project.id !== projectId) await openProject(projectId);
+  const node = button.dataset.hitNode
+    ? S.project.nodes.find(item => item.id === button.dataset.hitNode)
+    : null;
+  if (node) {
+    S.chapter = S.project.chapters.find(chapter => chapter.id === node.chapter_id) || null;
+    S.selectedNodeId = node.id;
+  } else {
+    S.chapter = null;
+    S.selectedNodeId = null;
+  }
+  renderSide();
+  renderMain();
+  if (button.dataset.hitRaw) {
+    const raw = $('#rawHistory');
+    if (raw) {
+      raw.open = true;
+      raw.scrollIntoView({block: 'nearest'});
+    }
+  }
+}
+
+function bindSearchHits() {
+  $('#searchResults').querySelectorAll('[data-hit-project]').forEach(button => {
+    button.onclick = () => openHit(button).catch(error => notify(error.message));
+  });
+}
 
 let searchTimer;
 function hideSearch() {
@@ -3353,13 +3671,10 @@ $('#search').oninput = event => {
   searchTimer = setTimeout(async () => {
     try {
       const value = await api('/api/v2/search?q=' + encodeURIComponent(query) + '&scope=all&limit=30');
-      $('#searchResults').innerHTML = value.hits.map(hit => `
-        <div class="hit">
-          <b>${esc(hit.title || hit.kind || hit.event_type || hit.scope)}</b>
-          <div>${esc(String(hit.body || hit.overview || '').slice(0, 260))}</div>
-          <small>${esc(hit.scope)} · ${fmt(hit.occurred_at || hit.captured_at || hit.created_at || hit.updated_at)}</small>
-        </div>
-      `).join('') || '<div class="hit"><b>没有结果</b><div>换一个更具体的关键词试试。</div></div>';
+      $('#searchResults').innerHTML = (value.hits.map(searchHitHtml).join('')
+        || '<div class="hit"><b>没有结果</b><div>换一个更具体的关键词试试。</div></div>')
+        + searchTruncationHtml(value);
+      bindSearchHits();
       $('#searchResults').hidden = false;
       $('#search').setAttribute('aria-expanded', 'true');
     } catch (error) {
@@ -3369,6 +3684,18 @@ $('#search').oninput = event => {
     }
   }, 250);
 };
+/* 存储层给语义层留了保底名额并算出了截断信息。不说出来的话，用户看到 30 条
+   就以为只有 30 条——而被挤掉的往往正是他要找的那条语义记录。 */
+function searchTruncationHtml(value) {
+  if (!value || !value.truncated) return '';
+  const omitted = value.omitted || {};
+  const parts = Object.keys(omitted)
+    .filter(key => omitted[key])
+    .map(key => `${esc(SEARCH_SCOPE_LABEL[key] || key)} ${esc(omitted[key])} 条`);
+  if (!parts.length) return '';
+  return `<div class="hit meta">还有 ${parts.join('、')}未显示。改用 scope=semantic 或换更具体的关键词。</div>`;
+}
+
 document.addEventListener('click', event => {
   if (!event.target.closest('.search-shell')) hideSearch();
 });

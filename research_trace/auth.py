@@ -1,4 +1,4 @@
-"""GitHub OAuth and browser-session helpers for the v2 service.
+"""GitHub OAuth and browser-session helpers for the Research Trace service.
 
 OAuth access tokens are deliberately short lived in this process: they are used
 only to read the GitHub identity (and optional organization membership) during
@@ -11,18 +11,24 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 
 SESSION_COOKIE = "trace_session"
 OAUTH_NONCE_COOKIE = "trace_oauth_nonce"
+ADMIN_BUCKET = "admins"
+MEMBER_BUCKET = "allowed_users"
 
 
 class OAuthError(RuntimeError):
@@ -57,11 +63,139 @@ def safe_return_to(value: str | None) -> str:
     return value
 
 
-def login_set(value: str | set[str] | list[str] | tuple[str, ...] | None) -> frozenset[str]:
+@dataclass(frozen=True)
+class Principals:
+    """一条白名单（admins 或 allowed_users）解析后的形状。
+
+    GitHub 用户名在账号改名或注销后会被释放，任何人都能抢注同一个名字。
+    所以用户名只被当作"还没解析出数字 id 的占位符"：真正的锚是不可变的
+    `github_id`。配置里可以直接写 `id:12345` 一步到位，也可以写用户名，
+    由 IdentityPins 在首次登录时把 id 钉下来。
+    """
+
+    logins: frozenset[str]
+    github_ids: frozenset[int]
+
+    def __bool__(self) -> bool:
+        return bool(self.logins or self.github_ids)
+
+
+def parse_principals(
+    value: str | set[str] | list[str] | tuple[str, ...] | None,
+) -> Principals:
     if value is None:
-        return frozenset()
+        return Principals(frozenset(), frozenset())
     items = value.split(",") if isinstance(value, str) else value
-    return frozenset(str(item).strip().lower() for item in items if str(item).strip())
+    logins: set[str] = set()
+    ids: set[int] = set()
+    for item in items:
+        text = str(item).strip()
+        if not text:
+            continue
+        # 只有显式的 `id:` 前缀才当数字 id：GitHub 允许纯数字用户名，
+        # 裸数字如果被猜成 id，会把一个普通用户静默提权成别人。
+        if text.lower().startswith("id:"):
+            digits = text[3:].strip()
+            if digits.isdigit() and int(digits) > 0:
+                ids.add(int(digits))
+                continue
+            raise ValueError(f"invalid GitHub id entry: {text}")
+        logins.add(text.lower())
+    return Principals(frozenset(logins), frozenset(ids))
+
+
+class IdentityPins:
+    """把配置里写的 GitHub 用户名，在首次成功解析后钉到不可变的数字 id 上。
+
+    迁移路径：现有部署的 `TRACE_GITHUB_ADMINS=jinhang23` 不用改。第一次
+    jinhang23 登录成功时把 `jinhang23 -> 4711` 写进这个文件；此后同一条配置
+    只认 4711，用户名被释放并被抢注也拿不到权限；而本人改名后仍然认得出来。
+    """
+
+    def __init__(self, path: str | os.PathLike[str] | None = None):
+        self.path = Path(path) if path else None
+        self._lock = threading.Lock()
+        self._pins: dict[str, dict[str, int]] = self._load()
+
+    def _load(self) -> dict[str, dict[str, int]]:
+        if not self.path or not self.path.is_file():
+            return {}
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            # 钉的记录坏了不能让服务起不来；退化成"还没钉过"，
+            # 下一次成功登录会重新写。
+            return {}
+        pins: dict[str, dict[str, int]] = {}
+        for bucket, mapping in (raw.get("pins") or {}).items():
+            if not isinstance(mapping, dict):
+                continue
+            pins[str(bucket)] = {
+                str(login).lower(): int(value)
+                for login, value in mapping.items()
+                if str(value).lstrip("-").isdigit() and int(value) > 0
+            }
+        return pins
+
+    def _write_locked(self) -> None:
+        if not self.path:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.tmp")
+        payload = json.dumps({"version": 1, "pins": self._pins}, indent=2, sort_keys=True) + "\n"
+        temporary.write_text(payload, encoding="utf-8")
+        os.replace(temporary, self.path)
+
+    def pinned_id(self, bucket: str, login: str) -> int | None:
+        with self._lock:
+            return self._pins.get(bucket, {}).get(str(login).lower())
+
+    def pin(self, bucket: str, login: str, github_id: int) -> None:
+        normalized = str(login).lower()
+        with self._lock:
+            current = self._pins.setdefault(bucket, {})
+            if current.get(normalized) == int(github_id):
+                return
+            current[normalized] = int(github_id)
+            self._write_locked()
+
+    def snapshot(self) -> dict[str, dict[str, int]]:
+        with self._lock:
+            return {bucket: dict(mapping) for bucket, mapping in self._pins.items()}
+
+
+class RateLimiter:
+    """按 key 的滑动窗口限流，全部在进程内存里。
+
+    只用于挡住"一个客户端 15 秒打满全局配额"这种粗暴洪水；单实例服务
+    （SQLite WAL 只允许一个实例）下够用，不需要外部状态。
+    """
+
+    def __init__(self, limit: int, window_seconds: float, max_keys: int = 4096):
+        self.limit = max(int(limit), 1)
+        self.window_seconds = max(float(window_seconds), 1.0)
+        self.max_keys = max(int(max_keys), 16)
+        self._hits: dict[str, deque[float]] = {}
+        self._lock = threading.Lock()
+
+    def hit(self, key: str) -> float:
+        """记一次尝试；返回 0 表示放行，否则返回建议的 Retry-After 秒数。"""
+        now = time.monotonic()
+        cutoff = now - self.window_seconds
+        with self._lock:
+            for existing in [name for name, times in self._hits.items() if not times or times[-1] <= cutoff]:
+                self._hits.pop(existing, None)
+            if len(self._hits) >= self.max_keys and key not in self._hits:
+                # 攻击者可以换 IP 撑爆字典；宁可对新 key 直接退让，
+                # 也不要让限流器本身变成内存耗尽的入口。
+                return self.window_seconds
+            times = self._hits.setdefault(key, deque())
+            while times and times[0] <= cutoff:
+                times.popleft()
+            if len(times) >= self.limit:
+                return max(times[0] + self.window_seconds - now, 1.0)
+            times.append(now)
+            return 0.0
 
 
 @dataclass(frozen=True)
@@ -70,11 +204,12 @@ class GitHubOAuthConfig:
     client_secret: str
     public_url: str
     session_secret: str
-    admins: frozenset[str]
-    allowed_users: frozenset[str]
+    admins: Principals
+    allowed_users: Principals
     allowed_org: str | None = None
     allow_all: bool = False
     session_days: int = 30
+    device_credential_days: int = 90
     secure_cookies: bool = True
 
     @property
@@ -98,6 +233,7 @@ class GitHubOAuthConfig:
         allowed_org: str | None = None,
         allow_all: bool = False,
         session_days: int = 30,
+        device_credential_days: int = 90,
         insecure_cookies: bool = False,
     ) -> "GitHubOAuthConfig | None":
         pieces = [str(client_id or "").strip(), str(client_secret or "").strip(),
@@ -120,8 +256,8 @@ class GitHubOAuthConfig:
             raise ValueError("GitHub OAuth requires HTTPS (HTTP is allowed only for loopback development)")
         if len(session_secret_value) < 32:
             raise ValueError("GitHub OAuth session secret must be at least 32 characters")
-        admin_set = login_set(admins)
-        user_set = login_set(allowed_users)
+        admin_set = parse_principals(admins)
+        user_set = parse_principals(allowed_users)
         org_value = str(allowed_org or "").strip() or None
         if not (admin_set or user_set or org_value or allow_all):
             raise ValueError(
@@ -129,6 +265,8 @@ class GitHubOAuthConfig:
             )
         if not 1 <= int(session_days) <= 365:
             raise ValueError("GitHub OAuth session days must be between 1 and 365")
+        if not 1 <= int(device_credential_days) <= 3650:
+            raise ValueError("device credential days must be between 1 and 3650")
         return cls(
             client_id=client_id_value,
             client_secret=client_secret_value,
@@ -139,14 +277,51 @@ class GitHubOAuthConfig:
             allowed_org=org_value,
             allow_all=bool(allow_all),
             session_days=int(session_days),
+            device_credential_days=int(device_credential_days),
             secure_cookies=parsed.scheme == "https",
         )
 
-    def permitted_role(self, login: str, *, active_org_member: bool = False) -> str | None:
+    @staticmethod
+    def _matches(
+        principals: Principals,
+        bucket: str,
+        login: str,
+        github_id: int | None,
+        pins: IdentityPins | None,
+    ) -> bool:
+        if github_id is not None and int(github_id) in principals.github_ids:
+            return True
+        if github_id is not None and pins is not None:
+            # 本人改名之后，配置里写的仍是旧用户名，但钉住的 id 没变，
+            # 所以先按 id 反查一遍，别把改过名的管理员锁在门外。
+            for candidate in principals.logins:
+                if pins.pinned_id(bucket, candidate) == int(github_id):
+                    return True
         normalized = str(login or "").strip().lower()
-        if normalized in self.admins:
+        if not normalized or normalized not in principals.logins:
+            return False
+        if github_id is None or pins is None:
+            return True
+        pinned = pins.pinned_id(bucket, normalized)
+        if pinned is None:
+            pins.pin(bucket, normalized, int(github_id))
+            return True
+        # 名字对上了但 id 对不上 —— 这正是"用户名被释放后被抢注"的形状。
+        return pinned == int(github_id)
+
+    def resolve_role(
+        self,
+        *,
+        login: str,
+        github_id: int | None = None,
+        active_org_member: bool = False,
+        pins: IdentityPins | None = None,
+    ) -> str | None:
+        if self._matches(self.admins, ADMIN_BUCKET, login, github_id, pins):
             return "admin"
-        if normalized in self.allowed_users or self.allow_all or active_org_member:
+        if self._matches(self.allowed_users, MEMBER_BUCKET, login, github_id, pins):
+            return "member"
+        if self.allow_all or active_org_member:
             return "member"
         return None
 

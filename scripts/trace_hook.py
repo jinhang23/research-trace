@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """Claude Code hooks for durable Research Trace event capture.
 
-The hook never writes research records itself.  It stages immutable raw events in
-CLAUDE_PLUGIN_DATA and, once per main turn, asks Claude to hand one batch to a
-forked recorder.  All failures are fail-open: research work must not be blocked
-because the recorder or the central service is unavailable.
+三条硬性质，按重要性排列：
+
+1. **只录显式绑定过的项目。** 第一件事是从 cwd 向上找 `.research-trace.json`；找不到就
+   立即返回，一个字节都不写、一个目录都不建。装上插件不等于同意录下这台机器上每个项目
+   （REQUIREMENTS §13 的项目排除、§7 的「不能静默创建重复项目」）。
+2. **hook 不投递。** 它只把事件原子地写进 `pending/` 就返回，绝不碰网络、绝不等任何人。
+   把 pending 送到中央并只在 2xx 后搬进 `sent/` 是独立进程 `trace-deliver` 的事。
+   于是正确性不再依赖模型是否记得调用工具、fork 是否成功、或缓存是否命中（§6）。
+3. **隐藏推理不落盘。** transcript 增量按行解析，`thinking` / `redacted_thinking` 块在
+   进 outbox 之前就被丢掉（§6「隐藏 chain-of-thought 不采集」）。
+
+所有失败都 fail-open：研究工作不能因为 Research Trace 而中断（§6.1）。
 """
 
 from __future__ import annotations
@@ -14,6 +22,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import uuid
@@ -26,12 +35,33 @@ from typing import Any, Iterator
 SCHEMA = "research-trace.event.v1"
 RECORDER_MARKER = "[research-trace-recorder]"
 BATCH_MARKER = "[research-trace-batch:"
-FINAL_RECEIPT_STATUSES = {"stored", "local", "ignored"}
-RECEIPT_RE = re.compile(r"^TRACE_RECEIPT\s+(\{.*\})\s*$", re.MULTILINE)
 RECORDER_READ_TOOLS = {"Read", "Grep", "Glob"}
 RECORDER_TRACE_TOOLS = {
     "trace_context", "trace_ingest", "trace_record", "trace_curate", "trace_attach", "trace_search",
 }
+
+MARKER_NAME = ".research-trace.json"
+
+# outbox 里装着完整对话和带令牌的命令原文。在多用户 HPC 节点上默认 0755/0644 等于
+# 同机任何人可读；凭证文件早就是 0600，这里照抄同一个标准。Windows 上 chmod 基本无效，
+# 所以是 best-effort，不影响流程。
+DIR_MODE = 0o700
+FILE_MODE = 0o600
+
+# 隐藏推理块的类型名。字节级 hint 用来在不解析 JSON 的前提下跳过绝大多数行。
+THINKING_TYPES = {"thinking", "redacted_thinking"}
+THINKING_HINT = b"thinking"
+
+# 同一个 session 两次 SessionStart 之间不重复拉起投递器（/clear 会连发）。
+DELIVER_SPAWN_INTERVAL = 60.0
+
+_PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+if str(_PLUGIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PLUGIN_ROOT))
+try:  # marker 的权威实现在包里，hook 只是它的第一个消费者
+    from research_trace.deliver import project_binding as _package_binding
+except Exception:  # pragma: no cover - 未安装/被裁剪时退化成下面的内联版本
+    _package_binding = None
 
 
 def _now() -> str:
@@ -50,74 +80,221 @@ def _json_text(value: Any) -> str:
         return repr(value)
 
 
+def _long(path: Path) -> Path:
+    """Windows 上给绝对路径加 `\\\\?\\` 前缀，绕开 260 字符的 MAX_PATH。
+
+    outbox 路径的长度我们只控制得了一半：`${CLAUDE_PLUGIN_DATA}` 有多深是宿主决定的，
+    session id 是 36 字符的 UUID，事件文件名本身就有 64 字符。实测在一个稍深的
+    data-dir 下，`os.replace` 会以 WinError 3 失败，而 hook 是 fail-open 的——
+    退出码仍然是 0，只在没人看的 stderr 上留一行，于是这台机器上每一条事件都被
+    静默丢掉。加前缀之后同一条路径可以写到约 32767 字符。
+
+    只在真的超长时才加：`\\\\?\\` 路径不做任何规范化，短路径没必要冒这个险。
+    """
+    if os.name != "nt":
+        return path
+    text = str(path)
+    if len(text) < 240 or text.startswith("\\\\?\\"):
+        return path
+    absolute = os.path.abspath(text)
+    if absolute.startswith("\\\\"):  # UNC: \\server\share -> \\?\UNC\server\share
+        return Path("\\\\?\\UNC" + absolute[1:])
+    return Path("\\\\?\\" + absolute)
+
+
+def _chmod(path: Path, mode: int) -> None:
+    try:
+        os.chmod(_long(path), mode)
+    except OSError:
+        pass
+
+
+def _mkdir(path: Path) -> None:
+    _long(path).mkdir(parents=True, exist_ok=True)
+    _chmod(path, DIR_MODE)
+
+
 def _atomic_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.parent / f".{uuid.uuid4().hex}.tmp"
-    temp.write_text(
-        json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str),
-        encoding="utf-8",
+    _atomic_bytes(
+        path,
+        json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8"),
     )
-    os.replace(temp, path)
 
 
 def _atomic_bytes(path: Path, value: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.parent / f".{uuid.uuid4().hex}.tmp"
-    temp.write_bytes(value)
-    os.replace(temp, path)
+    _mkdir(path.parent)
+    temp = _long(path.parent / f".{uuid.uuid4().hex}.tmp")
+    try:
+        temp.write_bytes(value)
+        _chmod(temp, FILE_MODE)
+        os.replace(temp, _long(path))
+    except OSError:
+        # 失败必须把半成品带走：旧实现留下的 .tmp 会在「永不自动删除」的目录里无限堆积。
+        try:
+            temp.unlink()
+        except OSError:
+            pass
+        raise
+    _chmod(path, FILE_MODE)
 
 
 def _read_json(path: Path, default: Any) -> Any:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(_long(path).read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
         return default
 
 
-def _session_root(data_dir: Path, payload: dict[str, Any]) -> Path:
-    cwd = str(payload.get("cwd") or os.getcwd())
-    project = hashlib.sha256(os.path.normcase(cwd).encode("utf-8")).hexdigest()[:16]
+# --------------------------------------------------------------------------------------
+# ② 采集 opt-in：没有 marker 的目录直接跳过
+# --------------------------------------------------------------------------------------
+
+
+def _inline_binding(cwd: str | None) -> dict[str, Any] | None:
+    """`research_trace` 不可导入时的退化实现：只认 marker 在不在、capture 开不开。"""
+    try:
+        current = Path(cwd or os.getcwd()).expanduser().resolve()
+    except OSError:
+        return None
+    for _ in range(64):
+        candidate = current / MARKER_NAME
+        try:
+            if candidate.is_file():
+                value = _read_json(candidate, {})
+                if not isinstance(value, dict):
+                    value = {}
+                if value.get("capture") is False:
+                    return None
+                keys = [
+                    str(item).strip()
+                    for item in [value.get("workspace_key"), *(value.get("workspace_keys") or [])]
+                    if str(item or "").strip()
+                ]
+                return {
+                    "marker_path": str(candidate),
+                    "project_dir": str(current),
+                    "workspace_keys": keys,
+                    "workspace_key": keys[0] if keys else None,
+                    "project_id": str(value.get("project_id") or "").strip() or None,
+                    "project_name": str(value.get("project_name") or "").strip() or None,
+                }
+        except OSError:
+            return None
+        if current.parent == current:
+            break
+        current = current.parent
+    return None
+
+
+def binding_for(payload: dict[str, Any]) -> dict[str, Any] | None:
+    cwd = payload.get("cwd")
+    cwd = str(cwd) if isinstance(cwd, str) and cwd.strip() else None
+    if _package_binding is not None:
+        try:
+            return _package_binding(cwd)
+        except Exception:
+            pass
+    return _inline_binding(cwd)
+
+
+def _session_root(data_dir: Path, payload: dict[str, Any], binding: dict[str, Any]) -> Path:
+    # 目录用 workspace key 做 hash：同一个项目在不同路径/worktree 下打开时共用一个 outbox
+    # 分支（§7：绝对 cwd 不是项目身份）。没有 key 的 marker 退回 cwd。
+    identity = binding.get("workspace_key") or os.path.normcase(
+        str(payload.get("cwd") or os.getcwd())
+    )
+    workspace = hashlib.sha256(str(identity).encode("utf-8")).hexdigest()[:16]
     session = _safe(payload.get("session_id"), "unknown-session")
-    root = data_dir / "outbox" / project / session
+    root = data_dir / "outbox" / workspace / session
     for name in (
-        "pending", "awaiting_upload", "sent", "batches", "batches/done",
-        "transcripts/pending", "transcripts/awaiting_upload", "transcripts/sent",
-        "transcripts/meta",
+        "pending", "sent", "batches", "batches/done",
+        "transcripts/pending", "transcripts/sent", "transcripts/meta",
     ):
-        (root / name).mkdir(parents=True, exist_ok=True)
+        _mkdir(root / name)
+    _chmod(root, DIR_MODE)
+    _chmod(root.parent, DIR_MODE)
+    _chmod(data_dir / "outbox", DIR_MODE)
     return root
 
 
 @contextmanager
-def _state_lock(root: Path, timeout: float = 2.0) -> Iterator[bool]:
-    """A tiny cross-platform lock based on atomic directory creation."""
+def _state_lock(root: Path, timeout: float = 1.0, stale: float = 10.0) -> Iterator[bool]:
+    """A tiny cross-platform lock based on atomic directory creation.
+
+    被 kill 掉的 hook 会留下这个目录。旧实现的过期判断是 `now - mtime > 30` 且只在单向上
+    生效：系统时钟回拨（HPC 上 NTP 常见）会让差值永远为负，锁再也拆不掉，此后每一次
+    hook 事件固定多花整个 timeout。这里改成双向判断，并且优先看持有者进程还在不在。
+    """
     lock = root / ".state-lock"
     deadline = time.monotonic() + timeout
     acquired = False
-    while time.monotonic() < deadline:
+    while True:
         try:
             lock.mkdir()
             acquired = True
             break
         except FileExistsError:
-            try:
-                if time.time() - lock.stat().st_mtime > 30:
-                    lock.rmdir()
-                    continue
-            except OSError:
-                pass
-            time.sleep(0.025)
+            # 拆完不直接 continue：万一 rmdir 也失败，这里必须仍然受 deadline 约束。
+            if _lock_is_dead(lock, stale):
+                _drop_lock(lock)
+        except OSError:
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.02)
+    if acquired:
+        try:
+            (lock / "owner").write_text(str(os.getpid()), encoding="utf-8")
+        except OSError:
+            pass
     try:
         yield acquired
     finally:
         if acquired:
+            _drop_lock(lock)
+
+
+def _lock_is_dead(lock: Path, stale: float) -> bool:
+    owner = _read_int(lock / "owner")
+    if owner and owner != os.getpid() and not _pid_alive(owner):
+        return True
+    try:
+        age = time.time() - lock.stat().st_mtime
+    except OSError:
+        return False
+    return age > stale or age < -stale
+
+
+def _read_int(path: Path) -> int | None:
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (OSError, AttributeError, ValueError):
+        return True  # Windows 与权限不足都无法判定，交给时间兜底
+    return True
+
+
+def _drop_lock(lock: Path) -> None:
+    try:
+        for child in lock.iterdir():
             try:
-                lock.rmdir()
+                child.unlink()
             except OSError:
                 pass
+        lock.rmdir()
+    except OSError:
+        pass
 
 
-def _write_event(root: Path, payload: dict[str, Any]) -> Path:
+def _write_event(root: Path, payload: dict[str, Any], binding: dict[str, Any]) -> Path:
     event_id = f"claude-{uuid.uuid4().hex}"
     record = {
         "schema": SCHEMA,
@@ -126,6 +303,8 @@ def _write_event(root: Path, payload: dict[str, Any]) -> Path:
         "source": "claude-code",
         "session_id": payload.get("session_id"),
         "project_dir": payload.get("cwd"),
+        "project_id": binding.get("project_id"),
+        "workspace_keys": binding.get("workspace_keys") or [],
         "hook_event": payload.get("hook_event_name"),
         "agent_id": payload.get("agent_id"),
         "agent_type": payload.get("agent_type"),
@@ -135,6 +314,95 @@ def _write_event(root: Path, payload: dict[str, Any]) -> Path:
     path = root / "pending" / f"{stamp}_{event_id}.json"
     _atomic_json(path, record)
     return path
+
+
+# --------------------------------------------------------------------------------------
+# ③ transcript：逐行剥掉隐藏推理再落盘
+# --------------------------------------------------------------------------------------
+
+
+def _drop_thinking(value: Any, depth: int = 0) -> tuple[Any, bool]:
+    """返回 (清理后的值, 是否改动过)。值为 None 表示这个节点整体该被删掉。"""
+    if depth > 16:
+        return value, False
+    if isinstance(value, dict):
+        kind = value.get("type")
+        if isinstance(kind, str) and kind in THINKING_TYPES:
+            return None, True
+        out: dict[str, Any] = {}
+        changed = False
+        for key, item in value.items():
+            if key in THINKING_TYPES or (key == "signature" and "thinking" in value):
+                changed = True  # {"thinking": "...", "signature": "..."} 这种平铺形状
+                continue
+            new, sub = _drop_thinking(item, depth + 1)
+            if new is None:
+                changed = True
+                continue
+            out[key] = new
+            changed = changed or sub
+        return out, changed
+    if isinstance(value, list):
+        items: list[Any] = []
+        changed = False
+        for item in value:
+            new, sub = _drop_thinking(item, depth + 1)
+            if new is None:
+                changed = True
+                continue
+            items.append(new)
+            changed = changed or sub
+        return items, changed
+    return value, False
+
+
+def _scrub_line(line: bytes) -> bytes | None:
+    """一行 transcript JSONL → 允许落盘的字节；None 表示整行丢掉。
+
+    绝大多数行不含 `thinking` 字样，走字节判断直接原样返回，完全不进 JSON 解析器，
+    所以这条每次事件都跑的路径在 10 MB transcript 上仍是一次线性扫描量级。
+    含该字样但解析不了的行不能放行（无法确认里面没有隐藏推理），也不能静默消失，
+    所以换成一条只有长度和 hash 的占位记录：留下缺口证据，不留下原文。
+    """
+    if THINKING_HINT not in line:
+        return line
+    try:
+        value = json.loads(line.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return json.dumps(
+            {
+                "type": "research-trace.redacted",
+                "reason": "unparsable transcript line containing hidden-reasoning markers",
+                "bytes": len(line),
+                "sha256": hashlib.sha256(line).hexdigest(),
+            },
+            ensure_ascii=False, separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+    scrubbed, changed = _drop_thinking(value)
+    if scrubbed is None:
+        return None
+    if not changed:
+        return line
+    return json.dumps(scrubbed, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
+
+
+def _read_scrubbed(stream: Any, remaining: int, chunk_size: int) -> tuple[int, bytes]:
+    """读若干完整行，返回 (从源文件消耗的字节数, 清理后要落盘的字节)。
+
+    消耗量按源文件计，落盘量按清理后计，两者故意分开：cursor 因此不受剥离影响。
+    没有换行结尾的尾巴是「正在被追加的半条记录」，留到下次，绝不切开一条 JSON。
+    """
+    consumed = 0
+    parts: list[bytes] = []
+    while consumed < chunk_size and consumed < remaining:
+        line = stream.readline()
+        if not line or not line.endswith(b"\n"):
+            break
+        consumed += len(line)
+        scrubbed = _scrub_line(line)
+        if scrubbed:
+            parts.append(scrubbed)
+    return consumed, b"".join(parts)
 
 
 def _capture_transcripts(
@@ -168,7 +436,7 @@ def _capture_transcripts(
             continue
         start = int(cursors.get(key, 0) or 0)
         if start < 0 or start > size:
-            start = 0
+            start = 0  # 文件被轮换/截断；重来一遍，中央按 chunk_id 去重
         if start == size:
             continue
         try:
@@ -176,41 +444,46 @@ def _capture_transcripts(
                 stream.seek(start)
                 offset = start
                 while offset < size:
-                    parts: list[bytes] = []
-                    part_size = 0
-                    while offset + part_size < size and part_size < chunk_size:
-                        line = stream.readline()
-                        if not line:
-                            break
-                        parts.append(line)
-                        part_size += len(line)
-                    raw = b"".join(parts)
-                    if not raw:
+                    consumed, raw = _read_scrubbed(stream, size - offset, chunk_size)
+                    if consumed == 0:
                         break
-                    end = offset + len(raw)
-                    digest = hashlib.sha256(raw).hexdigest()
-                    chunk_id = f"claude-transcript-{digest}"
-                    filename = f"{key}_{offset:016d}_{end:016d}_{digest[:16]}.jsonl"
-                    destination = root / "transcripts" / "pending" / filename
-                    if not destination.exists():
-                        _atomic_bytes(destination, raw)
-                    metadata = {
-                        "path": f"transcripts/pending/{filename}",
-                        "chunk_id": chunk_id,
-                        "session_id": payload.get("session_id"),
-                        "agent_id": agent_id,
-                        "source_path": source_text,
-                        "start_offset": offset,
-                        "end_offset": end,
-                        "sha256": digest,
-                    }
-                    _atomic_json(root / "transcripts" / "meta" / f"{filename}.json", metadata)
-                    captured.append(metadata)
+                    end = offset + consumed
+                    if raw:
+                        digest = hashlib.sha256(raw).hexdigest()
+                        filename = f"{key}_{offset:016d}_{end:016d}_{digest[:16]}.jsonl"
+                        destination = root / "transcripts" / "pending" / filename
+                        if not _long(destination).exists():
+                            _atomic_bytes(destination, raw)
+                        metadata = {
+                            "path": f"transcripts/pending/{filename}",
+                            "chunk_id": f"claude-transcript-{digest}",
+                            "session_id": payload.get("session_id"),
+                            "agent_id": agent_id,
+                            "source_path": source_text,
+                            "start_offset": offset,
+                            "end_offset": end,
+                            "sha256": digest,
+                        }
+                        _atomic_json(root / "transcripts" / "meta" / f"{filename}.json", metadata)
+                        captured.append(metadata)
                     offset = end
-                cursors[key] = offset
-        except OSError:
+                    size = max(size, end)
+                    # 每成功写完一块就推进 cursor：旧实现只在整个文件走完后才写，
+                    # 一次 I/O 失败就让下一次从头重抄整份 transcript。
+                    cursors[key] = offset
+        except OSError as exc:
+            # 静默吞掉是旧实现最坏的一条：transcript 永远采不到而退出码仍是 0。
+            print(
+                f"research-trace hook: transcript capture failed for {source_text}: {exc}",
+                file=sys.stderr,
+            )
             continue
     return captured
+
+
+# --------------------------------------------------------------------------------------
+# Recorder 编排（语义层）
+# --------------------------------------------------------------------------------------
 
 
 def _extract_agent_id(value: Any) -> str | None:
@@ -235,120 +508,60 @@ def _extract_agent_id(value: Any) -> str | None:
     return None
 
 
-def _receipt_from_message(message: Any) -> dict[str, Any] | None:
-    if not isinstance(message, str):
-        return None
-    matches = list(RECEIPT_RE.finditer(message))
-    if not matches:
-        return None
-    try:
-        value = json.loads(matches[-1].group(1))
-    except ValueError:
-        return None
-    if not isinstance(value, dict):
-        return None
-    batch_id = _safe(value.get("batch_id"), "")
-    status = str(value.get("status") or "").lower()
-    if not batch_id or status not in FINAL_RECEIPT_STATUSES | {"retry"}:
-        return None
-    value["batch_id"] = batch_id
-    value["status"] = status
-    value["received_at"] = _now()
-    return value
-
-
-def _reconcile_receipts(root: Path) -> None:
-    done = root / "batches" / "done"
-    for manifest_path in sorted((root / "batches").glob("*.json")):
-        if manifest_path.name.endswith(".receipt.json"):
-            continue
-        receipt_path = manifest_path.with_name(manifest_path.stem + ".receipt.json")
-        if not receipt_path.is_file():
-            continue
-        receipt = _read_json(receipt_path, {})
-        if receipt.get("status") not in FINAL_RECEIPT_STATUSES:
-            continue
-        manifest = _read_json(manifest_path, {})
-        archive_dir = "sent" if receipt.get("status") == "stored" else "awaiting_upload"
-        archived_events: list[str] = []
-        for rel in manifest.get("events", []):
-            candidate = Path(str(rel))
-            if candidate.is_absolute() or ".." in candidate.parts or candidate.parts[:1] != ("pending",):
-                continue
-            source = root / candidate
-            if source.is_file():
-                destination = root / archive_dir / source.name
-                os.replace(source, destination)
-                archived_events.append(f"{archive_dir}/{source.name}")
-        archived_chunks: list[dict[str, Any]] = []
-        for item in manifest.get("transcript_chunks", []):
-            if not isinstance(item, dict):
-                continue
-            candidate = Path(str(item.get("path") or ""))
-            if (
-                candidate.is_absolute() or ".." in candidate.parts
-                or candidate.parts[:2] != ("transcripts", "pending")
-            ):
-                continue
-            source = root / candidate
-            if source.is_file():
-                destination = root / "transcripts" / archive_dir / source.name
-                os.replace(source, destination)
-                archived = dict(item)
-                archived["path"] = f"transcripts/{archive_dir}/{source.name}"
-                archived_chunks.append(archived)
-                meta = root / "transcripts" / "meta" / f"{source.name}.json"
-                try:
-                    meta.unlink()
-                except OSError:
-                    pass
-        manifest["receipt_status"] = receipt.get("status")
-        manifest["archived_events"] = archived_events
-        manifest["archived_transcript_chunks"] = archived_chunks
-        _atomic_json(done / manifest_path.name, manifest)
-        manifest_path.unlink()
-        os.replace(receipt_path, done / receipt_path.name)
-
-
 def _open_manifests(root: Path) -> list[tuple[Path, dict[str, Any]]]:
     out: list[tuple[Path, dict[str, Any]]] = []
     for path in sorted((root / "batches").glob("*.json")):
-        if path.name.endswith(".receipt.json"):
-            continue
         value = _read_json(path, {})
         if isinstance(value, dict) and value.get("batch_id"):
             out.append((path, value))
     return out
 
 
-def _ensure_batch(root: Path, payload: dict[str, Any]) -> tuple[Path, dict[str, Any]] | None:
+def _chunk_bounds(name: str) -> tuple[str, int]:
+    parts = name.split("_")
+    try:
+        return parts[0], int(parts[2])
+    except (IndexError, ValueError):
+        return name, 0
+
+
+def _ensure_batch(
+    root: Path, payload: dict[str, Any], state: dict[str, Any], binding: dict[str, Any]
+) -> tuple[Path, dict[str, Any]] | None:
+    """给 Recorder 组一个待处理 batch。
+
+    候选来自 `pending/` **和** `sent/`：投递器随时可能把文件搬进 sent/，语义层的取材范围
+    不能因此塌掉。用单调游标而不是「谁还在 pending 里」来判断哪些已经派过工。
+    """
+    cursor = str(state.get("batched_through") or "")
+    events: list[tuple[str, str]] = []
+    for directory in ("pending", "sent"):
+        for path in (root / directory).glob("*.json"):
+            if path.name > cursor:
+                events.append((path.name, f"{directory}/{path.name}"))
+    events.sort(key=lambda item: item[0])
+
+    chunk_cursor = state.setdefault("transcript_batch_offsets", {})
+    if not isinstance(chunk_cursor, dict):
+        chunk_cursor = {}
+        state["transcript_batch_offsets"] = chunk_cursor
+    chunks: list[tuple[str, dict[str, Any]]] = []
+    seen: set[str] = set()
+    for directory in ("pending", "sent"):
+        for path in (root / "transcripts" / directory).glob("*.jsonl"):
+            key, end = _chunk_bounds(path.name)
+            if path.name in seen or end <= int(chunk_cursor.get(key, 0) or 0):
+                continue
+            seen.add(path.name)
+            metadata = _read_json(root / "transcripts" / "meta" / f"{path.name}.json", {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata["path"] = f"transcripts/{directory}/{path.name}"
+            chunks.append((path.name, metadata))
+    chunks.sort(key=lambda item: item[0])
+
     open_batches = _open_manifests(root)
-    already_batched = {
-        str(rel)
-        for _, manifest in open_batches
-        for rel in manifest.get("events", [])
-    }
-    waiting = [
-        path for path in sorted((root / "pending").glob("*.json"))
-        if f"pending/{path.name}" not in already_batched
-    ]
-    already_batched_chunks = {
-        str(item.get("path"))
-        for _, manifest in open_batches
-        for item in manifest.get("transcript_chunks", [])
-        if isinstance(item, dict)
-    }
-    waiting_chunks: list[dict[str, Any]] = []
-    for path in sorted((root / "transcripts" / "pending").glob("*.jsonl")):
-        rel = f"transcripts/pending/{path.name}"
-        if rel in already_batched_chunks:
-            continue
-        metadata = _read_json(root / "transcripts" / "meta" / f"{path.name}.json", {})
-        if not isinstance(metadata, dict):
-            metadata = {}
-        metadata["path"] = rel
-        waiting_chunks.append(metadata)
-    if waiting or waiting_chunks:
+    if events or chunks:
         batch_id = f"{int(time.time())}-{uuid.uuid4().hex[:10]}"
         manifest = {
             "schema": "research-trace.batch.v1",
@@ -356,15 +569,40 @@ def _ensure_batch(root: Path, payload: dict[str, Any]) -> tuple[Path, dict[str, 
             "created_at": _now(),
             "session_id": payload.get("session_id"),
             "project_dir": payload.get("cwd"),
-            "event_count": len(waiting),
-            "events": [f"pending/{path.name}" for path in waiting],
-            "transcript_chunk_count": len(waiting_chunks),
-            "transcript_chunks": waiting_chunks,
+            "project_id": binding.get("project_id"),
+            "workspace_keys": binding.get("workspace_keys") or [],
+            "event_count": len(events),
+            "events": [rel for _, rel in events],
+            "transcript_chunk_count": len(chunks),
+            "transcript_chunks": [metadata for _, metadata in chunks],
         }
         manifest_path = root / "batches" / f"{batch_id}.json"
         _atomic_json(manifest_path, manifest)
+        if events:
+            state["batched_through"] = events[-1][0]
+        for name, _ in chunks:
+            key, end = _chunk_bounds(name)
+            chunk_cursor[key] = max(int(chunk_cursor.get(key, 0) or 0), end)
         open_batches.append((manifest_path, manifest))
     return open_batches[0] if open_batches else None
+
+
+def _close_batch(root: Path, batch_id: str) -> None:
+    """Recorder 处理完一个 manifest 就归档它。
+
+    注意这只影响语义层：原始文件的去向由投递器按中央 2xx 决定，跟这里无关。
+    """
+    manifest_path = root / "batches" / f"{_safe(batch_id, '')}.json"
+    if not batch_id or not manifest_path.is_file():
+        return
+    manifest = _read_json(manifest_path, {})
+    if isinstance(manifest, dict):
+        manifest["recorder_finished_at"] = _now()
+        _atomic_json(root / "batches" / "done" / manifest_path.name, manifest)
+    try:
+        manifest_path.unlink()
+    except OSError:
+        pass
 
 
 def _is_trace_orchestration(
@@ -401,20 +639,15 @@ def _is_trace_orchestration(
             state.pop("recorder_agent_id", None)
         return True
 
-    receipt = _receipt_from_message(payload.get("last_assistant_message"))
-    if event == "SubagentStop" and receipt:
-        batch_id = receipt["batch_id"]
-        manifest = root / "batches" / f"{batch_id}.json"
-        if manifest.is_file():
-            receipt_path = manifest.with_name(manifest.stem + ".receipt.json")
-            receipt["agent_id"] = payload.get("agent_id")
-            _atomic_json(receipt_path, receipt)
-            if payload.get("agent_id"):
-                state["recorder_agent_id"] = str(payload["agent_id"])
+    recorder_id = str(state.get("recorder_agent_id") or "")
+    is_recorder = bool(recorder_id) and str(payload.get("agent_id") or "") == recorder_id
+    if event == "SubagentStop" and is_recorder:
+        # Recorder 身份只来自它被派发时记下的 agent id，绝不来自收尾消息里的自称文本：
+        # 旧实现认任何带 batch_id 的 TRACE_RECEIPT，普通子 agent 因此会被误认成 Recorder
+        # 并被此后所有 Edit/Write/Bash 拒绝，主任务当场被插件挡死。
+        _close_batch(root, str(state.pop("dispatched_batch", "") or ""))
         return True
-
-    recorder_id = state.get("recorder_agent_id")
-    if recorder_id and str(payload.get("agent_id") or "") == str(recorder_id):
+    if is_recorder:
         return True
     if event == "Stop" and payload.get("stop_hook_active"):
         return True
@@ -470,7 +703,7 @@ def _nudge(
     batch_message = (
         f"{BATCH_MARKER}{batch_id}] Read the batch manifest at {manifest_path}. "
         f"Follow the recorder protocol at {protocol_path}. Process this batch without asking "
-        "the user, then end with the required one-line TRACE_RECEIPT JSON."
+        "the user, then finish with one short line and no raw logs."
     )
     if recorder_id:
         action = (
@@ -483,10 +716,12 @@ def _nudge(
             "A fork is required because it receives the main agent's complete current context."
         )
     guidance = (
-        "Research Trace has durably queued a recorder batch. Do not summarize or interpret the "
-        "batch in the main context. " + action + " After dispatching it once, stop without adding "
-        "a user-facing trace message and do not wait for the background recorder. If fork or "
-        "SendMessage is unavailable, do not retry this turn; the batch remains safely queued."
+        "Research Trace has durably queued a recorder batch. Raw history is already safe on disk "
+        "and is uploaded by the independent trace-deliver process, so nothing here affects "
+        "durability. Do not summarize or interpret the batch in the main context. " + action
+        + " After dispatching it once, stop without adding a user-facing trace message and do not "
+        "wait for the background recorder. If fork or SendMessage is unavailable, do not retry "
+        "this turn; the batch remains safely queued."
     )
     # Stop hooks do not support hookSpecificOutput.additionalContext.  The documented
     # continuation mechanism is a top-level block decision whose reason becomes the
@@ -494,15 +729,61 @@ def _nudge(
     return {"decision": "block", "reason": guidance}
 
 
-def handle(payload: dict[str, Any], data_dir: Path, protocol_path: Path) -> dict[str, Any] | None:
+# --------------------------------------------------------------------------------------
+# ① 投递器：分离启动，绝不等待
+# --------------------------------------------------------------------------------------
+
+
+def _spawn_deliver(data_dir: Path, url: str, state: dict[str, Any]) -> bool:
+    """Fire-and-forget 拉起一次 `trace-deliver`。
+
+    hook 自己绝不发网络请求：DNS 挂掉或中央不可达时，重试成本必须落在这个分离进程上，
+    而不是落在用户的每一次工具调用上。启动失败同样无所谓 —— 内容已经在 pending/ 里，
+    下一次 SessionStart、手动 `trace-deliver` 或 `--watch` 常驻都能把它带走。
+    """
+    if os.environ.get("TRACE_HOOK_NO_SPAWN"):
+        return False
+    now = time.time()
+    last = float(state.get("deliver_spawned_at") or 0.0)
+    if 0 <= now - last < DELIVER_SPAWN_INTERVAL:
+        return False
+    state["deliver_spawned_at"] = now
+    command = [sys.executable, "-m", "research_trace.deliver", "--data-dir", str(data_dir), "--quiet"]
+    if url:
+        command += ["--url", url]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(_PLUGIN_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    options: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
+        "cwd": str(_PLUGIN_ROOT), "env": env,
+    }
+    if os.name == "nt":
+        options["creationflags"] = 0x00000008 | 0x08000000  # DETACHED_PROCESS | CREATE_NO_WINDOW
+    else:
+        options["start_new_session"] = True
+    try:
+        subprocess.Popen(command, **options)  # 故意不 wait，也不看返回码
+        return True
+    except Exception as exc:
+        print(f"research-trace hook: could not start trace-deliver: {exc}", file=sys.stderr)
+        return False
+
+
+def handle(
+    payload: dict[str, Any], data_dir: Path, protocol_path: Path, url: str = ""
+) -> dict[str, Any] | None:
     """Handle one hook input. Exposed separately for deterministic tests."""
-    root = _session_root(data_dir, payload)
+    binding = binding_for(payload)
+    if binding is None:
+        # 未绑定的项目：不建目录、不写文件、不看 transcript。采集是 opt-in 的。
+        return None
+    root = _session_root(data_dir, payload, binding)
     state_path = root / "state.json"
     with _state_lock(root) as acquired:
         if not acquired:
             # Unique event files remain safe without the state lock. Avoid nudging because
             # batching while another process owns state could duplicate a batch.
-            _write_event(root, payload)
+            _write_event(root, payload, binding)
             return None
         state = _read_json(state_path, {})
         if not isinstance(state, dict):
@@ -510,14 +791,17 @@ def handle(payload: dict[str, Any], data_dir: Path, protocol_path: Path) -> dict
         _capture_transcripts(root, payload, state)
         internal = _is_trace_orchestration(root, payload, state)
         if not internal:
-            _write_event(root, payload)
-        _reconcile_receipts(root)
+            _write_event(root, payload, binding)
+
+        if payload.get("hook_event_name") in {"SessionStart", "SessionEnd"}:
+            _spawn_deliver(data_dir, url, state)
 
         result = _recorder_tool_guard(payload, state)
         if result is None and payload.get("hook_event_name") == "Stop" and not payload.get("stop_hook_active"):
-            selected = _ensure_batch(root, payload)
+            selected = _ensure_batch(root, payload, state, binding)
             recorder_id = state.get("recorder_agent_id")
             if selected and not _recorder_running(payload, recorder_id):
+                state["dispatched_batch"] = selected[1]["batch_id"]
                 result = _nudge(selected[0], selected[1], recorder_id, protocol_path)
         state["updated_at"] = _now()
         _atomic_json(state_path, state)
@@ -529,6 +813,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--data-dir", required=True)
     parser.add_argument("--protocol", required=True)
     parser.add_argument("--capture-enabled", default="on")
+    parser.add_argument("--url", default=os.environ.get("TRACE_URL", ""))
     args = parser.parse_args(argv)
     if str(args.capture_enabled).strip().lower() in {"0", "false", "off", "no"}:
         return 0
@@ -537,7 +822,7 @@ def main(argv: list[str] | None = None) -> int:
         payload = json.loads(raw)
         if not isinstance(payload, dict):
             return 0
-        output = handle(payload, Path(args.data_dir), Path(args.protocol))
+        output = handle(payload, Path(args.data_dir), Path(args.protocol), str(args.url or ""))
         if output:
             print(json.dumps(output, ensure_ascii=False, separators=(",", ":")))
     except Exception as exc:  # fail-open by design; stderr is debug-only on exit 0

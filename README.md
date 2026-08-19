@@ -89,16 +89,28 @@ secret，也不会 force-push。
 ```mermaid
 flowchart LR
     Main["Claude Code 主会话"] --> Hook["Claude Code Hooks"]
-    Hook --> Outbox["本机持久 Outbox"]
+    Hook -->|"只写 pending/，不联网"| Outbox["本机持久 Outbox"]
+    Outbox --> Deliver["trace-deliver 独立投递器"]
+    Deliver -->|"2xx 后才移入 sent/"| Server["中央 Research Trace 服务"]
     Main --> Recorder["完整上下文 Fork Recorder"]
-    Outbox --> Recorder
+    Outbox -.->|"batch manifest：只用于选材"| Recorder
     Recorder --> MCP["Research Trace MCP"]
-    MCP --> Server["中央 Research Trace 服务"]
+    MCP --> Server
     Server --> Store["SQLite + 内容寻址附件"]
     Server --> UI["项目结构图 + 记录页面"]
     Server --> Export["确定性备份导出"]
     Export --> GitHub["私有 GitHub 仓库"]
 ```
+
+**原始历史的耐久性不经过模型。** Hook 把事件同步写进 `pending/` 就返回，全程不发网络请求；
+把它们送上中央、并且只在中央确认（2xx）之后移入 `sent/`，是独立进程 `trace-deliver` 的职责。
+Recorder 只读 batch manifest 来决定「这段工作里有什么值得记住」，它不上传、也无权判定
+某段历史是否已经存好。
+
+**采集是按项目 opt-in 的。** 只有放了 `.research-trace.json` marker 的目录会被记录；
+没有 marker 时 hook 在建任何目录之前就返回，一个字节都不写。
+
+**隐藏推理不出本机。** transcript 增量在写盘前逐行剥掉 `thinking` / `redacted_thinking` 块。
 
 Recorder 首次以 fork 方式继承主 Agent 当时的完整上下文；同一 Claude Code 会话中的后续批次
 发送给同一个 Recorder agent id。它不会跨主会话永久驻留，长期状态保存在中央服务中。
@@ -138,10 +150,13 @@ Project
 - 关键代码证据、附件、图片和外部产物引用；
 - 跨项目全文搜索与原始历史查询；
 - Claude Code Hook、持久 outbox 和受限 Recorder；
+- 按项目 opt-in 的采集绑定（`trace-project bind` / `status` / `disable`）；
+- 独立投递器 `trace-deliver`：扫全部会话的 outbox，只有中央 2xx 才归档；
 - GitHub OAuth 网页登录、团队白名单与角色；
-- GitHub 账号批准的逐设备凭证，不共享机器 Token；
+- GitHub 账号批准的逐设备凭证，不共享机器 Token，凭证有到期时间且可自助续期；
 - 多机器连接一个中央服务；
-- 每日确定性 Git 备份、校验和空库恢复。
+- 每日确定性 Git 备份、校验和空库恢复；
+- 管理员紧急 purge 与备份历史重写（命令行）。
 
 ## 快速开始
 
@@ -172,7 +187,7 @@ trace-server --data-dir /srv/research-trace/data \
 
 - `url`：中央服务地址；
 - `python`：Python 3.10+ 解释器的绝对路径；
-- `capture`：默认 `on`，处理敏感内容前可以临时设为 `off`；
+- `capture`：全局暂停开关，默认 `on`；采集本身按项目 opt-in，见下一步；
 - `token`：只用于旧部署兼容；使用 GitHub 设备登录后留空。
 
 登录工作站或 HPC：
@@ -181,8 +196,36 @@ trace-server --data-dir /srv/research-trace/data \
 trace-login --url https://trace.example.org --device-name hipergator-login-01
 ```
 
-也可以直接让 Claude 调用 `trace_login`。机器保存的是 Research Trace 设备凭证，不是 GitHub
-access token；凭证可从网页撤销。
+终端会打印 `/device` 地址和一个 8 位验证码，在网页上手工输入并批准即可。没有一键批准链接，
+也永远不要输入别人发来的验证码。机器保存的是 Research Trace 设备凭证，不是 GitHub access
+token；凭证有到期时间（默认 90 天，`trace-login --renew` 续期），可从网页撤销。
+
+### 绑定要记录的项目
+
+装上插件不会记录任何东西。只有显式绑定过的目录才会被采集：
+
+```bash
+cd /path/to/my-project
+trace-project bind --url https://trace.example.org   # 写入 .research-trace.json
+trace-project status                                  # 查看绑定与项目归属
+trace-project disable                                 # 项目排除：保留 marker，停止采集
+```
+
+marker 跟着目录走，所以不同机器的路径和 Git worktree 会解析到同一个中央项目。中央匹配不到
+workspace key 时命令会拒绝静默新建项目，要求你指定已有 `--project-id` 或明确 `--create`。
+
+### 投递
+
+Hook 只把事件写进本机 `pending/`。上传由独立进程负责：
+
+```bash
+trace-deliver --url https://trace.example.org            # 跑一轮
+trace-deliver --url https://trace.example.org --watch    # 常驻重试
+```
+
+它扫本机 outbox 下所有项目、所有会话（包括已经退出或被 kill 的），只有中央返回 2xx 才把文件
+移入 `sent/`，失败原样留在 `pending/`。不额外配置时，hook 会在 SessionStart 和 SessionEnd
+各分离启动一次投递；用 cron/systemd 自行调度的话设 `TRACE_HOOK_NO_SPAWN=1` 关掉这个行为。
 
 ### 配置私有 GitHub 备份
 
@@ -201,7 +244,7 @@ Recorder 使用六个研究工具，另有一个登录工具：
 | 工具 | 用途 |
 |---|---|
 | `trace_context` | 确认项目身份，读取 Overview、Chapter 和近期上下文 |
-| `trace_ingest` | 把 outbox batch 的完整原始历史上传到中央服务 |
+| `trace_ingest` | 手动补录原始历史；Claude Code 路径不用它，投递由 `trace-deliver` 负责 |
 | `trace_record` | 创建精选 Node；不能创建 Chapter，且始终未确认 |
 | `trace_curate` | 修订 Overview、Chapter 摘要或已有 Node |
 | `trace_attach` | 保存小附件，或登记大产物的机器与路径 |
@@ -231,13 +274,26 @@ trace-backup restore \
   --data-dir /srv/research-trace/restored-empty-data
 ```
 
+备份格式版本为 2，更早版本导出的目录会被 `verify` 拒绝，需要用当前代码重新导出一次。
+误采集的敏感内容可以用 `trace-backup purge` 真删除并留下不含原文的审计记录，
+再用 `trace-backup rewrite-history` 重建备份分支；涉及令牌时仍必须轮换密钥。
+
 ## Alpha 边界
 
 - Claude Code 自动 Hook 已实现；Codex CLI / Desktop 的自动采集适配尚未实现。
-- outbox 不会自动删除；当前也不提供跨 Claude 会话的独立自动重放 worker。异常批次仍保留在
-  本机，可手动恢复或在后续版本处理。
-- 默认永久保存的原始历史可能包含命令、路径和对话中的敏感信息。可临时关闭采集，但管理员
-  emergency purge 与备份轮换流程尚未完成。
+- `pending/` 不会自动删除；跨会话的重放由 `trace-deliver` 扫全部会话目录完成。
+  `sent/` 默认保留 30 天（`--retain-sent-days` / `TRACE_RETAIN_SENT_DAYS`），
+  磁盘紧张时只告警，绝不删除未确认内容。`trace-deliver --status` 不联网就能看本机积压。
+- 网页“状态”面板显示中央存储、GitHub 备份（含远端落后的 commit 数），以及各机器上报的
+  outbox 与 Recorder 未处理量；从没有机器上报过时显示“未上报”，不画假绿灯。
+- 默认永久保存的原始历史可能包含命令、路径和对话中的敏感信息。现在有三层控制（不绑定项目、
+  `trace-project disable`、`capture=off`），管理员紧急 purge 与备份历史重写都已实现，
+  入口有命令行（`trace-backup purge` / `rewrite-history`）与 REST（`POST /api/v2/admin/purge`）。
+- 未配置 GitHub OAuth 时读取完全公开（含原始 transcript 与附件），启动会打印警告，
+  网页“状态”面板也会红字提示；该模式下网页写入只算 `recorder`，不能产生 `human` 记录或确认。
+- 备份仍然是一棵全量树：按年份/容量分卷与容量告警尚未实现。
+- 数据流视图尚未实现：Recorder 协议已经要求登记产物时给出 `sha256` 或规范化 `uri`，
+  但存量数据还没有这个键，现在画出来只会是空图。
 - 这是 alpha；部署团队数据前应使用私有仓库、HTTPS、OAuth 白名单和独立数据目录。
 
 ## 开发与验证
@@ -250,10 +306,11 @@ python -m pytest -q
 
 ```text
 research_trace/             中央服务、存储、MCP、OAuth、备份与网页
+research_trace/deliver.py   独立投递器 trace-deliver 与项目绑定 trace-project
 hooks/                      Claude Code Hook 清单与 Recorder 协议
-scripts/trace_hook.py       本机 outbox、批次和 Recorder 调度
-docs/QUICKSTART.md       部署与登录
-docs/REQUIREMENTS.md     完整需求、不变量和验收标准
+scripts/trace_hook.py       本机 outbox、批次和 Recorder 调度（不联网）
+docs/QUICKSTART.md          部署、绑定、投递与登录
+docs/REQUIREMENTS.md        完整需求、不变量和验收标准
 tests/                      回归测试
 ```
 

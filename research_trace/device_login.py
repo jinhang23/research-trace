@@ -88,10 +88,13 @@ def save_device_credential(
     if not credential.startswith("rtv2d_"):
         raise DeviceLoginError("server did not return a Research Trace device credential")
     store = _read_store(target)
+    device = response.get("device") or {}
     store["credentials"][key] = {
         "credential": credential,
-        "device": response.get("device") or {},
+        "device": device,
         "user": response.get("user") or {},
+        # 设备凭证现在有有效期，本地留一份，好在过期前提示或自动换发。
+        "expires_at": response.get("expires_at") or device.get("expires_at"),
         "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     _atomic_write(target, store)
@@ -161,6 +164,20 @@ def request_json(
 
 def start_login(url: str, device_name: str) -> dict[str, Any]:
     status, value = request_json(url, "POST", "/api/v2/device/start", {"device_name": device_name})
+    if status == 429:
+        raise DeviceLoginError(
+            "Research Trace is rate limiting device logins from this machine; wait and retry"
+        )
+    if status != 200:
+        raise DeviceLoginError(str(value.get("error") or value.get("detail") or value))
+    if not value.get("verification_uri") or not value.get("user_code"):
+        raise DeviceLoginError("server did not return a verification URI and user code")
+    return value
+
+
+def renew_login(url: str, credential: str) -> dict[str, Any]:
+    """用还没过期的凭证换一份新的，不需要人再批准一次。"""
+    status, value = request_json(url, "POST", "/api/v2/device/renew", {}, credential=credential)
     if status != 200:
         raise DeviceLoginError(str(value.get("error") or value.get("detail") or value))
     return value
@@ -182,9 +199,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--credential-file", default=os.environ.get("TRACE_CREDENTIAL_FILE"))
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--logout", action="store_true")
+    parser.add_argument("--renew", action="store_true",
+                        help="roll this machine's credential over before it expires")
     args = parser.parse_args(argv)
     try:
         url = normalize_server_url(args.url)
+        if args.renew:
+            current = load_device_credential(args.credential_file, url)
+            if not current:
+                raise DeviceLoginError("no device credential on this machine; run trace-login first")
+            result = renew_login(url, current["credential"])
+            target = save_device_credential(args.credential_file, url, result)
+            expiry = result.get("expires_at") or (result.get("device") or {}).get("expires_at")
+            print(f"Device credential renewed until {expiry}. Saved to {target}")
+            return 0
         if args.logout:
             current = load_device_credential(args.credential_file, url)
             if current:
@@ -199,11 +227,18 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Research Trace device credential removed: {target}")
             return 0
         started = start_login(url, args.device_name)
-        print(f"Open: {started['verification_uri_complete']}", flush=True)
-        print(f"Code: {started['user_code']}", flush=True)
+        # 刻意不提供一键批准链接：能被转发的链接就能被用来钓鱼，
+        # 让别人替攻击者的机器批准。验证码必须由本人手工输入。
+        print(f"Open: {started['verification_uri']}", flush=True)
+        print(f"Type this code there: {started['user_code']}", flush=True)
+        print(
+            "Only approve if you started this on your own machine. "
+            "Never enter a code somebody sent you.",
+            flush=True,
+        )
         if not args.no_browser:
             try:
-                webbrowser.open(started["verification_uri_complete"])
+                webbrowser.open(started["verification_uri"])
             except Exception:
                 pass
         deadline = time.monotonic() + int(started.get("expires_in", 600))
@@ -212,9 +247,11 @@ def main(argv: list[str] | None = None) -> int:
             result = poll_login(url, started["device_code"])
             if result.get("status") == "authorized":
                 target = save_device_credential(args.credential_file, url, result)
+                expiry = result.get("expires_at") or (result.get("device") or {}).get("expires_at")
                 print(
                     f"Logged in as @{result['user']['login']} on {result['device']['name']}. "
                     f"Credential saved to {target}"
+                    + (f" (valid until {expiry}; renew with trace-login --renew)" if expiry else "")
                 )
                 return 0
             time.sleep(interval)
