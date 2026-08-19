@@ -62,6 +62,13 @@ Binding is a human action with two entry points:
    directory the user did not ask you to bind, and never create a second central project for a
    workspace that already has one.
 
+Besides the marker key and the normalized Git remote, an administrator-maintained team mapping can
+resolve a workspace to an existing project; a resolved response says so with
+`resolved_by: "team_mapping"`. When that mapping is ambiguous the response is **not** an error: it
+carries `pending_confirmation: true`, `reason: "team_mapping_ambiguous"` and a `candidates` list,
+and no project is created even if creation was requested. Report the candidates to the user and let
+them pick one — nothing is bound and no marker is written in that state.
+
 ## Process one batch
 
 1. Read the named manifest. You may inspect its event and transcript files when needed, but never
@@ -118,10 +125,47 @@ Binding is a human action with two entry points:
   `trace_attach`.
 - Large dataset/checkpoint/generated output: external path/URI, machine, size and checksum only.
 
-When registering an artifact with `trace_attach`, always give a `sha256` **or** a normalized `uri`.
-That key is what lets the same artifact be recognised as one Node's output and another's input; a
-name alone cannot be joined on, and a data-flow view built from unjoinable artifacts is worse than
-no view at all.
+## Registering an artifact: the key is the whole point
+
+When registering an artifact with `trace_attach`, always give a comparable key: a `sha256`, **or** a
+normalized absolute `uri`, **or** `machine` together with an absolute `external_path`. A content
+hash on its own is a complete registration — the store accepts a well-formed 64-hex `sha256` with
+nothing else attached.
+
+This is not a style rule. The data-flow view (`trace_context` with `include_dataflow`, or
+`GET /api/projects/{id}/dataflow`) is derived by **joining registered artifacts on that key and
+nothing else**: an edge exists only where one Node's `direction: "output"` and another Node's
+`direction: "input"` carry the same key. Producers and consumers are never inferred from prose, from
+node titles, or from the order things happened. So the consequence of omitting the key is exact and
+permanent:
+
+- **No key → no edge, ever.** The artifact is still stored and still readable on the Node, but that
+  run is invisible in the data flow. Nobody looking at the graph later can tell that your training
+  Node produced the checkpoint the evaluation Node consumed.
+- **Nothing repairs it afterwards.** There is no background matcher and no fuzzy name matching. The
+  only fix is a human noticing and re-registering the artifact by hand, years later, from memory.
+- The view counts what you left out: an artifact with no key lands in `unkeyed` with a reason. An
+  empty graph therefore reads as either "this project has no artifact relations" (fine) or "records
+  were made with unjoinable artifacts" (your doing).
+
+Four shapes that look like keys and are not — each silently produces nothing:
+
+- a relative path (`out/model.ckpt`) — whose working directory?
+- a bare `~/…` path — whose home directory on which machine?
+- an `external_path` with no `machine` — two machines' `/data/out.csv` are not one artifact;
+- a truncated or prefixed hash (`sha256:abc…`, the first 12 chars) — only 64 hex characters count.
+
+Also set `direction` deliberately. It defaults to `reference`, and **`reference` participates on
+neither side of the join**: it means "I am only pointing at this", not "this Node produced or
+consumed it". Use `output` for what this Node produced and `input` for what it consumed; a
+registration with a perfect key but the default direction still draws no edge. That mistake is
+counted too — it shows up as `stats.unlabeled_direction`, separately from `unkeyed`, so "we
+registered everything correctly except the direction" is visible rather than looking like a project
+with no artifacts at all.
+
+Only register what you actually observed in this batch. An artifact registered as this Node's output
+because it seemed likely is a fabricated edge, and unlike a wrong sentence in a summary, nobody
+reading the graph can see that it was a guess.
 
 ## Finishing
 

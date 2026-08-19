@@ -105,6 +105,41 @@ def test_trace_context_binds_a_directory_only_when_explicitly_asked(tmp_path):
     assert result["bound"]["marker"]["project_name"] == "Batch effect"
 
 
+def test_trace_attach_tells_the_agent_that_a_key_is_the_only_way_onto_the_data_flow():
+    """登记产物不给键就永远连不上边，而 agent 不会知道自己少给了什么（§8 / §10）。
+    这条约定只能写在工具描述里——schema 没法把"三选一"表达成必填。"""
+    attach = next(tool for tool in TOOLS if tool["name"] == "trace_attach")
+    description = attach["description"]
+    for required in ("sha256", "uri", "external_path", "machine"):
+        assert required in description, required
+    assert "never guesses" in description, "§8：不许从自然语言猜生产者和消费者"
+    assert "relative" in description.lower() and "~" in description
+
+
+def test_trace_context_can_ask_for_the_derived_dataflow_and_says_when_it_is_missing():
+    """空图和"这台中央服务不会算"在响应里长得一样，必须说破——否则 agent 会把
+    "服务端还没实现"报成"这个项目没有产物关系"。"""
+    context = next(tool for tool in TOOLS if tool["name"] == "trace_context")
+    assert context["inputSchema"]["properties"]["include_dataflow"]["default"] is False
+
+    class OldServer:
+        def request(self, method, path, payload=None):
+            self.last = payload
+            return {"matched": True, "project": {"id": "proj-7"}}
+
+    old = OldServer()
+    result = call_tool(old, "trace_context", {"include_dataflow": True})
+    assert old.last["include_dataflow"] is True, "标志必须原样转发给服务端"
+    assert "dataflow_unavailable" in result
+
+    class NewServer:
+        def request(self, method, path, payload=None):
+            return {"matched": True, "project": {"id": "proj-7", "dataflow": {"edges": []}}}
+
+    # 真的返回了空图就不许再加那句提示：空图是 §8 说的正常情况
+    assert "dataflow_unavailable" not in call_tool(NewServer(), "trace_context", {"include_dataflow": True})
+
+
 def test_manifest_loader_reads_raw_files_without_model_transcription(tmp_path):
     root = tmp_path / "session"
     (root / "batches").mkdir(parents=True)

@@ -11,6 +11,10 @@
 - 写入身份只来自凭证，不来自请求体；只有浏览器会话算 `human`，机器凭证一律 `recorder`。
 - **采集是按项目 opt-in 的**：只有放了 `.research-trace.json` marker 的目录会被记录（§6、§7、§13）。
 - **原始投递由独立进程 `trace-deliver` 负责**，不经过 Recorder、不经过 hook 的网络调用（§6、§12）。
+- 备份导出按年份/容量分卷（格式版本 3；版本 2 的旧树仍可 verify/restore）并带容量阈值告警（§13），
+  告警显示在健康视图的备份卡片上；数据流派生视图（§8）在网页项目视图里作为第三种呈现方式出现；
+  团队配置映射（§7.1）已实现，但它的**网页管理界面**仍【未实现】，目前靠 REST 或直接编辑
+  数据目录里的 JSON。
 - 文档中标注【未实现】的条目是待办，不是错误描述：它们仍然是验收目标。
 
 ## 1. 产品目标
@@ -197,9 +201,19 @@ Hook 的任何失败都 fail-open：退出码恒为 0，不输出会阻断主任
 ## 7. 项目识别
 
 绝对 cwd 不能作为中央项目身份。中央 `project_id` 是稳定 UUID；客户端可以用下列 workspace keys
-发现同一项目：显式 project marker、规范化 Git remote、团队配置映射（第三种【未实现】）。
+发现同一项目：显式 project marker、规范化 Git remote、团队配置映射。
 不同机器路径和 Git worktree 可以映射到同一项目。映射不确定时进入待确认状态，不能静默创建多个
 重复项目。
+
+`POST /api/context` 按这个顺序解析，**创建被推迟到最后**：先查 `workspace_keys` 表（前两种发现
+方式都落在这张表里），没命中再过团队映射，只有两者都没有结果时才考虑 `create_if_missing`。
+顺序反过来的话，第二台机器会在团队映射有机会说话之前就新建一个重复项目。
+
+路径形态的字符串不是 workspace key：`/abs`、`C:\…`、`~/…`、`./…`、`\\UNC`、`file://` 都会被
+`deliver.workspace_key_problem()` 拒绝（它是唯一实现，server 从 deliver 单向 import）。
+`/api/context` 与 `POST /api/projects` 把这类 key 丢掉并在响应里回报
+`rejected_workspace_keys`，只有当**每一个** key 都是路径形态时才 400——本地 mirror clone 的
+仓库仍有 marker 的 `rt-ws-…` key 可用，不能一刀切。
 
 显式 marker 是项目根目录下的 `.research-trace.json`，同时承担三个职责：采集开关、workspace
 身份、投递时的项目归属。
@@ -226,14 +240,80 @@ Hook 的任何失败都 fail-open：退出码恒为 0，不输出会阻断主任
   agent 不得擅自为用户没有要求绑定的目录写 marker。`trace_context` 另有一个可选的
   `bind_path` 参数，agent 只能在用户明确要求绑定时传它，解析成功后由客户端写 marker。
 
+### 7.1 团队配置映射（第三种发现方式）
+
+管理员在中央维护一张 glob 规则表，把 workspace key 映射到已有 `project_id`。它解决的是
+「团队里第 N 台机器 clone 同一个仓库，但 marker 还没写 `project_id`」——没有它，每台机器
+都只能靠人手工 `--project-id`。
+
+- 存储在 `<data_dir>/team-project-map.json`（`research-trace.team-map.v1`，原子写）。
+  它是运维配置而不是研究数据，因此不进 SQLite：可以直接 diff、直接当团队配置文件发下去，
+  也可以在没有 OAuth 的部署里由管理员手工编辑播种。
+- 规则形状 `{id, pattern, project_id, note, created_by, created_at}`。`pattern` 是 glob，
+  与 workspace key 走同一套规范化，且必须含至少 4 个字面字符——一条 `*` 会把全世界映射到
+  同一个项目，那是「静默落进错误项目」，同样违背本节的意图。
+- `created_by` 只来自凭证，请求体里自称的值被忽略；增删都写进 `history`（含 actor 与时间，
+  上限 500 条），所以映射本身可被审计。
+- REST：`GET /api/team/mapping`（read；同时是「导出成团队配置」的出口）、
+  `POST /api/team/mapping`（规则必须指向真实存在的项目）、`DELETE /api/team/mapping/{rule_id}`。
+  两个写端点要求**管理员的网页会话 + CSRF**，机器凭证不行；没有配置 OAuth 时 `require_admin`
+  一律 404，此时只能编辑上面那个 JSON 文件（它在服务启动时读入一次，手工编辑后要重启）。
+- 命中唯一项目时，本次的 keys 会被 `add_workspace_keys` 登记到该项目上：下一个 clone
+  直接走第一/第二种发现方式，不必再过映射。响应带 `resolved_by="team_mapping"` 与
+  `matched_rules`。
+- **命中多于一个项目时进入待确认状态**：HTTP 200，`{matched: false, pending_confirmation: true,
+  reason: "team_mapping_ambiguous", candidates: [...]}`，**即使调用方传了 `create_if_missing`
+  也绝不创建**。`candidates[i]` 带 `project_id / project_name / pattern / created_by /
+  created_at / matched_key`，所以「是谁加的规则把我送到这里」在客户端直接可见。
+  `trace-project bind` 会把候选打印出来、退出码 2、一个字都不写 marker。
+- 规则指向的项目已被 purge 时不算命中，退回「没有映射」，而不是让 `/api/context` 整条 404。
+- 网页上的管理员界面【未实现】：目前维护映射只有 REST 与直接编辑 JSON 两条路。
+
 ## 8. 数据流
 
 数据流是可选派生视图，只来自 Node 上明确登记的 input/output artifact references。
 不从自然语言自动猜生产者和消费者，不建立独立 Pipeline 模型。没有 artifact 关系的项目仍可完整使用。
 
+实现是一条按键 join 的查询 `Store.dataflow(project_id, limit=2000)`：不建表、不存边、
+不写任何东西，每次调用重新 join `attachments`。一条边的唯一来源是「A 的 `direction='output'`
+附件与 B 的 `direction='input'` 附件共享同一个键」。`reference` 方向两边都不参与——登记它的人
+没有声明任何流向。
+
+可比对的键只有三种，判据是「按定义相等」而不是「大概是同一个」：
+
+- `sha256`：恰好 64 位十六进制，小写化。截断的前缀、`sha256:` 前缀都不算键。
+- `uri`：scheme 至少两个字母（一个字母的是 Windows 盘符，即一条没有机器的裸路径）。
+  scheme 与 host 小写化，path 大小写保留，尾斜杠**不删**（S3 里 `k` 与 `k/` 是两个对象），
+  不做百分号解码、不省默认端口；`file://localhost/x` 归一到 `file:///x`。
+- `machine` + 绝对 `external_path`：**成对**才算键。没有机器的路径不是任何一块磁盘上的东西，
+  两台机器上的 `/data/out.csv` 也不是同一份产物。整条路径不做 casefold——那要先假设文件系统
+  大小写不敏感，是对行为的猜测。
+
+相对路径、`~/…`、只给 `external_path` 不给 `machine`、以及截断的哈希都不产生键，因此永远
+连不上边。边上带 `key_kind`（`sha256` / `uri` / `path`）：前者是「同一份字节」，后两者只是
+「同一个位置」——一次重跑覆盖 `latest.ckpt` 会给出同一个 path 键但不同的内容，把两者合并成
+匿名的「相同」等于把这件事藏起来。
+
+其它取舍：同一个 Node 既 output 又 input 同一份产物不产生自环；不按时间过滤方向，因此环
+（A→B→A）可能出现，而查询只做一次键 join、不做图遍历，环不会让它转不出来；join `nodes`
+顺带挡掉指向已 purge Node 的孤儿附件；边的生成量有硬上限（`max(limit*4, 10000)`），超了
+如实标 `stats.truncated`。返回值另带 `unkeyed` 与 `stats.unkeyed`，因为「空图」必须能分辨
+是「这个项目没有 artifact 关系」（正常）还是「登记时忘了给键」（可修）。
+
+可修的空图有**两种**，因此还有 `stats.unlabeled_direction`：登记的键完全正确、只是
+`direction` 停在默认值 `reference`。reference 两边都不参与 join，所以这种项目的
+`artifacts / keyed / unkeyed` 全是 0，和「一个产物都没登记」在返回值里一模一样。它比缺键
+更容易发生——键要主动写错，方向只要不写就错。查询不因此改变行为（reference 仍然一条边都
+不连，登记它的人确实没有声明流向），只是单独数一格让人看得见。
+
+取数有两个入口：MCP `trace_context` 的可选 `include_dataflow`（默认关闭——context 是每个
+batch 都要拉的热路径），以及 `GET /api/projects/{project_id}/dataflow?limit=`。网页在项目视图
+里把它作为第三种呈现方式渲染，见 §10。
+
 ## 9. 最小 MCP 接口
 
-1. `trace_context`：发现项目，返回 Overview、Chapters、最近 Nodes、人工 corrections 和同步游标。
+1. `trace_context`：发现项目，返回 Overview、Chapters、最近 Nodes、人工 corrections 和同步游标；
+   可选 `include_dataflow` 附带 §8 的派生数据流（默认关闭）。
 2. `trace_ingest`：幂等写入原始 events、sessions、agents 和 transcript chunks。
    Claude Code 路径**不使用**它：hook batch 由 `trace-deliver` 投递（§6.2），
    这个工具只用于手动补录和没有投递器的非 Claude 宿主。
@@ -264,9 +344,22 @@ Comments 的人工操作走网页 REST；不为每个网页动作增加 MCP 工�
   最近一次错误和 Recorder 未处理的 batch 数；`GET /api/health` 把最近一次结果放在
   `outbox.machines[]` 与 `recorder` 里。没有任何机器上报过时界面显示「未上报」，不画假绿灯。
   同一份统计也写在本机 `outbox/delivery-status.json`，`trace-deliver --status` 不联网就能读。
-  备份卡片额外显示 `unpushed_commits`，「本地 commit 成功但远端落后几周」因此看得见。
-- 数据流只在存在明确 artifact 关系时显示【未实现】：还缺一条「登记产物必须给出可比对的键
-  （`sha256` 或规范化 `uri`）」的 Recorder 约定，在它落实前画出的图只会是空图或错图。
+  备份卡片额外显示 `unpushed_commits`，「本地 commit 成功但远端落后几周」因此看得见；
+  同一张卡片显示 `backup.capacity`（导出体积、仓库体积、分卷数、最大文件与逐条告警，
+  `critical` 把整张卡片提到 danger）与 `backup.missing_objects` 的条数（§13）。
+- 数据流只在存在明确 artifact 关系时显示：项目视图的结构面板有第三个切换「数据流」，
+  **只有真的连出边时才出现**，并且上一个项目选过它、下一个项目没有关系时自动退回结构图。
+  边只来自 `GET /api/projects/{project_id}/dataflow`（agent 侧是 `trace_context` 的
+  `include_dataflow`），除这个 payload 之外不画任何边。界面必须说清三件事，都已落实：
+  每条边标出凭什么连的（`key_kind`：同一份字节 vs 同一个位置，后者可能已被后一次运行覆盖）；
+  一条边都没有但 `stats.unkeyed > 0` 时在结构面板写明「N 个产物登记时没有可比对的键」，
+  `stats.unlabeled_direction > 0` 时另写一句「N 个产物的 direction 仍是默认的 reference」，
+  否则这两种可修的缺口都和「这个项目没有 artifact 关系」长得一模一样；
+  `stats.truncated` 时说明只画了前 N 条。空图是正常状态，不是错误（§8 最后一句）。
+  数据流的边可以跨 Chapter（消融吃主实验的产物），但这不给 Chapter 之间引入任何顺序：
+  这个视图里没有 Chapter 容器，Chapter 只作为节点卡片上的一行标签。
+- 团队配置映射（§7.1）的管理员界面与待确认状态的界面【未实现】：`/api/context` 现在可能返回
+  `pending_confirmation`，网页目前会把它当成普通的 `matched: false`。
 
 ## 11. 并发与可靠性
 
@@ -320,7 +413,57 @@ outbox/
 - 大产物只备份引用元数据。
 - 常规备份只追加/正常 push，不 force-push；必须支持 verify 和从空数据库 restore。
   上一轮 push 失败但 commit 已成功时，下一轮即使没有新数据也要补 push。
-- Git 接近容量阈值时告警，并支持按年份/容量分卷【未实现】：导出目前永远是一棵全量树。
+- Git 接近容量阈值时告警，并支持按年份/容量分卷。
+
+导出树是**先按年、年内再按容量**的分卷结构（备份格式版本 3）：
+
+```text
+research-trace-backup/
+├── index.json                     每卷的 manifest 校验和、字节数、最大文件与行数
+├── .gitattributes
+└── volumes/<年 | base>/
+    ├── manifest.json              format=research-trace-backup-volume
+    ├── tables/<table>.NNNN.jsonl  年内按字节切的分片
+    ├── transcripts/<chunk_id>.zlib
+    └── objects/<sha 前缀路径>
+```
+
+按年是主轴，因为一行的 `created_at` 永不改变：去年的卷一旦写定就再也不被重写，Git 不必
+每天重新打包全部历史，某一年太大时可以整卷搬走。纯按容量切做不到这点——中间插一行会推移
+其后所有分片边界，等于每天重写整棵树。年内再按字节切分片，是因为托管方的限制有两个量级：
+单文件 50 MiB 警告 / 100 MiB 拒绝 push，仓库 1 GiB 建议 / 5 GiB 附近受限；按年只压得住
+仓库增速，压不住「某年 events 表本身 300 MB」的单文件超限。分片预算默认 32 MiB
+（`TRACE_BACKUP_PART_BYTES` / `--part-bytes`）。没有 `created_at` 的行（`schema_meta`）
+进 `volumes/base`。
+
+- verify 有三种粒度：整体（校验根文件、每卷 manifest 的 sha、逐卷内容，并核对 `volumes/`
+  下的目录集合与索引完全一致、各表行数逐卷求和等于索引总数）、`--volume <年>` 只验一卷、
+  或直接把 `--source` 指到卷目录。
+- restore 与卷的顺序无关：先把所有卷的所有表读进来合并，再按固定顺序一次性写库。否则
+  2027 年的 Node 指向 2026 年的 Chapter 会撞外键。
+- **旧格式（版本 2 的全量单树）仍然可以 verify 和 restore**：写入端只写当前版本，读取端
+  永不退役。备份的全部意义是「几年后还能读回来」，一次不兼容的升级就把之前所有备份变成废纸。
+  对旧树原地重新导出会把它升级成分卷并删掉根 `manifest.json`。
+- 容量告警只报不拦——容量到顶时最不该做的事就是停止备份。`export_backup` 与
+  `sync_git_backup` 的返回值都带 `capacity = {level: ok|warn|critical, warnings[], limits,
+  export_bytes, largest_file, largest_file_bytes, volumes}`，sync 额外带 `repository_bytes`
+  （`git count-objects -v`，含历史）。看三样东西：单文件、仓库总量、以及没有仓库尺寸时用
+  导出树总量兜底。四个阈值都可用 `TRACE_BACKUP_{FILE,REPO}_{WARN,CRITICAL}_BYTES` 覆盖，
+  因为自建 Gitea / GHE 的数字不一样。`repository_bytes` 故意不写进 `index.json`，否则每次
+  push 后仓库尺寸变化都会让索引变，每轮产生一个「内容没变」的 commit。
+  统计口径包含每个卷的 `manifest.json`：它不在自己的 `files` 表里（没法给自己算校验和），
+  但它是树里真实存在的一个文件，而且每个文件一条记录——一个有几十万附件对象的卷，manifest
+  本身就能越过单文件硬拒线。只有 `index.json` 不计，因为它内含 `export_bytes`，自我引用。
+- 服务把 `capacity` 与 `missing_objects` 写进 `/api/health` 的 `backup`，level 为
+  warn/critical 时另打一行 stderr（无人值守部署没人开网页）；网页备份卡片渲染同一份数据，
+  `critical` 把整张卡片提到 danger（§10）。
+- 附件对象在导出时已不存在不再中止整次导出：缺口登记进卷 manifest 与索引的
+  `missing_objects` 并继续；restore 同样跳过并报出来。否则从那天起所有新增历史都进不了备份。
+- push 之后重新数一遍积压：`unpushed_commits` 是 push 之后的数字（补推成功后为 0），
+  push 之前的那个数字叫 `retried_commits`。否则刚补推成功的那一轮会和真的落后长得一样。
+- `git add` 之后用 `git ls-files --cached` 与 `backup_file_paths()` 对账，备份仓的
+  `.gitignore` 吞掉文件时抛错而不是报成功——verify 只看工作树，这是唯一能回答
+  「推上去的那份是不是完整的」的一步。
 
 默认永久保存不等于无法清除敏感内容：管理员必须有紧急 purge 能力。紧急 purge 可以重写备份、
 轮换仓库或加密密钥，并留下不含原文的审计记录。系统不自动脱敏，但提供三层「不采集」控制：
@@ -332,10 +475,10 @@ outbox/
 已实现的 purge 路径：`trace-backup purge`（真删除中央库内容并写只含 id/计数/操作者/理由的审计
 记录）与 `trace-backup rewrite-history`（重建备份分支，§13 允许的唯一 force-push 场景）。
 purge 只保证中央库、下一次导出和被重写后的备份分支里不再有原文；远端托管方的旧对象要等它自己
-GC，别的机器已经克隆的备份副本管不到，涉及令牌时仍必须轮换密钥。网页侧的管理员 purge 入口
-有两条入口：CLI（`trace-backup purge` / `rewrite-history`）与管理员 REST
-（`POST /api/admin/purge`、`GET /api/admin/purges`，两者都要 admin 凭证，理由必填，
-操作者取自凭证而不是请求体）。界面提示命令与 transcript 可能含令牌和敏感路径。
+GC，别的机器已经克隆的备份副本管不到，涉及令牌时仍必须轮换密钥。purge 有两条入口：
+CLI（`trace-backup purge` / `rewrite-history`）与管理员 REST（`POST /api/admin/purge`、
+`GET /api/admin/purges`，都要求管理员的网页会话与 CSRF，理由必填，操作者取自凭证而不是
+请求体）；网页上的操作界面【未实现】。提示里要写明命令与 transcript 可能含令牌和敏感路径。
 
 ## 14. 明确不做
 
@@ -371,7 +514,8 @@ GC，别的机器已经克隆的备份副本管不到，涉及令牌时仍必须
 - 【已实现】人工 correction 会进入后续 Recorder 上下文且不会被自动摘要覆盖。
 - 【已实现】多人并发编辑不会静默丢内容（版本号 + revisions）。
 - 【已实现】关键代码记录包含可独立理解的 snippet/diff，而不是依赖可能消失的 branch。
-- 【已实现】GitHub 备份可以从空数据库恢复并通过 manifest/hash 校验；备份格式版本为 2。
+- 【已实现】GitHub 备份可以从空数据库恢复并通过 manifest/hash 校验；备份格式版本为 3，
+  且版本 2 的旧全量树仍然可以 `verify` 和 `restore`（读取端永不退役）。
 - 【已实现】搜索不被原始事件淹没：存储层给语义层保底名额并算出截断信息，`/api/search`
   返回 `SearchResult.as_dict()`（旧的 `hits` 键仍在，另带 `totals` / `returned` / `omitted` /
   `truncated`），搜索下拉在结果末尾写出「还有 N 条未显示」。
@@ -384,7 +528,21 @@ GC，别的机器已经克隆的备份副本管不到，涉及令牌时仍必须
   真人能写，纠正在界面与后续 `trace_context` 里保持未处理直到有人关掉它。
 - 【已实现】超长 outbox 路径不静默吞事件：Windows 上 hook 与投递器都对 outbox 用扩展长度前缀
   长路径，否则 260 字符的 MAX_PATH 会让每一次落盘失败而退出码仍是 0。
-- 【未实现】按年份/容量分卷与备份容量告警（§13）。
+- 【已实现】按年份/容量分卷（§13）：导出树是 `volumes/<年>/…` + 顶层 `index.json`，
+  每卷自足、可单独 `verify --volume <年>`，restore 与卷顺序无关；去年的卷写定后不再被重写。
+- 【已实现】备份容量告警：单文件 / 仓库总量 / 导出树三个口径，阈值可用环境变量覆盖，
+  告警只报不拦，结果进 `/api/health`、服务日志与网页备份卡片。
+- 【已实现】数据流（§8）：`Store.dataflow()` 按明确登记的 sha256 / uri / machine+path 键
+  join，`reference` 不参与，不从自然语言猜生产者与消费者；没有 artifact 关系的项目是空图
+  而不是错误，缺键的登记如实记在 `unkeyed` 里并在界面上说出来。入口是
+  `GET /api/projects/{project_id}/dataflow`、`trace_context {include_dataflow: true}`，
+  以及项目视图里只在有边时才出现的「数据流」切换。
+- 【已实现】团队配置映射（§7.1）：新机器 clone 后 `trace-project bind` 无需手工指定
+  `--project-id` 就能落到同一个中央项目（命中唯一规则时还会把本次的 keys 登记上去，
+  下一个 clone 直接走前两种发现方式）；映射不确定时返回 `pending_confirmation`，
+  即使传了 `create_if_missing` 也不创建任何项目，CLI 列出候选并以退出码 2 结束。
+  规则的增删有 `created_by`（取自凭证）与 history 审计。【未实现】网页上的映射管理界面
+  与待确认状态界面（§10）。
 - 【未实现】Codex CLI / Codex Desktop 的自动采集适配（§2）。
 
 ## 16. 命名与历史包袱

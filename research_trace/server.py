@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fnmatch
 import html
+import json
 import os
+import re
 import secrets
 import sys
+import threading
 import urllib.parse
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from .auth import (
     ADMIN_BUCKET,
@@ -28,6 +32,7 @@ from .auth import (
     csrf_token,
 )
 from .backup import sync_git_backup
+from .deliver import workspace_key_problem
 from .storage import (
     SCHEMA_VERSION,
     Conflict,
@@ -35,6 +40,7 @@ from .storage import (
     Store,
     StoreError,
     ValidationError,
+    normalize_workspace_key,
     now_utc,
 )
 
@@ -62,6 +68,158 @@ def _parse_timestamp(value: str | None) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+TEAM_MAP_SCHEMA = "research-trace.team-map.v1"
+TEAM_MAP_FILE = "team-project-map.json"
+TEAM_MAP_HISTORY_LIMIT = 500
+
+
+def usable_workspace_keys(raw: Sequence[Any]) -> tuple[list[str], list[dict[str, str]]]:
+    """规范化请求里的 workspace keys，并把路径形态的那些**丢掉并回报**。
+
+    为什么是丢掉而不是整个请求 400：一个 `git clone /srv/mirror/repo` 的仓库，
+    remote 就是一条本机路径，而它同时还有 marker 的 `rt-ws-…` key。把整个请求打回去
+    等于让这类仓库根本没法绑定；只把不合格的那一个剔掉，身份仍然成立。
+
+    但如果调用方给的**每一个** key 都是路径形态，那就一个机器无关的身份都没有，
+    继续往下走只会在下一台机器上再建一个重复项目（§7）——那时候才 400。
+    """
+    kept: list[str] = []
+    rejected: list[dict[str, str]] = []
+    for item in raw:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        problem = workspace_key_problem(text)
+        if problem:
+            rejected.append({"workspace_key": text, "reason": problem})
+            continue
+        normalized = normalize_workspace_key(text)
+        if normalized not in kept:
+            kept.append(normalized)
+    if rejected and not kept:
+        raise ValidationError(
+            "every workspace key was a filesystem path: " + "; ".join(
+                f"{item['workspace_key']} {item['reason']}" for item in rejected
+            )
+        )
+    return kept, rejected
+
+
+def normalize_team_pattern(value: str) -> str:
+    """团队映射规则的 glob。和 workspace key 走同一套规范化，否则两边比不上。"""
+    text = str(value or "").strip()
+    problem = workspace_key_problem(text)
+    if problem:
+        raise ValidationError(f"team mapping pattern {problem}")
+    # `*` 一条规则就能把全世界映射到一个项目上，那是「静默落进错误项目」而不是
+    # 「静默创建重复项目」，同样违背 §7 的意图。要求规则里有足够的字面量。
+    if len(re.sub(r"[*?\[\]]", "", text)) < 4:
+        raise ValidationError(
+            "team mapping pattern must contain at least 4 literal characters; "
+            "a bare wildcard would map every workspace to one project"
+        )
+    return normalize_workspace_key(text)
+
+
+class TeamProjectMap:
+    """§7 的第三种 workspace key 发现方式：团队配置映射。
+
+    形状选择：中央持有一张表，管理员用 REST 维护，成员可读（因此也可以导出成
+    一份团队配置文件发下去）。为什么不是 SQLite 表——这是运维配置而不是研究数据，
+    和 `identity-pins.json` 同一类：从空库 restore 之后它必须能被管理员独立重建，
+    而且要能直接 diff、直接读给人看。
+
+    每条规则记 `created_by`（来自凭证，不是请求体）和 `created_at`，增删都进 `history`，
+    §7 要求映射本身可被审计。
+    """
+
+    def __init__(self, path: str | os.PathLike[str]):
+        self.path = Path(path)
+        # FastAPI 把同步端点丢进线程池，两个管理员同时加规则会互相盖掉对方那一行。
+        self._lock = threading.Lock()
+        self._value: dict[str, Any] = {"schema": TEAM_MAP_SCHEMA, "rules": [], "history": []}
+        try:
+            loaded = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            loaded = None
+        if isinstance(loaded, dict):
+            self._value["rules"] = [r for r in (loaded.get("rules") or []) if isinstance(r, dict)]
+            self._value["history"] = [h for h in (loaded.get("history") or []) if isinstance(h, dict)]
+
+    def _write(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temp = self.path.with_name(f".{self.path.name}.{secrets.token_hex(8)}.tmp")
+        temp.write_text(
+            json.dumps(self._value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temp, self.path)
+
+    def rules(self) -> list[dict[str, Any]]:
+        return [dict(rule) for rule in self._value["rules"]]
+
+    def history(self, limit: int = 100) -> list[dict[str, Any]]:
+        window = self._value["history"][-max(1, min(int(limit), TEAM_MAP_HISTORY_LIMIT)):]
+        return [dict(item) for item in reversed(window)]
+
+    def _log(self, action: str, rule: dict[str, Any], actor: str) -> None:
+        self._value["history"].append({
+            "action": action, "rule_id": rule.get("id"), "pattern": rule.get("pattern"),
+            "project_id": rule.get("project_id"), "actor": actor, "at": now_utc(),
+        })
+        del self._value["history"][:-TEAM_MAP_HISTORY_LIMIT]
+
+    def add(self, *, pattern: str, project_id: str, note: str, actor: str) -> dict[str, Any]:
+        normalized = normalize_team_pattern(pattern)
+        project_id = str(project_id or "").strip()
+        if not project_id:
+            raise ValidationError("team mapping rule requires a project_id")
+        with self._lock:
+            for rule in self._value["rules"]:
+                if rule.get("pattern") != normalized:
+                    continue
+                if rule.get("project_id") == project_id:
+                    return dict(rule)  # 幂等：同一条规则重复添加不产生第二行
+                raise Conflict(
+                    f"pattern {normalized} already maps to {rule.get('project_id')}; "
+                    "delete that rule first rather than stacking an ambiguous second one"
+                )
+            rule = {
+                "id": "map_" + secrets.token_hex(8), "pattern": normalized,
+                "project_id": project_id, "note": str(note or "")[:500],
+                "created_by": actor, "created_at": now_utc(),
+            }
+            self._value["rules"].append(rule)
+            self._log("add", rule, actor)
+            self._write()
+            return dict(rule)
+
+    def remove(self, rule_id: str, *, actor: str) -> dict[str, Any]:
+        with self._lock:
+            for index, rule in enumerate(self._value["rules"]):
+                if rule.get("id") == rule_id:
+                    self._value["rules"].pop(index)
+                    self._log("remove", rule, actor)
+                    self._write()
+                    return {"removed": True, "rule": dict(rule)}
+        raise NotFound(f"team mapping rule not found: {rule_id}")
+
+    def match(self, keys: Sequence[str]) -> list[dict[str, Any]]:
+        """命中的规则，带上是哪一个 key 命中的。"""
+        hits: list[dict[str, Any]] = []
+        for rule in self._value["rules"]:
+            pattern = str(rule.get("pattern") or "").lower()
+            if not pattern or not rule.get("project_id"):
+                continue
+            for key in keys:
+                # 必须是 fnmatchcase：fnmatch.fnmatch 会先过 os.path.normcase，
+                # Windows 上它把 `/` 换成 `\`，同一条规则在两个平台上匹配结果不同。
+                if fnmatch.fnmatchcase(str(key).lower(), pattern):
+                    hits.append({**rule, "matched_key": key})
+                    break
+        return hits
 
 
 ANONYMOUS_READ_WARNING = (
@@ -130,6 +288,8 @@ def create_app(
     # 用户名 -> GitHub 数字 id 的钉子和 SQLite 放在同一个数据目录，
     # 这样搬数据目录不会把 admin 锚点丢在原地。
     identity_pins = IdentityPins(root / "identity-pins.json") if oauth_config else None
+    # §7 第三种 workspace key。和 identity-pins 一样是运维配置，放数据目录旁边。
+    team_map = TeamProjectMap(root / TEAM_MAP_FILE)
     device_start_limiter = RateLimiter(
         limit=(device_start_limit if device_start_limit is not None
                else int(os.environ.get("TRACE_DEVICE_START_LIMIT", "10"))),
@@ -171,6 +331,13 @@ def create_app(
         # 上一轮 commit 成功但 push 失败时这里 > 0：否则"远端落后几周"在健康页上
         # 看起来和一切正常完全一样。
         "unpushed_commits": None,
+        # §13 的容量阈值告警。备份撞上 GitHub 的上限是**渐进**发生的：等到 push
+        # 被拒才知道，就已经有一轮备份没写进去了。sync_git_backup 每轮都算这个，
+        # 服务端必须把它带到 /api/health，否则那次计算谁也看不见。
+        "capacity": None,
+        # 大产物只备份引用元数据，但小附件的对象文件确实可能在数据卷上丢了。
+        # 这不该让整轮备份失败，可是也绝不能悄悄过去。
+        "missing_objects": None,
     }
     # 每台工作站最近一次 trace-deliver 的自述。它是客户端上报的，不是中央推断的，
     # 所以只作为健康显示，不参与任何正确性判断。
@@ -186,10 +353,22 @@ def create_app(
                     sync_git_backup, store, backup_repo,
                     subdirectory=backup_subdirectory, remote=backup_remote, branch=backup_branch,
                 )
+                capacity = result.get("capacity") or None
                 backup_state.update(
                     last_success_at=now_utc(), changed=result["changed"], pushed=result["pushed"],
                     unpushed_commits=result.get("unpushed_commits"),
+                    capacity=capacity,
+                    missing_objects=list(result.get("missing_objects") or []),
                 )
+                # 无人值守的部署没人开网页。容量告警至少要落进服务日志一次。
+                if capacity and capacity.get("level") in {"warn", "critical"}:
+                    print(
+                        "research-trace backup capacity "
+                        f"{capacity.get('level')}: " + "; ".join(
+                            str(item) for item in (capacity.get("warnings") or [])
+                        ),
+                        file=sys.stderr, flush=True,
+                    )
             except Exception as exc:
                 backup_state["error"] = f"{type(exc).__name__}: {exc}"
             finally:
@@ -215,6 +394,7 @@ def create_app(
     app.state.write_token = write_token
     app.state.backup_status = backup_state
     app.state.oauth_config = oauth_config
+    app.state.team_map = team_map
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
@@ -801,8 +981,12 @@ $('approve').onclick=async()=>{{
     @app.post("/api/projects", dependencies=[Depends(require_write)])
     async def create_project(request: Request):
         body = await request.json()
-        return store.create_project(body.get("name"), workspace_keys=body.get("workspace_keys") or [],
-                                    overview=body.get("overview") or "")
+        keys, rejected = usable_workspace_keys(body.get("workspace_keys") or [])
+        value = store.create_project(body.get("name"), workspace_keys=keys,
+                                     overview=body.get("overview") or "")
+        if rejected:
+            value["rejected_workspace_keys"] = rejected
+        return value
 
     @app.get("/api/projects/{project_id}", dependencies=[Depends(require_read)])
     def project(project_id: str):
@@ -814,12 +998,113 @@ $('approve').onclick=async()=>{{
 
     @app.post("/api/context", dependencies=[Depends(require_write)])
     async def context(request: Request):
+        """按 §7 的三种 workspace key 依次解析：显式 marker key / 规范化 Git remote
+        （两者都在 `workspace_keys` 表里）→ 团队配置映射 → 最后才考虑新建。
+
+        创建被推迟到映射之后是这条路径的关键：以前 `create_if_missing` 一路直达
+        `store.context`，团队映射再准也没机会说话，第二台机器照样新建一个重复项目。
+        """
         body = await request.json()
-        return store.context(
-            project_id=body.get("project_id"), workspace_keys=body.get("workspace_keys") or [],
-            create_if_missing=bool(body.get("create_if_missing")), project_name=body.get("project_name"),
-            recent_limit=body.get("recent_limit", 20),
+        keys, rejected = usable_workspace_keys(body.get("workspace_keys") or [])
+        recent_limit = body.get("recent_limit", 20)
+        # §8 的派生数据流视图是可选的，默认不算：context 是每个 batch 都要拉的热路径。
+        # 这个标志必须原样透传给 storage，否则 MCP 侧的 include_dataflow 会被静默吞掉，
+        # 客户端只会看到「这台服务器不会算数据流」。
+        include_dataflow = bool(body.get("include_dataflow"))
+
+        def decorate(value: dict[str, Any]) -> dict[str, Any]:
+            if rejected:
+                value["rejected_workspace_keys"] = rejected
+            return value
+
+        result = store.context(
+            project_id=body.get("project_id"), workspace_keys=keys,
+            create_if_missing=False, project_name=body.get("project_name"),
+            recent_limit=recent_limit, include_dataflow=include_dataflow,
         )
+        if result.get("matched") is not False:
+            return decorate(result)
+
+        # 规则指向的项目可能已经被 purge 掉了。这种规则不能算命中，否则整条
+        # /api/context 会 404，这台机器就此停摆——而它其实只需要退回到「没有映射」。
+        matches = [rule for rule in team_map.match(keys)
+                   if _project_name_or_none(rule["project_id"]) is not None]
+        targets = {str(rule["project_id"]) for rule in matches}
+        if len(targets) > 1:
+            # §7 硬要求：不确定时进入待确认状态，**即使调用方传了 create_if_missing**。
+            # 这里返回 200 而不是 409，因为「需要人来选一个」是一个正常的中间状态，
+            # 客户端要拿着候选列表继续往下走，而不是把它当成一次失败。
+            return decorate({
+                "matched": False, "pending_confirmation": True,
+                "reason": "team_mapping_ambiguous", "workspace_keys": keys,
+                "candidates": [
+                    {**rule, "project_name": _project_name_or_none(rule["project_id"])}
+                    for rule in matches
+                ],
+                "projects": result.get("projects"),
+            })
+        if targets:
+            pid = next(iter(targets))
+            try:
+                # 把命中的 key 登记到这个项目上：下一次这台机器（和这个仓库的
+                # 下一个 clone）直接走第一/第二种发现方式，不必再过映射。
+                if keys:
+                    store.add_workspace_keys(pid, keys)
+            except StoreError:
+                pass
+            resolved = store.context(
+                project_id=pid, recent_limit=recent_limit, include_dataflow=include_dataflow
+            )
+            resolved["resolved_by"] = "team_mapping"
+            resolved["matched_rules"] = matches
+            return decorate(resolved)
+
+        if body.get("create_if_missing"):
+            return decorate(store.context(
+                project_id=body.get("project_id"), workspace_keys=keys,
+                create_if_missing=True, project_name=body.get("project_name"),
+                recent_limit=recent_limit, include_dataflow=include_dataflow,
+            ))
+        return decorate(result)
+
+    @app.get("/api/projects/{project_id}/dataflow", dependencies=[Depends(require_read)])
+    def project_dataflow(project_id: str, limit: int = 2000):
+        """§8 的可选派生视图，给网页一个不用重拉整个 context 的入口。
+
+        边只来自 Node 上明确登记的 input/output artifact 键；没有 artifact 关系的项目
+        返回空图，那是正常状态而不是错误（§8 最后一句）。
+        """
+        return store.dataflow(project_id, limit=limit)
+
+    def _project_name_or_none(project_id: str) -> str | None:
+        """规则指向的项目还在不在。不在就返回 None——规则本身留着不动，
+        删除是管理员的显式动作，不是一次读请求的副作用。"""
+        try:
+            return str(store.get_project(project_id, include_nodes=False)["name"])
+        except StoreError:
+            return None
+
+    @app.get("/api/team/mapping", dependencies=[Depends(require_read)])
+    def team_mapping(history: int = 50):
+        """团队映射的可读视图，也是「可分发的团队配置文件」的导出口。"""
+        return {"schema": TEAM_MAP_SCHEMA, "rules": team_map.rules(),
+                "history": team_map.history(history)}
+
+    @app.post("/api/team/mapping")
+    async def team_mapping_add(request: Request, identity: dict[str, Any] = Depends(require_admin)):
+        body = await request.json()
+        # 规则必须指向一个真实存在的项目，否则第一个撞上它的人会被送进一个
+        # 解析不出来的待确认状态，而他根本看不到规则是谁写错的。
+        project = store.get_project(str(body.get("project_id") or ""), include_nodes=False)
+        return team_map.add(
+            pattern=body.get("pattern"), project_id=str(project["id"]),
+            note=body.get("note") or "", actor=principal(identity, request)[1],
+        )
+
+    @app.delete("/api/team/mapping/{rule_id}")
+    def team_mapping_remove(rule_id: str, request: Request,
+                            identity: dict[str, Any] = Depends(require_admin)):
+        return team_map.remove(rule_id, actor=principal(identity, request)[1])
 
     @app.post("/api/projects/{project_id}/chapters", dependencies=[Depends(require_write)])
     async def create_chapter(project_id: str, request: Request):

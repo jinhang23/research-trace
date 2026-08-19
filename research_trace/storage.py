@@ -1,4 +1,4 @@
-"""SQLite-backed central store for Research Trace v2.
+"""SQLite-backed central store for Research Trace.
 
 The online database is intentionally private to one service process.  Raw events
 are append-only; every editable semantic object is versioned before it changes.
@@ -236,6 +236,107 @@ def _code_signature(item: dict[str, Any]) -> dict[str, Any]:
         "attribution": str(item.get("attribution") or "unknown"),
         "contributor_agent_ids": sorted({str(x) for x in item.get("contributor_agent_ids") or []}),
     }
+
+
+# --------------------------------------------------------------------------
+# 数据流的键（REQUIREMENTS §8）
+#
+# §8 只承认一种边：一个 Node **明确登记**的 output 与另一个 Node **明确登记**的
+# input 指向同一份产物。产物是不是"同一份"只能用登记时给出的字段判定，不能去读
+# 标题和正文猜——猜出来的边比空图好看，但它会把两个从来没有关系的实验连起来，
+# 而看图的人分辨不出哪条边是真的。这里的规范化因此只做"按定义就相等"的改写，
+# 凡是"多半一样"的一律不做：漏一条边只是视图不全，连错一条边是伪造出处。
+#
+# 逐条判据：
+#
+# * `sha256` 是内容本身的名字，最强的键。只有 64 位十六进制才算数——"abc"、
+#   "sha256:…"、截断的前 12 位都可能是别的东西，当键就是拿约定俗成赌相等。
+# * `uri` 的 scheme 与 host 按 RFC 3986 大小写不敏感，可以小写；path **不能**动
+#   大小写，http 与对象存储的 path 是大小写敏感的。尾斜杠也不能删：S3 里 `k` 和
+#   `k/` 是两个不同的对象键。百分号编码不解码、默认端口不省略，同理。
+# * 单字母 scheme 不当 URI：`C:\data\x.csv` 在语法上完美匹配"scheme 是 c"，
+#   而它其实是一条 Windows 裸路径。裸路径不带机器就不知道是谁的磁盘（见下条），
+#   所以没有 scheme（或只有一个字母）的字符串一律不产生键。
+# * `machine` + `external_path` 只有**成对**出现才算键。不同机器上的
+#   `/data/out.csv` 不是同一份东西，而只给 `external_path` 时我们并不知道机器是
+#   哪台，因此单独的 external_path 不产生键。路径侧只改分隔符与盘符大小写：
+#   Win32 路径语法里 `\` 与 `/` 等价、`c:` 与 `C:` 是同一个卷，这是语法事实；
+#   而 casefold 整条路径要先假设文件系统大小写不敏感，那是对行为的猜测，不做。
+# * 相对路径和以 `~` 开头的路径没有锚点（谁的 cwd？哪台机器上的谁的家目录？），
+#   不产生键。
+#
+# 键的种类会带在边上（`key_kind`）：`sha256` 是"同一份字节"，`path` / `uri` 只是
+# "同一个位置"——同一个输出路径可能被后一次运行覆盖过。两者强度不同，界面和读者
+# 有权知道自己看的是哪一种，所以不合并成一个匿名的"相同"。
+_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+# scheme 至少两个字母：一个字母的是 Windows 盘符，不是 scheme。
+_URI_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]+):(.*)$", re.S)
+_WINDOWS_ABS_RE = re.compile(r"^[A-Za-z]:[\\/]")
+_DRIVE_RE = re.compile(r"^(/*)([a-z]):")
+
+
+def artifact_uri_key(value: Any) -> str | None:
+    """规范化一个登记的 URI；判不了就返回 None（不连边好过连错边）。"""
+    text = str(value or "").strip()
+    match = _URI_RE.match(text)
+    if not match:
+        return None
+    scheme = match.group(1).lower()
+    rest = match.group(2)
+    authority: str | None = None
+    if rest.startswith("//"):
+        raw, slash, tail = rest[2:].partition("/")
+        userinfo, at, hostport = raw.rpartition("@")
+        # host 大小写不敏感，userinfo 不是，所以只小写 @ 之后的部分。
+        authority = f"{userinfo}{at}{hostport.lower()}"
+        if scheme == "file" and authority == "localhost":
+            authority = ""  # RFC 8089: file://localhost/x 与 file:///x 同义
+        path = slash + tail
+    else:
+        path = rest
+    if scheme == "file":
+        path = path.replace("\\", "/")
+        path = _DRIVE_RE.sub(lambda m: f"{m.group(1)}{m.group(2).upper()}:", path)
+    if authority is None:
+        return f"{scheme}:{path}"
+    return f"{scheme}://{authority}{path}"
+
+
+def artifact_path_key(machine: Any, external_path: Any) -> str | None:
+    """`machine` + 绝对 `external_path` 才算一个键，缺一不可。"""
+    host = str(machine or "").strip().lower()  # 主机名大小写不敏感
+    path = str(external_path or "").strip()
+    if not host or not path or path.startswith("~"):
+        return None
+    if _WINDOWS_ABS_RE.match(path) or path.startswith("\\\\"):
+        path = path.replace("\\", "/")
+        if re.match(r"^[a-z]:", path):
+            path = path[0].upper() + path[1:]
+    elif not path.startswith("/"):
+        return None  # 相对路径没有锚点
+    # POSIX 把连续斜杠当一个，只有恰好两个前导斜杠是实现定义的，所以留着它。
+    lead = "//" if path.startswith("//") else ""
+    normalized = lead + re.sub(r"/{2,}", "/", path[len(lead):])
+    # 文件系统里 /a/b/ 与 /a/b 就是同一个东西（POSIX 尾斜杠只要求它是目录），
+    # 这一点和对象存储的 URI 不同，所以这边删尾斜杠、URI 那边不删。
+    normalized = normalized.rstrip("/") or "/"
+    return f"{host}|{normalized}"
+
+
+def artifact_keys(item: Any) -> list[tuple[str, str]]:
+    """一条 attachment 登记出的全部可比对的键；没有任何键时返回空列表。"""
+    value = item if isinstance(item, dict) else dict(item)
+    keys: list[tuple[str, str]] = []
+    digest = str(value.get("sha256") or "").strip()
+    if _SHA256_RE.match(digest):
+        keys.append(("sha256", digest.lower()))
+    uri = artifact_uri_key(value.get("uri"))
+    if uri:
+        keys.append(("uri", uri))
+    path = artifact_path_key(value.get("machine"), value.get("external_path"))
+    if path:
+        keys.append(("path", path))
+    return keys
 
 
 class Store:
@@ -652,6 +753,7 @@ class Store:
         create_if_missing: bool = False,
         project_name: str | None = None,
         recent_limit: int = 20,
+        include_dataflow: bool = False,
     ) -> dict[str, Any]:
         keys = [normalize_workspace_key(key) for key in workspace_keys if str(key).strip()]
         resolved: set[str] = set()
@@ -691,6 +793,10 @@ class Store:
                 (pid,),
             ).fetchone()
             detail["raw_cursor"] = dict(cursor)
+        if include_dataflow:
+            # 默认不算：数据流是可选派生视图（§8），而 context 是每个 batch 都要拉的
+            # 热路径，不该为一个多数项目是空图的视图付出一次全表 join。
+            detail["dataflow"] = self.dataflow(pid)
         return {"matched": True, "project": detail}
 
     def add_workspace_keys(self, project_id: str, keys: Sequence[str]) -> None:
@@ -1337,6 +1443,20 @@ class Store:
                     ).fetchone()
                     if stored and stored["sha256"] != digest:
                         conflicting_chunk_ids.append(chunk_id)
+            if pid and session_id:
+                # §7 说 marker 的 project_id 要等中央映射完成后才写进去，而 hook 从
+                # marker 存在那一刻就开始采集，所以绑定之前投出去的那一批 events /
+                # transcript_chunks 的 project_id 是 NULL。sessions 那条 upsert 有
+                # COALESCE 会被后来的 batch 补上，这两张表用的却是 INSERT OR IGNORE：
+                # 写进去是 NULL 就永远是 NULL，raw_timeline(project_id) 与
+                # /api/projects/{id}/raw 从此再也看不到它们——历史还在库里，但对人
+                # 不存在。所以在同一个 session 拿到归属时把空的那些一并补上。
+                # 只补空、不改写：已经有归属的历史不因为一次新的 batch 被搬走。
+                for table in ("events", "transcript_chunks"):
+                    db.execute(
+                        f"UPDATE {table} SET project_id=? WHERE session_id=? AND project_id IS NULL",
+                        (pid, session_id),
+                    )
             db.execute(
                 "INSERT INTO ingest_batches"
                 "(batch_id,project_id,event_count,transcript_chunk_count,created_at,delivered_by) "
@@ -1399,8 +1519,15 @@ class Store:
                 temp.write_bytes(raw)
                 os.replace(temp, destination)
             object_path = relative.as_posix()
-        elif not any((uri, external_path)):
-            raise ValidationError("provide data_base64, uri, or external_path")
+        elif not any((uri, external_path, _SHA256_RE.match(str(sha256 or "")))):
+            # sha256 单独就是一次合法的登记：它是数据流最强的键（§8），也是
+            # RECORDER_PROTOCOL 让登记者优先给出的那一个。以前这里只认位置，
+            # 于是"我知道这份产物的内容哈希、但它不在任何一个我能写下的路径上"
+            # 无法登记，而只给一个名字的登记反而只差一个假路径就能过。
+            raise ValidationError(
+                "provide data_base64, a 64-hex sha256, a uri, or external_path; "
+                "a name alone can never be joined to anything"
+            )
         timestamp = now_utc()
         with self.transaction() as db:
             pid = self._project_row(db, project_id)["id"]
@@ -1442,6 +1569,142 @@ class Store:
             if self.objects_dir not in path.parents:
                 raise StoreError("invalid object path")
             return path, row["mime_type"], row["name"]
+
+    def dataflow(self, project_id: str, *, limit: int = 2000) -> dict[str, Any]:
+        """按登记的 artifact 键现算的数据流视图（§8）。
+
+        纯派生：不建表、不存边、不写任何东西。边只有一个来源——A 的
+        `direction='output'` 附件与 B 的 `direction='input'` 附件共享同一个键
+        （键的判据见模块上方 artifact_keys 那段注释）。`reference` 方向两边都不
+        参与：它既不是产出也不是消费，登记它的人没有声明任何流向。
+
+        几个刻意的取舍：
+
+        * 没有可比对键的项目返回空图，不报错也不告警——§8 说"没有 artifact
+          关系的项目仍可完整使用"，把这种情况做成警告等于逼所有人去登记产物。
+          但缺键的条目数会如实放在 `unkeyed` 里：图是空的可以是"没产物"，也可以
+          是"登记时忘了给 sha256/uri"，这两件事必须能分辨。
+        * 同一个 Node 既 output 又 input 同一份产物（原地覆盖）不产生自环：那不是
+          节点**之间**的流向，画出来只会挡住真正的边。
+        * 不按时间过滤方向。消费者的 occurred_at 早于生产者时边照样存在——登记关系
+          是明确写下来的，时间顺序是推测；用时间去掉一条边就是在猜。因此环
+          （A→B→A）是可能出现的，这里只做一次键 join、不做任何图遍历，环不会
+          让查询转不出来。
+        * JOIN nodes 顺带挡掉指向已删除 Node 的孤儿 attachment（purge 之后可能
+          留下），它们不会变成指向不存在节点的边。
+        """
+        limit = max(1, min(int(limit), 10000))
+        with self._lock:
+            pid = self._project_row(self._db, project_id)["id"]
+            rows = self._db.execute(
+                "SELECT a.id,a.direction,a.name,a.sha256,a.uri,a.machine,a.external_path,"
+                "n.id node_id,n.title,n.chapter_id,n.occurred_at "
+                "FROM attachments a JOIN nodes n ON n.id=a.target_id AND n.project_id=a.project_id "
+                "WHERE a.project_id=? AND a.target_type='node' AND a.direction IN ('input','output') "
+                "ORDER BY a.created_at,a.id",
+                (pid,),
+            ).fetchall()
+            # `direction` 的默认值就是 'reference'，而 reference 两边都不参与 join。
+            # 于是「两个 Node 用完美的 sha256 登记了同一份产物，只是谁都没改方向」
+            # 和「这个项目根本没有产物」在返回值里长得一模一样。这正是 §8 最后一段
+            # 要求必须能分辨的沉默失败，而且它比「忘了给键」更容易发生：键要主动
+            # 写错，方向只要不写就错。所以单独数一格，别的什么都不做——reference
+            # 仍然一条边都不连（登记它的人确实没有声明流向）。
+            unlabeled = self._db.execute(
+                "SELECT COUNT(*) AS total FROM attachments a "
+                "JOIN nodes n ON n.id=a.target_id AND n.project_id=a.project_id "
+                "WHERE a.project_id=? AND a.target_type='node' "
+                "AND a.direction NOT IN ('input','output')",
+                (pid,),
+            ).fetchone()["total"]
+
+        producers: dict[tuple[str, str], dict[str, list[dict[str, Any]]]] = {}
+        consumers: dict[tuple[str, str], dict[str, list[dict[str, Any]]]] = {}
+        node_index: dict[str, dict[str, Any]] = {}
+        unkeyed: list[dict[str, Any]] = []
+        keyed = 0
+        for row in rows:
+            item = dict(row)
+            node_index.setdefault(item["node_id"], {
+                "id": item["node_id"], "title": item["title"],
+                "chapter_id": item["chapter_id"], "occurred_at": item["occurred_at"],
+            })
+            keys = artifact_keys(item)
+            if not keys:
+                unkeyed.append({
+                    "attachment_id": item["id"], "node_id": item["node_id"],
+                    "name": item["name"], "direction": item["direction"],
+                    "reason": "no sha256, no absolute uri, no machine+external_path",
+                })
+                continue
+            keyed += 1
+            side = producers if item["direction"] == "output" else consumers
+            for key in keys:
+                side.setdefault(key, {}).setdefault(item["node_id"], []).append(item)
+
+        # 一个键的生产者数 × 消费者数是二次的：一个被反复覆盖的 `latest.ckpt` 就能让
+        # 几百个 Node 两两配对。生成量因此有硬上限，超了就停下并如实标 truncated——
+        # 派生视图可以不全，但不能让一次浏览把服务打死。键与节点都按 id 排序遍历，
+        # 所以同一份数据每次截断在同一个地方。
+        build_cap = max(limit * 4, 10000)
+        edges: list[dict[str, Any]] = []
+        overflowed = False
+        for kind, key in sorted(set(producers) & set(consumers)):
+            if overflowed:
+                break
+            out_nodes = producers[(kind, key)]
+            in_nodes = consumers[(kind, key)]
+            for from_id in sorted(out_nodes):
+                if overflowed:
+                    break
+                out_items = out_nodes[from_id]
+                for to_id in sorted(in_nodes):
+                    in_items = in_nodes[to_id]
+                    if from_id == to_id:
+                        continue
+                    if len(edges) >= build_cap:
+                        overflowed = True
+                        break
+                    edges.append({
+                        "from_node_id": from_id,
+                        "to_node_id": to_id,
+                        "key": key,
+                        "key_kind": kind,
+                        "name": out_items[0]["name"],
+                        "output_attachment_ids": [x["id"] for x in out_items],
+                        "input_attachment_ids": [x["id"] for x in in_items],
+                    })
+
+        def edge_order(edge: dict[str, Any]) -> tuple[str, ...]:
+            source = node_index[edge["from_node_id"]]
+            target = node_index[edge["to_node_id"]]
+            return (
+                str(source["occurred_at"] or ""), edge["from_node_id"],
+                str(target["occurred_at"] or ""), edge["to_node_id"],
+                edge["key_kind"], edge["key"],
+            )
+
+        edges.sort(key=edge_order)
+        used = {edge["from_node_id"] for edge in edges[:limit]}
+        used |= {edge["to_node_id"] for edge in edges[:limit]}
+        nodes = sorted(
+            (node_index[node_id] for node_id in used),
+            key=lambda value: (str(value["occurred_at"] or ""), value["id"]),
+        )
+        return {
+            "project_id": pid,
+            "nodes": nodes,
+            "edges": edges[:limit],
+            "unkeyed": unkeyed[:50],
+            "stats": {
+                "artifacts": len(rows),
+                "keyed": keyed,
+                "unkeyed": len(unkeyed),
+                "unlabeled_direction": unlabeled,
+                "edges": len(edges),
+                "truncated": len(edges) > limit or overflowed,
+            },
+        }
 
     def search(
         self,

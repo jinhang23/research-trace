@@ -2182,6 +2182,65 @@ main.workspace-mode {
 .comments > summary,
 .raw-card > summary { color: var(--muted); }
 
+.flow-node { border-left: 3px solid var(--accent); }
+.flow-node .graph-node-state { color: var(--accent-strong); }
+.graph-edges path.flow-edge {
+  stroke: var(--accent);
+  stroke-width: 1.2;
+  marker-end: url(#flowArrow);
+}
+/* `.graph-edges path` 把所有 path 的 fill 关掉了，箭头本身是一个 path，
+   不单独放开就是一个看不见的箭头。 */
+.graph-edges marker path { fill: var(--accent); stroke: none; }
+/* 环（A 的产物被 B 消费、B 的产物又被 A 消费）在派生视图里是允许出现的：
+   存储层只做一次键 join，不按时间过滤方向。回边画成虚线，免得读者以为
+   自己看的是一条普通的前向依赖。 */
+.graph-edges path.flow-edge.back { stroke-dasharray: 4 3; opacity: .75; }
+.flow-edge-label {
+  fill: var(--muted);
+  font: 9px ui-monospace, SFMono-Regular, Consolas, monospace;
+  paint-order: stroke;
+  stroke: rgba(250, 252, 251, .96);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
+/* 只让画布自己横向滚。说明文字和依据清单留在面板宽度里：否则读者要先往右滚
+   看图、再滚回来读「这条边凭什么连的」，而后者正是判断图可不可信的东西。 */
+.flow-map { width: 100%; }
+.flow-map .graph-viewport {
+  min-width: 0;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+.flow-note,
+.flow-evidence { max-width: 720px; }
+.flow-note {
+  padding: 10px 16px 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.6;
+}
+.flow-evidence {
+  margin: 0;
+  padding: 10px 16px 18px;
+  list-style: none;
+}
+.flow-evidence > li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  padding: 5px 0;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+}
+.flow-evidence-pair { color: var(--ink); font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.flow-evidence code {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font: 10px ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
 @media (max-width: 720px) {
   :root { --header-offset: 101px; }
   .top { grid-template-columns: minmax(0, 1fr) auto; padding: 6px 8px; }
@@ -2277,16 +2336,20 @@ main.workspace-mode {
 <div class="toast-region" id="toastRegion" aria-live="polite" aria-atomic="true"></div>
 
 <script>
-/* 本地偏好的 key 已经去掉 v2 后缀；旧 key 仍然读一次，免得升级把别人存的
-   旧写入 token 和显示名悄悄弄丢。 */
+/* 本地偏好只有一个 key 前缀。曾经这里还兜底读一次带旧后缀的 key，免得升级把
+   开发者存的写入 token 弄丢；§16 已经拍板「现在没有任何已发凭证」，兼容读因此
+   只剩下一个违反命名要求的字符串，删掉的代价最多是本机重贴一次 token。 */
 function stored(name) {
-  return localStorage.getItem('trace.' + name) || localStorage.getItem('trace.v2.' + name) || '';
+  return localStorage.getItem('trace.' + name) || '';
 }
 
 const S = {
   projects: [],
   project: null,
   chapter: null,
+  /* §8 的可选派生视图。它跟着当前项目走，所以和 S.project 一起换，
+     不能留着上一个项目的图。 */
+  dataflow: null,
   selectedNodeId: null,
   workView: stored('workView') || 'graph',
   token: stored('token'),
@@ -2446,13 +2509,26 @@ async function loadProjects() {
   if (S.project && !S.projects.some(project => project.id === S.project.id)) {
     S.project = null;
     S.chapter = null;
+    S.dataflow = null;
   }
   renderSide();
   if (!S.project) renderMain();
 }
 
+/* 数据流单独一条请求，而且失败就当作「这个项目没有 artifact 关系」。
+   §8 说没有 artifact 关系的项目仍可完整使用，所以一个可选派生视图取不到
+   （旧服务端没有这个端点、或者查询超时）绝不能让整个项目页打不开。 */
+async function loadDataflow(projectId) {
+  try {
+    return await api('/api/projects/' + encodeURIComponent(projectId) + '/dataflow?limit=400');
+  } catch {
+    return null;
+  }
+}
+
 async function openProject(id) {
   S.project = await api('/api/projects/' + encodeURIComponent(id));
+  S.dataflow = await loadDataflow(id);
   S.chapter = null;
   S.selectedNodeId = null;
   renderSide();
@@ -2462,6 +2538,7 @@ async function openProject(id) {
 async function refreshProject(chapterId = S.chapter && S.chapter.id) {
   if (!S.project) return;
   S.project = await api('/api/projects/' + encodeURIComponent(S.project.id));
+  S.dataflow = await loadDataflow(S.project.id);
   S.chapter = chapterId
     ? S.project.chapters.find(chapter => chapter.id === chapterId) || null
     : null;
@@ -2830,13 +2907,213 @@ function listSectionHtml(chapter, nodes, showChapter = false) {
   `;
 }
 
+/* §10：数据流只在存在明确 artifact 关系时显示。一个恒空的面板是纯噪声，
+   所以「有没有这个视图」由有没有边决定，而不是由服务端答没答应。
+   注意判据是 edges 而不是 nodes：存储层只把参与了边的 Node 放进 nodes[]，
+   两者本该同进同退，但空图必须是「整块不出现」这一条不依赖那个巧合。 */
+function dataflowAvailable() {
+  return Boolean(S.dataflow && (S.dataflow.edges || []).length);
+}
+
+function effectiveWorkView() {
+  /* workView 存在 localStorage 里，会跨项目带过来。上一个项目选了数据流、
+     下一个项目没有 artifact 关系时必须退回结构图，否则就是一块空白。 */
+  if (S.workView === 'dataflow') return dataflowAvailable() ? 'dataflow' : 'graph';
+  return S.workView === 'list' ? 'list' : 'graph';
+}
+
+/* 返回值已经转义。这里和 fmt 是同一课：key_kind 来自数据库，未知取值会被原样
+   带出来，而每个调用点都是插进 innerHTML 的。 */
+function dataflowKeyLabel(kind) {
+  const labels = {
+    sha256: '同一份内容（sha256）',
+    uri: '同一个位置（uri）',
+    path: '同一个位置（机器 + 绝对路径）'
+  };
+  return esc(labels[kind] || kind || '未知依据');
+}
+
+/* 数据流的分层布局。和 layoutGraphNodes 画的**不是**一回事：那边的边是 Node 上
+   明确写下的 parent，只在 Chapter 内部；这边的边来自两个 Node 登记了同一个
+   artifact 键，因此可以跨 Chapter（消融吃主实验的产物）。跨的是 Node 之间的
+   产物关系，Chapter 本身依旧互不相连——所以这个视图里没有任何 Chapter 容器，
+   Chapter 只作为节点卡片上的一行标签出现。
+   存储层允许出现环（它只做一次键 join，不按时间过滤方向），深度计算因此必须
+   自带环保护：一条 A→B→A 不能让页面转不出来。 */
+function layoutDataflowNodes(nodes, edges) {
+  const byId = new Map(nodes.map(node => [node.id, node]));
+  const incoming = new Map(nodes.map(node => [node.id, []]));
+  edges.forEach(edge => {
+    if (!byId.has(edge.from_node_id) || !byId.has(edge.to_node_id)) return;
+    if (edge.from_node_id === edge.to_node_id) return;
+    incoming.get(edge.to_node_id).push(edge.from_node_id);
+  });
+  const depth = new Map();
+  const visiting = new Set();
+  const depthOf = id => {
+    if (depth.has(id)) return depth.get(id);
+    if (visiting.has(id)) return 0;
+    visiting.add(id);
+    let value = 0;
+    (incoming.get(id) || []).forEach(from => {
+      value = Math.max(value, depthOf(from) + 1);
+    });
+    visiting.delete(id);
+    depth.set(id, value);
+    return value;
+  };
+  const ordered = [...nodes].sort(nodeOrder);
+  ordered.forEach(node => depthOf(node.id));
+
+  const cardWidth = 184;
+  const cardHeight = 88;
+  const gapX = 26;
+  const gapY = 62;
+  const padding = 20;
+  const positions = {};
+  const filled = new Map();
+  let maxColumn = 0;
+  let maxDepth = 0;
+  ordered.forEach(node => {
+    const row = depth.get(node.id) || 0;
+    const column = filled.get(row) || 0;
+    filled.set(row, column + 1);
+    positions[node.id] = {
+      depth: row,
+      column,
+      left: padding + column * (cardWidth + gapX),
+      top: padding + row * (cardHeight + gapY)
+    };
+    maxColumn = Math.max(maxColumn, column);
+    maxDepth = Math.max(maxDepth, row);
+  });
+  return {
+    nodes: ordered,
+    positions,
+    cardWidth,
+    cardHeight,
+    width: Math.max(360, padding * 2 + cardWidth + maxColumn * (cardWidth + gapX)),
+    height: Math.max(168, padding * 2 + cardHeight + maxDepth * (cardHeight + gapY))
+  };
+}
+
+function dataflowSectionHtml() {
+  if (!dataflowAvailable()) return '';
+  const flow = S.dataflow;
+  const nodes = flow.nodes || [];
+  const layout = layoutDataflowNodes(nodes, flow.edges || []);
+  const known = new Set(nodes.map(node => node.id));
+  const edges = (flow.edges || []).filter(edge => known.has(edge.from_node_id) && known.has(edge.to_node_id));
+  const ordinal = new Map(layout.nodes.map((node, index) => [node.id, String(index + 1).padStart(2, '0')]));
+  const chapters = new Map((S.project.chapters || []).map(chapter => [chapter.id, chapter.name]));
+
+  /* 相邻两层之间的边，横向拐点落在两层之间的空隙里，永远不会压到任何卡片。
+     跨层的边（包括环上的回边）不行：同一列上它就是一条直接从中间那些节点身上
+     碾过去的竖线。所以跨层的边一律绕到画布右侧，每条占一条自己的通道。 */
+  const laneGap = 18;
+  const spanning = edges.filter(edge =>
+    layout.positions[edge.to_node_id].depth !== layout.positions[edge.from_node_id].depth + 1
+  );
+  const laneOf = new Map(spanning.map((edge, index) => [edge, layout.width + 2 + index * laneGap]));
+  const canvasWidth = spanning.length ? layout.width + spanning.length * laneGap + 10 : layout.width;
+  const outgoing = new Map();
+
+  const paths = edges.map(edge => {
+    const from = layout.positions[edge.from_node_id];
+    const to = layout.positions[edge.to_node_id];
+    const x1 = from.left + layout.cardWidth / 2;
+    const y1 = from.top + layout.cardHeight;
+    const x2 = to.left + layout.cardWidth / 2;
+    const y2 = to.top;
+    const lane = laneOf.get(edge);
+    const back = to.depth <= from.depth;
+    const d = lane === undefined
+      ? `M ${x1} ${y1} V ${y1 + (y2 - y1) / 2} H ${x2} V ${y2}`
+      : `M ${x1} ${y1} V ${y1 + 16} H ${lane} V ${y2 - 16} H ${x2} V ${y2}`;
+    /* 每条边都要说清凭什么连的，否则读者没法判断这张图可不可信——§8 的全部立场
+       就是「只画登记过的，不猜」。短标签贴在产物**离开生产者**的那一头（同一个
+       生产者的多条边依次往下排，不会互相盖住），完整的键在下面的依据清单里。 */
+    const stack = outgoing.get(edge.from_node_id) || 0;
+    outgoing.set(edge.from_node_id, stack + 1);
+    const shortKey = String(edge.key || '');
+    const label = `${edge.key_kind || '?'} ${shortKey.length > 14 ? shortKey.slice(0, 12) + '…' : shortKey}`;
+    return `
+        <path class="flow-edge ${back ? 'back' : ''}" d="${d}"></path>
+        <text class="flow-edge-label" x="${x1}" y="${y1 + 13 + stack * 11}" text-anchor="middle">${esc(label)}</text>
+    `;
+  }).join('');
+
+  const cards = layout.nodes.map(node => {
+    const position = layout.positions[node.id];
+    const selected = S.selectedNodeId === node.id;
+    const chapter = chapters.get(node.chapter_id) || '未知 Chapter';
+    return `
+      <button class="graph-node flow-node ${selected ? 'selected' : ''}" type="button"
+        data-select-node="${esc(node.id)}" aria-pressed="${selected}"
+        aria-label="数据流节点 ${ordinal.get(node.id)}：${esc(node.title)}，属于 ${esc(chapter)}"
+        title="${esc(node.id)}" style="left:${position.left}px;top:${position.top}px">
+        <span class="graph-node-meta"><span>${ordinal.get(node.id)}</span><time>${fmt(node.occurred_at)}</time></span>
+        <strong>${esc(node.title)}</strong>
+        <span class="graph-node-state">${esc(chapter)}</span>
+      </button>
+    `;
+  }).join('');
+
+  const evidence = edges.map(edge => `
+      <li>
+        <span class="flow-evidence-pair">${ordinal.get(edge.from_node_id)} → ${ordinal.get(edge.to_node_id)}</span>
+        <span>${dataflowKeyLabel(edge.key_kind)}</span>
+        <code>${esc(edge.key)}</code>
+        ${edge.name ? `<span class="meta">${esc(edge.name)}</span>` : ''}
+      </li>
+  `).join('');
+
+  const stats = flow.stats || {};
+  /* 位置相同不等于内容相同：重跑一次覆盖掉 latest.ckpt 会给出同一个路径键但不同的
+     字节。把 sha256 和 uri/path 混成一个匿名的「相同」就是在藏这件事。 */
+  const located = edges.some(edge => edge.key_kind !== 'sha256');
+  const notes = [
+    '边只来自 Node 上明确登记的 input / output artifact 键，不从自然语言推断生产者和消费者。',
+    '边可以跨 Chapter；Chapter 之间仍然没有任何时间、父子或 pipeline 顺序。',
+    located ? '按位置（uri / 机器+路径）连的边只说明两次登记指向同一个位置，后一次运行可能已经覆盖了内容。' : '',
+    stats.truncated ? `关系太多，这里只画了前 ${esc(edges.length)} 条（共 ${esc(stats.edges ?? '—')} 条）。` : '',
+    Number(stats.unkeyed || 0) > 0
+      ? `另有 ${esc(stats.unkeyed)} 个登记的产物没有可比对的键（缺 sha256、缺带 scheme 的绝对 uri、或缺机器 + 绝对路径），它们不出现在这张图里。`
+      : '',
+    Number(stats.unlabeled_direction || 0) > 0
+      ? `另有 ${esc(stats.unlabeled_direction)} 个产物的 direction 仍是默认的 reference：登记它的人没有声明流向，因此两端都不参与连边。`
+      : ''
+  ].filter(Boolean);
+
+  return `
+    <section class="chapter-map flow-map">
+      <div class="graph-viewport">
+        <div class="graph-canvas" style="width:${canvasWidth}px;height:${layout.height}px">
+          <svg class="graph-edges" viewBox="0 0 ${canvasWidth} ${layout.height}" width="${canvasWidth}" height="${layout.height}" aria-hidden="true">
+            <defs>
+              <marker id="flowArrow" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto">
+                <path d="M0 0 L6 3 L0 6 z" fill="currentColor" stroke="none"></path>
+              </marker>
+            </defs>
+            ${paths}
+          </svg>
+          ${cards}
+        </div>
+      </div>
+      <div class="flow-note">${notes.join('<br>')}</div>
+      <ul class="flow-evidence" aria-label="每条边的连接依据">${evidence}</ul>
+    </section>
+  `;
+}
+
 function structureContentHtml() {
+  if (effectiveWorkView() === 'dataflow') return dataflowSectionHtml();
   const populated = S.project.chapters.filter(chapter =>
     S.project.nodes.some(node => node.chapter_id === chapter.id)
   );
   const chapters = S.chapter ? [S.chapter] : (populated.length ? populated : S.project.chapters);
   const showChapter = !S.chapter;
-  const renderer = S.workView === 'list' ? listSectionHtml : graphSectionHtml;
+  const renderer = effectiveWorkView() === 'list' ? listSectionHtml : graphSectionHtml;
   return chapters.map(chapter => renderer(
     chapter,
     S.project.nodes.filter(node => node.chapter_id === chapter.id),
@@ -2867,6 +3144,26 @@ function workspaceHtml() {
   const nodeCount = S.chapter
     ? S.project.nodes.filter(node => node.chapter_id === S.chapter.id).length
     : S.project.nodes.length;
+  const view = effectiveWorkView();
+  const flow = S.dataflow || {};
+  const flowStats = flow.stats || {};
+  const viewHint = {
+    graph: '连线仅表示明确的 parent 关系',
+    list: '按发生时间排列',
+    dataflow: '连线只来自登记过的 artifact 键，可跨 Chapter；Chapter 之间仍无顺序'
+  }[view];
+  /* 图是空的可以是「这个项目没有产物」（§8 说这完全正常），也可以是一个可修的缺口。
+     缺口有两种，必须分别说出来，否则它们和「没有产物」长得一模一样：
+       * 给了方向但没给可比对的键；
+       * 键给对了，但 direction 停在默认值 reference —— reference 两边都不参与
+         join，所以图照样是空的。这一种更常见：键要主动写错，方向只要不写就错。 */
+  const gaps = view !== 'dataflow' && !dataflowAvailable() ? [
+    Number(flowStats.unkeyed || 0) > 0
+      ? `${esc(flowStats.unkeyed)} 个产物登记时没有可比对的键，数据流连不出边` : '',
+    Number(flowStats.unlabeled_direction || 0) > 0
+      ? `${esc(flowStats.unlabeled_direction)} 个产物的 direction 仍是默认的 reference，不声明流向就不参与数据流` : ''
+  ].filter(Boolean) : [];
+  const unkeyedHint = gaps.map(item => `<span>${item}</span>`).join('');
   const chapterOptions = [
     `<option value="" ${S.chapter ? '' : 'selected'}>全部章节（无先后）</option>`,
     ...S.project.chapters.map(chapter =>
@@ -2885,13 +3182,15 @@ function workspaceHtml() {
               <select class="scope-select" id="chapterScope" aria-label="查看范围">${chapterOptions}</select>
             </div>
             <div class="view-switch" role="group" aria-label="结构呈现方式">
-              <button type="button" data-work-view="graph" aria-pressed="${S.workView === 'graph'}">结构图</button>
-              <button type="button" data-work-view="list" aria-pressed="${S.workView === 'list'}">记录列表</button>
+              <button type="button" data-work-view="graph" aria-pressed="${view === 'graph'}">结构图</button>
+              <button type="button" data-work-view="list" aria-pressed="${view === 'list'}">记录列表</button>
+              ${dataflowAvailable() ? `<button type="button" data-work-view="dataflow" aria-pressed="${view === 'dataflow'}">数据流</button>` : ''}
             </div>
           </header>
           <div class="structure-subhead">
-            <span>${nodeCount} 条记录</span>
-            <span>${S.workView === 'graph' ? '连线仅表示明确的 parent 关系' : '按发生时间排列'}</span>
+            <span>${view === 'dataflow' ? `${esc((flow.edges || []).length)} 条产物关系` : `${nodeCount} 条记录`}</span>
+            <span>${viewHint}</span>
+            ${unkeyedHint}
             ${S.chapter && canWrite() ? `<button class="inline-add" id="addNode" type="button">${icon('plus')}添加记录</button>` : ''}
           </div>
           <div class="structure-scroll" id="structureScroll">${structureContentHtml()}</div>
@@ -3361,8 +3660,8 @@ function showNewChapter() {
 /* §10 要求的健康状态。这是用户判断"我这台机器的东西到底传上去没有"的唯一入口：
    投递器把本机 outbox 报上来之前，中央能证明的只有"最近一次被确认存下的 batch"，
    所以未上报要显式说出来，不能画一个绿灯糊弄过去。 */
-const HEALTH_STATE_PILL = {ok: 'confirmed', warn: 'corrected', unknown: 'muted'};
-const HEALTH_STATE_LABEL = {ok: '正常', warn: '需要注意', unknown: '未上报'};
+const HEALTH_STATE_PILL = {ok: 'confirmed', warn: 'corrected', critical: 'corrected', unknown: 'muted'};
+const HEALTH_STATE_LABEL = {ok: '正常', warn: '需要注意', critical: '严重', unknown: '未上报'};
 
 function healthCardHtml(title, state, lines) {
   return `
@@ -3412,6 +3711,40 @@ function recorderHealthHtml(value) {
   return healthCardHtml('Recorder', recorder.last_error || Number(recorder.pending_batches || 0) > 0 ? 'warn' : 'ok', lines);
 }
 
+/* 只由 Number 造字符串，任何一条路径都不会把入参原样交回去（fmt 那次存储型 XSS
+   就是从「解析失败原样返回」来的）。 */
+function bytesLabel(value) {
+  const size = Number(value);
+  if (!Number.isFinite(size) || size < 0) return '—';
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let index = 0;
+  let scaled = size;
+  while (scaled >= 1024 && index < units.length - 1) {
+    scaled /= 1024;
+    index += 1;
+  }
+  return (index ? scaled.toFixed(1) : String(Math.round(scaled))) + ' ' + units[index];
+}
+
+/* §13 的容量告警。备份撞上 GitHub 的上限是渐进发生的：等到 push 被拒才知道，
+   就已经有一轮备份没写进去了。backup.capacity 是 sync_git_backup 每轮算出来的
+   （backup._capacity → server 的 backup_state → /api/health），这里是它唯一的
+   落点——不渲染的话那次计算等于没做。 */
+function backupCapacityLines(capacity) {
+  if (!capacity) return [];
+  const facts = [
+    `导出 ${bytesLabel(capacity.export_bytes)}`,
+    capacity.repository_bytes === null || capacity.repository_bytes === undefined
+      ? '' : `仓库 ${bytesLabel(capacity.repository_bytes)}`,
+    capacity.volumes ? `${esc(capacity.volumes)} 个分卷` : '',
+    capacity.largest_file ? `最大文件 ${esc(capacity.largest_file)} ${bytesLabel(capacity.largest_file_bytes)}` : ''
+  ].filter(Boolean).join(' · ');
+  const critical = String(capacity.level || '') === 'critical';
+  return [facts, ...(capacity.warnings || []).map(
+    item => critical ? `<span class="danger">${esc(item)}</span>` : esc(item)
+  )];
+}
+
 function backupHealthHtml(value) {
   const backup = value.backup || {};
   if (!backup.enabled) {
@@ -3420,12 +3753,25 @@ function backupHealthHtml(value) {
   /* 本地 commit 成功但 push 失败时远端会静静落后好几周，而 last_success_at
      照样在往前走。unpushed_commits 是唯一能把这件事说出来的字段。 */
   const behind = Number(backup.unpushed_commits || 0);
-  const state = (backup.error || behind) ? 'warn' : (backup.last_success_at ? 'ok' : 'unknown');
+  const capacity = backup.capacity || null;
+  const level = capacity ? String(capacity.level || 'ok') : 'ok';
+  const missing = backup.missing_objects || [];
+  const state = level === 'critical'
+    ? 'critical'
+    : ((backup.error || behind || level === 'warn' || missing.length)
+      ? 'warn'
+      : (backup.last_success_at ? 'ok' : 'unknown'));
   return healthCardHtml('GitHub 每日备份', state, [
     backup.running ? '正在导出…' : '',
     `最近尝试 ${fmt(backup.last_attempt_at) || '—'} · 最近成功 ${fmt(backup.last_success_at) || '—'}`,
     backup.changed === null || backup.changed === undefined ? '' : `上次导出${backup.changed ? '有变化并已 commit' : '内容未变化'}${backup.pushed ? ' · 已 push' : ''}`,
     behind ? `<span class="danger">远端落后 ${esc(behind)} 个 commit：上一轮 push 没成功，下一轮会补推。</span>` : '',
+    ...backupCapacityLines(capacity),
+    /* 大产物只备份引用元数据，但小附件的对象文件确实可能在数据卷上丢了。
+       导出不因此中止，可是「备份里没有这些字节」必须有人看得见。 */
+    missing.length
+      ? `<span class="danger">${esc(missing.length)} 个附件对象在导出时已不存在，备份里没有它们的字节。</span>`
+      : '',
     backup.error ? `<span class="danger">${esc(backup.error)}</span>` : ''
   ]);
 }

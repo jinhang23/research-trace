@@ -184,10 +184,18 @@ trace-project bind --url https://trace.example.org
 
 它会用 workspace key 去中央解析项目：
 
-- 匹配到已有项目就把 `project_id` 写进 marker；
-- 匹配不到时**拒绝静默新建**，列出候选并要求你用 `--project-id <已有 id>` 或 `--create` 明确表态；
+- 匹配到已有项目（marker 里的 key 或规范化 Git remote 已经登记过）就把 `project_id` 写进 marker；
+- 都没登记过时再过一遍**团队配置映射**（第 4.3 节）：命中唯一一条规则就直接绑到那个项目，
+  并打印是哪条规则、谁加的；
+- 团队映射同时命中多个项目时进入**待确认状态**：列出候选、退出码 2，**一个字都不写 marker**，
+  也不会创建任何项目。按提示挑一个 `--project-id <id>` 再跑一次；
+- 什么都匹配不到时**拒绝静默新建**，列出候选并要求你用 `--project-id <已有 id>` 或 `--create` 明确表态；
 - 中央不可达时写一份离线 marker（也可以直接 `--offline`），采集立刻生效，`project_id` 等下次
   绑定时补上；在补上之前，这段原始历史以未归属状态上传。
+
+workspace key 不能是路径：`/data/proj`、`C:\proj`、`~/proj`、`./proj`、`\\host\share`、
+`file://…` 都会被拒绝（`--workspace-key` 直接报错，中央侧则丢掉这个 key 并在响应里回报
+`rejected_workspace_keys`）。绝对路径是机器局部的东西，正是 §7 不允许当身份的那一类。
 
 marker 跟着项目目录走，所以换一台机器、换一个绝对路径、或者开一个 Git worktree，都会解析到
 同一个中央项目。绑定时默认还会把规范化的 Git remote 作为第二个 workspace key 写进去
@@ -224,6 +232,63 @@ Chapter 由人创建并定义为“主实验”“消融实验”等并列研究
 `trace_context`、`trace_ingest`、`trace_record`、`trace_curate`、`trace_attach`、
 `trace_search`；另有只用于账号绑定的 `trace_login`。其中 `trace_ingest` 只用于手动补录和没有
 投递器的非 Claude 宿主。
+
+### 4.3 团队配置映射（让新机器不必手工填 `--project-id`）
+
+前两种项目发现方式（marker 里的 `workspace_key`、规范化的 Git remote）都要求这个 key 已经在
+中央登记过。团队里第一个人绑完之后，第二个人 clone 同一个仓库时 remote key 已经登记，直接就
+能解析；但**换一个新仓库、或者一批机器还没有任何一台绑过**时，每台机器都得有人手工把
+`--project-id` 抄进去。团队配置映射就是补这一段：管理员在中央写一条 glob 规则，把 workspace
+key 指到已有项目。
+
+规则表在 `<data_dir>/team-project-map.json`（`research-trace.team-map.v1`，原子写）：
+
+```json
+{
+  "schema": "research-trace.team-map.v1",
+  "rules": [
+    {
+      "id": "map_0a1b2c3d4e5f6071",
+      "pattern": "https://github.com/team/*",
+      "project_id": "prj_…",
+      "note": "batch effect correction 的所有仓库",
+      "created_by": "gh:jinhang23",
+      "created_at": "2026-08-19T02:03:04.000Z"
+    }
+  ],
+  "history": []
+}
+```
+
+两条维护路径：
+
+1. **REST**（推荐，会自动写审计 history）：
+   - `GET /api/team/mapping?history=50` —— 读权限即可，同时是「把映射导出成一份团队配置文件
+     发下去」的出口；
+   - `POST /api/team/mapping` body `{pattern, project_id, note}`；
+   - `DELETE /api/team/mapping/{rule_id}`。
+
+   写操作要求**管理员的网页会话**（cookie + `X-CSRF-Token` 头），不接受机器 Bearer 凭证，
+   也不接受旧的共享 `TRACE_TOKEN`；没有配置 GitHub OAuth 时这两个端点一律 404。
+   网页上的管理界面还没有实现，所以现在通常是在已登录的管理员浏览器里发这两个请求
+   （CSRF token 可从 `GET /api/auth/me` 读到）。
+2. **直接编辑那个 JSON 文件**（未配置 OAuth 时这是唯一入口）。注意规则表在服务启动时读入
+   一次，手工编辑之后要重启服务才会生效；REST 改动则立即生效。
+
+几条规矩：
+
+- `pattern` 是 glob，和 workspace key 走同一套规范化，并且必须含至少 4 个字面字符——一条 `*`
+  会把所有工作区映射到同一个项目，那是「静默落进错误项目」，和「静默创建重复项目」一样糟。
+- `pattern` 本身也不能是路径形态（`/srv/...`、`C:\...`、`~/...`）。
+- 同一个 pattern 只能有一条规则：重复添加同一条是幂等的，指向另一个项目会 409，要求先删
+  再加，而不是叠出一个必然歧义的第二条。
+- `created_by` 取自凭证，请求体里自称的值被忽略；增删都进 `history`（含操作者和时间）。
+- 规则指向的项目被 purge 掉之后不算命中，解析会退回「没有映射」，而不是让所有机器的
+  `/api/context` 一起 404。
+- 命中唯一项目时，中央会把本次的 workspace keys 登记到该项目上，所以**映射通常只被用一次**：
+  下一个 clone 直接走前两种发现方式。
+- 命中多个项目时进入待确认状态（HTTP 200，`pending_confirmation`），**即使调用方要求创建也
+  不创建**；`trace-project bind` 会把候选连同「是谁在什么时候加的这条规则」一起打印出来。
 
 ## 5. 投递：`trace-deliver`
 
@@ -294,6 +359,49 @@ trace-backup sync-git --data-dir /srv/research-trace/data \
   --repo /srv/research-trace/private-backup --branch main
 ```
 
+### 6.1 分卷与容量阈值
+
+导出树**先按年分卷、年内再按容量切分片**：
+
+```text
+research-trace-backup/
+├── index.json                     每卷的 manifest 校验和、字节数、最大文件与行数
+├── .gitattributes
+└── volumes/
+    ├── base/                      没有 created_at 的行（schema_meta）
+    ├── 2025/
+    │   ├── manifest.json
+    │   ├── tables/events.0000.jsonl
+    │   ├── tables/events.0001.jsonl
+    │   ├── transcripts/<chunk_id>.zlib
+    │   └── objects/<sha 前缀路径>
+    └── 2026/…
+```
+
+按年切是为了让去年的卷写定之后**再也不被重写**：一行的 `created_at` 永不改变，所以 Git 不必
+每天重新打包全部历史，而且某一年太大时可以整卷搬走。年内再按字节切分片，是因为托管方的限制
+有两个量级：单文件 50 MiB 警告 / 100 MiB 拒绝 push，仓库 1 GiB 建议 / 5 GiB 附近受限；只按年
+切压得住仓库增速，压不住「某一年的 events 表本身 300 MB」。分片预算默认 32 MiB。
+
+容量告警随每次 `export` / `sync-git` 的结果返回（`capacity`），服务端把它写进 `/api/health`
+的 `backup.capacity`，level 是 `warn` / `critical` 时另打一行 stderr。它**只报不拦**——容量
+到顶时最不该做的事就是停止备份。
+
+| 环境变量 | 默认 | 作用 |
+|---|---|---|
+| `TRACE_BACKUP_PART_BYTES` | `33554432`（32 MiB） | 卷内每个分片文件的字节预算，也可用 `--part-bytes` |
+| `TRACE_BACKUP_FILE_WARN_BYTES` | `52428800`（50 MiB） | 单文件告警线 |
+| `TRACE_BACKUP_FILE_CRITICAL_BYTES` | `94371840`（90 MiB） | 单文件严重线（离 GitHub 的 100 MiB 硬拒留 10% 余量） |
+| `TRACE_BACKUP_REPO_WARN_BYTES` | `1073741824`（1 GiB） | 仓库总量告警线（`git count-objects -v`，含历史） |
+| `TRACE_BACKUP_REPO_CRITICAL_BYTES` | `4294967296`（4 GiB） | 仓库总量严重线 |
+
+`trace-server` 没有单独的 `--backup-part-bytes` 参数，给服务进程设 `TRACE_BACKUP_PART_BYTES`
+即可，备份模块自己读它。
+
+**升级提示**：从旧的全量树升上来之后，第一次 sync 会删掉整棵旧树、写出分卷树，因此产生一个
+体量很大的 commit（内容等价、路径全变）。这是一次性的；之后只有当年的卷会变。旧的备份仓库
+不需要重建，旧 commit 里的旧格式树用当前代码 restore 依然可读。
+
 备份包含确定性 JSONL、zlib transcript chunks、小附件、GitHub 用户/角色、设备名称与设备
 凭证哈希、manifest 和 SHA-256。大产物只保存机器、路径、大小和校验和等引用，不复制产物
 本身。运行中的 `trace.sqlite3`、WAL、待批准 device code、网页 session、设备凭证原文、
@@ -304,19 +412,35 @@ GitHub access token 和所有 secret 都不会进入备份。
 ```bash
 trace-backup verify --source /srv/research-trace/private-backup/research-trace-backup
 
+# 只验一卷（大备份上快得多），或者直接把 --source 指到卷目录
+trace-backup verify \
+  --source /srv/research-trace/private-backup/research-trace-backup --volume 2025
+
 trace-backup restore \
   --source /srv/research-trace/private-backup/research-trace-backup \
   --data-dir /srv/research-trace/restored-empty-data
 ```
 
-Restore 只接受空数据目录，并在事务内检查外键。恢复成功后先以另一个端口启动服务并核对，
-再切换生产数据目录。
+整体 `verify` 校验根文件、每卷 manifest 的 SHA-256、逐卷内容，并核对 `volumes/` 下的目录集合
+与 `index.json` 完全一致、各表行数逐卷求和等于索引里的总数——所以「少了一整卷」也会被发现，
+而不只是「某个文件被改过」。
 
-备份格式版本现在是 **2**。旧版本导出的备份目录会被 `verify` 以
-“unsupported backup format version” 拒绝：如果手上有旧格式的备份，需要先用旧代码 restore、
-再用当前代码重新 export 一次。格式 2 的两个变化是：transcript 正文只保存 zlib 副本
-（不再额外写一份明文 `search_text`），以及导出树里带一个 `.gitattributes`
-（`core.autocrlf=true` 的机器克隆备份仓库后字节不会被改写，否则校验和会全部对不上）。
+Restore 只接受空数据目录，并在事务内检查外键。它先把**所有卷**的所有表读进来合并，再一次性
+写库，因此与卷的顺序无关（否则 2027 年的 Node 指向 2026 年的 Chapter 会撞外键）。恢复成功后
+先以另一个端口启动服务并核对，再切换生产数据目录。
+
+备份格式版本现在是 **3**（分卷树 + 顶层 `index.json`）。**版本 2 的旧全量树仍然可以 `verify`
+和 `restore`**：写入端只写当前格式，读取端永不退役——备份的全部意义是「几年后还能读回来」，
+一次不兼容的升级就把之前所有备份变成废纸。对旧目录原地重新 `export` 会把它升级成分卷结构，
+并删掉根上的旧 `manifest.json`。
+
+格式 2 引入、格式 3 保留的两点：transcript 正文只保存 zlib 副本（不再额外写一份明文
+`search_text`），以及导出树里带一个 `.gitattributes`（`core.autocrlf=true` 的机器克隆备份
+仓库后字节不会被改写，否则校验和会全部对不上）。
+
+导出时如果某个附件对象在数据卷上已经不存在，导出不会中止：缺口记进卷 manifest 与 `index.json`
+的 `missing_objects` 并继续（restore 同样跳过并报出来）。否则从那天起所有新增历史都永远进不了
+备份。这个列表也会出现在 `/api/health` 的 `backup.missing_objects` 里。
 
 ## 8. 紧急清除敏感内容
 
@@ -341,17 +465,69 @@ trace-backup rewrite-history --data-dir /srv/research-trace/data \
 它把备份分支压成一个全新的根 commit 并 force-push（这是唯一允许 force-push 的场景）。
 
 必须知道它管不到什么：远端托管方的旧对象要等它自己 GC，别人已经克隆过的备份副本也无法回收。
-**涉及令牌或密钥时，purge 不能替代轮换密钥。** 网页上的管理员 purge 入口还没有实现，
-目前只有上面这两条命令。
+**涉及令牌或密钥时，purge 不能替代轮换密钥。** 网页上还没有 purge 的操作界面；除了上面这两条
+命令，另一条入口是管理员 REST（`POST /api/admin/purge`、`GET /api/admin/purges`，理由必填，
+操作者取自凭证而不是请求体）。
 
-## 9. 当前 alpha 边界
+## 9. 数据流视图（可选）
+
+数据流是**派生视图**：它只把一个 Node 明确登记的 output 与另一个 Node 明确登记的 input 按
+**同一个键**连起来，从不从对话文字里猜谁产出了什么、谁消费了什么，也不存在独立的 Pipeline
+模型。没有 artifact 关系的项目照常使用，只是这张图是空的——空图是正常状态，不是错误。
+
+### 怎么才能让边出现
+
+1. 登记产物时用 `trace_attach` 给出 `direction`：`output`（这个 Node 产出的）或
+   `input`（它消费的）。**默认是 `reference`，而 `reference` 两边都不参与连边**——
+   登记它的人没有声明任何流向。
+2. 给一个可比对的键，三选一（可以都给）：
+   - `sha256`：恰好 64 位十六进制。截断的前缀、`sha256:` 这种前缀都不算；
+   - `uri`：带 scheme 的绝对 URI（`s3://bucket/k`、`file:///data/out.csv`）。
+     单字母 scheme 不算——`C:\data\x.csv` 语法上像「scheme 是 c」，其实是一条裸路径；
+   - `machine` + 绝对 `external_path`：**成对**才算。两台机器上的 `/data/out.csv` 不是同一份
+     产物，而没有机器的路径不是任何一块磁盘上的东西。
+
+   相对路径、`~/…`、只给 `external_path` 不给 `machine`、以及截断的哈希，都等于没有键，
+   这条登记**永远连不上边**。
+
+### 怎么看
+
+```bash
+curl -s "$URL/api/projects/<project_id>/dataflow?limit=2000"
+```
+
+Agent 侧则是 `trace_context` 的可选参数 `include_dataflow: true`（默认关闭：context 是每个
+batch 都要拉的热路径，多数项目这张图是空的，不该为它付一次全表 join）。
+
+返回 `{project_id, nodes[], edges[], unkeyed[], stats{}}`：
+
+- 每条边带 `key_kind`：`sha256` 是「同一份字节」，`uri` / `path` 只是「同一个位置」——
+  同一个输出路径可能被后一次运行覆盖过，两者强度不同，不合并成匿名的「相同」。
+- `stats.unkeyed` 与 `unkeyed[]` 用来区分「这个项目没有 artifact 关系」和「登记了产物但忘了
+  给键」。图是空的时候先看这个数字。
+- `stats.unlabeled_direction` 是另一种可修的空图：键给对了，但 `direction` 还是默认的
+  `reference`，两边都不参与 join。图空而 `unkeyed` 也是 0 时看这个数字——它比缺键更常见。
+- `stats.truncated` 表示边的生成量撞到了上限（一个被反复覆盖的 `latest.ckpt` 能让几百个 Node
+  两两配对，是二次的）。
+- 同一个 Node 既 output 又 input 同一份产物（原地覆盖）不产生自环。
+
+网页上，项目视图的结构面板会多出第三个切换「数据流」——**只有真的连出边时它才出现**。
+图上每条边都标着凭什么连的（`sha256` / `uri` / 机器+路径），图下有一份完整的依据清单；
+一条边都没有但确实有产物登记漏了键时，结构面板会写明「N 个产物登记时没有可比对的键」；
+键没问题、只是 `direction` 还停在默认的 `reference` 时，写的是「N 个产物的 direction 仍是
+默认的 reference」。
+数据流的边可以跨 Chapter（消融吃主实验的产物），但这不给 Chapter 之间引入任何顺序：
+这个视图里没有 Chapter 容器，Chapter 只是节点卡片上的一行标签。
+
+## 10. 当前 alpha 边界
 
 - Claude Code 已接入；Codex CLI / Desktop 适配尚未接入自动 Hook。
 - 采集按项目 opt-in，投递由独立的 `trace-deliver` 负责；hook 不联网，只写 `pending/`。
 - 网页已有 Project、Overview、Comment/Correction、Chapter、Node、Chapter 内结构图/记录列表、
-  附件显示、原始历史按需展开、修订历史、全文搜索、GitHub OAuth 与团队角色。
-- 网页“状态”面板显示中央存储、GitHub 备份（含远端落后几个 commit）、以及各机器上报的
-  outbox 与 Recorder 未处理量。从来没有机器上报过时显示“未上报”，不画假绿灯；
+  存在 artifact 关系时的数据流视图、附件显示、原始历史按需展开、修订历史、全文搜索、
+  GitHub OAuth 与团队角色。
+- 网页“状态”面板显示中央存储、GitHub 备份（含远端落后几个 commit、容量告警与导出时缺失的
+  附件对象数）、以及各机器上报的 outbox 与 Recorder 未处理量。从来没有机器上报过时显示“未上报”，不画假绿灯；
   本机情况随时可以用 `trace-deliver --status` 或 `outbox/delivery-status.json` 直接看。
 - 网页 OAuth 与设备凭证均来自同一 GitHub 白名单和实时角色；设备凭证有到期时间；旧的共享
   `TRACE_TOKEN` 只为迁移兼容，建议新部署不再配置。
@@ -359,6 +535,14 @@ trace-backup rewrite-history --data-dir /srv/research-trace/data \
   此时网页自身的写入也只能算 `recorder`，无法产生 `human` 记录或确认。
 - 默认永久保存可能包含命令、路径或 transcript 中的敏感信息。现在已经有三层控制（不绑定、
   `trace-project disable`、`capture=off`）、`sent/` 的保留期与磁盘告警，以及管理员紧急 purge
-  （CLI 与 `POST /api/admin/purge`）；备份仍然是一棵全量树，按年份/容量分卷尚未实现。
-- 数据流视图尚未实现：它要求登记产物时给出 `sha256` 或规范化 `uri` 作为可 join 的键。
-  协议里已经这么要求了，但存量数据还没有，画出来只会是空图。
+  （CLI 与 `POST /api/admin/purge`）。
+- 备份已按年份/容量分卷并带容量阈值告警（第 6.1 节）。仍然没有的：把某一整卷搬去另一个仓库的
+  搬迁工具（`index.json` 的结构允许，但没有 CLI），以及对已有备份仓库做历史瘦身——旧 commit
+  里的全量树仍占仓库体积，唯一能重写历史的路径仍然只有 purge 之后的 `rewrite-history`。
+  容量告警在 `/api/health`、服务日志和网页备份卡片上都能看到。
+- 数据流已实现（第 9 节），网页上作为项目视图的第三种呈现方式出现。存量数据大多没有可比对的
+  键，所以多数项目现在仍然是空图；`stats.unkeyed` 与 `stats.unlabeled_direction` 用来区分
+  「没有产物」「登记时忘了给键」「键给对了但方向还是默认的 reference」三件事。
+- 团队配置映射已实现（第 4.3 节），但网页上的映射管理界面与待确认状态界面尚未实现：
+  维护规则目前靠 REST 或直接编辑 `<data_dir>/team-project-map.json`，
+  `pending_confirmation` 在命令行上会列出候选，在网页上还没有落点。

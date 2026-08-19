@@ -1,4 +1,4 @@
-"""Research Trace v2: central research memory and recorder APIs."""
+"""Research Trace: central research memory and recorder APIs."""
 
 from .storage import Conflict, NotFound, Store
 

@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from research_trace.storage import Conflict, Store, ValidationError
+from research_trace.storage import Conflict, Store, ValidationError, artifact_keys
 
 
 def test_project_chapters_general_nodes_and_idempotency(tmp_path):
@@ -274,6 +274,42 @@ def test_raw_ingest_is_append_only_searchable_and_batch_idempotent(tmp_path):
     assert {item["kind"] for item in timeline} == {"event", "transcript"}
     assert next(item for item in timeline if item["kind"] == "event")["agent_id"] == "agent-1"
     assert "RNA counts" in next(item for item in timeline if item["kind"] == "transcript")["preview"]
+
+
+def test_history_delivered_before_binding_stops_being_orphaned(tmp_path):
+    """§7 让 marker 的 project_id 等中央映射完成后才写，而 hook 从 marker 存在那一刻
+    就开始采集。中间那批 batch 因此带着 project_id=None 投上来，而 events /
+    transcript_chunks 是 INSERT OR IGNORE——写进去是 NULL 就永远是 NULL，
+    `raw_timeline(project_id)` 从此看不到它们：历史还在库里，但对人不存在。
+    同一个 session 之后拿到归属时必须把它们补上。"""
+    store = Store(tmp_path)
+    project = store.create_project("Late binding")
+    store.ingest(
+        batch_id="before-bind", project_id=None,
+        session={"id": "session-9", "source": "claude-code"}, agents=[],
+        events=[{"event_id": "orphan-1", "event_type": "Stop", "payload": {"note": "unattributed"}}],
+        transcript_chunks=[{"chunk_id": "orphan-chunk", "content": '{"m":"unattributed"}\n'}],
+    )
+    assert store.raw_timeline(project["id"]) == []  # 归属之前确实看不到，这是对的
+
+    store.ingest(
+        batch_id="after-bind", project_id=project["id"],
+        session={"id": "session-9", "source": "claude-code"}, agents=[],
+        events=[{"event_id": "attributed-1", "event_type": "Stop", "payload": {"note": "bound"}}],
+    )
+    timeline = store.raw_timeline(project["id"])
+    assert {item["id"] for item in timeline} == {"orphan-1", "orphan-chunk", "attributed-1"}
+
+    # 只补空，不改写：另一个项目的历史不因为一次新 batch 被搬走
+    other = store.create_project("Other")
+    store.ingest(
+        batch_id="other-project", project_id=other["id"],
+        session={"id": "session-9", "source": "claude-code"}, agents=[],
+        events=[{"event_id": "other-1", "event_type": "Stop", "payload": {}}],
+    )
+    assert {item["id"] for item in store.raw_timeline(other["id"])} == {"other-1"}
+    assert "orphan-1" in {item["id"] for item in store.raw_timeline(project["id"])}
+    store.close()
 
 
 def test_content_addressed_attachment_and_external_artifact(tmp_path):
@@ -549,3 +585,227 @@ def test_a_machine_cannot_patch_over_a_human_edit_even_with_the_right_version(tm
         node["id"], {"body": "再改一次"}, expect_version=edited["version"],
         actor_type="human", actor_id="jinhang",
     )["body"] == "再改一次"
+
+
+DIGEST_A = "a" * 64
+DIGEST_B = "b" * 64
+
+
+def test_dataflow_edges_come_only_from_registered_output_and_input_keys(tmp_path):
+    """§8：边只来自明确登记的 output/input，且必须共享一个可比对的键。"""
+    store = Store(tmp_path)
+    project = store.create_project("P")
+    prepare = store.record_node(
+        project["id"], idempotency_key="n1", title="预处理",
+        occurred_at="2026-01-01T00:00:00.000+00:00",
+    )
+    train = store.record_node(
+        project["id"], idempotency_key="n2", title="训练",
+        occurred_at="2026-01-02T00:00:00.000+00:00",
+    )
+    reading = store.record_node(
+        project["id"], idempotency_key="n3", title="读论文",
+        occurred_at="2026-01-03T00:00:00.000+00:00",
+    )
+    store.attach(project["id"], target_type="node", target_id=prepare["id"], name="counts.parquet",
+                 direction="output", sha256=DIGEST_A, uri="s3://lab/counts.parquet")
+    store.attach(project["id"], target_type="node", target_id=train["id"], name="counts.parquet",
+                 direction="input", sha256=DIGEST_A)
+    # reference 既不是产出也不是消费：登记的人没有声明任何流向，不能凭它连边
+    store.attach(project["id"], target_type="node", target_id=reading["id"], name="counts.parquet",
+                 direction="reference", sha256=DIGEST_A)
+    # 同一个 Node 原地读写同一份产物不是节点之间的流向，不产生自环
+    store.attach(project["id"], target_type="node", target_id=train["id"], name="ckpt",
+                 direction="output", sha256=DIGEST_B)
+    store.attach(project["id"], target_type="node", target_id=train["id"], name="ckpt",
+                 direction="input", sha256=DIGEST_B)
+
+    flow = store.dataflow(project["id"])
+    assert [(edge["from_node_id"], edge["to_node_id"], edge["key_kind"]) for edge in flow["edges"]] == [
+        (prepare["id"], train["id"], "sha256")
+    ]
+    assert flow["edges"][0]["key"] == DIGEST_A
+    assert {node["id"] for node in flow["nodes"]} == {prepare["id"], train["id"]}
+    assert flow["stats"]["unkeyed"] == 0
+    store.close()
+
+
+def test_a_sha256_alone_is_a_valid_artifact_registration_but_a_name_alone_is_not(tmp_path):
+    """RECORDER_PROTOCOL 让登记者给 sha256 **或** 规范化 uri；旧的校验只认位置，
+    等于把最强的那个键拒之门外。只有名字的登记仍然要拒——它永远连不上任何边。"""
+    store = Store(tmp_path)
+    project = store.create_project("P")
+    node = store.record_node(project["id"], idempotency_key="n1", title="产出")
+    registered = store.attach(project["id"], target_type="node", target_id=node["id"],
+                              name="model.ckpt", direction="output", sha256=DIGEST_A)
+    assert registered["object_path"] is None and registered["sha256"] == DIGEST_A
+    with pytest.raises(ValidationError, match="joined"):
+        store.attach(project["id"], target_type="node", target_id=node["id"],
+                     name="model.ckpt", direction="output", sha256="abc123")
+    store.close()
+
+
+def test_artifact_keys_only_merge_what_is_equal_by_definition():
+    """规范化过头就是在猜（§8）。这条钉住"该合的合、判不了的不给键"的分界线。"""
+    def keys(**fields):
+        return dict(artifact_keys(fields))
+
+    # scheme 与 host 按 RFC 3986 大小写不敏感；path 不是
+    assert keys(uri="S3://Lab/Counts.parquet")["uri"] == keys(uri="s3://lab/Counts.parquet")["uri"]
+    assert keys(uri="s3://lab/counts.parquet")["uri"] != keys(uri="s3://lab/Counts.parquet")["uri"]
+    # 对象存储里 k 和 k/ 是两个键，所以 URI 的尾斜杠不能删
+    assert keys(uri="s3://lab/out")["uri"] != keys(uri="s3://lab/out/")["uri"]
+    # RFC 8089 明写 file://localhost/x 与 file:///x 同义；Windows 盘符与分隔符是语法事实
+    assert keys(uri="file://localhost/data/x.csv")["uri"] == keys(uri="file:///data/x.csv")["uri"]
+    assert keys(uri="file:///c:/Data/x.csv")["uri"] == keys(uri=r"file:///C:\Data\x.csv")["uri"]
+
+    # machine + 绝对路径成对才算键，主机名大小写不敏感，尾斜杠与重复斜杠在文件系统里无意义
+    assert (keys(machine="HPG", external_path=r"C:\data\x.csv")["path"]
+            == keys(machine="hpg", external_path="c:/data/x.csv")["path"])
+    assert (keys(machine="hpg", external_path="/blue/lab//out/")["path"]
+            == keys(machine="hpg", external_path="/blue/lab/out")["path"])
+    # 不同机器上的同名路径不是同一份东西
+    assert (keys(machine="hpg", external_path="/data/x.csv")["path"]
+            != keys(machine="laptop", external_path="/data/x.csv")["path"])
+
+    # 判不了的一律不给键：没有机器、相对路径、~、截断的哈希、裸路径冒充 URI
+    assert "path" not in keys(external_path="/data/x.csv")
+    assert "path" not in keys(machine="hpg", external_path="out/x.csv")
+    assert "path" not in keys(machine="hpg", external_path="~/out/x.csv")
+    assert "sha256" not in keys(sha256="abc123")
+    assert "uri" not in keys(uri=r"C:\data\x.csv")  # 单字母"scheme"是盘符
+    assert "uri" not in keys(uri="/data/x.csv")
+    assert artifact_keys({"name": "只有名字"}) == []
+
+
+def test_dataflow_is_empty_and_quiet_without_keys_but_still_counts_the_gap(tmp_path):
+    """没有 artifact 关系的项目仍可完整使用（§8）：空图、不报错、不告警。
+    但"没登记产物"和"登记了却没给键"必须分得开，否则空图无法解释。"""
+    store = Store(tmp_path)
+    project = store.create_project("P")
+    empty = store.dataflow(project["id"])
+    assert empty["edges"] == [] and empty["nodes"] == []
+    assert empty["stats"] == {"artifacts": 0, "keyed": 0, "unkeyed": 0,
+                              "unlabeled_direction": 0, "edges": 0, "truncated": False}
+
+    producer = store.record_node(project["id"], idempotency_key="n1", title="跑了个脚本")
+    consumer = store.record_node(project["id"], idempotency_key="n2", title="用了那个结果")
+    store.attach(project["id"], target_type="node", target_id=producer["id"],
+                 name="results.csv", direction="output", external_path="results.csv")
+    store.attach(project["id"], target_type="node", target_id=consumer["id"],
+                 name="results.csv", direction="input", external_path="results.csv")
+    flow = store.dataflow(project["id"])
+    assert flow["edges"] == []  # 同名不是键：两条相对路径可能根本不在同一台机器上
+    assert flow["stats"]["unkeyed"] == 2
+    assert {item["node_id"] for item in flow["unkeyed"]} == {producer["id"], consumer["id"]}
+    store.close()
+
+
+def test_dataflow_counts_artifacts_left_at_the_default_reference_direction(tmp_path):
+    """键给得完美、只是没人改 direction —— 这是最容易发生的空图，必须能说出来。
+
+    `direction` 默认就是 `reference`，而 reference 两边都不参与 join。没有这一格
+    计数时，「两个 Node 用同一个 sha256 登记了同一份产物」和「这个项目没有任何
+    产物」在返回值里一模一样（artifacts / keyed / unkeyed 全是 0），§8 要求能分辨的
+    正是这种沉默失败。
+    """
+    store = Store(tmp_path)
+    project = store.create_project("P")
+    producer = store.record_node(project["id"], idempotency_key="n1", title="训练")
+    consumer = store.record_node(project["id"], idempotency_key="n2", title="评估")
+    for node in (producer, consumer):
+        store.attach(project["id"], target_type="node", target_id=node["id"],
+                     name="model.ckpt", sha256=DIGEST_A)  # direction 用默认值
+    flow = store.dataflow(project["id"])
+    # reference 依然一条边都不连：登记它的人确实没有声明流向，猜它是猜。
+    assert flow["edges"] == [] and flow["nodes"] == []
+    assert flow["stats"]["unkeyed"] == 0  # 键没问题，问题在方向
+    assert flow["stats"]["unlabeled_direction"] == 2
+
+    # 有方向的登记不会被算进这一格
+    fixed = store.record_node(project["id"], idempotency_key="n3", title="产出")
+    store.attach(project["id"], target_type="node", target_id=fixed["id"],
+                 name="x", direction="output", sha256=DIGEST_B)
+    assert store.dataflow(project["id"])["stats"]["unlabeled_direction"] == 2
+    store.close()
+
+
+def test_dataflow_survives_cycles_and_attachments_pointing_at_deleted_nodes(tmp_path):
+    """环、自引用和孤儿附件都不能让这条查询崩——它是每次现算的派生视图。"""
+    store = Store(tmp_path)
+    project = store.create_project("P")
+    first = store.record_node(project["id"], idempotency_key="n1", title="第一轮",
+                              occurred_at="2026-01-01T00:00:00.000+00:00")
+    second = store.record_node(project["id"], idempotency_key="n2", title="第二轮",
+                               occurred_at="2026-01-02T00:00:00.000+00:00")
+    # 迭代式实验：A 的产物喂给 B，B 的产物又回到 A。时间顺序不能用来砍边（那是猜），
+    # 所以图里就是有环。
+    store.attach(project["id"], target_type="node", target_id=first["id"], name="a",
+                 direction="output", sha256=DIGEST_A)
+    store.attach(project["id"], target_type="node", target_id=second["id"], name="a",
+                 direction="input", sha256=DIGEST_A)
+    store.attach(project["id"], target_type="node", target_id=second["id"], name="b",
+                 direction="output", sha256=DIGEST_B)
+    store.attach(project["id"], target_type="node", target_id=first["id"], name="b",
+                 direction="input", sha256=DIGEST_B)
+    with store.transaction() as db:
+        # purge 之后可能留下指向已删除 Node 的附件行；它不能变成指向不存在节点的边
+        db.execute(
+            "INSERT INTO attachments(id,project_id,target_type,target_id,direction,name,sha256,"
+            "created_at) VALUES('att_ghost',?,'node','nd_deleted','input','ghost',?,?)",
+            (project["id"], DIGEST_A, "2026-01-03T00:00:00.000+00:00"),
+        )
+
+    flow = store.dataflow(project["id"])
+    pairs = {(edge["from_node_id"], edge["to_node_id"]) for edge in flow["edges"]}
+    assert pairs == {(first["id"], second["id"]), (second["id"], first["id"])}
+    assert all(edge["to_node_id"] != "nd_deleted" for edge in flow["edges"])
+    store.close()
+
+
+def test_dataflow_bounds_a_hub_artifact_instead_of_pairing_everything(tmp_path):
+    """一个被反复覆盖的 latest.ckpt 会让几百个 Node 两两配对（生产者数 × 消费者数）。
+    生成量必须有上限，而且截断要说出来，不能装作图就是这么大。"""
+    store = Store(tmp_path)
+    project = store.create_project("P")
+    chapter = store.get_project(project["id"])["chapters"][0]["id"]
+    stamp = "2026-01-01T00:00:00.000+00:00"
+    nodes = []
+    attachments = []
+    for side in ("out", "in"):
+        for i in range(110):
+            node_id = f"nd_{side}_{i:03d}"
+            nodes.append((node_id, project["id"], chapter, f"{side} {i}", stamp, f"k_{side}_{i}",
+                          stamp, stamp))
+            attachments.append((
+                f"att_{side}_{i:03d}", project["id"], "node", node_id,
+                "output" if side == "out" else "input", "latest.ckpt", DIGEST_A, stamp,
+            ))
+    with store.transaction() as db:
+        db.executemany(
+            "INSERT INTO nodes(id,project_id,chapter_id,title,occurred_at,idempotency_key,"
+            "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)", nodes)
+        db.executemany(
+            "INSERT INTO attachments(id,project_id,target_type,target_id,direction,name,sha256,"
+            "created_at) VALUES(?,?,?,?,?,?,?,?)", attachments)
+
+    flow = store.dataflow(project["id"], limit=50)
+    assert len(flow["edges"]) == 50
+    assert flow["stats"]["truncated"] is True
+    assert flow["stats"]["edges"] <= 10000, "两两配对必须在上限处停下，不能算满 12100 条"
+    assert all(edge["from_node_id"].startswith("nd_out") for edge in flow["edges"])
+    store.close()
+
+
+def test_context_only_computes_dataflow_when_asked(tmp_path):
+    """context 是每个 batch 都要拉的热路径，派生视图必须是可选的（§8）。"""
+    store = Store(tmp_path)
+    project = store.create_project("P", workspace_keys=["rt-ws-flow"])
+    node = store.record_node(project["id"], idempotency_key="n1", title="产出")
+    store.attach(project["id"], target_type="node", target_id=node["id"], name="x",
+                 direction="output", sha256=DIGEST_A)
+    assert "dataflow" not in store.context(workspace_keys=["rt-ws-flow"])["project"]
+    detail = store.context(workspace_keys=["rt-ws-flow"], include_dataflow=True)["project"]
+    assert detail["dataflow"]["stats"]["keyed"] == 1
+    assert detail["dataflow"]["edges"] == []
+    store.close()

@@ -74,6 +74,16 @@ TOOLS: list[dict[str, Any]] = [
                 "create_if_missing": {"type": "boolean", "default": False},
                 "project_name": {"type": "string"},
                 "recent_limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                "include_dataflow": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Also return the derived data-flow view: edges between Nodes whose "
+                        "registered output and input artifacts share the same sha256/uri/machine+path "
+                        "key. Nothing is inferred from prose, so a project that never registered "
+                        "artifacts simply has no edges — that is normal, not an error."
+                    ),
+                },
                 "bind_path": {
                     "type": "string",
                     "description": (
@@ -165,7 +175,18 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "trace_attach",
-        "description": "Attach a small file to Overview/Chapter/Node or register an external input/output/reference artifact.",
+        "description": (
+            "Attach a small file to Overview/Chapter/Node or register an external "
+            "input/output/reference artifact. ALWAYS give a comparable key: either sha256, or an "
+            "absolute uri with a scheme (s3://…, file:///…), or machine together with an absolute "
+            "external_path. That key is the only thing that can ever link one Node's output to "
+            "another Node's input — the data-flow view joins registered artifacts on it and never "
+            "guesses producers or consumers from prose, so an artifact registered with a name "
+            "alone is silently unjoinable forever. Relative paths, bare '~/…' paths, an "
+            "external_path with no machine, and truncated hashes are all treated as no key at all. "
+            "Use direction=output for what this Node produced, input for what it consumed, and "
+            "reference for anything you are only pointing at."
+        ),
         "inputSchema": {
             "type": "object",
             "required": ["project_id", "target_type", "target_id", "name"],
@@ -187,6 +208,10 @@ TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    # 数据流挂在 trace_context 的 include_dataflow 上，不挂在这里：search 的输入是
+    # 一个文本 query，而数据流是整个项目的派生图，没有可查询的文本；做成 scope=dataflow
+    # 会让必填的 q 变成一个被忽略的参数。也不能新开一个第七个研究工具——§9 把研究工具
+    # 钉死在六个。
     {
         "name": "trace_search",
         "description": "Search semantic records and/or permanent raw history across projects. Use scope=semantic when looking for conclusions or existing records; scope=all also dredges up raw events.",
@@ -435,6 +460,16 @@ def call_tool(remote: Remote, name: str, args: dict[str, Any]) -> Any:
         value = dict(args)
         bind_path = str(value.pop("bind_path", "") or "").strip()
         result = remote.request("POST", "/api/context", value)
+        if value.get("include_dataflow") and isinstance(result, dict):
+            project = result.get("project")
+            if isinstance(project, dict) and "dataflow" not in project:
+                # "空图"和"这台中央服务还不会算数据流"在响应里长得一模一样，而 §8 说
+                # 空图是正常的——不说破就会让 agent 把后者报成"这个项目没有产物关系"。
+                result = dict(result)
+                result["dataflow_unavailable"] = (
+                    "this central service did not return a dataflow view; it is older than the "
+                    "derived data-flow query. Do not report this as 'no artifact relations'."
+                )
         if bind_path and isinstance(result, dict) and result.get("matched") is not False:
             result = dict(result)
             result["bound"] = _bind_marker(

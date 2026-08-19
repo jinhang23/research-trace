@@ -54,6 +54,12 @@ _CHUNK_NAME_RE = re.compile(
     r"^(?P<key>[0-9a-f]+)_(?P<start>\d{16})_(?P<end>\d{16})_(?P<digest>[0-9a-f]{8,})\.jsonl$"
 )
 
+# 路径形态的 workspace key。§7 的第一句就是「绝对 cwd 不能作为中央项目身份」，
+# 而在此之前没有任何一层做过形态校验：`/home/alice/proj` 和 `C:\Users\bob\proj`
+# 是两个不同的字符串，于是同一个仓库在两台机器上各自 create 一个中央项目——
+# 正是 §7 明令禁止的「静默创建多个重复项目」。
+_PATH_SHAPED_KEY_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|[\\/]|~[\\/]|\.{1,2}[\\/]|file://)")
+
 
 class DeliveryError(RuntimeError):
     """无法继续本轮投递（网络不可达、鉴权失败）。文件全部留在 pending/。"""
@@ -82,6 +88,25 @@ def long_path(path: str | os.PathLike[str]) -> Path:
     if absolute.startswith("\\\\"):
         return Path("\\\\?\\UNC" + absolute[1:])
     return Path("\\\\?\\" + absolute)
+
+
+def workspace_key_problem(value: str) -> str | None:
+    """workspace key 的形态校验。合格返回 None，否则返回一句可以直接打给人看的原因。
+
+    这一条规则同时被客户端（marker / `trace-project bind`）和中央服务
+    （`/api/context`、`/api/projects`）用，所以只能有一份实现。它住在这里而不是
+    storage 里，是因为写 marker 的人是它第一个把关的对象，而 marker 的读写就在
+    这个文件；服务端 import 它，不反过来（server 依赖 fastapi，客户端不能依赖）。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return "cannot be empty"
+    if _PATH_SHAPED_KEY_RE.match(text):
+        return (
+            "looks like a filesystem path; an absolute cwd is machine-specific and cannot be a "
+            "project identity (REQUIREMENTS §7). Use the marker's rt-ws-… key or a Git remote URL"
+        )
+    return None
 
 
 def marker_path_for(directory: str | os.PathLike[str]) -> Path:
@@ -185,7 +210,10 @@ def git_remote_key(directory: str | os.PathLike[str]) -> str | None:
         host, _, path = url[4:].partition(":")
         url = f"https://{host}/{path}"
     url = re.sub(r"\.git$", "", url.rstrip("/\\"), flags=re.I)
-    return url.lower() if re.match(r"https?://", url, re.I) else url
+    url = url.lower() if re.match(r"https?://", url, re.I) else url
+    # `git clone /srv/mirrors/repo` 的 remote 是一条本机路径，它和 cwd 一样是
+    # 机器局部的，拿它当第二个 workspace key 只会在每台机器上长出一个新项目。
+    return None if workspace_key_problem(url) else url
 
 
 def write_marker(
@@ -442,11 +470,25 @@ def session_identity(session_dir: Path) -> dict[str, Any]:
             continue
         value = _read_json(path)
         if value:
-            return {
+            identity = {
                 "session_id": value.get("session_id"),
                 "cwd": value.get("project_dir"),
                 "project_id": value.get("project_id"),
             }
+            # 事件文件里的 project_id 是它被写下那一刻的快照，marker 才是当前真相。
+            # §7 明说 `project_id` 要等 workspace key 在中央映射完成之后才写进 marker，
+            # 而 hook 从 marker 存在的那一刻起就开始采集：这中间产生的 pending 事件
+            # 全都带着 None。按快照投出去，它们会以未归属状态永久留在中央——
+            # storage.ingest 只对 sessions 行做 COALESCE 回填，events / transcript_chunks
+            # 是 INSERT OR IGNORE，写进去时是 NULL 就永远是 NULL。
+            #
+            # 只补空，不改写：事件已经带着一个 project_id 时那是当时确实成立的归属，
+            # 项目后来被重新绑定到别处不应该追溯性地搬走旧历史。
+            if not identity.get("project_id") and identity.get("cwd"):
+                binding = project_binding(identity["cwd"])
+                if binding and binding.get("project_id"):
+                    identity["project_id"] = binding["project_id"]
+            return identity
     return {}
 
 
@@ -948,7 +990,13 @@ def project_main(argv: list[str] | None = None) -> int:
 
     existing = read_marker(marker_path_for(directory))
     keys = _marker_keys(existing)
-    key = args.workspace_key.strip() or (keys[0] if keys else new_workspace_key())
+    requested_key = args.workspace_key.strip()
+    if requested_key:
+        problem = workspace_key_problem(requested_key)
+        if problem:
+            print(f"--workspace-key {requested_key!r} {problem}", file=sys.stderr)
+            return 2
+    key = requested_key or (keys[0] if keys else new_workspace_key())
     extra = [item for item in keys if item != key]
     if not args.no_git:
         remote = git_remote_key(directory)
@@ -962,6 +1010,28 @@ def project_main(argv: list[str] | None = None) -> int:
             body = _resolve_project(
                 url, [key, *extra], name, args.create, args.token, args.credential_file, 30.0
             )
+            for dropped in body.get("rejected_workspace_keys") or []:
+                print(
+                    f"ignored workspace key {dropped.get('workspace_key')!r}: {dropped.get('reason')}",
+                    file=sys.stderr,
+                )
+            if body.get("pending_confirmation"):
+                # §7：「映射不确定时进入待确认状态，不能静默创建多个重复项目。」
+                # 团队映射命中了不止一个项目，谁也不知道是哪个——这时候唯一正确的
+                # 行为是把候选摊开让人选，而不是挑一个或者新建一个。
+                print(
+                    f"the team mapping matches more than one central project for {key}; "
+                    "nothing was created or bound.", file=sys.stderr,
+                )
+                for item in body.get("candidates") or []:
+                    print(
+                        f"  {item.get('project_id')}  {item.get('project_name')}"
+                        f"   <- rule {item.get('pattern')!r} added by {item.get('created_by')}"
+                        f" on {item.get('created_at')}",
+                        file=sys.stderr,
+                    )
+                print("Pick one: trace-project bind --project-id <id>", file=sys.stderr)
+                return 2
             if body.get("matched") is False:
                 print(f"no central project matches {key}.", file=sys.stderr)
                 print(
@@ -972,7 +1042,18 @@ def project_main(argv: list[str] | None = None) -> int:
                 for item in body.get("projects") or []:
                     print(f"  {item.get('id')}  {item.get('name')}", file=sys.stderr)
                 return 2
-            project_id = str(body.get("id") or "") or None
+            # /api/context 的成功响应是 {"matched": true, "project": {...}}，id 在里层。
+            # 这里以前读的是外层的 body["id"]，永远是 None，所以 `trace-project bind`
+            # 从来没有把 project_id 写进过 marker：每台机器都停在「未归属」，
+            # 而那正是 §7 要靠 marker 解决的问题本身。
+            resolved = body.get("project") if isinstance(body.get("project"), dict) else body
+            project_id = str(resolved.get("id") or "") or None
+            if body.get("resolved_by") == "team_mapping":
+                rule = (body.get("matched_rules") or [{}])[0]
+                print(
+                    f"resolved through the team mapping: rule {rule.get('pattern')!r} "
+                    f"added by {rule.get('created_by')} on {rule.get('created_at')}"
+                )
         except DeliveryError as exc:
             print(f"central not reachable ({exc}); writing an offline marker", file=sys.stderr)
     target = write_marker(

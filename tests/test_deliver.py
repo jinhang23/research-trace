@@ -318,6 +318,124 @@ def test_status_answers_without_the_network_and_deliver_reports_health(
     assert after["pending"] == 0 and after["last_delivery"]["delivered_events"] == 3
 
 
+def test_bind_writes_the_resolved_project_id_into_the_marker(tmp_path: Path, monkeypatch):
+    """`/api/context` 的成功响应把项目放在 `project` 里，这里以前读的是外层 `body["id"]`，
+    永远是 None —— 所以 `trace-project bind` 从来没写进过 project_id，每台机器都停在
+    「未归属」，而那正是 §7 要靠 marker 解决的问题本身。"""
+    project = tmp_path / "repo"
+    project.mkdir()
+
+    def fake(url, path, value, token, timeout):
+        assert path == "/api/context"
+        return 200, {"matched": True, "project": {"id": "prj_42", "name": "Batch effect"}}
+
+    monkeypatch.setattr(D, "_post_json", fake)
+    assert D.project_main(["bind", str(project), "--no-git", "--create"]) == 0
+    marker = D.read_marker(project / D.MARKER_NAME)
+    assert marker["project_id"] == "prj_42"
+    assert D.project_binding(project)["project_id"] == "prj_42"
+
+
+def test_an_ambiguous_team_mapping_stops_the_bind_instead_of_creating_a_duplicate(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """§7：「映射不确定时进入待确认状态，不能静默创建多个重复项目。」
+
+    --create 也不能把它推过去：候选摊开给人选，marker 一个字都不写。"""
+    project = tmp_path / "repo"
+    project.mkdir()
+
+    def ambiguous(url, path, value, token, timeout):
+        return 200, {
+            "matched": False, "pending_confirmation": True, "reason": "team_mapping_ambiguous",
+            "candidates": [
+                {"project_id": "prj_a", "project_name": "Alpha", "pattern": "https://github.com/lab/*",
+                 "created_by": "alice", "created_at": "2026-08-19T00:00:00Z"},
+                {"project_id": "prj_b", "project_name": "Beta", "pattern": "https://github.com/*/shared",
+                 "created_by": "bob", "created_at": "2026-08-19T01:00:00Z"},
+            ],
+        }
+
+    monkeypatch.setattr(D, "_post_json", ambiguous)
+    assert D.project_main(["bind", str(project), "--no-git", "--create"]) == 2
+    err = capsys.readouterr().err
+    assert "prj_a" in err and "prj_b" in err
+    assert "alice" in err, "映射要能被审计：是谁加的规则把我送到这里的"
+    assert not (project / D.MARKER_NAME).exists(), "待确认状态下不许留下任何绑定"
+
+
+def test_a_filesystem_path_is_never_accepted_as_a_workspace_key(tmp_path: Path, monkeypatch):
+    """审计复核：绝对 cwd 以前可以直接当项目身份，于是同一个仓库在两台机器上
+    会各自长出一个中央项目（§7 禁止的「静默创建重复项目」）。"""
+    for bad in ("/home/alice/rna", "C:\\Users\\bob\\rna", "~/rna", "./rna",
+                "\\\\fileserver\\share\\rna", "file:///home/alice/rna"):
+        assert D.workspace_key_problem(bad), bad
+    for good in ("rt-ws-0123456789ab", "https://github.com/lab/rna",
+                 "git@github.com:lab/rna.git", "batch-effect-correction"):
+        assert D.workspace_key_problem(good) is None, good
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    assert D.project_main(
+        ["bind", str(project), "--no-git", "--offline", "--workspace-key", str(project)]
+    ) == 2
+    assert not (project / D.MARKER_NAME).exists()
+
+    # 本机路径的 Git remote 同样不能变成第二个 key
+    class Local:
+        returncode = 0
+        stdout = "/srv/mirrors/rna.git\n"
+
+    class Remote:
+        returncode = 0
+        stdout = "git@github.com:lab/rna.git\n"
+
+    monkeypatch.setattr(D.subprocess, "run", lambda *a, **k: Local())
+    assert D.git_remote_key(project) is None
+    monkeypatch.setattr(D.subprocess, "run", lambda *a, **k: Remote())
+    assert D.git_remote_key(project) == "https://github.com/lab/rna"
+
+
+def test_events_staged_before_the_marker_had_a_project_id_still_arrive_assigned(
+    tmp_path: Path, monkeypatch
+):
+    """§7 说 `project_id` 要等中央映射完成后才写进 marker，而 hook 从 marker 存在
+    那一刻就开始采集。中间那批 pending 事件带着 None；按快照投出去就永久孤立，
+    因为 storage.ingest 只对 sessions 行 COALESCE 回填，events 是 INSERT OR IGNORE。"""
+    data = tmp_path / "plugin-data"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    root = data / "outbox" / "ws-a" / "session-1"
+    (root / "pending").mkdir(parents=True)
+    (root / "pending" / "0000000000000000000_claude-e1.json").write_text(
+        json.dumps({
+            "event_id": "claude-e1", "session_id": "session-1", "project_dir": str(repo),
+            "project_id": None, "hook_event": "UserPromptSubmit", "payload": {"prompt": "hi"},
+        }),
+        encoding="utf-8",
+    )
+    D.write_marker(repo, workspace_key="rt-ws-late", project_id="prj_late", capture=True)
+
+    # 只补空、不改写：这个 session 的事件已经带着归属，marker 后来改绑到别的项目
+    # 也不能追溯性地把旧历史搬走。
+    other = data / "outbox" / "ws-b" / "session-2"
+    (other / "pending").mkdir(parents=True)
+    (other / "pending" / "0000000000000000000_claude-e2.json").write_text(
+        json.dumps({
+            "event_id": "claude-e2", "session_id": "session-2", "project_dir": str(repo),
+            "project_id": "prj_original", "hook_event": "Stop", "payload": {},
+        }),
+        encoding="utf-8",
+    )
+
+    accept = recorder(200)
+    monkeypatch.setattr(D, "_post_json", accept)
+    D.deliver_once(data, "http://127.0.0.1:8765", token="t")
+    delivered = {call["value"]["session"]["id"]: call["value"]["project_id"]
+                 for call in accept.calls}
+    assert delivered == {"session-1": "prj_late", "session-2": "prj_original"}
+
+
 def test_a_skipped_run_says_so_instead_of_looking_like_an_empty_outbox(tmp_path):
     """被锁挡住时必须**出声**。
 

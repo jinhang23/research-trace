@@ -155,7 +155,11 @@ Project
 - GitHub OAuth 网页登录、团队白名单与角色；
 - GitHub 账号批准的逐设备凭证，不共享机器 Token，凭证有到期时间且可自助续期；
 - 多机器连接一个中央服务；
-- 每日确定性 Git 备份、校验和空库恢复；
+- 团队配置映射：管理员用 glob 规则把 workspace key 指到已有项目，新机器不必手工填 `--project-id`；
+  映射不确定时进入待确认状态，不静默创建重复项目；
+- 数据流派生视图：只按明确登记的 `sha256` / `uri` / `machine+path` 键把一个 Node 的 output
+  连到另一个 Node 的 input，从不从自然语言猜；只在真的连出边时出现；
+- 每日确定性 Git 备份、按年份/容量分卷、容量阈值告警、校验和空库恢复；
 - 管理员紧急 purge 与备份历史重写（命令行）。
 
 ## 快速开始
@@ -243,7 +247,7 @@ Recorder 使用六个研究工具，另有一个登录工具：
 
 | 工具 | 用途 |
 |---|---|
-| `trace_context` | 确认项目身份，读取 Overview、Chapter 和近期上下文 |
+| `trace_context` | 确认项目身份，读取 Overview、Chapter 和近期上下文；可选 `include_dataflow` 返回派生数据流 |
 | `trace_ingest` | 手动补录原始历史；Claude Code 路径不用它，投递由 `trace-deliver` 负责 |
 | `trace_record` | 创建精选 Node；不能创建 Chapter，且始终未确认 |
 | `trace_curate` | 修订 Overview、Chapter 摘要或已有 Node |
@@ -265,16 +269,25 @@ Recorder 使用六个研究工具，另有一个登录工具：
 Git 备份包含确定性 JSONL、压缩 transcript chunks、小附件、manifest 和 SHA-256。大产物只
 保存机器、路径、大小和校验和等引用，不复制大文件本体。
 
+导出树按年分卷、年内再按容量切分片（`volumes/<年>/…` + 顶层 `index.json`），并在接近
+单文件 / 仓库容量阈值时告警：
+
 ```bash
 trace-backup verify \
   --source /srv/research-trace/private-backup/research-trace-backup
+
+trace-backup verify \
+  --source /srv/research-trace/private-backup/research-trace-backup --volume 2025
 
 trace-backup restore \
   --source /srv/research-trace/private-backup/research-trace-backup \
   --data-dir /srv/research-trace/restored-empty-data
 ```
 
-备份格式版本为 2，更早版本导出的目录会被 `verify` 拒绝，需要用当前代码重新导出一次。
+备份格式版本为 3。**版本 2 的旧全量树仍然可以 `verify` 和 `restore`**：写入端只写当前格式，
+读取端永不退役，否则一次升级就会把之前所有备份变成废纸。对旧目录原地重新导出会把它升级成
+分卷结构。容量告警出现在 `export` / `sync-git` 的输出和 `/api/health` 的 `backup.capacity` 里，
+只报不拦——容量到顶时最不该做的事就是停止备份。
 误采集的敏感内容可以用 `trace-backup purge` 真删除并留下不含原文的审计记录，
 再用 `trace-backup rewrite-history` 重建备份分支；涉及令牌时仍必须轮换密钥。
 
@@ -286,14 +299,23 @@ trace-backup restore \
   磁盘紧张时只告警，绝不删除未确认内容。`trace-deliver --status` 不联网就能看本机积压。
 - 网页“状态”面板显示中央存储、GitHub 备份（含远端落后的 commit 数），以及各机器上报的
   outbox 与 Recorder 未处理量；从没有机器上报过时显示“未上报”，不画假绿灯。
+  备份卡片同时显示容量告警（导出与仓库体积、分卷数、最大文件、逐条警告）和导出时已经
+  丢失的附件对象数。
 - 默认永久保存的原始历史可能包含命令、路径和对话中的敏感信息。现在有三层控制（不绑定项目、
   `trace-project disable`、`capture=off`），管理员紧急 purge 与备份历史重写都已实现，
   入口有命令行（`trace-backup purge` / `rewrite-history`）与 REST（`POST /api/admin/purge`）。
 - 未配置 GitHub OAuth 时读取完全公开（含原始 transcript 与附件），启动会打印警告，
   网页“状态”面板也会红字提示；该模式下网页写入只算 `recorder`，不能产生 `human` 记录或确认。
-- 备份仍然是一棵全量树：按年份/容量分卷与容量告警尚未实现。
-- 数据流视图尚未实现：Recorder 协议已经要求登记产物时给出 `sha256` 或规范化 `uri`，
-  但存量数据还没有这个键，现在画出来只会是空图。
+- 备份已按年份/容量分卷并带容量告警；仍然没有「把 2019 年整卷搬去另一个仓库」的搬迁工具
+  （`index.json` 的结构允许，但没有 CLI），也没有对已有备份仓库做历史瘦身——旧 commit 里的
+  全量树仍占仓库体积，唯一能重写历史的路径仍然只有 purge 之后的 `rewrite-history`。
+- 数据流已实现（`GET /api/projects/{id}/dataflow`、`trace_context` 的 `include_dataflow`，
+  以及项目视图里的「数据流」切换）。边只来自明确登记的键；存量数据大多没有这个键，所以现在
+  多数项目仍然是空图——空图是正常状态，界面用 `stats.unkeyed` 与 `stats.unlabeled_direction`
+  区分「没有产物」「登记时忘了给键」和「键给对了但 `direction` 还是默认的 `reference`」。
+- 团队配置映射目前只有 REST（`/api/team/mapping`）与直接编辑 `<data_dir>/team-project-map.json`
+  两条维护路径，网页管理界面尚未实现；`/api/context` 的待确认状态在网页上也还没有落点
+  （命令行 `trace-project bind` 已经会列出候选并拒绝创建）。
 - 这是 alpha；部署团队数据前应使用私有仓库、HTTPS、OAuth 白名单和独立数据目录。
 
 ## 开发与验证
