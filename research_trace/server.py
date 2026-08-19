@@ -30,6 +30,8 @@ from .auth import (
     PendingOAuthStore,
     RateLimiter,
     csrf_token,
+    normalize_base_path,
+    safe_return_to,
 )
 from .backup import sync_git_backup
 from .deliver import workspace_key_problem
@@ -46,10 +48,13 @@ from .storage import (
 
 try:
     from fastapi import Depends, FastAPI, HTTPException, Request
-    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+    from fastapi.responses import (
+        FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse,
+    )
 except ImportError:  # pragma: no cover
     Depends = FastAPI = HTTPException = Request = None  # type: ignore[assignment]
     FileResponse = HTMLResponse = JSONResponse = RedirectResponse = None  # type: ignore[assignment]
+    PlainTextResponse = None  # type: ignore[assignment]
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -241,6 +246,7 @@ def create_app(
     backup_subdirectory: str = "research-trace-backup",
     backup_remote: str = "origin",
     backup_branch: str = "main",
+    base_path: str | None = None,
     github_client_id: str | None = None,
     github_client_secret: str | None = None,
     public_url: str | None = None,
@@ -260,7 +266,14 @@ def create_app(
     if FastAPI is None:  # pragma: no cover
         raise RuntimeError("server requires fastapi; install research-trace[server]")
 
+    # 挂载前缀。服务把整个前缀据为己有：不带前缀的请求一律 404（见下面的 base_guard），
+    # 所以「靠不可猜路径隐藏」在绕过反向代理直连端口时同样成立。
+    base = normalize_base_path(base_path if base_path is not None
+                               else os.environ.get("TRACE_BASE_PATH"))
+    cookie_path = base or "/"
+
     oauth_config = GitHubOAuthConfig.build(
+        base_path=base,
         client_id=github_client_id if github_client_id is not None else os.environ.get("TRACE_GITHUB_CLIENT_ID"),
         client_secret=(github_client_secret if github_client_secret is not None
                        else os.environ.get("TRACE_GITHUB_CLIENT_SECRET")),
@@ -389,12 +402,31 @@ def create_app(
                 await task
             store.close()
 
-    app = FastAPI(title="Research Trace", version="2.0.0-alpha.4", lifespan=lifespan)
+    app = FastAPI(title="Research Trace", version="2.0.0-alpha.4", lifespan=lifespan,
+                  root_path=base)
+    app.state.base_path = base
     app.state.store = store
     app.state.write_token = write_token
     app.state.backup_status = backup_state
     app.state.oauth_config = oauth_config
     app.state.team_map = team_map
+
+    @app.middleware("http")
+    async def base_guard(request: Request, call_next):
+        """前缀之外一律 404。
+
+        只设 root_path 是不够的：Starlette 的 get_route_path 在路径**不以** root_path
+        开头时原样返回，于是 /api/health 绕过前缀照样能匹配到路由。对「站点只存在于
+        某个不可猜前缀之下」这种部署来说，那等于门没锁。
+        """
+        if not base:
+            return await call_next(request)
+        path = request.scope.get("path", "")
+        if path == base:
+            return RedirectResponse(base + "/", status_code=307)
+        if not path.startswith(base + "/"):
+            return PlainTextResponse("Not Found", status_code=404)
+        return await call_next(request)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
@@ -407,9 +439,12 @@ def create_app(
             "script-src 'self' 'unsafe-inline'; img-src 'self' data: https://avatars.githubusercontent.com; "
             "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
         )
+        route_path = request.url.path
+        if base and route_path.startswith(base):
+            route_path = route_path[len(base):] or "/"
         if (
-            request.url.path.startswith("/auth/") or request.url.path.startswith("/api/auth/")
-            or request.url.path.startswith("/api/device/")
+            route_path.startswith("/auth/") or route_path.startswith("/api/auth/")
+            or route_path.startswith("/api/device/")
         ):
             response.headers["Cache-Control"] = "no-store"
         return response
@@ -566,17 +601,19 @@ def create_app(
 
     @app.get("/api/auth/config")
     def auth_config():
-        return {"enabled": bool(oauth_config), "login_url": "/auth/github/login" if oauth_config else None}
+        return {"enabled": bool(oauth_config),
+                "login_url": base + "/auth/github/login" if oauth_config else None}
 
     @app.get("/auth/github/login")
-    def github_login(return_to: str = "/"):
+    def github_login(return_to: str | None = None):
         if not oauth_config or not github:
             raise HTTPException(status_code=404, detail="GitHub OAuth is not enabled")
-        state, nonce, _verifier, challenge = pending_oauth.create(return_to)
+        state, nonce, _verifier, challenge = pending_oauth.create(
+            safe_return_to(return_to, base))
         response = RedirectResponse(github.authorize_url(state=state, challenge=challenge), status_code=302)
         response.set_cookie(
             OAUTH_NONCE_COOKIE, nonce, max_age=pending_oauth.ttl_seconds, httponly=True,
-            secure=oauth_config.secure_cookies, samesite="lax", path="/",
+            secure=oauth_config.secure_cookies, samesite="lax", path=cookie_path,
         )
         return response
 
@@ -621,9 +658,10 @@ def create_app(
         response = RedirectResponse(attempt.return_to, status_code=303)
         response.set_cookie(
             SESSION_COOKIE, raw_session, max_age=oauth_config.session_days * 86400, httponly=True,
-            secure=oauth_config.secure_cookies, samesite="lax", path="/",
+            secure=oauth_config.secure_cookies, samesite="lax", path=cookie_path,
         )
-        response.delete_cookie(OAUTH_NONCE_COOKIE, path="/", secure=oauth_config.secure_cookies, samesite="lax")
+        response.delete_cookie(OAUTH_NONCE_COOKIE, path=cookie_path,
+                               secure=oauth_config.secure_cookies, samesite="lax")
         return response
 
     @app.get("/api/auth/me")
@@ -649,7 +687,8 @@ def create_app(
         _check_csrf(request)
         store.delete_web_session(raw_session)
         response = JSONResponse({"logged_out": True})
-        response.delete_cookie(SESSION_COOKIE, path="/", secure=oauth_config.secure_cookies, samesite="lax")
+        response.delete_cookie(SESSION_COOKIE, path=cookie_path,
+                               secure=oauth_config.secure_cookies, samesite="lax")
         return response
 
     def client_key(request: Request) -> str:
@@ -765,7 +804,8 @@ def create_app(
             raise HTTPException(status_code=404, detail="GitHub OAuth is not enabled")
         user = browser_user(request)
         if not user:
-            login_url = "/auth/github/login?" + urllib.parse.urlencode({"return_to": "/device"})
+            login_url = base + "/auth/github/login?" + urllib.parse.urlencode(
+                {"return_to": base + "/device"})
             return RedirectResponse(login_url, status_code=303)
         safe_login = html.escape(str(user["login"]))
         page = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
@@ -818,6 +858,7 @@ inputmode="latin" maxlength="9" placeholder="ABCD-EFGH" required>
 <button id="approve" type="button">批准此设备</button></div>
 <p id="status" class="meta" role="status" aria-live="polite"></p></main>
 <script>
+const BASE={base!r};
 const $=id=>document.getElementById(id);
 const out=$('status');
 const fail=message=>{{out.className='danger';out.textContent=message}};
@@ -830,7 +871,7 @@ $('lookupForm').onsubmit=async event=>{{
   const normalized=typed.slice(0,4)+'-'+typed.slice(4);
   const button=$('lookup');button.disabled=true;
   try{{
-    const response=await fetch('/api/device/authorization?user_code='+encodeURIComponent(normalized));
+    const response=await fetch(BASE+'/api/device/authorization?user_code='+encodeURIComponent(normalized));
     const value=await response.json();
     if(!response.ok)throw Error(value.error||value.detail||response.statusText);
     pendingCode=value.user_code;
@@ -842,8 +883,8 @@ $('lookupForm').onsubmit=async event=>{{
 $('approve').onclick=async()=>{{
   const button=$('approve');button.disabled=true;button.textContent='批准中…';out.className='meta';
   try{{
-    const me=await fetch('/api/auth/me').then(r=>r.json());
-    const response=await fetch('/api/device/approve',{{method:'POST',
+    const me=await fetch(BASE+'/api/auth/me').then(r=>r.json());
+    const response=await fetch(BASE+'/api/device/approve',{{method:'POST',
       headers:{{'Content-Type':'application/json','X-CSRF-Token':me.csrf_token}},
       body:JSON.stringify({{user_code:pendingCode}})}});
     const value=await response.json();
@@ -1228,8 +1269,8 @@ $('approve').onclick=async()=>{{
 
     @app.get("/", response_class=HTMLResponse)
     def index():
-        from .webapp import INDEX_HTML
-        return HTMLResponse(INDEX_HTML)
+        from .webapp import render_index
+        return HTMLResponse(render_index(base))
 
     return app
 
@@ -1240,6 +1281,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--token", default=os.environ.get("TRACE_TOKEN", ""))
+    parser.add_argument("--base-path", default=os.environ.get("TRACE_BASE_PATH", ""),
+                        help="把服务挂在一个路径前缀下，例如 /trace；前缀之外一律 404")
     parser.add_argument("--backup-repo", default=os.environ.get("TRACE_BACKUP_REPO"))
     parser.add_argument("--backup-interval-hours", type=float,
                         default=float(os.environ.get("TRACE_BACKUP_INTERVAL_HOURS", "24")))
@@ -1279,7 +1322,8 @@ def main(argv: list[str] | None = None) -> int:
             args.data_dir, token=args.token, backup_repo=args.backup_repo,
             backup_interval_hours=args.backup_interval_hours,
             backup_subdirectory=args.backup_subdirectory, backup_remote=args.backup_remote,
-            backup_branch=args.backup_branch, public_url=args.public_url,
+            backup_branch=args.backup_branch, base_path=args.base_path,
+            public_url=args.public_url,
             github_client_id=args.github_client_id, github_client_secret=args.github_client_secret,
             session_secret=args.session_secret, github_admins=args.github_admins,
             github_allowed_users=args.github_allowed_users, github_allowed_org=args.github_allowed_org,
