@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from research_trace.server import main
+from research_trace.device_login import main
 
 
 if __name__ == "__main__":

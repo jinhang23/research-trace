@@ -1,6 +1,6 @@
 {
   "name": "research-trace",
-  "displayName": "Research Trace v2",
+  "displayName": "Research Trace",
   "version": "2.0.0-alpha.4",
   "description": "团队研究与项目记忆：永久保存可见的 agent 历史，由 Recorder 精选想法、论文、数据理解、实验、失败和关键实现为 Project / Overview / Chapter / Node。提供 7 个 MCP 工具：6 个研究工具和 trace_login 账号设备登录。",
   "author": {"name": "Jinhang Wei"},
@@ -18,7 +18,7 @@
     "token": {
       "type": "string",
       "title": "机器写入 Token",
-      "description": "旧部署兼容项，可留空。推荐通过 trace_login 或 trace-v2-login 用 GitHub 账号绑定设备，凭证会自动保存和读取。",
+      "description": "旧部署兼容项，可留空。推荐通过 trace_login 或 trace-login 用 GitHub 账号绑定设备，凭证会自动保存和读取。",
       "sensitive": true
     },
     "capture": {
@@ -30,17 +30,17 @@
     "python": {
       "type": "string",
       "title": "Python 解释器",
-      "description": "Python 3.10+ 的绝对路径最可靠。Windows/conda/HPC 上运行 `python -c \"import sys; print(sys.executable)\"` 获取当前环境的绝对路径；配置后可运行 trace_v2_mcp.py --selfcheck 验证。",
+      "description": "Python 3.10+ 的绝对路径最可靠。Windows/conda/HPC 上运行 `python -c \"import sys; print(sys.executable)\"` 获取当前环境的绝对路径；配置后可运行 trace_mcp.py --selfcheck 验证。",
       "default": "python3"
     }
   },
   "mcpServers": {
     "trace": {
       "command": "${user_config.python}",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/trace_v2_mcp.py"],
+      "args": ["${CLAUDE_PLUGIN_ROOT}/trace_mcp.py"],
       "env": {
-        "TRACE_V2_URL": "${user_config.url}",
-        "TRACE_V2_TOKEN": "${user_config.token}"
+        "TRACE_URL": "${user_config.url}",
+        "TRACE_TOKEN": "${user_config.token}"
       }
     }
   },

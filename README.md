@@ -8,9 +8,6 @@ Recorder 只把真正有长期价值的内容整理成简洁、可纠正、可�
 它记录的不只是“实验”。论文搜索、想法讨论、数据理解、失败方案、关键代码实现、指标、
 图片、产物路径和阶段性结论，都可以成为项目知识的一部分。
 
-> 当前主线是 v2 alpha。v1 的 Step/Pipeline 文件树模型已移入
-> [v1 归档参考](docs/V1_REFERENCE.md)，不再作为新用户的默认设计。
-
 ## 为什么做这个项目
 
 研究过程很少是一份整齐的实验表：一次对话可能先查论文，再检查数据，随后尝试代码，
@@ -155,12 +152,12 @@ git clone https://github.com/jinhang23/research-trace
 cd research-trace
 python -m pip install -e ".[server]"
 
-trace-v2-server --data-dir /srv/research-trace/data \
+trace-server --data-dir /srv/research-trace/data \
   --host 127.0.0.1 --port 8765
 ```
 
 本地打开 `http://127.0.0.1:8765/`。团队部署应使用 HTTPS 和 GitHub OAuth，完整配置见
-[v2 快速开始](docs/V2_QUICKSTART.md)。
+[快速开始](docs/QUICKSTART.md)。
 
 ### 安装 Claude Code 插件
 
@@ -181,7 +178,7 @@ trace-v2-server --data-dir /srv/research-trace/data \
 登录工作站或 HPC：
 
 ```bash
-trace-v2-login --url https://trace.example.org --device-name hipergator-login-01
+trace-login --url https://trace.example.org --device-name hipergator-login-01
 ```
 
 也可以直接让 Claude 调用 `trace_login`。机器保存的是 Research Trace 设备凭证，不是 GitHub
@@ -190,7 +187,7 @@ access token；凭证可从网页撤销。
 ### 配置私有 GitHub 备份
 
 ```bash
-trace-v2-server --data-dir /srv/research-trace/data \
+trace-server --data-dir /srv/research-trace/data \
   --backup-repo /srv/research-trace/private-backup \
   --backup-branch main --backup-interval-hours 24
 ```
@@ -218,7 +215,7 @@ Recorder 使用六个研究工具，另有一个登录工具：
 
 中央数据目录包含：
 
-- `trace-v2.sqlite3`：在线数据库；
+- `trace.sqlite3`：在线数据库；
 - `objects/`：内容寻址附件；
 - transcript chunks、事件、版本和身份信息。
 
@@ -226,10 +223,10 @@ Git 备份包含确定性 JSONL、压缩 transcript chunks、小附件、manifes
 保存机器、路径、大小和校验和等引用，不复制大文件本体。
 
 ```bash
-trace-v2-backup verify \
+trace-backup verify \
   --source /srv/research-trace/private-backup/research-trace-backup
 
-trace-v2-backup restore \
+trace-backup restore \
   --source /srv/research-trace/private-backup/research-trace-backup \
   --data-dir /srv/research-trace/restored-empty-data
 ```
@@ -246,25 +243,24 @@ trace-v2-backup restore \
 ## 开发与验证
 
 ```bash
-python trace_v2_mcp.py --selfcheck
 python -m pytest -q
 ```
 
 主要目录：
 
 ```text
-research_trace_v2/          v2 中央服务、存储、MCP、OAuth、备份与网页
+research_trace/             中央服务、存储、MCP、OAuth、备份与网页
 hooks/                      Claude Code Hook 清单与 Recorder 协议
 scripts/trace_hook.py       本机 outbox、批次和 Recorder 调度
-docs/V2_QUICKSTART.md       部署与登录
-docs/V2_REQUIREMENTS.md     完整需求、不变量和验收标准
-tests/                      Python 与前端回归测试
+docs/QUICKSTART.md       部署与登录
+docs/REQUIREMENTS.md     完整需求、不变量和验收标准
+tests/                      回归测试
 ```
 
 ## 文档
 
-- [v2 快速开始](docs/V2_QUICKSTART.md)
-- [v2 完整需求](docs/V2_REQUIREMENTS.md)
+- [快速开始](docs/QUICKSTART.md)
+- [完整需求](docs/REQUIREMENTS.md)
 - [Recorder 协议](hooks/RECORDER_PROTOCOL.md)
 
 ## License

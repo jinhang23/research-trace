@@ -9,37 +9,32 @@ description = "团队研究与项目记忆：完整 agent 历史与精选语义�
 readme = "README.md"
 requires-python = ">=3.10"
 
-# 零运行时依赖。MCP 是一份开放协议规范，`mcp` 那个 pip 包只是它的官方 Python SDK；
-# stdio 侧就是换行分隔的 JSON-RPC 2.0，直接说协议即可，不必依赖 SDK。
+# MCP 那一侧零运行时依赖。MCP 是一份开放协议规范，`mcp` 那个 pip 包只是它的官方
+# Python SDK；stdio 侧就是换行分隔的 JSON-RPC 2.0，直接说协议即可，不必依赖 SDK。
 # 于是也不会再被 SDK 的破坏性改版牵连（mcp 2.0 删掉了 1.x 的整套装饰器 API）。
+# 中央服务另需 fastapi/uvicorn，见下面的 optional-dependencies。
 dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/jinhang23/research-trace"
 
-# 装完之后 `trace-mcp` 就是一个真正的命令（Windows 上是 Scripts/trace-mcp.exe），
-# 于是 MCP 配置写成 `command: trace-mcp`，和别的 MCP server 形状一致，
-# 不用在配置里写死某个 .py 文件的绝对路径。
+# 装完之后这几个就是真正的命令（Windows 上是 Scripts/*.exe），于是 MCP 配置写成
+# `command: trace-mcp`，和别的 MCP server 形状一致，不用写死某个 .py 的绝对路径。
 [project.scripts]
-trace-mcp = "trace_mcp:main"
-trace-v2-mcp = "research_trace_v2.mcp:main"
-trace-v2-server = "research_trace_v2.server:main"
-trace-v2-backup = "research_trace_v2.backup:main"
-trace-v2-login = "research_trace_v2.device_login:main"
+trace-mcp = "research_trace.mcp:main"
+trace-server = "research_trace.server:main"
+trace-backup = "research_trace.backup:main"
+trace-login = "research_trace.device_login:main"
 
-# 网页服务和 CLI 需要读仓库里的 web/ 与 projects/，只能在仓库里跑，
-# 所以不打包，用 `pip install -e .[server]` 或直接 requirements.txt。
 [project.optional-dependencies]
 server = ["fastapi>=0.110", "uvicorn>=0.27"]
-# 只在跑测试时用：拿官方 SDK 的客户端连上我们手写的服务端，验证互操作。
-# 运行时不需要。
-dev = ["pytest", "mcp>=1.9,<2"]
+dev = ["pytest"]
 
 [tool.setuptools]
-# 只装 MCP 这条链路要用到的三个模块。它们都是纯代码，不依赖仓库里的任何数据文件，
-# 所以装到 site-packages 之后照样能跑。
-py-modules = ["trace_mcp", "trace_core", "trace_write"]
-packages = ["research_trace_v2"]
+packages = ["research_trace"]
+# 根目录那三个 .py 只是薄薄的入口转发（给不想用 console script 的人直接
+# `python trace_server.py` 用），本体全在 research_trace 包里。
+py-modules = ["trace_mcp", "trace_server", "trace_login"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
