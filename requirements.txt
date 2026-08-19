@@ -1,8 +1,6 @@
-# 服务端全部依赖就这两个。内核（trace_core.py）连这两个都不需要——它只用标准库，
-# 所以 check / build / 单元测试在任何裸 Python 3.10+ 上都能跑。
+# 中央服务的全部依赖就这两个。
+# MCP 那一侧（research_trace/mcp.py）只用标准库——stdio 上就是换行分隔的
+# JSON-RPC 2.0，不需要官方 SDK，也就不会被 SDK 的破坏性改版牵连。
+# 所以工作站上只装插件、不装服务时，这两个都不必要。
 fastapi>=0.110
 uvicorn>=0.27
-
-# 只有 MCP 协议层需要（trace_mcp.py）。它的两个后端——HTTP 和本地文件——
-# 都只用标准库，所以不装这个也不影响服务端和 CLI。
-# pip install mcp
