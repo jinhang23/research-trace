@@ -793,7 +793,10 @@ def handle(
         if not internal:
             _write_event(root, payload, binding)
 
-        if payload.get("hook_event_name") in {"SessionStart", "SessionEnd"}:
+        # Stop 也要拉一次：一轮对话刚结束，batch 正好写完。只挂在 SessionStart/SessionEnd
+        # 上的话，HPC 上那种一开就是几小时、从不正常结束的会话可以攒到几百个批次都不投。
+        # 有 DELIVER_SPAWN_INTERVAL 的 60 秒节流兜着，不会变成每轮一个进程。
+        if payload.get("hook_event_name") in {"SessionStart", "SessionEnd", "Stop"}:
             _spawn_deliver(data_dir, url, state)
 
         result = _recorder_tool_guard(payload, state)

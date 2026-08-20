@@ -67,6 +67,22 @@ def test_plugin_manifest_does_not_redeclare_the_standard_hooks_file():
     )
 
 
+def test_delivery_is_kicked_off_at_every_turn_boundary(tmp_path: Path, monkeypatch):
+    """只挂在 SessionStart/SessionEnd 上的话，长会话可以攒到几百个批次一个都不投。
+
+    HPC 上的会话经常一开就是几小时、而且从不正常结束（被 kill、掉线、超时），
+    SessionEnd 根本不会来。Stop 是一轮对话刚结束、batch 正好写完的时刻。
+    """
+    project = bind(tmp_path, "project-a")
+    data = tmp_path / "data"
+    calls = []
+    monkeypatch.setattr(H, "_spawn_deliver", lambda *a, **k: calls.append(a[0]) or True)
+
+    for name in ("SessionStart", "Stop", "SessionEnd"):
+        H.handle(event(name, project), data, PROTOCOL, "https://example.org")
+    assert len(calls) == 3, f"每个回合边界都该拉一次投递，实际 {len(calls)} 次"
+
+
 def test_plugin_hooks_cover_the_loss_boundaries_and_reuse_configured_python():
     config = json.loads((ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
     required = {
