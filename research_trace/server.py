@@ -236,6 +236,30 @@ ANONYMOUS_READ_WARNING = (
 )
 
 
+NO_BACKUP_WARNING = (
+    "!!! Research Trace: running with --no-backup. The SQLite database and the object\n"
+    "!!! directory on this machine are the ONLY copy of every record and every raw\n"
+    "!!! transcript. One disk failure ends the project's history.\n"
+    "!!! Configure --backup-repo <a PRIVATE git worktree> as soon as this is more than a trial."
+)
+
+MISSING_BACKUP = (
+    "refusing to start without a backup destination.\n"
+    "\n"
+    "A provenance system whose only copy lives on one disk is not a provenance system.\n"
+    "Point --backup-repo (or TRACE_BACKUP_REPO) at a git worktree whose remote is a\n"
+    "PRIVATE repository -- the export carries raw transcripts:\n"
+    "\n"
+    "  trace-server --data-dir <dir> --backup-repo /srv/research-trace/private-backup\n"
+    "\n"
+    "Only the named subdirectory is staged and committed, so pointing this at a repo you\n"
+    "already use for something else does not sweep up its other changes.\n"
+    "\n"
+    "If you really mean to run without any backup (a local trial, a throwaway instance),\n"
+    "say so explicitly with --no-backup or TRACE_NO_BACKUP=true."
+)
+
+
 def create_app(
     data_dir: str | os.PathLike[str] | None = None,
     *,
@@ -1284,6 +1308,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base-path", default=os.environ.get("TRACE_BASE_PATH", ""),
                         help="把服务挂在一个路径前缀下，例如 /trace；前缀之外一律 404")
     parser.add_argument("--backup-repo", default=os.environ.get("TRACE_BACKUP_REPO"))
+    parser.add_argument("--no-backup", action="store_true", default=_env_bool("TRACE_NO_BACKUP"),
+                        help="明确表示这个实例不要备份（本地试用/一次性实例）")
     parser.add_argument("--backup-interval-hours", type=float,
                         default=float(os.environ.get("TRACE_BACKUP_INTERVAL_HOURS", "24")))
     parser.add_argument("--backup-subdirectory",
@@ -1312,6 +1338,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--insecure-cookies", action="store_true",
                         default=_env_bool("TRACE_INSECURE_COOKIES"))
     args = parser.parse_args(argv)
+    # 备份不是可选项，而是必须做出的一个选择。默认什么都不配就跑起来，等于让每个部署
+    # 都默默停在「唯一副本在一块盘上」这个状态 —— 而这件事通常要到盘坏了才被发现。
+    if not str(args.backup_repo or "").strip() and not args.no_backup:
+        print("trace-server: " + MISSING_BACKUP, file=os.sys.stderr)
+        return 2
+    if args.no_backup:
+        print(NO_BACKUP_WARNING, file=os.sys.stderr)
     try:
         import uvicorn
     except ImportError:
