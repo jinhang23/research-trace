@@ -292,15 +292,36 @@ def _post_json(
         raise DeliveryError(f"Research Trace unavailable at {url}: {exc}") from exc
 
 
-def auth_token(url: str, token: str = "", credential_file: str | os.PathLike[str] | None = None) -> str:
-    if token:
-        return token
+def auth_source(
+    url: str, token: str = "", credential_file: str | os.PathLike[str] | None = None
+) -> tuple[str, str]:
+    """返回 (bearer, 人能看懂的来源说明)。
+
+    显式 token 优先于设备凭证 —— 这是**静默**的：`TRACE_TOKEN` 还留在环境里时，
+    刚做完的 `trace-login` 一点作用都没有，而且没有任何报错，只会在某次写入时
+    莫名其妙地 401。所以把「谁在生效」做成一个能问出来的东西，别让人去猜。
+    """
     target = Path(credential_file).expanduser() if credential_file else default_credential_file()
+    stored = ""
     try:
         value = load_device_credential(target, url)
+        stored = str(value.get("credential") or "") if value else ""
     except Exception:
-        return ""
-    return str(value.get("credential") or "") if value else ""
+        stored = ""
+    if token:
+        if stored:
+            return token, (
+                f"explicit token (TRACE_TOKEN or --token); it takes precedence, so the "
+                f"device credential in {target} is NOT being used"
+            )
+        return token, "explicit token (TRACE_TOKEN or --token)"
+    if stored:
+        return stored, f"device credential in {target}"
+    return "", f"none (no explicit token, and no device credential for {url} in {target})"
+
+
+def auth_token(url: str, token: str = "", credential_file: str | os.PathLike[str] | None = None) -> str:
+    return auth_source(url, token, credential_file)[0]
 
 
 # --------------------------------------------------------------------------------------
@@ -962,6 +983,9 @@ def project_main(argv: list[str] | None = None) -> int:
 
     status = sub.add_parser("status", help="show the binding that applies to a directory")
     status.add_argument("path", nargs="?", default=".")
+    status.add_argument("--url", default=os.environ.get("TRACE_URL", "http://127.0.0.1:8765"))
+    status.add_argument("--token", default=os.environ.get("TRACE_TOKEN", ""))
+    status.add_argument("--credential-file", default=os.environ.get("TRACE_CREDENTIAL_FILE"))
 
     disable = sub.add_parser("disable", help="keep the marker but exclude the project from capture")
     disable.add_argument("path", nargs="?", default=".")
@@ -970,6 +994,8 @@ def project_main(argv: list[str] | None = None) -> int:
     directory = Path(args.path).expanduser().resolve()
 
     if args.command == "status":
+        _bearer, source = auth_source(args.url, args.token, args.credential_file)
+        print(f"auth for {args.url}: {source}")
         binding = project_binding(directory)
         if binding:
             print(json.dumps(binding, ensure_ascii=False, indent=2))
