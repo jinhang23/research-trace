@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "research-trace"
-version = "2.0.0a8"
+version = "2.0.0a9"
 description = "团队研究与项目记忆：完整 agent 历史与精选语义记录"
 readme = "README.md"
 requires-python = ">=3.10"
