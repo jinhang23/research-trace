@@ -29,6 +29,23 @@ def normalize_server_url(value: str) -> str:
     return url
 
 
+def _warn_if_shadowed_by_explicit_token() -> None:
+    """刚存下的凭证如果被一个显式 token 盖住了，现在就说，别等到某次 401。
+
+    auth_token() 是「显式 token 优先」，所以 TRACE_TOKEN 还在环境里的时候，
+    这次登录完全不起作用 —— 而且是静默的。这是最值得在此刻打断一下的一件事。
+    """
+    if not str(os.environ.get("TRACE_TOKEN") or "").strip():
+        return
+    print(
+        "WARNING: TRACE_TOKEN is set in this environment. An explicit token takes "
+        "precedence over device credentials, so the credential just saved will NOT be "
+        "used. Unset TRACE_TOKEN (and clear the plugin's `token` setting) to use this "
+        "device login.",
+        file=sys.stderr,
+    )
+
+
 def default_credential_file() -> Path:
     configured = os.environ.get("TRACE_CREDENTIAL_FILE")
     if configured:
@@ -212,6 +229,7 @@ def main(argv: list[str] | None = None) -> int:
             target = save_device_credential(args.credential_file, url, result)
             expiry = result.get("expires_at") or (result.get("device") or {}).get("expires_at")
             print(f"Device credential renewed until {expiry}. Saved to {target}")
+            _warn_if_shadowed_by_explicit_token()
             return 0
         if args.logout:
             current = load_device_credential(args.credential_file, url)
@@ -253,6 +271,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"Credential saved to {target}"
                     + (f" (valid until {expiry}; renew with trace-login --renew)" if expiry else "")
                 )
+                _warn_if_shadowed_by_explicit_token()
                 return 0
             time.sleep(interval)
         raise DeviceLoginError("device login expired; run trace-login again")

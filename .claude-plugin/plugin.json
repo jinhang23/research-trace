@@ -17,7 +17,7 @@
     "token": {
       "type": "string",
       "title": "机器写入 Token",
-      "description": "旧部署兼容项，可留空。推荐通过 trace_login 或 trace-login 用 GitHub 账号绑定设备，凭证会自动保存和读取。注意：这个值只注入 MCP 进程；独立投递器 trace-deliver 读的是设备凭证文件或环境变量 TRACE_TOKEN，只填这里不会让它通过鉴权。",
+      "description": "旧部署兼容项，用设备登录时**必须留空**。显式 token 优先于设备凭证：这里（或环境变量 TRACE_TOKEN）只要有值，trace-login 存下的凭证就不会被读取，而且不会报错，只会在某次写入时莫名 401。另注意这个值只注入 MCP 进程；独立投递器 trace-deliver 读的是设备凭证文件或环境变量 TRACE_TOKEN，只填这里不会让它通过鉴权。",
       "sensitive": true
     },
     "capture": {
