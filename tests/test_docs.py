@@ -17,6 +17,9 @@ DOCS = {
     "docs/QUICKSTART.md": (ROOT / "docs" / "QUICKSTART.md").read_text(encoding="utf-8"),
     "docs/REQUIREMENTS.md": (ROOT / "docs" / "REQUIREMENTS.md").read_text(encoding="utf-8"),
     "hooks/RECORDER_PROTOCOL.md": (ROOT / "hooks" / "RECORDER_PROTOCOL.md").read_text(encoding="utf-8"),
+    "skills/research-trace/SKILL.md": (
+        ROOT / "skills" / "research-trace" / "SKILL.md"
+    ).read_text(encoding="utf-8"),
 }
 CODE = "\n".join(
     path.read_text(encoding="utf-8")
@@ -135,3 +138,30 @@ def test_the_marker_shape_is_the_same_everywhere():
         assert '"capture"' in text, f"{name} shows a marker without the capture switch"
     assert shown >= 2, "the marker shape should be spelled out in at least two documents"
     assert MARKER_NAME in CODE and MARKER_SCHEMA in CODE
+
+
+def test_every_trace_tool_the_skill_mentions_is_a_real_mcp_tool():
+    """SKILL.md 是主 agent 唯一的指导，它点名的工具必须真的在工具表里。
+
+    上一版 skill 就是这么烂掉的：v1 删掉之后它还留在用户机器上，指着
+    `trace_new_step` / `trace_update_step` 这些已经不存在的工具，比没有 skill 更糟。
+    """
+    skill = DOCS["skills/research-trace/SKILL.md"]
+    real = set(re.findall(r'"name":\s*"(trace_[a-z_]+)"', (ROOT / "research_trace" / "mcp.py").read_text(encoding="utf-8")))
+    assert len(real) == 7, f"工具表变了，这条测试要跟着改：{sorted(real)}"
+    mentioned = set(re.findall(r"\btrace_[a-z0-9_]+", skill))
+    assert not (mentioned - real), f"SKILL.md 提到了不存在的工具：{sorted(mentioned - real)}"
+    assert not (real - mentioned), f"SKILL.md 漏讲了工具：{sorted(real - mentioned)}"
+
+
+def test_the_skill_has_the_frontmatter_that_makes_it_loadable():
+    """没有 frontmatter 的 SKILL.md 不会被当成 skill 加载，而这个失败是静默的。"""
+    skill = DOCS["skills/research-trace/SKILL.md"]
+    front = re.match(r"^---\n(.*?)\n---\n", skill, re.S)
+    assert front, "SKILL.md 缺 frontmatter"
+    assert re.search(r"^name:\s*research-trace\s*$", front.group(1), re.M)
+    description = re.search(r"^description:\s*(\S.*)$", front.group(1), re.M)
+    assert description, "缺 description —— 模型靠它决定要不要加载这个 skill"
+    # 触发词是这份 skill 唯一的入口，中英文都得有
+    assert "之前试过什么" in description.group(1)
+    assert "provenance" in description.group(1)

@@ -275,7 +275,7 @@ Recorder 使用六个研究工具，另有一个登录工具：
 | `trace_context` | 确认项目身份，读取 Overview、Chapter 和近期上下文；可选 `include_dataflow` 返回派生数据流 |
 | `trace_ingest` | 手动补录原始历史；Claude Code 路径不用它，投递由 `trace-deliver` 负责 |
 | `trace_record` | 创建精选 Node；不能创建 Chapter，且始终未确认 |
-| `trace_curate` | 修订 Overview、Chapter 摘要或已有 Node |
+| `trace_curate` | 修订 Overview 或 Chapter 摘要（只有这两种；Node 的修订走网页）|
 | `trace_attach` | 保存小附件，或登记大产物的机器与路径 |
 | `trace_search` | 搜索语义记录和原始历史 |
 | `trace_login` | 使用 GitHub 账号批准当前设备 |
