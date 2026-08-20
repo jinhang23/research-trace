@@ -4,6 +4,16 @@
 `research_trace/server.py`、`research_trace/mcp.py`、两个 `.claude-plugin/*.json`），
 有测试守它们一致。**改动插件包里的东西之后必须 bump**，否则已安装的机器拿不到。
 
+## 2.0.0-alpha.10
+
+- **修一个自我维持的反馈环。** Recorder fork 的回合写在同一个 transcript 文件里，而
+  transcript 采集**跑在** `_is_trace_orchestration` 之前 —— 事件层挡住了 Recorder，
+  transcript 层照单全收。于是「recorder 跑完 → transcript 变长 → 新 chunk →
+  `events or chunks` 成立 → 新 batch → 再派一个 fork」自己转起来：实测连转 8 圈，
+  每圈约 70 万 token，产出恒为 `0 nodes (recorder plumbing only)`。
+  现在 Recorder 名下的 transcript 行整行丢弃，和事件层同一条规矩。环在源头断掉 ——
+  没有 chunk 就没有 batch。
+
 ## 2.0.0-alpha.9
 
 - **Recorder 重新 fork 的间隔可配**（插件配置 `recorder_fork_window`，默认 1 = 每批）。
