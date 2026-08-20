@@ -112,8 +112,12 @@ Recorder 只读 batch manifest 来决定「这段工作里有什么值得记住�
 
 **隐藏推理不出本机。** transcript 增量在写盘前逐行剥掉 `thinking` / `redacted_thinking` 块。
 
-Recorder 首次以 fork 方式继承主 Agent 当时的完整上下文；同一 Claude Code 会话中的后续批次
-发送给同一个 Recorder agent id。它不会跨主会话永久驻留，长期状态保存在中央服务中。
+Recorder **每一批都以 fork 方式重新继承主 Agent 此刻的完整上下文**。fork 的唯一理由就是
+这份上下文；复用同一个 Recorder 时后续批次只收到一个 manifest 路径，手里是 fork 那一刻的
+陈旧快照，等于保留了昂贵的机制却只享受第一批的收益。重 fork 的前缀与主 Agent 完全一致，
+本来就该命中提示缓存，边际成本是缓存读取而不是全量重算。它不会跨主会话永久驻留，
+长期状态保存在中央服务中。（`TRACE_RECORDER_REUSE=1` 可退回整会话复用，供提示缓存不生效的
+部署使用，不推荐。）
 
 Hook 根据 Recorder agent id 强制限制工具权限：Recorder 只能读取必要上下文，并调用 Research
 Trace MCP；不能执行 Bash、编辑项目文件、启动其它 Agent 或自行进行外部研究。

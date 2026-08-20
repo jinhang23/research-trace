@@ -605,6 +605,15 @@ def _close_batch(root: Path, batch_id: str) -> None:
         pass
 
 
+def _recorder_reuse_enabled() -> bool:
+    """把整个会话的 Recorder 复用成一个（旧行为）。
+
+    默认关闭：见 SubagentStop 那一段。留这个开关是为了在提示缓存不生效的部署上
+    还能退回去，不是推荐用法。
+    """
+    return str(os.environ.get("TRACE_RECORDER_REUSE") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _is_trace_orchestration(
     root: Path, payload: dict[str, Any], state: dict[str, Any]
 ) -> bool:
@@ -646,6 +655,13 @@ def _is_trace_orchestration(
         # 旧实现认任何带 batch_id 的 TRACE_RECEIPT，普通子 agent 因此会被误认成 Recorder
         # 并被此后所有 Edit/Write/Bash 拒绝，主任务当场被插件挡死。
         _close_batch(root, str(state.pop("dispatched_batch", "") or ""))
+        if not _recorder_reuse_enabled():
+            # 下一批重新 fork。复用等于「保留了 fork 这个昂贵机制，却只享受了第一批的收益」：
+            # 后续批次通过 SendMessage 送过去的只有一个 manifest 路径，Recorder 手里是
+            # fork 那一刻的陈旧快照加它自己的记录历史，唯独没有这一批真正发生了什么。
+            # 而重 fork 的前缀与主 agent 完全一致，本来就该命中提示缓存 —— 边际成本是
+            # 缓存读取，不是全量重算。
+            state.pop("recorder_agent_id", None)
         return True
     if is_recorder:
         return True
