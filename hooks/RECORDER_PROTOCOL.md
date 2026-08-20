@@ -52,22 +52,16 @@ The hooks record **only** directories that contain (or sit under) a `.research-t
 - `"capture": false` keeps the marker but excludes the project (§13).
 - Without a marker the hook exits before creating a single file or directory.
 
-Binding is a human action with two entry points:
+Binding is a human action, driven from the CLI (`trace-project bind` / `status` / `disable`) or
+walked through by the **main agent**. None of it is yours: you are dispatched with a batch that has
+already been staged, you never see the request that would start a binding, and the tool guard denies
+everything you would need to act on one.
 
-1. CLI: `trace-project bind [PATH] [--project-id … | --create]`, and `trace-project status`,
-   `trace-project disable`.
-2. Agent side: when the user asks to start recording this project, resolve or create the project
-   with `trace_context` (passing the workspace keys, `create_if_missing` only when the user says so)
-   and then ask the user to run `trace-project bind --project-id <id>`. Never write a marker into a
-   directory the user did not ask you to bind, and never create a second central project for a
-   workspace that already has one.
-
-Besides the marker key and the normalized Git remote, an administrator-maintained team mapping can
-resolve a workspace to an existing project; a resolved response says so with
-`resolved_by: "team_mapping"`. When that mapping is ambiguous the response is **not** an error: it
-carries `pending_confirmation: true`, `reason: "team_mapping_ambiguous"` and a `candidates` list,
-and no project is created even if creation was requested. Report the candidates to the user and let
-them pick one — nothing is bound and no marker is written in that state.
+The main agent's side of that flow — resolving a workspace with `trace_context`, the
+`matched: false` and `pending_confirmation: true` responses that are **not** errors, and the rule
+that a marker is never written unasked — lives in `skills/research-trace/SKILL.md` §4, which is the
+document the main agent actually reads. Do not restate it here: two copies of one rule drift, and
+the copy in this file reaches a reader who cannot act on it.
 
 ## Process one batch
 
