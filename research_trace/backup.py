@@ -819,6 +819,42 @@ def _run_git(repo: Path, *args: str, check: bool = True) -> subprocess.Completed
     return completed
 
 
+def _rebase_onto_remote(repo: Path, remote: str, branch: str, result: dict[str, Any]) -> None:
+    """推之前先把远端的新提交接到下面。
+
+    备份仓库不一定只有我们一个写入者：把它指到项目自己的代码仓上（记录和代码同仓）
+    是文档明确支持的用法。那样别的机器随时会往同一个分支推东西，而我们只 commit 不 fetch
+    的话，第一次被推到前面之后 push 就永远是 non-fast-forward —— 而且是每轮都失败，
+    因为没有任何环节会去拉。
+
+    只 rebase 自己那几个备份 commit，且我们只碰自己的子目录，所以正常情况下不会有冲突。
+    真冲突了就中止 rebase 并把这一轮标记为失败：把别人的提交搅乱，比备份晚一轮严重得多。
+    """
+    fetched = _run_git(repo, "fetch", remote, branch, check=False)
+    if fetched.returncode != 0:
+        # 远端不可达时不要挡住本地 commit —— 内容已经落盘，下一轮再推。
+        result["fetch_failed"] = _redact(fetched.stderr.strip())[:300] or "git fetch failed"
+        return
+    tracking = f"{remote}/{branch}"
+    known = _run_git(repo, "rev-parse", "--verify", "--quiet", tracking, check=False)
+    if known.returncode != 0:
+        return                      # 远端还没有这个分支：第一次推，没什么可 rebase 的
+    behind = _run_git(repo, "rev-list", "--count", f"HEAD..{tracking}", check=False)
+    if behind.returncode != 0 or not behind.stdout.strip().isdigit():
+        return
+    if int(behind.stdout.strip()) == 0:
+        return                      # 没落后，直接推
+    rebased = _run_git(repo, "rebase", tracking, check=False)
+    if rebased.returncode != 0:
+        _run_git(repo, "rebase", "--abort", check=False)
+        raise ValidationError(
+            f"backup repository diverged from {tracking} and the rebase did not apply cleanly; "
+            "resolve it by hand in the backup worktree. Nothing was pushed and no local commit "
+            "was lost."
+        )
+    result["rebased_onto"] = int(behind.stdout.strip())
+
+
 def _unpushed_commits(repo: Path, remote: str, branch: str) -> int | None:
     """本地 HEAD 比"上次真的推上去的位置"多几个 commit。
 
@@ -930,6 +966,7 @@ def sync_git_backup(
     if not has_new_content and pending == 0:
         result["unpushed_commits"] = 0
         return result
+    _rebase_onto_remote(repo_path, remote, branch, result)
     _run_git(repo_path, "push", remote, f"HEAD:{branch}")
     # push 之后重新数一遍：返回 push 之前的积压量会让健康卡片在刚刚补推成功的那一轮
     # 依旧显示"远端落后"，和真的落后长得一模一样。
