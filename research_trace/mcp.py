@@ -48,6 +48,10 @@ INTERNAL_ERROR = -32603
 SERVER_INFO = {"name": "research-trace", "version": "2.0.0-alpha.5"}
 INSTRUCTIONS = (
     "Research Trace has a raw-history layer and a selective semantic layer. "
+    "Capture is opt-in per project: a directory without a .research-trace.json marker records "
+    "nothing at all, and says nothing about it — so when a user expects records and finds none, "
+    "check the binding first. Binding is a human decision: resolve the project with trace_context "
+    "and hand the user `trace-project bind`; never write that marker on your own initiative. "
     "Raw batches are delivered by the independent trace-deliver process; do not call trace_ingest "
     "for hook manifests — durability never depends on a model remembering to call a tool. "
     "Use trace_record only for work worth understanding "
