@@ -73,3 +73,48 @@ def test_a_running_recorder_is_still_not_disturbed(tmp_path):
     again = H.handle(event("Stop", project, background_tasks=[{"id": "busy-1", "status": "running"}]),
                      data, PROTOCOL)
     assert again is None, "上一个 Recorder 还在跑，这一轮不该再派"
+
+
+@pytest.mark.parametrize("post_tool_use_arrives_last", [False, True])
+def test_the_dispatch_events_may_arrive_in_either_order(tmp_path, post_tool_use_arrives_last):
+    """一次派发会产生多个事件，先后顺序由 harness 决定。
+
+    SubagentStop 之后如果还收到那次派发的 PostToolUse，照原样写回 agent id 就会把
+    「已经结束、下一批重新 fork」悄悄改回「复用这个已经停掉的 agent」—— 下一批于是
+    被 SendMessage 发给一个死掉的 Recorder。只在某一种顺序下才正确的实现是脆的。
+    """
+    project, data = bind(tmp_path, f"order-{post_tool_use_arrives_last}"), tmp_path / "data"
+    post = event("PostToolUse", project, tool_name="Agent",
+                 tool_input={"prompt": f"{H.RECORDER_MARKER} 干活"},
+                 tool_response={"agent_id": "a1"})
+
+    H.handle(event("UserPromptSubmit", project, prompt="做事"), data, PROTOCOL)
+    H.handle(event("Stop", project), data, PROTOCOL)
+    H.handle(event("PreToolUse", project, tool_name="Agent",
+                   tool_input={"prompt": f"{H.RECORDER_MARKER} 干活"}), data, PROTOCOL)
+    H.handle(event("SubagentStart", project, agent_id="a1"), data, PROTOCOL)
+    if not post_tool_use_arrives_last:
+        H.handle(post, data, PROTOCOL)
+    H.handle(event("SubagentStop", project, agent_id="a1"), data, PROTOCOL)
+    if post_tool_use_arrives_last:
+        H.handle(post, data, PROTOCOL)
+
+    H.handle(event("UserPromptSubmit", project, prompt="再做事"), data, PROTOCOL)
+    text = dispatch_text(H.handle(event("Stop", project), data, PROTOCOL))
+    assert "subagent_type='fork'" in text
+    assert "Use SendMessage once with to=" not in text, "退休过的 Recorder 不能被复活"
+
+
+def test_a_brand_new_dispatch_clears_the_retirement(tmp_path):
+    """退休名单只针对上一个 agent，不能把之后的派发也永久拒掉。"""
+    project, data = bind(tmp_path, "retire"), tmp_path / "data"
+    run_a_batch(project, data, agent_id="a1")
+    H.handle(event("UserPromptSubmit", project, prompt="再做事"), data, PROTOCOL)
+    H.handle(event("Stop", project), data, PROTOCOL)
+    H.handle(event("PreToolUse", project, tool_name="Agent",
+                   tool_input={"prompt": f"{H.RECORDER_MARKER} 干活"}), data, PROTOCOL)
+    H.handle(event("SubagentStart", project, agent_id="a2"), data, PROTOCOL)
+    # a2 正在跑，这一轮不该再派
+    again = H.handle(event("Stop", project, background_tasks=[{"id": "a2", "status": "running"}]),
+                     data, PROTOCOL)
+    assert again is None
