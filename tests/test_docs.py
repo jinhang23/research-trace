@@ -20,6 +20,9 @@ DOCS = {
     "skills/research-trace/SKILL.md": (
         ROOT / "skills" / "research-trace" / "SKILL.md"
     ).read_text(encoding="utf-8"),
+    # 新文档一样要被漂移守卫覆盖：命令、环境变量、REST 路径都会对着代码核。
+    "docs/DESIGN.md": (ROOT / "docs" / "DESIGN.md").read_text(encoding="utf-8"),
+    "CHANGELOG.md": (ROOT / "CHANGELOG.md").read_text(encoding="utf-8"),
 }
 CODE = "\n".join(
     path.read_text(encoding="utf-8")
@@ -165,3 +168,16 @@ def test_the_skill_has_the_frontmatter_that_makes_it_loadable():
     # 触发词是这份 skill 唯一的入口，中英文都得有
     assert "之前试过什么" in description.group(1)
     assert "provenance" in description.group(1)
+
+
+def test_no_document_links_to_a_file_that_does_not_exist():
+    """文档之间互相指路，指错了比不指更糟 —— 读的人会以为那份东西不存在。"""
+    broken = []
+    for name in DOCS:
+        source = ROOT / name
+        for text, target in re.findall(r"\[([^\]]+)\]\(([^)]+)\)", DOCS[name]):
+            if target.startswith(("http://", "https://", "#", "mailto:")):
+                continue
+            if not (source.parent / target.split("#")[0]).exists():
+                broken.append(f"{name}: [{text}]({target})")
+    assert not broken, "断链:\n" + "\n".join(broken)
