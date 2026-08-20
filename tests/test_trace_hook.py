@@ -50,6 +50,23 @@ def pending(data: Path) -> list[Path]:
     return sorted((session_root(data) / "pending").glob("*.json"))
 
 
+def test_plugin_manifest_does_not_redeclare_the_standard_hooks_file():
+    """manifest.hooks 只用来指向**额外的** hook 文件。
+
+    hooks/hooks.json 是标准路径，Claude Code 会自动加载；在 manifest 里再声明一次
+    等于同一个文件加载两次，插件会以 "Duplicate hooks file detected" 整体加载失败 ——
+    hook 不注册，MCP server 也起不来。这是加载期行为，manifest 的 schema 校验查不出来，
+    所以在这里守着。
+    """
+    manifest = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+    declared = manifest.get("hooks")
+    entries = [declared] if isinstance(declared, str) else list(declared or [])
+    standard = {"hooks/hooks.json", "./hooks/hooks.json"}
+    assert not (standard & {str(entry).strip() for entry in entries}), (
+        "plugin.json 不要声明 hooks/hooks.json —— 它是自动加载的"
+    )
+
+
 def test_plugin_hooks_cover_the_loss_boundaries_and_reuse_configured_python():
     config = json.loads((ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
     required = {
