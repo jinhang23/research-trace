@@ -15,7 +15,7 @@
         "repo": "jinhang23/research-trace"
       },
       "description": "永久保存可见的 agent 历史，并由 Recorder 只整理有长期价值的想法、论文、数据、实验、失败和关键实现。提供 7 个 MCP 工具：6 个研究工具和 trace_login GitHub 账号设备登录。",
-      "version": "2.0.0-alpha.7",
+      "version": "2.0.0-alpha.8",
       "category": "research",
       "tags": [
         "research",
