@@ -19,8 +19,17 @@ Git 仓库是可验证的灾备副本。
 ```bash
 python -m pip install -e ".[server]"
 trace-server --data-dir /srv/research-trace/data \
+  --backup-repo /srv/research-trace/private-backup \
   --host 127.0.0.1 --port 8765 --token "<long-random-token>"
 ```
+
+**`--backup-repo` 是必填的**（或环境变量 `TRACE_BACKUP_REPO`）。不给就拒绝启动 ——
+默认能跑起来的话，每个部署都会默默停在「唯一副本在一块盘上」这个状态，而这件事通常
+要到盘坏了才被发现。那个仓库的 remote **必须是私有的**：导出里带完整原始 transcript。
+只有指定的子目录会被 stage 和 commit，所以指向一个你已经在用的仓库不会把它其它改动卷进来。
+
+本地试用或一次性实例可以明确说不要：`--no-backup`（或 `TRACE_NO_BACKUP=true`）。
+它会在启动时打印一段醒目的警告，这是有意的。
 
 不配置 OAuth 时，浏览器打开 `http://127.0.0.1:8765/`；读取兼容旧的公开模式，写操作使用
 Bearer token。团队部署应按下一节配置 GitHub OAuth 和 HTTPS。启用后，Project、原始历史、
