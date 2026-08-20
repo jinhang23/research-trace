@@ -181,6 +181,11 @@ def project_binding(cwd: str | os.PathLike[str] | None = None) -> dict[str, Any]
         "workspace_key": keys[0] if keys else None,
         "project_id": project_id,
         "project_name": str(value.get("project_name") or "").strip() or None,
+        # 每处理几个批次重新 fork 一次 Recorder。放 marker 而不是插件配置项：插件配置项走
+        # hooks.json 的 `${user_config.…}` 展开，而**未设置的选项会让整个 hook 执行失败** ——
+        # 老安装升级上来时 settings 里根本没有这个键，结果是采集全停。marker 缺这个键就用
+        # 默认值，不会有任何东西展开失败。顺带它也确实该按项目走。
+        "recorder_fork_window": str(value.get("recorder_fork_window") or "").strip() or None,
     }
 
 

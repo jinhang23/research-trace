@@ -245,17 +245,29 @@ Recorder 以 fork 方式继承主 agent **此刻**的完整上下文 —— 这�
 那种 token，但底数不是零）。
 
 而实测下来很多批次的全部内容就是「某个子 agent 结束了」（一份真实样本里，137 个采集事件中
-`SubagentStop` 占 56 个），为这种批次付一次完整 fork 不划算。插件配置项
-`recorder_fork_window` 控制这个节奏：
+`SubagentStop` 占 56 个），为这种批次付一次完整 fork 不划算。在项目 marker
+（`.research-trace.json`）里加一个键控制这个节奏：
+
+```json
+{
+  "schema": "research-trace.project.v1",
+  "workspace_key": "rt-ws-…",
+  "capture": true,
+  "recorder_fork_window": "4"
+}
+```
 
 | 取值 | 含义 |
 |---|---|
-| `1`（默认） | 每批都重新 fork，最新鲜 |
+| 不写（默认） | 每批都重新 fork，最新鲜 |
 | `4` | 每 4 批 fork 一次，窗口内复用；上下文逐渐变旧，省下那些读取 |
 | `0` | 整个会话只 fork 一次，最省也最旧 |
 
-环境变量 `TRACE_RECORDER_FORK_WINDOW` 同样生效；旧的 `TRACE_RECORDER_REUSE=1` 继续认，
-等价于 `0`。
+环境变量 `TRACE_RECORDER_FORK_WINDOW` 同样生效；旧的 `TRACE_RECORDER_REUSE=1` 等价于 `0`。
+
+**为什么不是插件配置项**：插件配置项在 `hooks.json` 里走 `${user_config.…}` 展开，
+而**未设置的选项会让整个 hook 执行失败** —— 不是降级，是采集全停。升级上来的机器
+settings 里没有新键，就会集体停摆。marker 是 hook 本来就要读的东西，缺键即默认值。
 
 ## 4. 安装 Claude Code 插件
 

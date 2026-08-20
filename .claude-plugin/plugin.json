@@ -1,7 +1,7 @@
 {
   "name": "research-trace",
   "displayName": "Research Trace",
-  "version": "2.0.0-alpha.10",
+  "version": "2.0.0-alpha.11",
   "description": "团队研究与项目记忆：采集按项目绑定（`trace-project bind`），只记录你显式绑定过的项目。永久保存可见的 agent 历史，由 Recorder 精选想法、论文、数据理解、实验、失败和关键实现为 Project / Overview / Chapter / Node。提供 7 个 MCP 工具：6 个研究工具和 trace_login 账号设备登录。",
   "author": {
     "name": "Jinhang Wei"
@@ -40,12 +40,6 @@
       "title": "Python 解释器",
       "description": "Python 3.10+ 的绝对路径最可靠。Windows/conda/HPC 上运行 `python -c \"import sys; print(sys.executable)\"` 获取当前环境的绝对路径；配置后可运行 trace_mcp.py --selfcheck 验证。",
       "default": "python3"
-    },
-    "recorder_fork_window": {
-      "type": "string",
-      "title": "Recorder 重新 fork 的间隔（批次数）",
-      "description": "每处理多少个批次重新 fork 一次 Recorder。1 = 每批都拿当下的完整上下文（最新鲜，但每次约 60 万 token 的缓存读取）；调大则在窗口内复用同一个 Recorder，它手里的上下文会逐渐变旧，但省下那些读取。0 或留空 = 整个会话只 fork 一次。实测缓存命中率 99.7–99.9%，所以这是「多久付一次便宜的读取」，不是「算不算得起」。",
-      "default": "1"
     }
   },
   "mcpServers": {
