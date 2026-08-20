@@ -238,6 +238,25 @@ trace-project status --url https://trace.example.org
 - **先有人登录过网页。** 批准页要求一个已登录、且在白名单里的 GitHub 账号。
 - **写入要 member 或 admin。** `reader` 角色的设备凭证读得到、写不了（403）。
 
+### Recorder 多久重新 fork 一次
+
+Recorder 以 fork 方式继承主 agent **此刻**的完整上下文 —— 这是它知道「刚才发生了什么」的
+唯一途径。代价是每次 fork 首轮读入约 60 万 token（实测缓存命中率 99.7–99.9%，所以是便宜的
+那种 token，但底数不是零）。
+
+而实测下来很多批次的全部内容就是「某个子 agent 结束了」（一份真实样本里，137 个采集事件中
+`SubagentStop` 占 56 个），为这种批次付一次完整 fork 不划算。插件配置项
+`recorder_fork_window` 控制这个节奏：
+
+| 取值 | 含义 |
+|---|---|
+| `1`（默认） | 每批都重新 fork，最新鲜 |
+| `4` | 每 4 批 fork 一次，窗口内复用；上下文逐渐变旧，省下那些读取 |
+| `0` | 整个会话只 fork 一次，最省也最旧 |
+
+环境变量 `TRACE_RECORDER_FORK_WINDOW` 同样生效；旧的 `TRACE_RECORDER_REUSE=1` 继续认，
+等价于 `0`。
+
 ## 4. 安装 Claude Code 插件
 
 ```text
