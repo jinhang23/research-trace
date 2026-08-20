@@ -439,6 +439,28 @@ trace-server --data-dir /srv/research-trace/data \
 服务启动后会先执行一次，随后按间隔导出、校验、仅在内容变化时 commit，并用普通 push
 上传；不会 force-push。失败不会阻断记录服务，状态可在 `/api/health` 查看。
 
+### 和项目代码同仓
+
+备份仓库不必是专用的空仓库 —— 指向项目自己的代码仓，记录和实现就住在一起，
+`git clone` 一次同时拿到「怎么做的」和「为什么这么做」：
+
+```bash
+trace-server --data-dir /srv/research-trace/data \
+  --backup-repo /srv/checkouts/my-project \
+  --backup-subdirectory research-trace-backup --backup-branch main
+```
+
+两件事让它成立：
+
+- **只有 `--backup-subdirectory` 那一个目录会被 stage 和 commit**，所以这个工作副本里
+  别的改动不会被卷进备份提交（子目录等于仓库根时直接拒绝）。
+- **push 之前会 `fetch` 并把本轮备份 commit rebase 到远端之上**，所以别的机器往同一个
+  分支推代码不会让备份从此推不上去。真的发生冲突（有人手改了备份文件）时，rebase 会被
+  中止、这一轮报错、本地 commit 保留 —— 宁可晚一轮备份，也不把别人的提交搅乱。
+
+**代码仓必须是私有的。** 导出里带完整原始 transcript；推进一个公开仓库是不可逆的。
+不确定的话就用专用私有仓库，别和公开代码混在一起。
+
 也可以交给 cron/SLURM 定时任务单独执行：
 
 ```bash
