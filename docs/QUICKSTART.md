@@ -37,6 +37,38 @@ python -c "import sys; print(sys.executable)"
 服务只允许一个进程访问这份 SQLite 数据目录，不要启动多个 uvicorn worker，也不要让多台
 机器直接挂载同一个 SQLite 文件；所有机器都通过 HTTPS/MCP 连接这一个服务。
 
+## 1b. 挂在一个路径前缀下（可选）
+
+没有独立域名、只能借用现有站点的一段路径时，用 `--base-path`：
+
+```bash
+trace-server --data-dir /srv/research-trace/data \
+  --base-path /trace --host 127.0.0.1 --port 8765
+```
+
+**服务把整个前缀据为己有**：`/trace/...` 之外的一切都是 404，包括 `/api/health`。
+所以反向代理**不要**剥掉前缀，原样转发即可：
+
+```nginx
+location /trace/ {
+    proxy_pass http://127.0.0.1:8765;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+这条「前缀之外一律 404」不只是整洁问题：它意味着绕过反向代理直连 `:8765` 的人
+也进不去。要是让代理来剥前缀，那个端口在内网上就等于没有门。
+
+配了 OAuth 时，`TRACE_PUBLIC_URL` **必须带上同一个前缀**（`https://example.org/trace`），
+否则 GitHub 会把人回调到域名根上——那里通常是别的应用。前缀不一致时服务直接拒绝启动，
+而不是等到有人点了登录才出问题。
+
+会话 cookie 的作用域也会收敛到这个前缀。同一个域名下还跑着别的应用时这一点很重要：
+`Path=/` 的 cookie 会被浏览器发给那些应用，而它们未必是自己人。
+
+---
+
 ## 2. 配置 GitHub OAuth 网页登录
 
 先在 GitHub 的 **Settings → Developer settings → OAuth Apps → New OAuth App** 创建一个 OAuth
