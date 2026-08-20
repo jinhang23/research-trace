@@ -183,6 +183,52 @@ trace-login --url https://trace.example.org --logout
 服务端仍接受 `TRACE_TOKEN` 作为旧部署迁移兼容项，但新机器不需要配置它；共享 token 没有可
 认证的主体，因此它的写入一律按 `recorder` 处理，不能确认或纠正记录。
 
+## 3b. 客户端接入清单（照着走一遍就能记录）
+
+在一台新的工作站 / HPC 上，从零到「这个项目开始被记录」是这四步。顺序不能换：
+绑定要用登录拿到的凭证，而登录要先有人在网页上批准。
+
+```bash
+# 0) pip 包（trace-login / trace-project / trace-deliver 都来自它；插件不提供这三个命令）
+python -m pip install "research-trace @ git+https://github.com/jinhang23/research-trace"
+
+# 1) 确认没有显式 token 在挡路 —— 见下面的「最常见的一个坑」
+unset TRACE_TOKEN
+
+# 2) 设备登录：打印 8 位码，你在 <服务地址>/device 上手工输入并批准
+trace-login --url https://trace.example.org --device-name hipergator-login-01
+
+# 3) 绑定要记录的目录（会自动用上一步的凭证）
+cd /path/to/my-project
+trace-project bind --url https://trace.example.org --create --name "我的项目"
+
+# 4) 随时可以问「现在到底是哪份凭据在生效」
+trace-project status --url https://trace.example.org
+```
+
+第 4 步会先打印一行 `auth for <url>: …`，然后才是绑定信息。不确定的时候先看这一行。
+
+### 最常见的一个坑：显式 token 会**静默**盖住设备凭证
+
+`auth_token()` 是显式 token 优先。所以只要下面任何一处还有值，`trace-login` 存下的凭证
+就**根本不会被读取**：
+
+- 环境变量 `TRACE_TOKEN`（包括 shell profile 里的 `export`）；
+- Claude Code 插件配置里的 `token`；
+- 命令行 `--token`。
+
+而且这不会报错。表现是某次写入莫名其妙地 401 —— 尤其是服务端已经把那个旧的共享 token
+删掉之后。`trace-login` 现在会在登录成功时就检查环境变量并警告，`trace-project status`
+则会直接说出哪一份在生效。
+
+### 三个前提
+
+- **URL 三处必须一致。** 凭证在文件里是**按服务 URL 索引**的，`trace-login`、插件配置和
+  `trace-deliver` 用的 URL 必须是同一个（尾随斜杠会被去掉，不用纠结）。带路径前缀的部署
+  要把前缀带上，例如 `https://example.org/trace`。
+- **先有人登录过网页。** 批准页要求一个已登录、且在白名单里的 GitHub 账号。
+- **写入要 member 或 admin。** `reader` 角色的设备凭证读得到、写不了（403）。
+
 ## 4. 安装 Claude Code 插件
 
 ```text
