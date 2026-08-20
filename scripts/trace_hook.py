@@ -605,6 +605,30 @@ def _close_batch(root: Path, batch_id: str) -> None:
         pass
 
 
+def _recorder_reuse_enabled() -> bool:
+    """把整个会话的 Recorder 复用成一个（旧行为）。
+
+    默认关闭：见 SubagentStop 那一段。留这个开关是为了在提示缓存不生效的部署上
+    还能退回去，不是推荐用法。
+    """
+    return str(os.environ.get("TRACE_RECORDER_REUSE") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _remember_recorder(state: dict[str, Any], agent_id: str | None) -> None:
+    """记下当前 Recorder 的 agent id，但**退休过的不许复活**。
+
+    同一次派发会产生多个事件（PreToolUse / SubagentStart / SubagentStop /
+    PostToolUse），而它们的先后顺序由 harness 决定。SubagentStop 之后如果还收到
+    那次派发的 PostToolUse，照原样写回去就会把「已经结束、下一批重新 fork」
+    悄悄改回「复用这个已经停掉的 agent」——下一批于是被 SendMessage 发给一个死掉的
+    Recorder。只在某一种事件顺序下才正确的实现是脆的。
+    """
+    agent_id = str(agent_id or "")
+    if not agent_id or agent_id == str(state.get("retired_recorder_id") or ""):
+        return
+    state["recorder_agent_id"] = agent_id
+
+
 def _is_trace_orchestration(
     root: Path, payload: dict[str, Any], state: dict[str, Any]
 ) -> bool:
@@ -618,19 +642,18 @@ def _is_trace_orchestration(
 
     if event == "PreToolUse" and tool == "Agent" and RECORDER_MARKER in tool_blob:
         state["pending_recorder_spawn"] = _now()
+        state.pop("retired_recorder_id", None)   # 新的一次派发，退休名单清零
         return True
 
     if event == "SubagentStart" and state.get("pending_recorder_spawn"):
         agent_id = payload.get("agent_id")
         if agent_id:
-            state["recorder_agent_id"] = str(agent_id)
+            _remember_recorder(state, agent_id)
             state.pop("pending_recorder_spawn", None)
             return True
 
     if event == "PostToolUse" and tool == "Agent" and RECORDER_MARKER in tool_blob:
-        agent_id = _extract_agent_id(payload.get("tool_response"))
-        if agent_id:
-            state["recorder_agent_id"] = agent_id
+        _remember_recorder(state, _extract_agent_id(payload.get("tool_response")))
         state.pop("pending_recorder_spawn", None)
         return True
 
@@ -646,6 +669,14 @@ def _is_trace_orchestration(
         # 旧实现认任何带 batch_id 的 TRACE_RECEIPT，普通子 agent 因此会被误认成 Recorder
         # 并被此后所有 Edit/Write/Bash 拒绝，主任务当场被插件挡死。
         _close_batch(root, str(state.pop("dispatched_batch", "") or ""))
+        if not _recorder_reuse_enabled():
+            state["retired_recorder_id"] = recorder_id
+            # 下一批重新 fork。复用等于「保留了 fork 这个昂贵机制，却只享受了第一批的收益」：
+            # 后续批次通过 SendMessage 送过去的只有一个 manifest 路径，Recorder 手里是
+            # fork 那一刻的陈旧快照加它自己的记录历史，唯独没有这一批真正发生了什么。
+            # 而重 fork 的前缀与主 agent 完全一致，本来就该命中提示缓存 —— 边际成本是
+            # 缓存读取，不是全量重算。
+            state.pop("recorder_agent_id", None)
         return True
     if is_recorder:
         return True
