@@ -426,7 +426,7 @@ def create_app(
                 await task
             store.close()
 
-    app = FastAPI(title="Research Trace", version="2.0.0-alpha.6", lifespan=lifespan,
+    app = FastAPI(title="Research Trace", version="2.0.0-alpha.7", lifespan=lifespan,
                   root_path=base)
     app.state.base_path = base
     app.state.store = store

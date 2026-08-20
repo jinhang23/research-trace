@@ -4,6 +4,12 @@
 `research_trace/server.py`、`research_trace/mcp.py`、两个 `.claude-plugin/*.json`），
 有测试守它们一致。**改动插件包里的东西之后必须 bump**，否则已安装的机器拿不到。
 
+## 2.0.0-alpha.7
+
+- README 从 383 行精简到 188 行，中间补一段外行也能看懂的机制讲解（hook / 投递器 /
+  Recorder / 中央服务各管什么）。设计理念移到 `docs/DESIGN.md`，没有删。
+- 新增本文件，以及文档断链守卫。纯文档版本，没有行为变化。
+
 ## 2.0.0-alpha.6
 
 - **Recorder 每一批都重新 fork**，拿当下的完整上下文。此前只有第一批享受到 fork 的
