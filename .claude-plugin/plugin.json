@@ -7,7 +7,6 @@
   "homepage": "https://github.com/jinhang23/research-trace",
   "repository": "https://github.com/jinhang23/research-trace",
   "keywords": ["research", "provenance", "agent-memory", "lab-notebook", "科研", "溯源"],
-  "hooks": "./hooks/hooks.json",
   "userConfig": {
     "url": {
       "type": "string",
