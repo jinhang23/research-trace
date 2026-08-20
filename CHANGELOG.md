@@ -4,6 +4,13 @@
 `research_trace/server.py`、`research_trace/mcp.py`、两个 `.claude-plugin/*.json`），
 有测试守它们一致。**改动插件包里的东西之后必须 bump**，否则已安装的机器拿不到。
 
+## 2.0.0-alpha.9
+
+- **Recorder 重新 fork 的间隔可配**（插件配置 `recorder_fork_window`，默认 1 = 每批）。
+  依据是真实数据：一次 fork 首轮读入约 60 万 token（缓存命中率 99.7–99.9%），而很多批次
+  的全部内容就是「某个子 agent 结束了」—— 一份样本里 137 个事件中 `SubagentStop` 占 56 个。
+  为这种批次付一次完整 fork 不划算。`0` 等价于旧的 `TRACE_RECORDER_REUSE=1`。
+
 ## 2.0.0-alpha.8
 
 - **结构图密度**：卡片 184×88 → 156×52，纵向步距 142px → 78px。此前 27 条记录的画布

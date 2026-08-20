@@ -605,13 +605,28 @@ def _close_batch(root: Path, batch_id: str) -> None:
         pass
 
 
-def _recorder_reuse_enabled() -> bool:
-    """把整个会话的 Recorder 复用成一个（旧行为）。
+def _fork_window(configured: str = "") -> int:
+    """每处理多少个批次重新 fork 一次 Recorder。
 
-    默认关闭：见 SubagentStop 那一段。留这个开关是为了在提示缓存不生效的部署上
-    还能退回去，不是推荐用法。
+    fork 的意义是继承主 agent **此刻**的完整上下文。但实测下来，很多批次的全部内容
+    就是「某个子 agent 结束了」——为这种批次付一次完整 fork 不划算：实测一次 fork
+    首轮读入约 60 万 token（命中率 99.7–99.9%，所以是便宜的那种 token，但底数不是零）。
+
+    1 = 每批都重新 fork（最新鲜）。调大 = 窗口内复用同一个 Recorder，它的上下文逐渐
+    变旧，但省下那些读取。0 / 空 / 非数字 = 整个会话只 fork 一次（最省，最旧）。
     """
-    return str(os.environ.get("TRACE_RECORDER_REUSE") or "").strip().lower() in {"1", "true", "yes", "on"}
+    raw = str(configured or os.environ.get("TRACE_RECORDER_FORK_WINDOW") or "").strip()
+    if not raw and str(os.environ.get("TRACE_RECORDER_REUSE") or "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }:
+        return 0                      # 老开关继续认，等价于「整个会话只 fork 一次」
+    if not raw:
+        return 1
+    try:
+        value = int(raw)
+    except ValueError:
+        return 1
+    return max(0, value)
 
 
 def _remember_recorder(state: dict[str, Any], agent_id: str | None) -> None:
@@ -669,7 +684,10 @@ def _is_trace_orchestration(
         # 旧实现认任何带 batch_id 的 TRACE_RECEIPT，普通子 agent 因此会被误认成 Recorder
         # 并被此后所有 Edit/Write/Bash 拒绝，主任务当场被插件挡死。
         _close_batch(root, str(state.pop("dispatched_batch", "") or ""))
-        if not _recorder_reuse_enabled():
+        window = _fork_window(str(state.get("fork_window") or ""))
+        state["forked_batches"] = int(state.get("forked_batches") or 0) + 1
+        if window and state["forked_batches"] >= window:
+            state["forked_batches"] = 0
             state["retired_recorder_id"] = recorder_id
             # 下一批重新 fork。复用等于「保留了 fork 这个昂贵机制，却只享受了第一批的收益」：
             # 后续批次通过 SendMessage 送过去的只有一个 manifest 路径，Recorder 手里是
@@ -801,7 +819,8 @@ def _spawn_deliver(data_dir: Path, url: str, state: dict[str, Any]) -> bool:
 
 
 def handle(
-    payload: dict[str, Any], data_dir: Path, protocol_path: Path, url: str = ""
+    payload: dict[str, Any], data_dir: Path, protocol_path: Path, url: str = "",
+    fork_window: str = "",
 ) -> dict[str, Any] | None:
     """Handle one hook input. Exposed separately for deterministic tests."""
     binding = binding_for(payload)
@@ -819,6 +838,8 @@ def handle(
         state = _read_json(state_path, {})
         if not isinstance(state, dict):
             state = {}
+        if fork_window:
+            state["fork_window"] = fork_window
         _capture_transcripts(root, payload, state)
         internal = _is_trace_orchestration(root, payload, state)
         if not internal:
@@ -847,6 +868,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--data-dir", required=True)
     parser.add_argument("--protocol", required=True)
     parser.add_argument("--capture-enabled", default="on")
+    parser.add_argument("--recorder-fork-window", default="")
     parser.add_argument("--url", default=os.environ.get("TRACE_URL", ""))
     args = parser.parse_args(argv)
     if str(args.capture_enabled).strip().lower() in {"0", "false", "off", "no"}:
@@ -856,7 +878,8 @@ def main(argv: list[str] | None = None) -> int:
         payload = json.loads(raw)
         if not isinstance(payload, dict):
             return 0
-        output = handle(payload, Path(args.data_dir), Path(args.protocol), str(args.url or ""))
+        output = handle(payload, Path(args.data_dir), Path(args.protocol), str(args.url or ""),
+                        fork_window=str(args.recorder_fork_window or ""))
         if output:
             print(json.dumps(output, ensure_ascii=False, separators=(",", ":")))
     except Exception as exc:  # fail-open by design; stderr is debug-only on exit 0
