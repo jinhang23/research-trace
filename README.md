@@ -349,6 +349,13 @@ trace-backup restore \
 python -m pytest -q
 ```
 
+网页里的 markdown 渲染器另有一套断言（正文是通过 API 写进来的不可信输入，安全断言排在最前面）。
+`pytest` 会自动带上它们，装了 node 就跑、没装就跳过；也可以单独跑：
+
+```bash
+node --test tests/md.test.js
+```
+
 主要目录：
 
 ```text
