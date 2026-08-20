@@ -804,7 +804,7 @@ def deliver_once(
         "sessions": 0, "recovered": 0,
         "delivered_batches": 0, "delivered_events": 0, "delivered_chunks": 0,
         "failed_batches": 0, "unreadable": 0, "conflicts": 0, "reclaimed": 0,
-        "last_error": None, "finished_at": None, "skipped": False,
+        "last_error": None, "finished_at": None, "skipped": False, "ok": True,
     }
     if not outbox.is_dir():
         report["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -825,7 +825,9 @@ def deliver_once(
                 "wait a few seconds and run it again."
             )
             report["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            report["ok"] = False
             print("research-trace deliver: " + report["last_error"], file=sys.stderr)
+            _write_status(outbox, report)
             return report
         try:
             for session_dir in iter_session_dirs(outbox):
@@ -843,6 +845,7 @@ def deliver_once(
         stats = outbox_stats(outbox)
         report.update(stats)
         report["reported"] = report_outbox_status(resolved, bearer, stats, report, timeout)
+        report["ok"] = not (report.get("last_error") or report.get("failed_batches"))
         _write_status(outbox, report)
     return report
 
@@ -909,6 +912,7 @@ def main(argv: list[str] | None = None) -> int:
         value["last_delivery"] = _read_json(outbox / "delivery-status.json") or None
         print(json.dumps(value, ensure_ascii=False, indent=2))
         return 1 if value.get("pending") else 0
+    outbox_root = long_path(Path(args.data_dir).expanduser() / "outbox")
     while True:
         try:
             report = deliver_once(
@@ -917,8 +921,15 @@ def main(argv: list[str] | None = None) -> int:
                 retain_sent_days=args.retain_sent_days,
             )
         except Exception as exc:  # 投递器自身崩溃不能变成用户可见的失败循环
+            # 但它必须留下痕迹。hook 拉起的那个进程 stdout/stderr 都是 DEVNULL 且带
+            # --quiet，所以「投递从来没成功过」和「投递一启动就死」在 --status 里
+            # 长得一模一样（last_delivery 都是 null）。排查会因此卡住很久。
+            report = {
+                "ok": False, "last_error": str(exc), "failed_batches": 1, "url": args.url,
+                "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
             print(f"research-trace deliver failed: {exc}", file=sys.stderr)
-            report = {"last_error": str(exc), "failed_batches": 1}
+            _write_status(outbox_root, report)
         if not args.quiet:
             print(json.dumps(report, ensure_ascii=False, indent=2))
         if not args.watch:
