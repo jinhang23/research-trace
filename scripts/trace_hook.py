@@ -356,7 +356,24 @@ def _drop_thinking(value: Any, depth: int = 0) -> tuple[Any, bool]:
     return value, False
 
 
-def _scrub_line(line: bytes) -> bytes | None:
+def _remember_recorder_id(state: dict[str, Any], agent_id: str | None) -> None:
+    """记住这个会话里所有当过 Recorder 的 agent id。
+
+    只留「当前那一个」是不够的：每批重新 fork 之后 id 会换，而上一个 Recorder 的
+    transcript 尾巴可能在它退休之后才被采集到。漏掉一行就够重新点着那个反馈环。
+    """
+    agent_id = str(agent_id or "")
+    if not agent_id:
+        return
+    known = state.setdefault("recorder_ids", [])
+    if not isinstance(known, list):
+        known = []
+    if agent_id not in known:
+        known.append(agent_id)
+    state["recorder_ids"] = known[-20:]
+
+
+def _scrub_line(line: bytes, recorder_ids: frozenset[str] = frozenset()) -> bytes | None:
     """一行 transcript JSONL → 允许落盘的字节；None 表示整行丢掉。
 
     绝大多数行不含 `thinking` 字样，走字节判断直接原样返回，完全不进 JSON 解析器，
@@ -364,6 +381,21 @@ def _scrub_line(line: bytes) -> bytes | None:
     含该字样但解析不了的行不能放行（无法确认里面没有隐藏推理），也不能静默消失，
     所以换成一条只有长度和 hash 的占位记录：留下缺口证据，不留下原文。
     """
+    # Recorder 自己的回合不是研究材料，而且它们跟事件层走的是两条路：事件被
+    # _is_trace_orchestration 挡住了，transcript 却是照单全收的。而 fork 的回合就写在
+    # 同一个 transcript 文件里，于是「recorder 跑完 → transcript 变长 → 新 chunk →
+    # `events or chunks` 成立 → 新 batch → 再派一个 fork」自己转起来，每转一圈烧掉
+    # 一次完整 fork，产出恒为 0。这里断掉的就是那个环。
+    for agent_id in recorder_ids:
+        if agent_id.encode("utf-8") not in line:
+            continue                      # 快路径：id 的字节都不在这行里，不必解析
+        try:
+            value = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            break                         # 解析不了就交给下面的 thinking 逻辑处理
+        if isinstance(value, dict) and str(value.get("agentId") or "") == agent_id:
+            return None
+        break
     if THINKING_HINT not in line:
         return line
     try:
@@ -386,7 +418,9 @@ def _scrub_line(line: bytes) -> bytes | None:
     return json.dumps(scrubbed, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
 
 
-def _read_scrubbed(stream: Any, remaining: int, chunk_size: int) -> tuple[int, bytes]:
+def _read_scrubbed(
+    stream: Any, remaining: int, chunk_size: int, recorder_ids: frozenset[str] = frozenset()
+) -> tuple[int, bytes]:
     """读若干完整行，返回 (从源文件消耗的字节数, 清理后要落盘的字节)。
 
     消耗量按源文件计，落盘量按清理后计，两者故意分开：cursor 因此不受剥离影响。
@@ -399,7 +433,7 @@ def _read_scrubbed(stream: Any, remaining: int, chunk_size: int) -> tuple[int, b
         if not line or not line.endswith(b"\n"):
             break
         consumed += len(line)
-        scrubbed = _scrub_line(line)
+        scrubbed = _scrub_line(line, recorder_ids)
         if scrubbed:
             parts.append(scrubbed)
     return consumed, b"".join(parts)
@@ -421,6 +455,9 @@ def _capture_transcripts(
     agent_path = payload.get("agent_transcript_path")
     if isinstance(agent_path, str) and agent_path.strip():
         candidates.append((agent_path, str(payload.get("agent_id") or "") or None))
+
+    known = state.get("recorder_ids")
+    recorder_ids = frozenset(str(x) for x in known if str(x)) if isinstance(known, list) else frozenset()
 
     cursors = state.setdefault("transcript_offsets", {})
     if not isinstance(cursors, dict):
@@ -444,7 +481,8 @@ def _capture_transcripts(
                 stream.seek(start)
                 offset = start
                 while offset < size:
-                    consumed, raw = _read_scrubbed(stream, size - offset, chunk_size)
+                    consumed, raw = _read_scrubbed(
+                        stream, size - offset, chunk_size, recorder_ids)
                     if consumed == 0:
                         break
                     end = offset + consumed
@@ -664,11 +702,13 @@ def _is_trace_orchestration(
         agent_id = payload.get("agent_id")
         if agent_id:
             _remember_recorder(state, agent_id)
+            _remember_recorder_id(state, agent_id)
             state.pop("pending_recorder_spawn", None)
             return True
 
     if event == "PostToolUse" and tool == "Agent" and RECORDER_MARKER in tool_blob:
         _remember_recorder(state, _extract_agent_id(payload.get("tool_response")))
+        _remember_recorder_id(state, _extract_agent_id(payload.get("tool_response")))
         state.pop("pending_recorder_spawn", None)
         return True
 
