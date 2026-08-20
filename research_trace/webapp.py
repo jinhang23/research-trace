@@ -1884,6 +1884,18 @@ main.workspace-mode {
 }
 .chapter-map-title:hover { color: var(--accent-strong); background: #fff; }
 .chapter-map-title span { color: var(--muted); font-size: 10px; font-weight: 500; }
+/* 列表的装订线。行高必须和 railSvg 拿到的那个数一致，否则点会对不上行。 */
+.record-rail { display: flex; align-items: flex-start; gap: 2px; }
+.record-rail-gutter { flex: 0 0 auto; padding-top: 0; }
+.record-rail .record-list { flex: 1; min-width: 0; }
+.record-rail .record-row { min-height: 58px; height: 58px; box-sizing: border-box; }
+.rail { display: block; overflow: visible; }
+.rail .rail-edge { fill: none; stroke: #9eafa9; stroke-width: 1.5; }
+.rail .rail-dot { fill: #fff; stroke: #7f948e; stroke-width: 1.6; }
+.rail .rail-dot.confirmed { fill: var(--accent); stroke: var(--accent); }
+.rail .rail-dot.needs-review,
+.rail .rail-dot.corrected { fill: #fff; stroke: #a94d55; stroke-width: 2; }
+
 .graph-viewport { min-width: 100%; }
 .graph-canvas { position: relative; }
 .graph-edges {
@@ -1901,13 +1913,13 @@ main.workspace-mode {
 .graph-node {
   position: absolute;
   display: flex;
-  width: 184px;
-  height: 88px;
+  width: 156px;
+  height: 52px;
   flex-direction: column;
   align-items: stretch;
-  justify-content: flex-start;
-  gap: 4px;
-  padding: 9px 10px;
+  justify-content: center;
+  gap: 2px;
+  padding: 6px 9px;
   overflow: hidden;
   border: 1px solid #cbd5d1;
   border-radius: 9px;
@@ -1926,25 +1938,27 @@ main.workspace-mode {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 6px;
   color: var(--muted);
-  font: 9px/1.25 ui-monospace, SFMono-Regular, Consolas, monospace;
+  font: 8.5px/1.2 ui-monospace, SFMono-Regular, Consolas, monospace;
 }
+/* 卡片矮下来之后，日期是这里最没用的一段：图本来就是按时间排的，
+   而标题被挤成一行会真的看不懂。让日期先走。 */
+.graph-node-meta time { display: none; }
 .graph-node strong {
   display: -webkit-box;
   overflow: hidden;
-  font-size: 12px;
-  font-weight: 630;
-  line-height: 1.35;
+  font-size: 11.5px;
+  font-weight: 620;
+  line-height: 1.3;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
 }
 .graph-node-state {
-  margin-top: auto;
   overflow: hidden;
   color: var(--muted);
-  font-size: 9px;
-  line-height: 1.2;
+  font-size: 8.5px;
+  line-height: 1.15;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -3317,11 +3331,14 @@ function layoutGraphNodes(inputNodes) {
   roots.forEach(root => place(root, 0));
   nodes.filter(node => !visited.has(node.id)).forEach(node => place(node, 0));
 
-  const cardWidth = 184;
-  const cardHeight = 88;
-  const gapX = 26;
-  const gapY = 54;
-  const padding = 20;
+  // 结构图的用处是「一眼看出形状」。此前 184×88 的卡片加 54 的纵向间距 = 142px 步距，
+  // 27 条记录就是 2000px 高的画布，而它住在一个 ~640px 宽的栏里 —— 一屏只看得到四个节点，
+  // 要看出形状得上下滚半天，那就不是图了。压到 78px 步距，同样的树一屏能看完大半。
+  const cardWidth = 156;
+  const cardHeight = 52;
+  const gapX = 18;
+  const gapY = 26;
+  const padding = 14;
   Object.values(positions).forEach(position => {
     position.left = padding + position.column * (cardWidth + gapX);
     position.top = padding + position.depth * (cardHeight + gapY);
@@ -3388,13 +3405,99 @@ function graphSectionHtml(chapter, nodes, showChapter = false) {
   `;
 }
 
+/* 列表左侧那条装订线的车道分配。就是 git graph 那套：一条链占一条车道，
+   分叉时新开一条，一条链走完就把车道让出来给后面的用。
+
+   这不是装饰。「延续记录 07」这种文字提示要求人一边读一边在脑子里拼出树形，
+   而一条线是直接看见的 —— 尤其是科研记录这种大部分时候是一条直链、偶尔分个叉的形状。 */
+/* 装订线的行高必须和 .record-row 的实际行高一致，否则点会一行行地错开。
+   两边引用同一个常量，别让 CSS 和 JS 各写一个数。 */
+const RAIL_ROW_HEIGHT = 58;
+
+/* === rail lanes (begin) === */
+function railLanes(ordered) {
+  const index = new Map(ordered.map((node, i) => [node.id, i]));
+  const pending = new Map(ordered.map(node => [node.id, 0]));
+  ordered.forEach(node => {
+    if (node.parent_id && pending.has(node.parent_id)) {
+      pending.set(node.parent_id, pending.get(node.parent_id) + 1);
+    }
+  });
+
+  const occupant = [];      // 每条车道当前的前沿节点
+  const debt = [];          // 这条车道上还有几个节点等着长孩子
+  const lane = new Map();
+  const edges = [];
+
+  ordered.forEach((node, row) => {
+    const parentId = node.parent_id && index.has(node.parent_id) ? node.parent_id : null;
+    // 父节点必须**已经排在前面**才算数：排序键是 (occurred_at, id)，同一毫秒内由随机 id
+    // 决定先后，所以子节点完全可能排在父节点前面。那种情况下这一行按新起点画，不画边 ——
+    // 一条指向「还没出现的行」的线只会更难懂。
+    const parent = parentId !== null && index.get(parentId) < row && lane.has(parentId)
+      ? parentId : null;
+
+    let column = -1;
+    if (parent !== null) {
+      const parentLane = lane.get(parent);
+      // 父节点还占着自己那条车道时，第一个孩子直接续上去；后面的孩子另开一条。
+      if (occupant[parentLane] === parent) column = parentLane;
+    }
+    if (column < 0) {
+      column = occupant.findIndex(item => item === null || item === undefined);
+      if (column < 0) column = occupant.length;
+    }
+
+    lane.set(node.id, column);
+    occupant[column] = node.id;
+    debt[column] = debt[column] || 0;
+    if (pending.get(node.id) > 0) debt[column] += 1;
+    if (parent !== null) {
+      edges.push({from: index.get(parent), to: row, fromLane: lane.get(parent), toLane: column});
+      pending.set(parent, pending.get(parent) - 1);
+      if (pending.get(parent) === 0) debt[lane.get(parent)] -= 1;
+    }
+
+    // 一条车道只有在「上面再没有节点等着长孩子」时才能让出去。只看当前这个节点是不是
+    // 叶子是不够的：父节点还有别的孩子没排上来时，那个孩子要从这条车道分出去，
+    // 中间这段是被占着的。放早了，后来的边会直接穿过已经画好的点，看起来像一条直链。
+    occupant.forEach((_, i) => { if (!debt[i]) occupant[i] = null; });
+  });
+
+  return {lane, edges, width: Math.max(1, occupant.length)};
+}
+/* === rail lanes (end) === */
+
+function railSvg(ordered, rowHeight) {
+  const {lane, edges, width} = railLanes(ordered);
+  const laneWidth = 13;
+  const svgWidth = width * laneWidth + 6;
+  const x = column => 6 + column * laneWidth;
+  const y = row => row * rowHeight + rowHeight / 2;
+  const parts = edges.map(edge => {
+    const x1 = x(edge.fromLane), x2 = x(edge.toLane);
+    const y1 = y(edge.from), y2 = y(edge.to);
+    if (x1 === x2) return `<path class="rail-edge" d="M${x1} ${y1}V${y2}"/>`;
+    // 换道时走一个圆角肘弯，和 git graph 里并线的形状一致，不用另外教人认。
+    const radius = Math.min(laneWidth, rowHeight / 2);
+    const dir = x2 > x1 ? 1 : -1;
+    return `<path class="rail-edge" d="M${x1} ${y1}V${y2 - radius}Q${x1} ${y2} ${x1 + dir * radius} ${y2}H${x2}"/>`;
+  });
+  const dots = ordered.map((node, row) => {
+    const [reviewClass] = nodeReview(node);
+    return `<circle class="rail-dot ${reviewClass}" cx="${x(lane.get(node.id))}" cy="${y(row)}" r="3.4"/>`;
+  });
+  return `<svg class="rail" width="${svgWidth}" height="${ordered.length * rowHeight}"
+    viewBox="0 0 ${svgWidth} ${ordered.length * rowHeight}" aria-hidden="true">${parts.join('')}${dots.join('')}</svg>`;
+}
+
 function listSectionHtml(chapter, nodes, showChapter = false) {
   const ordered = [...nodes].sort(nodeOrder);
   const ordinal = new Map(ordered.map((node, index) => [node.id, String(index + 1).padStart(2, '0')]));
   return `
     <section class="chapter-map record-group ${showChapter ? 'grouped' : ''}">
       ${showChapter ? `<button class="chapter-map-title" type="button" data-focus-chapter="${esc(chapter.id)}">${esc(chapter.name)}<span>${ordered.length} 条</span></button>` : ''}
-      ${ordered.length ? `<div class="record-list">${ordered.map((node, index) => {
+      ${ordered.length ? `<div class="record-rail"><div class="record-rail-gutter">${railSvg(ordered, RAIL_ROW_HEIGHT)}</div><div class="record-list">${ordered.map((node, index) => {
         const [reviewClass, reviewLabel] = nodeReview(node);
         const selected = S.selectedNodeId === node.id;
         return `
@@ -3405,7 +3508,7 @@ function listSectionHtml(chapter, nodes, showChapter = false) {
             <span class="record-state">${esc(reviewLabel)}</span>
           </button>
         `;
-      }).join('')}</div>` : '<div class="structure-empty">这个 Chapter 还没有记录。</div>'}
+      }).join('')}</div></div>` : '<div class="structure-empty">这个 Chapter 还没有记录。</div>'}
     </section>
   `;
 }
