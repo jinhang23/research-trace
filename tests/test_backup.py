@@ -62,6 +62,20 @@ def one_file(root, name):
     return matches[0]
 
 
+def project_nodes(store, project):
+    """按排序契约取回节点。
+
+    排序是 (occurred_at, id)，而 populated_store 的两个节点几乎总是落在同一毫秒里，
+    id 又是随机的 —— 所以「第 0 个就是先建的那个」不成立，每次跑都可能换个顺序。
+    要断言的是「恢复出来的库和源库一致」，不是硬编码某个创建顺序。
+    """
+    return store.get_project(project["id"])["nodes"]
+
+
+def node_by_title(store, project, title):
+    return next(node for node in project_nodes(store, project) if node["title"] == title)
+
+
 def populated_store(path):
     store = Store(path)
     project = store.create_project("RNA project", overview="Current understanding")
@@ -168,9 +182,10 @@ def test_backup_is_deterministic_verified_and_restores_an_empty_store(tmp_path):
     result = restore_backup(target, restored)
     assert result["restored"] is True
     assert restored.health()["counts"] == source.health()["counts"]
-    detail = restored.get_project(project["id"])
-    assert [node["title"] for node in detail["nodes"]] == ["Inspect counts", "Check confounding"]
-    assert detail["nodes"][1]["parent_id"] == detail["nodes"][0]["id"]
+    assert ([(node["id"], node["title"], node["parent_id"]) for node in project_nodes(restored, project)]
+            == [(node["id"], node["title"], node["parent_id"]) for node in project_nodes(source, project)])
+    child = node_by_title(restored, project, "Check confounding")
+    assert child["parent_id"] == node_by_title(restored, project, "Inspect counts")["id"]
     assert restored.search("raw history", project_id=project["id"])[0]["scope"] == "transcript"
 
 
@@ -305,7 +320,9 @@ def test_restore_merges_volumes_in_any_order(tmp_path):
     result = restore_backup(target, restored)
     assert set(result["volumes"]) == {entry["volume"] for entry in index["volumes"]}
     assert restored.health()["counts"] == store.health()["counts"]
-    assert restored.get_project(project["id"])["nodes"][1]["parent_id"] is not None
+    assert ([(node["id"], node["parent_id"]) for node in project_nodes(restored, project)]
+            == [(node["id"], node["parent_id"]) for node in project_nodes(store, project)])
+    assert node_by_title(restored, project, "Check confounding")["parent_id"] is not None
 
 
 def test_a_backup_written_in_the_previous_format_still_verifies_and_restores(tmp_path):
@@ -404,7 +421,8 @@ def test_backup_tree_survives_a_clone_with_core_autocrlf_true(tmp_path):
     verify_backup(cloned)
     restored = Store(tmp_path / "restored")
     restore_backup(cloned, restored)
-    assert restored.get_project(project["id"])["nodes"][0]["title"] == "Inspect counts"
+    assert ([node["title"] for node in project_nodes(restored, project)]
+            == [node["title"] for node in project_nodes(store, project)])
 
 
 @requires_git
@@ -434,7 +452,7 @@ def test_a_commit_left_unpushed_by_a_failed_push_is_retried_next_round(tmp_path)
 
 def test_one_missing_attachment_object_does_not_abort_the_whole_export(tmp_path):
     store, project = populated_store(tmp_path / "source")
-    node_id = store.get_project(project["id"])["nodes"][1]["id"]
+    node_id = node_by_title(store, project, "Check confounding")["id"]
     kept = store.attach(
         project["id"], target_type="node", target_id=node_id, name="keep.txt",
         data_base64=base64.b64encode(b"still here").decode("ascii"), mime_type="text/plain",
