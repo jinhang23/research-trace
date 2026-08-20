@@ -53,13 +53,43 @@ def csrf_token(session_secret: str, raw_session: str) -> str:
     ).digest())
 
 
-def safe_return_to(value: str | None) -> str:
-    value = str(value or "/").strip()
+def normalize_base_path(value: str | None) -> str:
+    """把挂载前缀归一成 "" 或 "/前缀"（有前导斜杠、无尾随斜杠）。
+
+    服务和 OAuth 校验必须用同一份定义，否则「public URL 的路径要等于 base path」
+    这条检查会在两种写法（有无尾随斜杠）之间莫名其妙地不成立。
+    """
+    value = str(value or "").strip()
+    if not value or value == "/":
+        return ""
+    # 校验必须在补前导斜杠**之前**：给 "https://x/y" 补成 "/https://x/y" 之后，
+    # urlparse 就再也看不出它原本是个绝对 URL 了。
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
+        raise ValueError("base path must be a plain path such as /trace")
+    if value.startswith("//") or "\\" in value:
+        raise ValueError("base path must be a single absolute path segment chain")
+    if not value.startswith("/"):
+        value = "/" + value
+    return value.rstrip("/")
+
+
+def safe_return_to(value: str | None, base_path: str = "") -> str:
+    """登录后要跳回哪里。任何可疑取值都退回站点首页。
+
+    挂在前缀下时首页是 base_path + "/"，不是域名根 —— 退回 "/" 会把人踢到
+    同一个域名上的**别的**应用去，那不是这个站点的首页。
+    """
+    base = normalize_base_path(base_path)
+    home = base + "/" if base else "/"
+    value = str(value or home).strip()
     if (
         not value.startswith("/") or value.startswith("//") or "\\" in value
         or any(ord(character) < 32 or ord(character) == 127 for character in value)
     ):
-        return "/"
+        return home
+    if base and value != base and not value.startswith(base + "/"):
+        return home
     return value
 
 
@@ -228,6 +258,7 @@ class GitHubOAuthConfig:
         client_secret: str | None,
         public_url: str | None,
         session_secret: str | None,
+        base_path: str = "",
         admins: str | set[str] | list[str] | tuple[str, ...] | None = None,
         allowed_users: str | set[str] | list[str] | tuple[str, ...] | None = None,
         allowed_org: str | None = None,
@@ -249,8 +280,14 @@ class GitHubOAuthConfig:
         parsed = urllib.parse.urlparse(public_url_value)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.query or parsed.fragment:
             raise ValueError("GitHub OAuth public URL must be an absolute http(s) origin")
-        if parsed.path not in {"", "/"}:
-            raise ValueError("GitHub OAuth public URL must not include a path")
+        # 站点挂在前缀下时，public URL 必须带上同一个前缀 —— callback_url 是从它派生的，
+        # 少了前缀 GitHub 会把人回调到域名根上（那里通常是别的应用）。
+        base = normalize_base_path(base_path)
+        if normalize_base_path(parsed.path) != base:
+            raise ValueError(
+                "GitHub OAuth public URL path must match the service base path"
+                f" ({base or '/'})"
+            )
         is_loopback = (parsed.hostname or "").lower() in {"127.0.0.1", "localhost", "::1"}
         if parsed.scheme != "https" and not (insecure_cookies and is_loopback):
             raise ValueError("GitHub OAuth requires HTTPS (HTTP is allowed only for loopback development)")

@@ -1,5 +1,9 @@
 """Dependency-free Research Trace web client embedded by the service."""
 
+#: 页面里所有指回本服务的地址都从这个占位符派生。挂在域名根时它渲染成空串，
+#: 于是 BASE + '/api/x' 还是 '/api/x' —— 根部署的行为一个字节都没变。
+BASE_PLACEHOLDER = "__TRACE_BASE__"
+
 INDEX_HTML = r'''<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -2263,7 +2267,7 @@ main.workspace-mode {
 <a class="skip-link" href="#main">跳到主要内容</a>
 <header class="top-shell">
   <div class="top">
-    <a class="brand" href="/" aria-label="Research Trace 首页">
+    <a class="brand" href="__TRACE_BASE__/" aria-label="Research Trace 首页">
       <span class="brand-mark" aria-hidden="true">
         <svg class="icon" viewBox="0 0 24 24">
           <circle cx="6" cy="6" r="2.2"></circle>
@@ -2385,6 +2389,10 @@ const ICONS = {
 };
 const icon = name => ICONS[name] || '';
 
+/* 服务可以挂在一个路径前缀下（trace-server --base-path）。页面里每一个指回本服务的
+   地址都要带上它；根部署时它是空串，拼接结果与从前完全一致。 */
+const BASE = '__TRACE_BASE__';
+
 function headers(write = false) {
   const result = {'Content-Type': 'application/json', 'X-Trace-Actor': S.actor};
   if (!S.authEnabled && S.token) result.Authorization = 'Bearer ' + S.token;
@@ -2393,7 +2401,7 @@ function headers(write = false) {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
+  const response = await fetch(BASE + path, {
     ...options,
     headers: {
       ...headers(Boolean(options.method && options.method !== 'GET')),
@@ -2407,7 +2415,7 @@ async function api(path, options = {}) {
     catch { value = {error: raw}; }
   }
   if (response.status === 401 && S.authEnabled) {
-    location.href = '/auth/github/login?return_to=' +
+    location.href = BASE + '/auth/github/login?return_to=' +
       encodeURIComponent(location.pathname + location.search);
     throw Error('登录已过期，正在重新登录');
   }
@@ -2711,7 +2719,7 @@ function nodeHtml(node) {
     <div class="artifact">
       ${icon('file')}
       <div><strong>${esc(directionLabels[artifact.direction] || artifact.direction)}</strong> ·
-        ${artifact.object_path ? `<a href="/api/attachments/${encodeURIComponent(artifact.id)}/content">${esc(artifact.name)}</a>` : esc(artifact.name)}
+        ${artifact.object_path ? `<a href="${BASE}/api/attachments/${encodeURIComponent(artifact.id)}/content">${esc(artifact.name)}</a>` : esc(artifact.name)}
         ${artifact.external_path ? ' · ' + esc(artifact.machine || '') + ':' + esc(artifact.external_path) : ''}
         ${artifact.uri ? ' · ' + esc(artifact.uri) : ''}
       </div>
@@ -4058,11 +4066,12 @@ async function bootstrap() {
   const config = await api('/api/auth/config');
   S.authEnabled = config.enabled;
   if (S.authEnabled) {
-    const response = await fetch('/api/auth/me', {headers: {Accept: 'application/json'}});
+    const response = await fetch(BASE + '/api/auth/me', {headers: {Accept: 'application/json'}});
     if (!response.ok) {
       setAccountLabel('GitHub 登录');
       $('#tokenBtn').onclick = () => {
-        location.href = '/auth/github/login?return_to=/';
+        location.href = BASE + '/auth/github/login?return_to='
+          + encodeURIComponent(BASE + '/');
       };
       $('#sidebar').hidden = true;
       $('.layout').style.gridTemplateColumns = '1fr';
@@ -4073,7 +4082,7 @@ async function bootstrap() {
             <span class="section-icon login-icon">${icon('user')}</span>
             <h2>登录 Research Trace</h2>
             <p>使用获准的 GitHub 账户访问团队研究记录。</p>
-            <a class="btn primary" href="/auth/github/login?return_to=/">使用 GitHub 登录</a>
+            <a class="btn primary" href="${BASE}/auth/github/login?return_to=${encodeURIComponent(BASE + '/')}">使用 GitHub 登录</a>
           </div>
         </div>
       `;
@@ -4094,3 +4103,8 @@ bootstrap().catch(error => {
 </script>
 </body>
 </html>'''
+
+
+def render_index(base_path: str = "") -> str:
+    """按挂载前缀渲染首页。base_path 为空即根部署，渲染结果与模板逐字节相同。"""
+    return INDEX_HTML.replace(BASE_PLACEHOLDER, base_path or "")
