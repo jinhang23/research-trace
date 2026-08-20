@@ -60,3 +60,23 @@ def test_markdown_renderer_assertions_pass_under_node():
     )
     assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-2000:]
     assert "# fail 0" in result.stdout
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="没装 node")
+def test_rail_lane_assertions_pass_under_node():
+    """列表装订线的车道分配。算错不会抛异常，只会画出一张读不懂的图。"""
+    result = subprocess.run(
+        [shutil.which("node"), "--test", str(ROOT / "tests" / "rail.test.js")],
+        capture_output=True, text=True, cwd=ROOT,
+    )
+    assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-2000:]
+    assert "# fail 0" in result.stdout
+
+
+def test_the_rail_row_height_is_shared_between_css_and_js():
+    """点按 RAIL_ROW_HEIGHT 定位，行高由 CSS 定 —— 两个数不一致，点就会一行行错开。"""
+    stated = re.search(r"const RAIL_ROW_HEIGHT = (\d+);", WEBAPP)
+    assert stated, "找不到 RAIL_ROW_HEIGHT"
+    css = re.search(r"\.record-rail \.record-row \{[^}]*height:\s*(\d+)px", WEBAPP)
+    assert css, "找不到 .record-rail .record-row 的固定行高"
+    assert stated.group(1) == css.group(1), f"JS {stated.group(1)} vs CSS {css.group(1)}"
