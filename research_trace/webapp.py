@@ -1016,10 +1016,7 @@ details[open] > summary .chevron { transform: rotate(180deg); }
 
 /* 原始历史的时间线。左侧一道细线 + 每条一个色点：事件类型是这里唯一稳定的结构，
    用颜色编码它，人扫一眼就能分出「我说的话 / 跑的命令 / 命令的输出 / 一轮的回答」。 */
-.raw-row {
-  position: relative;
-  padding-left: 20px;
-}
+.raw-row { position: relative; }
 .raw-row::before {                      /* 贯穿的时间线 */
   content: "";
   position: absolute;
@@ -1115,7 +1112,9 @@ details[open] > summary .chevron { transform: rotate(180deg); }
   border-top: 1px solid var(--line);
 }
 .raw-row {
-  padding: 13px 0;
+  /* 左内边距要和时间线的圆点一起改：padding 简写会把上面那条 padding-left 重置掉，
+     圆点就压在文字上了。所以只在这一处定义内边距。 */
+  padding: 13px 0 13px 20px;
   border-bottom: 1px solid var(--line);
 }
 .raw-row:last-child { border-bottom: 0; }
@@ -3961,7 +3960,8 @@ function rawSummary(item) {
     // 解析不出对话时不要退回原始 JSON —— 那正是这次要修掉的东西。说明情况就好，
     // 逐字核对的入口在下面的「原始记录」里一直开着。
     return {tone: 'transcript', label: '对话原文', text: '', turns,
-            meta: turns.length ? '' : '这一段没有可读的对话'};
+            meta: turns.length ? ''
+                : (item.plumbing ? 'Research Trace 自己的调度记录，已隐去' : '这一段没有可读的对话')};
   }
   const payload = item.payload || {};
   const tool = payload.tool_name || '工具';
