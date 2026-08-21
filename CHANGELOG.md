@@ -4,6 +4,22 @@
 `research_trace/server.py`、`research_trace/mcp.py`、两个 `.claude-plugin/*.json`），
 有测试守它们一致。**改动插件包里的东西之后必须 bump**，否则已安装的机器拿不到。
 
+## 2.0.0-alpha.12
+
+- **采集量减半（45.7%），全部无损。** 一份 130 MB 的真实采集实测降到 71.0 MB。两块：
+  - **不再采集编辑器/会话的运行期状态**（`file-history-snapshot`、`queue-operation`、
+    `bridge-session`、`custom-title`、`mode`）—— 其中 `file-history-snapshot` 一项就占
+    31.7 MB，内容是 343 个文件路径 × 一个 `backupFileName: null` 的空引用，指向一个
+    根本不会上传的本机备份库；
+  - **剥掉 `toolUseResult.file.base64`** —— 读图片时它和 `message.content` 里的图片块是
+    同一份字节，实测 50 行、26.2 MB、**100% 有副本**，占整份采集的 20%。换成一条记录
+    长度和 sha256 的占位，不直接删：「这里曾经有一张多大的图」本身也是溯源信息。
+    只剥这一层，`structuredPatch` / `filePath` / `numLines` 原样保留 —— 那是「这次编辑
+    改了什么」的证据。
+  匹配不上时一律保留，失败方向故意选「多存噪声」而不是「误删内容」。
+  **与提示缓存无关**：缓存在 API 侧按 prompt 前缀算，跟这里抄多少字节无关。
+  顺带记一个查过但**不值得做**的：tool_result 按内容 hash 去重只能省 0.7%（31.3→31.0 MB）。
+
 ## 2.0.0-alpha.11
 
 - **修 alpha.9 引入的一个会让采集全停的故障。** 那一版把 `recorder_fork_window` 做成插件
@@ -13,7 +29,6 @@
   现场报错：`SessionEnd hook [...] failed: Plugin option "recorder_fork_window" isn't set.`
   改成放项目 marker（`.research-trace.json` 的 `recorder_fork_window`），hook 本来就要读它，
   缺键即默认值。并加一条守卫：`hooks.json` 只允许引用一个冻结的选项名单。
-
 ## 2.0.0-alpha.10
 
 - **修一个自我维持的反馈环。** Recorder fork 的回合写在同一个 transcript 文件里，而
