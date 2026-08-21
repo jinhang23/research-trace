@@ -1014,6 +1014,100 @@ details[open] > summary .chevron { transform: rotate(180deg); }
 }
 .artifact .icon { width: 16px; height: 16px; margin-top: 2px; color: var(--accent); }
 
+/* 原始历史的时间线。左侧一道细线 + 每条一个色点：事件类型是这里唯一稳定的结构，
+   用颜色编码它，人扫一眼就能分出「我说的话 / 跑的命令 / 命令的输出 / 一轮的回答」。 */
+.raw-row {
+  position: relative;
+  padding-left: 20px;
+}
+.raw-row::before {                      /* 贯穿的时间线 */
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--line);
+}
+.raw-row:first-child::before { top: 18px; }
+.raw-row:last-child::before { bottom: auto; height: 18px; }
+.raw-row::after {                       /* 类型色点 */
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 15px;
+  width: 9px;
+  height: 9px;
+  border: 1.6px solid var(--muted);
+  border-radius: 50%;
+  background: var(--panel, #fff);
+}
+.raw-row.tone-prompt::after { border-color: var(--accent); background: var(--accent); }
+.raw-row.tone-turn::after { border-color: var(--accent); }
+.raw-row.tone-call::after { border-color: #7d8a86; }
+.raw-row.tone-result::after { border-color: #7d8a86; background: #7d8a86; }
+.raw-row.tone-agent::after { border-radius: 2px; }
+.raw-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 9px;
+}
+.raw-label { color: var(--ink); font-size: 13px; font-weight: 620; }
+.raw-when, .raw-who, .raw-dur {
+  color: var(--muted);
+  font: 10.5px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+.raw-who { margin-left: auto; }
+.raw-dur { color: var(--accent-strong); }
+.raw-brief {
+  margin: 5px 0 0;
+  max-width: 78ch;
+  color: var(--ink-soft, #344944);
+  font-size: 13px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+/* 你自己说的话和这一轮的回答是这里最该被读到的两类，给它们正常的字重。 */
+.raw-row.tone-prompt .raw-brief { color: var(--ink); }
+.raw-row.tone-call .raw-brief,
+.raw-row.tone-result .raw-brief {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 11.5px;
+}
+/* 对话原文里的每一轮。角色标签用固定宽度，多行时左边缘对齐，扫起来像剧本。 */
+.raw-turns { margin-top: 6px; display: grid; gap: 4px; }
+.raw-turn {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  gap: 8px;
+  margin: 0;
+  max-width: 78ch;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--ink-soft, #344944);
+  overflow-wrap: anywhere;
+}
+.raw-turn .who {
+  color: var(--muted);
+  font: 10.5px/1.75 ui-monospace, SFMono-Regular, Consolas, monospace;
+  text-align: right;
+}
+.raw-turn.side { opacity: .72; }        /* 子 agent 的回合压低一档，主线才读得出来 */
+
+.raw-full { margin-top: 6px; }
+.raw-full > summary {
+  display: inline-block;
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+  list-style: none;
+}
+.raw-full > summary::-webkit-details-marker { display: none; }
+.raw-full > summary::before { content: "▸ "; }
+.raw-full[open] > summary::before { content: "▾ "; }
+.raw-full > summary:hover { color: var(--accent-strong); }
+
 .raw-card { padding: 14px 20px; }
 .raw-list {
   margin-top: 8px;
@@ -3823,16 +3917,94 @@ function rawHistoryHtml() {
   `;
 }
 
+/* 原始历史此前是把 payload 直接 JSON.stringify 倒进 <pre>。那等于把「有没有存下来」
+   和「读不读得懂」混为一谈：东西确实都在，但没人翻得动。
+
+   每种事件其实都有一个真正承载信息的字段（你说的话、跑的命令、命令的输出、这一轮的
+   回答）。把那个字段挑出来当摘要，原始 JSON 收进 <details> —— 需要逐字核对时它一直在，
+   只是不再挡在阅读的路上。 */
+function briefText(value, limit = 220) {
+  const text = String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
+  return text.length > limit ? text.slice(0, limit) + '…' : text;
+}
+
+function toolBrief(input) {
+  if (!input || typeof input !== 'object') return briefText(input);
+  // 命令和路径是「这一步到底做了什么」的答案；其余字段是参数，收进 details 就行。
+  for (const key of ['command', 'file_path', 'path', 'pattern', 'query', 'description', 'prompt']) {
+    if (input[key]) return briefText(input[key]);
+  }
+  return briefText(JSON.stringify(input));
+}
+
+function resultBrief(response) {
+  if (response == null) return '';
+  if (typeof response !== 'object') return briefText(response);
+  if (response.interrupted) return '被中断';
+  const out = String(response.stdout || '').trim();
+  const err = String(response.stderr || '').trim();
+  if (out) return briefText(out);
+  if (err) return briefText(err);
+  return briefText(JSON.stringify(response));
+}
+
+function durationLabel(ms) {
+  const value = Number(ms);
+  if (!isFinite(value) || value <= 0) return '';
+  return value >= 1000 ? (value / 1000).toFixed(1) + ' s' : Math.round(value) + ' ms';
+}
+
+function rawSummary(item) {
+  if (item.kind !== 'event') {
+    // turns 由服务端解析好（preview 是按字符硬截断的，客户端解析不出完整 JSON 行）
+    const turns = Array.isArray(item.turns) ? item.turns : [];
+    // 解析不出对话时不要退回原始 JSON —— 那正是这次要修掉的东西。说明情况就好，
+    // 逐字核对的入口在下面的「原始记录」里一直开着。
+    return {tone: 'transcript', label: '对话原文', text: '', turns,
+            meta: turns.length ? '' : '这一段没有可读的对话'};
+  }
+  const payload = item.payload || {};
+  const tool = payload.tool_name || '工具';
+  switch (item.event_type) {
+    case 'UserPromptSubmit':
+      return {tone: 'prompt', label: '你说', text: briefText(payload.prompt), meta: ''};
+    case 'PreToolUse':
+      return {tone: 'call', label: tool, text: toolBrief(payload.tool_input), meta: ''};
+    case 'PostToolUse':
+      return {tone: 'result', label: tool + ' 的输出', text: resultBrief(payload.tool_response),
+              meta: durationLabel(payload.duration_ms)};
+    case 'Stop':
+      return {tone: 'turn', label: '一轮结束', text: briefText(payload.last_assistant_message), meta: ''};
+    case 'SubagentStop':
+      return {tone: 'agent', label: '子任务结束',
+              text: briefText(payload.agent_type || payload.agent_id || ''), meta: ''};
+    case 'SessionStart':
+      return {tone: 'turn', label: '会话开始', text: briefText(payload.source || ''), meta: ''};
+    default:
+      return {tone: 'other', label: item.event_type, text: briefText(JSON.stringify(payload)), meta: ''};
+  }
+}
+
 function rawRowHtml(item) {
-  const body = item.kind === 'event'
+  const brief = rawSummary(item);
+  const full = item.kind === 'event'
     ? JSON.stringify(item.payload, null, 2)
     : String(item.preview || '');
+  const agent = item.agent_id ? `agent ${item.agent_id}` : '主会话';
   return `
-    <div class="raw-row">
-      <div><strong>${esc(item.kind === 'event' ? item.event_type : 'transcript')}</strong>
-        <span class="meta">${fmt(item.at)} · session ${esc(item.session_id || '—')} · agent ${esc(item.agent_id || 'main')}</span>
+    <div class="raw-row tone-${brief.tone}">
+      <div class="raw-head">
+        <span class="raw-label">${esc(brief.label)}</span>
+        <span class="raw-when">${fmt(item.at)}</span>
+        ${brief.meta ? `<span class="raw-dur">${esc(brief.meta)}</span>` : ''}
+        <span class="raw-who">${esc(agent)}</span>
       </div>
-      <pre>${esc(body)}</pre>
+      ${brief.turns && brief.turns.length ? `<div class="raw-turns">${brief.turns.map(turn => `
+        <p class="raw-turn${turn.sidechain ? ' side' : ''}"><span class="who">${esc(turn.who)}</span>${esc(turn.text)}</p>
+      `).join('')}</div>` : ''}
+      ${brief.text ? `<p class="raw-brief">${esc(brief.text)}</p>` : ''}
+      ${!brief.text && !(brief.turns && brief.turns.length) ? `<p class="raw-brief empty-copy">${esc(brief.meta || '（无可读正文）')}</p>` : ''}
+      <details class="raw-full"><summary>原始记录</summary><pre>${esc(full)}</pre></details>
     </div>
   `;
 }
