@@ -1957,6 +1957,10 @@ main.workspace-mode {
   width: max-content;
   min-width: 100%;
 }
+/* 结构图必须**收在栏里**，否则 width:max-content 会让整段跟着画布一起变宽，
+   .graph-viewport 拿到 1240px 的可视宽、自己不再滚，右边的分支就被外层直接切掉，
+   而且缩放算出来永远是 100%（它以为自己装得下）。列表那边仍要 max-content。 */
+.chapter-map.graph-map { width: auto; min-width: 0; }
 .chapter-map.grouped + .chapter-map { border-top: 1px solid var(--line); }
 .chapter-map-title {
   position: sticky;
@@ -1993,8 +1997,31 @@ main.workspace-mode {
 .rail .rail-dot.needs-review,
 .rail .rail-dot.corrected { fill: #fff; stroke: #a94d55; stroke-width: 2; }
 
-.graph-viewport { min-width: 100%; }
-.graph-canvas { position: relative; }
+/* 画布常常比栏宽（分叉越多越宽），不给滚动就等于把右边的分支藏起来。
+   缩放沿用 v1 的分工：外面这层承担缩放**后**的尺寸（决定滚动范围），
+   .graph-canvas 保持自然尺寸再整体 scale——两者分开，缩放才不会把滚动条算错。 */
+.graph-viewport { overflow: auto; max-height: min(72vh, 760px); }
+.graph-zoomwrap { position: relative; }
+.graph-canvas { position: relative; transform-origin: 0 0; }
+.graph-zoom {
+  display: flex;
+  gap: 3px;
+  align-items: center;
+  margin-left: auto;
+  color: var(--muted);
+  font: 10.5px/1 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+.graph-zoom button {
+  min-width: 22px;
+  padding: 3px 5px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: inherit;
+  background: #fff;
+  font: inherit;
+}
+.graph-zoom button:hover { border-color: var(--accent); color: var(--accent-strong); }
+.graph-zoom output { min-width: 34px; text-align: right; }
 .graph-edges {
   position: absolute;
   inset: 0;
@@ -2007,68 +2034,60 @@ main.workspace-mode {
   stroke-width: 1.35;
   vector-effect: non-scaling-stroke;
 }
-/* 结构图：左边窄轨道，右边整行标题。行高固定，轨道的点才对得上行。 */
-.tree-view { display: flex; align-items: flex-start; gap: 2px; }
-.tree-rail { flex: 0 0 auto; }
-.tree-rows { flex: 1; min-width: 0; }
-.tree-row {
-  display: grid;
-  width: 100%;
-  height: 62px;
-  grid-template-columns: 30px minmax(0, 1fr);
-  align-items: center;
-  gap: 9px;
-  padding: 0 12px 0 4px;
-  border: 0;
-  border-bottom: 1px solid var(--line-soft, rgba(54, 83, 76, .07));
-  border-radius: 0;
+/* 结构图 = v1 的卡片图：SVG 画边，HTML 卡片叠在上面。卡片用 HTML 而不是
+   foreignObject，截断、hover、焦点态才都能用原生 CSS 写。 */
+.graph-node {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
   box-sizing: border-box;
+  overflow: hidden;
+  padding: 6px 9px;
+  border: 1.5px solid var(--line);
+  border-radius: 6px;
   color: var(--ink);
-  background: transparent;
+  background: #fff;
   text-align: left;
 }
-.tree-row:last-child { border-bottom: 0; }
-.tree-row:hover { background: rgba(255, 255, 255, .7); }
-.tree-row.selected { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }
-.tree-idx {
-  justify-self: start;
-  padding: 0 6px;
-  border: 1px solid var(--muted);
-  border-radius: 999px;
+.graph-node:hover { box-shadow: 0 3px 12px rgba(35, 58, 52, .14); }
+.graph-node.selected { box-shadow: 0 0 0 2.5px var(--accent), 0 4px 14px rgba(35, 58, 52, .16); }
+.graph-node-meta {
+  display: flex;
+  align-items: center;
+  gap: 5px;
   color: var(--muted);
-  font: 9.5px/1.7 ui-monospace, SFMono-Regular, Consolas, monospace;
+  font: 10.5px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace;
+  white-space: nowrap;
 }
-.tree-title {
+.graph-node-meta time { margin-left: auto; }
+.graph-idx { font-weight: 700; color: var(--ink); letter-spacing: .02em; }
+.graph-node-title {
   display: -webkit-box;
   overflow: hidden;
   font-size: 12.5px;
-  line-height: 1.45;
+  line-height: 1.42;
   -webkit-box-orient: vertical;
-  /* 标题中位 50 字，本栏一行约 38 字 —— 两行装得下绝大多数，三行覆盖到最长的 75 字。 */
-  -webkit-line-clamp: 3;
+  /* 卡片里放不下整条标题（中位 50 字），这里只给开头两行认人，
+     完整的一条在右边的详情里，鼠标停上去也有。图管形状，不管全文。 */
+  -webkit-line-clamp: 2;
 }
 
-/* v1 的状态语言：颜色 + 线型同时给，不靠颜色也读得出来。
-   已确认 = 绿实线实心，未确认 = 琥珀虚线空心，已纠正/有待处理 = 红点线空心。 */
-.tree-row.confirmed .tree-idx { border-color: var(--st-done); color: var(--st-done); }
-.tree-row.unreviewed .tree-idx {
-  border-style: dashed;
-  border-color: var(--st-wip);
-  color: var(--st-wip);
-}
-.tree-row.corrected .tree-idx, .tree-row.needs-review .tree-idx {
-  border-style: dotted;
-  border-color: var(--st-note);
-  color: var(--st-note);
-}
-.rail .rail-dot.confirmed { fill: var(--st-done); stroke: var(--st-done); }
-.rail .rail-dot.unreviewed { fill: #fff; stroke: var(--st-wip); }
-.rail .rail-dot.corrected,
-.rail .rail-dot.needs-review { fill: #fff; stroke: var(--st-note); stroke-width: 2; }
-.rail .rail-edge.confirmed { stroke: var(--st-done); }
-.rail .rail-edge.unreviewed { stroke: var(--st-wip); stroke-dasharray: 4 3; }
-.rail .rail-edge.corrected,
-.rail .rail-edge.needs-review { stroke: var(--st-note); stroke-dasharray: 1.5 3; stroke-linecap: round; }
+/* v1 的状态语言：颜色和线型**同时**给，所以黑白打印或看不清颜色时也读得出来。
+   已确认 = 绿实线，未确认 = 琥珀虚线，已纠正/有待处理 = 红点线。 */
+.graph-node.confirmed { border-style: solid; border-color: var(--st-done); }
+.graph-node.unreviewed { border-style: dashed; border-color: var(--st-wip); }
+.graph-node.corrected,
+.graph-node.needs-review { border-style: dotted; border-color: var(--st-note); background: var(--bg); }
+.graph-node.confirmed .graph-node-state { color: var(--st-done); }
+.graph-node.unreviewed .graph-node-state { color: var(--st-wip); }
+.graph-node.corrected .graph-node-state,
+.graph-node.needs-review .graph-node-state { color: var(--st-note); }
+.graph-edges path.tree-edge { stroke-width: 1.7; }
+.graph-edges path.tree-edge.confirmed { stroke: var(--st-done); }
+.graph-edges path.tree-edge.unreviewed { stroke: var(--st-wip); stroke-dasharray: 5 3.5; }
+.graph-edges path.tree-edge.corrected,
+.graph-edges path.tree-edge.needs-review { stroke: var(--st-note); stroke-dasharray: 1.5 3.5; stroke-linecap: round; }
 .structure-empty {
   width: min(100%, 520px);
   min-width: 340px;
@@ -2334,14 +2353,9 @@ main.workspace-mode {
   padding: 5px 12px;
   background: rgba(255, 255, 255, .94);
 }
-.graph-node {
-  border-color: #d7d1c8;
-  border-radius: 5px;
-  background: #fff;
-  box-shadow: none;
-}
-.graph-node:hover { border-color: #a9a096; }
-.graph-node.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+/* 这里以前统一压过 .graph-node 的 border-color，会把上面按 status 分出来的
+   三种颜色全抹成同一个灰 —— 边框归 status，这一档只管没有 status 的数据流卡片。 */
+.flow-node { border-color: #d7d1c8; border-radius: 5px; }
 .graph-edges path { stroke: #aaa298; }
 .record-row:hover { background: #fff; }
 .record-pane {
@@ -2359,6 +2373,22 @@ main.workspace-mode {
 /* 数据流用的是同一个 .graph-node，所以样式跟着一起走点式；
    它的点填成实心，和结构图区分开——那张图里实心表示「已确认」，这里表示「在数据流上」。 */
 .flow-node { border-left: 3px solid var(--accent); }
+.flow-node strong {
+  display: -webkit-box;
+  overflow: hidden;
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
+}
+.flow-node .graph-idx {
+  align-self: flex-start;
+  padding: 0 5px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font: 9.5px/1.7 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
 .flow-node .graph-idx { border-color: var(--accent); color: var(--accent-strong); }
 .graph-edges path.flow-edge {
   stroke: var(--accent);
@@ -2527,6 +2557,7 @@ const S = {
      不能留着上一个项目的图。 */
   dataflow: null,
   selectedNodeId: null,
+  graphZoom: null,   // null = 按栏宽自动适配；人调过之后记住那个数
   workView: stored('workView') || 'graph',
   token: stored('token'),
   actor: stored('actor') || 'human',
@@ -3395,8 +3426,25 @@ function parentOptionsHtml(chapterId, selectedId = '', excludeId = '') {
   ].join('');
 }
 
-/* Deterministic tidy-tree layout for the explicit parent relation.
-   Missing parents become roots; no edge is inferred from time or proximity. */
+/* 结构图的布局 = v1 的 Reingold–Tilford（trace_core.compute_tree 的等价移植），
+   常量也照搬：176×58 的卡片、同层间隔 20、层间 38、树与树之间 56、四周留 24。
+
+   为什么必须是 RT，而不是此前那版「每片叶子占一个新列」：后者的列号全局只增不减，
+   9 片叶子就排成 9 列 ≈ 2300px，塞进 540px 的栏里等于没有图。RT 的 nextX 是**按层**
+   记的，不同深度上的分支共用同一段横向空间，同一批数据只排到两三列。
+   紧凑不是为了省地方，是为了让一屏装得下整棵树 —— 那才是这张图存在的理由。
+
+   parent 指向一条不存在的记录时自成一棵树；时间上的先后、位置上的相邻都不算边。 */
+const TREE_NODE_W = 176;
+/* v1 写的是 58，但 58 装不下「一行元信息 + 两行标题」：6+17+3+35.5+6 = 67.5，
+   差的那 10px 会被卡片的 overflow:hidden 从第二行中间切开——半个字比没有字更难读。
+   宽度照搬 v1，高度按内容实测取整。 */
+const TREE_NODE_H = 68;
+const TREE_H_GAP = 20;    // 同层相邻
+const TREE_V_GAP = 38;    // 层与层
+const TREE_SIBLING_GAP = 56;  // 两棵树之间
+const TREE_PAD = 24;
+
 function layoutGraphNodes(inputNodes) {
   const nodes = [...inputNodes].sort(nodeOrder);
   const byId = new Map(nodes.map(node => [node.id, node]));
@@ -3409,152 +3457,163 @@ function layoutGraphNodes(inputNodes) {
   children.forEach(items => items.sort(nodeOrder));
   roots.sort(nodeOrder);
 
-  const positions = {};
-  const visiting = new Set();
-  const visited = new Set();
-  let nextLeaf = 0;
-  const place = (node, depth) => {
-    if (visited.has(node.id)) return positions[node.id].column;
-    if (visiting.has(node.id)) {
-      const column = nextLeaf++;
-      positions[node.id] = {column, depth};
-      visited.add(node.id);
-      return column;
-    }
-    visiting.add(node.id);
-    const descendants = (children.get(node.id) || []).filter(child => !visiting.has(child.id));
-    let column;
-    if (!descendants.length) column = nextLeaf++;
-    else {
-      const childColumns = descendants.map(child => place(child, depth + 1));
-      column = (childColumns[0] + childColumns[childColumns.length - 1]) / 2;
-    }
-    positions[node.id] = {column, depth};
-    visiting.delete(node.id);
-    visited.add(node.id);
-    return column;
+  // 深度：前序走一遍，父一定先于子定下来。seen 同时挡住 parent 成环的情况。
+  const depth = new Map();
+  const seen = new Set();
+  const descend = node => {
+    if (seen.has(node.id)) return;
+    seen.add(node.id);
+    const parent = node.parent_id && byId.has(node.parent_id) ? node.parent_id : null;
+    depth.set(node.id, parent && depth.has(parent) ? depth.get(parent) + 1 : 0);
+    (children.get(node.id) || []).forEach(descend);
   };
-  roots.forEach(root => place(root, 0));
-  nodes.filter(node => !visited.has(node.id)).forEach(node => place(node, 0));
+  roots.forEach(descend);
+  nodes.forEach(node => { if (!seen.has(node.id)) { seen.add(node.id); depth.set(node.id, 0); } });
 
-  // 结构图的用处是「一眼看出形状」，所以节点画成点加一行标题，而不是卡片。
-  // 卡片版一个节点占 156×52 加间距，27 条就是 1000px 高；点式把纵向步距压到 34px，
-  // 同一棵树一屏基本能看完 —— 这也是 v1 那张轨道图的做法（它的行高是 28）。
-  // 标题实测中位 50 字、p90 64 字（多为中文），一行放不下 —— 之前用 line-clamp: 2
-  // 把它切成两行，这才是「文字显示不完整」的原因，跟节点大小没关系。
-  // 240px 宽约 20 字一行，四行覆盖到 p90；再宽收益很小，横向却会翻倍。
-  const cardWidth = 240;
-  // 240px 约 19 字一行，五行约 95 字 —— 覆盖到最长的 75 字标题。
-  // 序号徽章绝对定位在角上，不占竖向空间，否则同样的高度只装得下三行。
-  const cardHeight = 112;
-  const gapX = 20;
-  const gapY = 34;
-  const padding = 14;
-  Object.values(positions).forEach(position => {
-    position.left = padding + position.column * (cardWidth + gapX);
-    position.top = padding + position.depth * (cardHeight + gapY);
+  const x = new Map();
+  const nextX = new Map();
+  const step = TREE_NODE_W + TREE_H_GAP;
+  let treeFloor = TREE_PAD;
+  const floorAt = d => (nextX.has(d) ? nextX.get(d) : treeFloor);
+
+  /* 居中后撞上本层左边已有的节点时，整棵子树一起右移 —— 只挪父节点的话，
+     它就不再居中于自己的孩子了。 */
+  const shiftSubtree = (id, delta) => {
+    const stack = [...(children.get(id) || [])];
+    const moved = new Set();
+    while (stack.length) {
+      const kid = stack.pop();
+      if (moved.has(kid.id) || !x.has(kid.id)) continue;
+      moved.add(kid.id);
+      x.set(kid.id, x.get(kid.id) + delta);
+      const d = depth.get(kid.id);
+      nextX.set(d, Math.max(floorAt(d), x.get(kid.id) + step));
+      stack.push(...(children.get(kid.id) || []));
+    }
+  };
+
+  const place = node => {
+    const d = depth.get(node.id);
+    const floor = floorAt(d);
+    const kids = (children.get(node.id) || []).filter(kid => x.has(kid.id));
+    if (!kids.length) x.set(node.id, floor);
+    else {
+      const desired = (x.get(kids[0].id) + x.get(kids[kids.length - 1].id)) / 2;
+      if (desired >= floor) x.set(node.id, desired);
+      else { x.set(node.id, floor); shiftSubtree(node.id, floor - desired); }
+    }
+    nextX.set(d, x.get(node.id) + step);
+  };
+
+  const placeTree = root => {
+    const stack = [[root, false]];
+    const opened = new Set();
+    while (stack.length) {   // 迭代后序：深链不会撞上递归上限
+      const [node, done] = stack.pop();
+      if (done) { place(node); continue; }
+      if (opened.has(node.id)) continue;
+      opened.add(node.id);
+      stack.push([node, true]);
+      const kids = children.get(node.id) || [];
+      for (let i = kids.length - 1; i >= 0; i--) stack.push([kids[i], false]);
+    }
+    /* 让下一棵树在**所有层**上都躲开这一棵。只把 nextX 里已有的键推高是不够的：
+       那些键只是这棵树到过的层，下一棵树若更深，多出来的层会退回 TREE_PAD，
+       从最左边排起，正好钻到前一棵树的下方。所以抬高公共下限、清空 nextX。 */
+    const reached = [...nextX.values()];
+    if (reached.length) treeFloor = Math.max(...reached) + TREE_SIBLING_GAP - TREE_H_GAP;
+    nextX.clear();
+  };
+  roots.forEach(placeTree);
+  nodes.forEach(node => { if (!x.has(node.id)) placeTree(node); });
+
+  const positions = {};
+  nodes.forEach(node => {
+    const d = depth.get(node.id) || 0;
+    positions[node.id] = {
+      depth: d,
+      left: Math.round((x.has(node.id) ? x.get(node.id) : TREE_PAD) * 100) / 100,
+      top: TREE_PAD + d * (TREE_NODE_H + TREE_V_GAP)
+    };
   });
-  const maxColumn = Math.max(0, ...Object.values(positions).map(position => position.column));
-  const maxDepth = Math.max(0, ...Object.values(positions).map(position => position.depth));
+  const spots = Object.values(positions);
+  const maxDepth = Math.max(0, ...spots.map(spot => spot.depth));
   return {
     nodes,
     positions,
-    cardWidth,
-    cardHeight,
-    width: Math.max(360, padding * 2 + cardWidth + maxColumn * (cardWidth + gapX)),
-    height: Math.max(168, padding * 2 + cardHeight + maxDepth * (cardHeight + gapY))
+    cardWidth: TREE_NODE_W,
+    cardHeight: TREE_NODE_H,
+    width: Math.max(...spots.map(spot => spot.left), TREE_PAD) + TREE_NODE_W + TREE_PAD,
+    height: TREE_PAD * 2 + (maxDepth + 1) * TREE_NODE_H + maxDepth * TREE_V_GAP
   };
 }
 
-/* 结构图 = v1 那张轨道图：左边一条窄轨道画出树的形状，右边是**完整标题**。
-
-   这两件事在一个窄栏里无法兼得——标题中位 50 字，塞进树的格子里就要 240px 列宽，
-   九列排出 2348px，而左栏只有 540px，屏幕上正好一个节点都看不见。v1 之所以能既完整
-   又紧凑，就是因为它把标题挪出了图：14px 的轨道槽在左，标题在右边的行里。
-
-   状态语言沿用 v1：已确认 = 绿实线实心，未确认 = 琥珀虚线空心，
-   已纠正/有待处理 = 红点线空心。颜色和线型同时给，所以不靠颜色也读得出来。 */
-const GRAPH_ROW_HEIGHT = 62;
-
-function treeOrder(nodes) {
-  // 按 parent 深度优先排，孩子紧跟父亲——树才读得下来。列表视图按时间排，两者分工不同。
-  const byId = new Map(nodes.map(node => [node.id, node]));
-  const children = new Map(nodes.map(node => [node.id, []]));
-  const roots = [];
-  nodes.forEach(node => {
-    if (node.parent_id && byId.has(node.parent_id)) children.get(node.parent_id).push(node);
-    else roots.push(node);
-  });
-  const out = [];
-  const seen = new Set();
-  const walk = node => {
-    if (seen.has(node.id)) return;
-    seen.add(node.id);
-    out.push(node);
-    (children.get(node.id) || []).sort(nodeOrder).forEach(walk);
-  };
-  roots.sort(nodeOrder).forEach(walk);
-  nodes.forEach(node => { if (!seen.has(node.id)) { seen.add(node.id); out.push(node); } });
-  return out;
-}
-
-function graphRailSvg(ordered, rowHeight) {
-  const {lane, edges, width} = railLanes(ordered);
-  const laneWidth = 15;
-  const svgWidth = width * laneWidth + 8;
-  const x = column => 7 + column * laneWidth;
-  const y = row => row * rowHeight + rowHeight / 2;
-  const stateOf = node => nodeReview(node)[0];
-  const paths = edges.map(edge => {
-    const x1 = x(edge.fromLane), x2 = x(edge.toLane);
-    const y1 = y(edge.from), y2 = y(edge.to);
-    const cls = stateOf(ordered[edge.to]);
-    if (x1 === x2) return `<path class="rail-edge ${cls}" d="M${x1} ${y1}V${y2}"/>`;
-    const radius = Math.min(laneWidth, rowHeight / 2);
-    const dir = x2 > x1 ? 1 : -1;
-    return `<path class="rail-edge ${cls}" d="M${x1} ${y1}V${y2 - radius}Q${x1} ${y2} ${x1 + dir * radius} ${y2}H${x2}"/>`;
-  });
-  const dots = ordered.map((node, row) =>
-    `<circle class="rail-dot ${stateOf(node)}" cx="${x(lane.get(node.id))}" cy="${y(row)}" r="4"/>`);
-  return `<svg class="rail" width="${svgWidth}" height="${ordered.length * rowHeight}"
-    viewBox="0 0 ${svgWidth} ${ordered.length * rowHeight}" aria-hidden="true">${paths.join('')}${dots.join('')}</svg>`;
+/* 一条记录在图上用哪套线型。有没解决的纠正压过一切：那是「这里还有事没完」，
+   比「已确认 / 未确认」更该先被看见。 */
+function graphState(node) {
+  const unresolved = (node.comments || []).some(comment => comment.kind === 'correction' && !comment.resolved_at);
+  return unresolved ? 'needs-review' : nodeReview(node)[0];
 }
 
 function graphSectionHtml(chapter, nodes, showChapter = false) {
-  const ordered = treeOrder([...nodes].sort(nodeOrder));
+  const ordered = [...nodes].sort(nodeOrder);
+  const head = showChapter
+    ? `<button class="chapter-map-title" type="button" data-focus-chapter="${esc(chapter.id)}">${esc(chapter.name)}<span>${ordered.length} 条</span></button>`
+    : '';
   if (!ordered.length) return `
-    <section class="chapter-map ${showChapter ? 'grouped' : ''}">
-      ${showChapter ? `<button class="chapter-map-title" type="button" data-focus-chapter="${esc(chapter.id)}">${esc(chapter.name)}<span>0 条</span></button>` : ''}
+    <section class="chapter-map graph-map ${showChapter ? 'grouped' : ''}">
+      ${head}
       <div class="structure-empty">这个 Chapter 还没有记录。</div>
     </section>
   `;
+  const layout = layoutGraphNodes(ordered);
   const ordinal = new Map(ordered.map((node, index) => [node.id, String(index + 1).padStart(2, '0')]));
-  const rows = ordered.map(node => {
+  const edges = ordered.map(node => {
+    const child = layout.positions[node.id];
+    const parent = node.parent_id && layout.positions[node.parent_id];
+    if (!parent) return '';
+    const x1 = parent.left + layout.cardWidth / 2;
+    const y1 = parent.top + layout.cardHeight;
+    const x2 = child.left + layout.cardWidth / 2;
+    const y2 = child.top;
+    const middle = y1 + (y2 - y1) / 2;
+    /* 线型跟着**子**节点走：一条边说的是「这一步接着那一步」，
+       而可信不可信是这一步自己的事，不是那条关系的事。 */
+    return `<path class="tree-edge ${graphState(node)}" d="M ${x1} ${y1} V ${middle} H ${x2} V ${y2}"/>`;
+  }).join('');
+  const cards = ordered.map(node => {
+    const position = layout.positions[node.id];
     const [reviewClass, reviewLabel] = nodeReview(node);
     const selected = S.selectedNodeId === node.id;
-    const unresolved = (node.comments || []).some(comment => comment.kind === 'correction' && !comment.resolved_at);
+    const state = graphState(node);
     return `
-      <button class="tree-row ${reviewClass} ${selected ? 'selected' : ''} ${unresolved ? 'needs-review' : ''}"
-        type="button" data-select-node="${esc(node.id)}" aria-pressed="${selected}"
-        aria-label="记录 ${ordinal.get(node.id)}：${esc(node.title)}，${esc(reviewLabel)}">
-        <span class="tree-idx">${ordinal.get(node.id)}</span>
-        <span class="tree-title">${esc(node.title)}</span>
+      <button class="graph-node ${state} ${selected ? 'selected' : ''}" type="button"
+        data-select-node="${esc(node.id)}" aria-pressed="${selected}"
+        title="${esc(node.title)}"
+        aria-label="记录 ${ordinal.get(node.id)}：${esc(node.title)}，${esc(reviewLabel)}${state === 'needs-review' ? '，有待处理的纠正' : ''}"
+        style="left:${position.left}px;top:${position.top}px;width:${layout.cardWidth}px;height:${layout.cardHeight}px">
+        <span class="graph-node-meta"><span class="graph-idx">${ordinal.get(node.id)}</span><span class="graph-node-state">${esc(reviewLabel)}</span><time>${fmt(node.occurred_at)}</time></span>
+        <span class="graph-node-title">${esc(node.title)}</span>
       </button>
     `;
   }).join('');
   return `
-    <section class="chapter-map ${showChapter ? 'grouped' : ''}">
-      ${showChapter ? `<button class="chapter-map-title" type="button" data-focus-chapter="${esc(chapter.id)}">${esc(chapter.name)}<span>${ordered.length} 条</span></button>` : ''}
-      <div class="tree-view">
-        <div class="tree-rail">${graphRailSvg(ordered, GRAPH_ROW_HEIGHT)}</div>
-        <div class="tree-rows">${rows}</div>
+    <section class="chapter-map graph-map ${showChapter ? 'grouped' : ''}">
+      ${head}
+      <div class="graph-viewport">
+        <div class="graph-zoomwrap">
+          <div class="graph-canvas" style="width:${layout.width}px;height:${layout.height}px">
+            <svg class="graph-edges" viewBox="0 0 ${layout.width} ${layout.height}" width="${layout.width}" height="${layout.height}" aria-hidden="true">${edges}</svg>
+            ${cards}
+          </div>
+        </div>
       </div>
     </section>
   `;
 }
 
-/* 列表装订线的行高必须和 railSvg 拿到的那个数一致，否则点会一行行地错开。
-   结构图有自己的行高（GRAPH_ROW_HEIGHT），两者互不影响。 */
+/* 列表装订线的行高必须和 .record-row 的实际行高一致，否则点会一行行地错开。
+   两边引用同一个常量，别让 CSS 和 JS 各写一个数。 */
 const RAIL_ROW_HEIGHT = 58;
 
 /* === rail lanes (begin) === */
@@ -3689,8 +3748,9 @@ function dataflowKeyLabel(kind) {
    Chapter 只作为节点卡片上的一行标签出现。
    存储层允许出现环（它只做一次键 join，不按时间过滤方向），深度计算因此必须
    自带环保护：一条 A→B→A 不能让页面转不出来。 */
-/* 数据流和结构图共用 .graph-node 的尺寸，布局常量必须跟着一起改，
-   否则点会落在标签外面。 */
+/* 数据流和结构图共用 .graph-node 的**外观**，但尺寸各算各的：结构图的卡片要密（一屏
+   装下整棵树），数据流的卡片只有几个、要看得清产物名字。所以两边都把宽高**内联**写在
+   卡片上，由各自的布局函数说了算 —— 让 CSS 定死一个尺寸，另一张图的边就会落在卡片外面。 */
 function layoutDataflowNodes(nodes, edges) {
   const byId = new Map(nodes.map(node => [node.id, node]));
   const incoming = new Map(nodes.map(node => [node.id, []]));
@@ -3716,7 +3776,7 @@ function layoutDataflowNodes(nodes, edges) {
   const ordered = [...nodes].sort(nodeOrder);
   ordered.forEach(node => depthOf(node.id));
 
-  const cardWidth = 240;      // 与结构图一致：两张图共用 .graph-node
+  const cardWidth = 240;
   const cardHeight = 112;
   const gapX = 26;
   const gapY = 62;
@@ -3803,7 +3863,8 @@ function dataflowSectionHtml() {
         data-select-node="${esc(node.id)}" aria-pressed="${selected}"
         aria-label="数据流节点 ${ordinal.get(node.id)}：${esc(node.title)}，属于 ${esc(chapter)}"
         data-title="${esc(node.title)}"
-        title="${esc(node.title)}" style="left:${position.left}px;top:${position.top}px">
+        title="${esc(node.title)}"
+        style="left:${position.left}px;top:${position.top}px;width:${layout.cardWidth}px;height:${layout.cardHeight}px">
         <span class="graph-idx">${ordinal.get(node.id)}</span>
         <strong>${esc(node.title)}</strong>
       </button>
@@ -3855,6 +3916,46 @@ function dataflowSectionHtml() {
       <ul class="flow-evidence" aria-label="每条边的连接依据">${evidence}</ul>
     </section>
   `;
+}
+
+/* 缩放。没有它，一棵 14 层的树在 900px 的视口里要滚三屏才看得完，
+   而「一眼看出形状」正是这张图存在的全部理由——滚着看等于回到列表。
+   S.graphZoom 为 null 时按栏宽自动适配；人一旦手动调过就记住他的选择。 */
+const GRAPH_ZOOM_MIN = 0.35;
+const GRAPH_ZOOM_MAX = 2;
+
+/* 自动档是按栏宽算的，窗口一变就得重算；只挂一次，别每次渲染都再挂一个。 */
+let graphResizeBound = false;
+function bindGraphResize() {
+  if (graphResizeBound) return;
+  graphResizeBound = true;
+  window.addEventListener('resize', () => applyGraphZoom());
+}
+
+/* 当前倍数以画布上真正生效的那个为准：自动档下 S.graphZoom 还是 null，
+   而人按「放大」想要的是「比现在大一点」，不是「比 1 大一点」。 */
+function currentGraphZoom() {
+  const canvas = document.querySelector('.graph-canvas');
+  const scale = canvas && canvas.style.transform.match(/scale\(([\d.]+)\)/);
+  return scale ? parseFloat(scale[1]) : 1;
+}
+
+function applyGraphZoom() {
+  document.querySelectorAll('.graph-zoomwrap').forEach(wrap => {
+    const canvas = wrap.querySelector('.graph-canvas');
+    if (!canvas) return;
+    const width = parseFloat(canvas.style.width) || 1;
+    const height = parseFloat(canvas.style.height) || 1;
+    const room = wrap.parentElement.clientWidth || width;
+    // 自动档只缩不放：一棵窄树没必要被拉大到糊掉。
+    const auto = Math.max(GRAPH_ZOOM_MIN, Math.min(1, room / width));
+    const zoom = S.graphZoom === null ? auto : S.graphZoom;
+    canvas.style.transform = zoom === 1 ? '' : `scale(${zoom})`;
+    wrap.style.width = Math.ceil(width * zoom) + 'px';
+    wrap.style.height = Math.ceil(height * zoom) + 'px';
+    const label = document.querySelector('[data-graph-zoom-value]');
+    if (label) label.textContent = Math.round(zoom * 100) + '%';
+  });
 }
 
 function structureContentHtml() {
@@ -3943,6 +4044,13 @@ function workspaceHtml() {
             <span>${viewHint}</span>
             ${unkeyedHint}
             ${S.chapter && canWrite() ? `<button class="inline-add" id="addNode" type="button">${icon('plus')}添加记录</button>` : ''}
+            ${view === 'graph' && nodeCount ? `
+              <span class="graph-zoom" role="group" aria-label="结构图缩放">
+                <button type="button" data-graph-zoom="out" aria-label="缩小">−</button>
+                <output data-graph-zoom-value aria-live="off">100%</output>
+                <button type="button" data-graph-zoom="in" aria-label="放大">+</button>
+                <button type="button" data-graph-zoom="fit" aria-label="适应栏宽">适宽</button>
+              </span>` : ''}
           </div>
           <div class="structure-scroll" id="structureScroll">${structureContentHtml()}</div>
         </section>
@@ -4212,6 +4320,27 @@ function bindWorkspace() {
       renderRecordPane(true);
     };
   });
+  document.querySelectorAll('[data-graph-zoom]').forEach(button => {
+    button.onclick = () => {
+      const kind = button.dataset.graphZoom;
+      if (kind === 'fit') S.graphZoom = null;
+      else S.graphZoom = Math.max(GRAPH_ZOOM_MIN,
+        Math.min(GRAPH_ZOOM_MAX, kind === 'in' ? currentGraphZoom() * 1.25 : currentGraphZoom() / 1.25));
+      applyGraphZoom();
+    };
+  });
+  document.querySelectorAll('.graph-viewport').forEach(viewport => {
+    // 只认 ctrl/⌘ + 滚轮：普通滚轮还得留给「往下读」。
+    viewport.onwheel = event => {
+      if (!event.ctrlKey && !event.metaKey) return;
+      event.preventDefault();
+      S.graphZoom = Math.max(GRAPH_ZOOM_MIN,
+        Math.min(GRAPH_ZOOM_MAX, currentGraphZoom() * (event.deltaY < 0 ? 1.1 : 1 / 1.1)));
+      applyGraphZoom();
+    };
+  });
+  applyGraphZoom();
+  bindGraphResize();
   document.querySelectorAll('[data-focus-chapter]').forEach(button => {
     button.onclick = () => {
       S.chapter = S.project.chapters.find(chapter => chapter.id === button.dataset.focusChapter) || null;
