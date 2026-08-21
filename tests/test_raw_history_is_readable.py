@@ -59,3 +59,38 @@ def test_noise_only_content_yields_nothing_rather_than_raw_json():
 def test_the_turn_count_is_bounded():
     many = "\n".join(LINES * 20)
     assert len(turns(many, limit=4)) == 4
+
+
+PLUMBING = [
+    '{"type":"user","message":{"role":"user","content":"[research-trace-recorder] 处理这一批"}}',
+    '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text",'
+    '"text":"I\'ll process research-trace batch 1787208372 per the recorder protocol."}]}}',
+    '{"type":"user","message":{"role":"user","content":'
+    '"Stop hook feedback: Research Trace has durably queued a recorder batch."}}',
+]
+
+
+def test_traces_own_dispatch_turns_are_hidden():
+    """记录动作本身不是研究材料。
+
+    hook 那一侧已经不再采集 Recorder 名下的行，但那只对新数据生效；库里存着的旧数据
+    仍然带着这些回合，显示出来就是「助手：I'll process research-trace batch …」这种
+    对读者毫无意义的东西。
+    """
+    assert turns("\n".join(PLUMBING)) == []
+
+
+def test_real_work_next_to_plumbing_still_shows():
+    """只挡调度那几条，同一段里真正的工作内容不能跟着消失。"""
+    mixed = PLUMBING + [LINES[0]]
+    result = turns("\n".join(mixed))
+    assert len(result) == 1
+    assert "8 Å" in result[0]["text"]
+
+
+def test_only_our_own_markers_are_matched():
+    """只匹配本系统自己产生的字符串，不去猜别人的措辞。"""
+    from research_trace.storage import Store
+    assert Store._is_plumbing("[research-trace-batch 123]") is True
+    assert Store._is_plumbing("我们讨论一下 recorder 的协议") is False
+    assert Store._is_plumbing("batch size 设成 32") is False

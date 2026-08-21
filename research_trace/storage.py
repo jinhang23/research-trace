@@ -1771,6 +1771,23 @@ class Store:
         selected.sort(key=order, reverse=True)
         return SearchResult(selected, totals=totals, limit=limit, scope=scope)
 
+    #: Research Trace 自己派发 Recorder 时注入的字样。记录动作本身不是研究材料——
+    #: 事件层和采集层早就在挡它了（hook 的 orchestration 过滤、以及不再采集 Recorder 名下的
+    #: transcript 行），但**那些只对新数据生效**；库里已经存着的旧数据仍然带着这些回合，
+    #: 显示出来就是「助手：I'll process research-trace batch … per the recorder protocol」
+    #: 这种对读者毫无意义的东西。所以显示这一侧也挡一道。
+    #: 只匹配本系统自己产生的字符串，不去猜别人的措辞。
+    PLUMBING_MARKERS = (
+        "[research-trace-recorder]",
+        "[research-trace-batch",
+        "research-trace batch",
+        "Research Trace has durably queued",
+    )
+
+    @staticmethod
+    def _is_plumbing(text: str) -> bool:
+        return any(marker in text for marker in Store.PLUMBING_MARKERS)
+
     @staticmethod
     def _transcript_turns(text: str, limit: int = 4) -> list[dict[str, Any]]:
         """从一段 transcript JSONL 里抽出前几轮，供界面直接显示。
@@ -1821,6 +1838,8 @@ class Store:
                 if not is_tool_result:
                     continue
                 body = "（工具输出）"
+            if Store._is_plumbing(body):
+                continue
             who = "助手" if value.get("type") == "assistant" else ("工具" if is_tool_result else "你")
             turns.append({
                 "who": who,
@@ -1857,6 +1876,9 @@ class Store:
             value["kind"] = "transcript"
             value["preview"] = content[:1000]
             value["turns"] = self._transcript_turns(content)
+            # 整段都是调度记录时说清楚，而不是显示成「没有可读的对话」——
+            # 那会让人以为这一段是空的，其实是被有意隐去的。
+            value["plumbing"] = bool(not value["turns"] and self._is_plumbing(content))
             value["truncated"] = len(content) > 1000
             value["at"] = value["created_at"]
             items.append(value)
