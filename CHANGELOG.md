@@ -20,15 +20,6 @@
   **与提示缓存无关**：缓存在 API 侧按 prompt 前缀算，跟这里抄多少字节无关。
   顺带记一个查过但**不值得做**的：tool_result 按内容 hash 去重只能省 0.7%（31.3→31.0 MB）。
 
-## 2.0.0-alpha.11
-
-- **修 alpha.9 引入的一个会让采集全停的故障。** 那一版把 `recorder_fork_window` 做成插件
-  配置项并在 `hooks.json` 里引用 `${user_config.recorder_fork_window}`。这个展开发生在 hook
-  启动**之前**，**未设置的选项会让整个 hook 执行失败** —— 不是降级、不是取默认值，是采集
-  直接停掉；plugin.json 里写 `default` 也不算数，因为升级上来的机器 settings 里根本没有这个键。
-  现场报错：`SessionEnd hook [...] failed: Plugin option "recorder_fork_window" isn't set.`
-  改成放项目 marker（`.research-trace.json` 的 `recorder_fork_window`），hook 本来就要读它，
-  缺键即默认值。并加一条守卫：`hooks.json` 只允许引用一个冻结的选项名单。
 - **原始历史看得懂了。** 此前每一条都是 `JSON.stringify(payload)` 倒进 `<pre>`：东西确实
   都存下来了，但没人翻得动。现在按类型抽出真正承载信息的那个字段做摘要 —— 你说的话、
   跑的命令、命令的输出（带耗时）、这一轮的回答、哪个子任务结束了 —— 排成一条带类型色点
@@ -39,6 +30,15 @@
   所以单独标成「工具」，否则整页都是「你说：（工具输出）」。子 agent 的回合压低一档显示。
   解析不出对话时说明情况，**不再退回原始 JSON**。
 
+## 2.0.0-alpha.11
+
+- **修 alpha.9 引入的一个会让采集全停的故障。** 那一版把 `recorder_fork_window` 做成插件
+  配置项并在 `hooks.json` 里引用 `${user_config.recorder_fork_window}`。这个展开发生在 hook
+  启动**之前**，**未设置的选项会让整个 hook 执行失败** —— 不是降级、不是取默认值，是采集
+  直接停掉；plugin.json 里写 `default` 也不算数，因为升级上来的机器 settings 里根本没有这个键。
+  现场报错：`SessionEnd hook [...] failed: Plugin option "recorder_fork_window" isn't set.`
+  改成放项目 marker（`.research-trace.json` 的 `recorder_fork_window`），hook 本来就要读它，
+  缺键即默认值。并加一条守卫：`hooks.json` 只允许引用一个冻结的选项名单。
 ## 2.0.0-alpha.10
 
 - **修一个自我维持的反馈环。** Recorder fork 的回合写在同一个 transcript 文件里，而
