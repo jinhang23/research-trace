@@ -4,6 +4,17 @@
 `research_trace/server.py`、`research_trace/mcp.py`、两个 `.claude-plugin/*.json`），
 有测试守它们一致。**改动插件包里的东西之后必须 bump**，否则已安装的机器拿不到。
 
+## 2.0.0-alpha.13
+
+- **原始历史里不再显示 Research Trace 自己的调度记录。** 采集那一侧已经不采 Recorder 名下的
+  行，但那只对新数据生效；库里存着的旧数据仍带着「I'll process research-trace batch … per the
+  recorder protocol」这类回合，对读者毫无意义。显示这一侧也挡一道，只匹配本系统自己产生的
+  字符串（`[research-trace-recorder]` / `[research-trace-batch` / 派发指令的首句），
+  不去猜别人的措辞。整段都是调度记录时明说「已隐去」，而不是显示成「没有可读的对话」——
+  后者会让人以为这一段是空的。
+- **修时间线圆点压住文字。** `padding` 简写写在 `padding-left` 之后，把它重置成了 0。
+  内边距现在只在一处定义。
+
 ## 2.0.0-alpha.12
 
 - **采集量减半（45.7%），全部无损。** 一份 130 MB 的真实采集实测降到 71.0 MB。两块：
