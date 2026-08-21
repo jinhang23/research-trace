@@ -1,7 +1,7 @@
 {
   "name": "research-trace",
   "displayName": "Research Trace",
-  "version": "2.0.0-alpha.15",
+  "version": "2.0.0-alpha.16",
   "description": "团队研究与项目记忆：采集按项目绑定（`trace-project bind`），只记录你显式绑定过的项目。永久保存可见的 agent 历史，由 Recorder 精选想法、论文、数据理解、实验、失败和关键实现为 Project / Overview / Chapter / Node。提供 7 个 MCP 工具：6 个研究工具和 trace_login 账号设备登录。",
   "author": {
     "name": "Jinhang Wei"

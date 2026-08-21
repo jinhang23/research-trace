@@ -186,8 +186,16 @@ const first = layoutGraphNodes(input);
 const second = layoutGraphNodes([...input].reverse());
 if (JSON.stringify(first.positions) !== JSON.stringify(second.positions)) throw Error('layout changed with input order');
 if (!(first.positions.a.depth < first.positions.b.depth && first.positions.b.depth < first.positions.d.depth)) throw Error('parent depth is wrong');
-if (!(first.positions.b.column < first.positions.c.column)) throw Error('siblings are not ordered');
+if (!(first.positions.b.left < first.positions.c.left)) throw Error('siblings are not ordered');
 if (first.positions.orphan.depth !== 0) throw Error('missing parent must create a root');
+// Reingold-Tilford 的两条定义性质，缺一张图就画错。
+if (first.positions.a.left !== (first.positions.b.left + first.positions.c.left) / 2) throw Error('a parent must sit centred over its children');
+if (first.positions.c.left - first.positions.b.left < first.cardWidth) throw Error('siblings overlap');
+// 每一层各自紧排：b 有孩子、c 没有，两者仍在同一层且只隔一个间距。
+if (first.positions.b.top !== first.positions.c.top) throw Error('siblings must share a row');
+// 孤儿是另一棵树，必须整个躲开第一棵，而不是压在它上面。
+const firstTreeRight = Math.max(first.positions.a.left, first.positions.c.left) + first.cardWidth;
+if (first.positions.orphan.left < firstTreeRight) throw Error('a second tree must clear the first');
 """
     result = subprocess.run(
         [node, "-"], input=functions + check, text=True, capture_output=True, check=False
@@ -851,3 +859,53 @@ def test_an_absolute_cwd_is_refused_as_a_project_identity(tmp_path):
         assert value["matched"] is True
         assert value["rejected_workspace_keys"][0]["workspace_key"] == WINDOWS_CWD_KEY
         assert [k["workspace_key"] for k in value["project"]["workspace_keys"]] == ["rt-ws-shared"]
+
+
+def test_web_graph_cards_carry_their_own_size():
+    """两张图的卡片都必须把宽高**写在自己身上**，不能指望 CSS 里有个尺寸等着它。
+
+    真出过事：一次改动把 `.graph-node` 的基础样式块（含 position/width/height）
+    整个删掉了，结构图因为改成了内联尺寸没事，数据流却还在等 CSS 给它宽高 ——
+    结果是一堆按内容自适应的卡片全挤在左上角，而边还画在原来的坐标上。
+    全套测试当时一条都没红：它们只比对 HTML 字符串，看不见样式表少了什么。
+
+    所以这条从两个方向钉死：卡片自带尺寸，且那个尺寸来自布局函数本人。
+    """
+    _run_js(_dataflow_js(), r"""
+S.project = {chapters: [{id: 'c1', name: '主实验'}]};
+S.dataflow = {
+  nodes: [
+    {id: 'n1', title: '预处理', chapter_id: 'c1'},
+    {id: 'n2', title: '训练', chapter_id: 'c1'}
+  ],
+  edges: [{from_node_id: 'n1', to_node_id: 'n2', key: 'sha256:abc', key_kind: 'sha256'}],
+  unkeyed: [],
+  stats: {edges: 1, unkeyed: 0, truncated: false}
+};
+const layout = layoutDataflowNodes(S.dataflow.nodes, S.dataflow.edges);
+const html = dataflowSectionHtml();
+const size = new RegExp('width:' + layout.cardWidth + 'px;height:' + layout.cardHeight + 'px');
+const cards = html.split('class="graph-node').length - 1;
+if (cards !== 2) throw Error('expected one card per node, got ' + cards);
+if ((html.match(new RegExp(size.source, 'g')) || []).length !== cards)
+  throw Error('every data flow card must carry the size its layout computed');
+""")
+
+    # 结构图同样：布局算出来的那个尺寸必须原样出现在卡片上。
+    _run_js(
+        "var S = {project: {chapters: []}, selectedNodeId: null};\n"
+        + _js_slice("const esc = value =>", "function file64")
+        + _js_function(INDEX_HTML, "nodeOrder")
+        + _js_function(INDEX_HTML, "nodeReview")
+        + _js_slice("const TREE_NODE_W", "\n/* 缩放。"),
+        r"""
+const nodes = [
+  {id: 'a', parent_id: null, title: '起点', occurred_at: '2026-01-01', review_state: 'unreviewed', comments: []},
+  {id: 'b', parent_id: 'a', title: '接着', occurred_at: '2026-01-02', review_state: 'unreviewed', comments: []}
+];
+const layout = layoutGraphNodes(nodes);
+const html = graphSectionHtml({id: 'c1', name: '主实验'}, nodes);
+const size = 'width:' + layout.cardWidth + 'px;height:' + layout.cardHeight + 'px';
+if ((html.split(size).length - 1) !== 2)
+  throw Error('every structure card must carry the size its layout computed');
+""")
