@@ -2003,61 +2003,68 @@ main.workspace-mode {
   stroke-width: 1.35;
   vector-effect: non-scaling-stroke;
 }
+/* v1 那张轨道图的做法：节点是一个小圆点加一行标题，不是卡片。
+   卡片的边框和阴影在几十个节点时会盖过边本身，形状反而看不出来；点式让边成为主角。 */
 .graph-node {
   position: absolute;
   display: flex;
-  width: 156px;
-  height: 52px;
+  width: 22px;
+  height: 22px;
   flex-direction: column;
-  align-items: stretch;
-  justify-content: center;
-  gap: 2px;
-  padding: 6px 9px;
-  overflow: hidden;
-  border: 1px solid #cbd5d1;
-  border-radius: 9px;
-  color: var(--ink);
-  background: rgba(255, 255, 255, .94);
-  box-shadow: 0 2px 7px rgba(35, 58, 52, .045);
-  text-align: left;
-}
-.graph-node:hover { border-color: #8fa69f; background: #fff; }
-.graph-node.selected {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 2px rgba(23, 107, 92, .14);
-}
-.graph-node.needs-review { border-left: 3px solid #a94d55; }
-.graph-node-meta {
-  display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 6px;
+  justify-content: center;
+  gap: 1px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  color: var(--ink);
+  background: none;
+}
+.graph-dot {
+  flex: 0 0 auto;
+  width: 9px;
+  height: 9px;
+  margin-left: 1px;
+  border: 1.6px solid #7f948e;
+  border-radius: 50%;
+  background: var(--panel, #fff);
+}
+.graph-idx {
+  flex: 0 0 auto;
   color: var(--muted);
-  font: 8.5px/1.2 ui-monospace, SFMono-Regular, Consolas, monospace;
+  font: 9.5px/1 ui-monospace, SFMono-Regular, Consolas, monospace;
 }
-/* 卡片矮下来之后，日期是这里最没用的一段：图本来就是按时间排的，
-   而标题被挤成一行会真的看不懂。让日期先走。 */
-.graph-node-meta time { display: none; }
-.graph-node strong {
-  display: -webkit-box;
-  overflow: hidden;
-  font-size: 11.5px;
-  font-weight: 620;
-  line-height: 1.3;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
+/* 标题不进图里（塞进去列距会被撑到 200px 以上），指着一个点时用浮层给出。 */
+.graph-node::after {
+  content: attr(data-title);
+  position: absolute;
+  /* 向右展开而不是居中：图是左对齐的，居中时最左那一列的浮层会被面板边缘切掉。 */
+  left: 14px;
+  top: calc(100% + 2px);
+  z-index: 4;
+  width: max-content;
+  max-width: 240px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 8px 20px rgba(24, 45, 40, .14);
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.45;
+  text-align: left;
+  opacity: 0;
+  pointer-events: none;
 }
-.graph-node-state {
-  overflow: hidden;
-  color: var(--muted);
-  font-size: 8.5px;
-  line-height: 1.15;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.graph-node.confirmed .graph-node-state { color: var(--accent-strong); }
-.graph-node.corrected .graph-node-state,
-.graph-node.needs-review .graph-node-state { color: #8e3f47; }
+.graph-node:hover::after, .graph-node:focus-visible::after { opacity: 1; }
+.graph-node:hover { background: var(--accent-soft); }
+.graph-node.selected { background: var(--accent-soft); }
+.graph-node.selected .graph-dot { border-color: var(--accent); background: var(--accent); }
+/* 已确认 = 实心，未确认 = 空心，有待处理的纠正 = 红边。
+   v1 用同一套编码（done 实心 / wip 空心 / dead 方块），这里沿用它的语法。 */
+.graph-node.confirmed .graph-dot { border-color: var(--accent); background: var(--accent); }
+.graph-node.corrected .graph-dot,
+.graph-node.needs-review .graph-dot { border-color: #a94d55; border-width: 2px; }
 .structure-empty {
   width: min(100%, 520px);
   min-width: 340px;
@@ -2345,8 +2352,9 @@ main.workspace-mode {
 .comments > summary,
 .raw-card > summary { color: var(--muted); }
 
-.flow-node { border-left: 3px solid var(--accent); }
-.flow-node .graph-node-state { color: var(--accent-strong); }
+/* 数据流用的是同一个 .graph-node，所以样式跟着一起走点式；
+   它的点填成实心，和结构图区分开——那张图里实心表示「已确认」，这里表示「在数据流上」。 */
+.flow-node .graph-dot { border-color: var(--accent); background: var(--accent-soft); }
 .graph-edges path.flow-edge {
   stroke: var(--accent);
   stroke-width: 1.2;
@@ -3424,13 +3432,13 @@ function layoutGraphNodes(inputNodes) {
   roots.forEach(root => place(root, 0));
   nodes.filter(node => !visited.has(node.id)).forEach(node => place(node, 0));
 
-  // 结构图的用处是「一眼看出形状」。此前 184×88 的卡片加 54 的纵向间距 = 142px 步距，
-  // 27 条记录就是 2000px 高的画布，而它住在一个 ~640px 宽的栏里 —— 一屏只看得到四个节点，
-  // 要看出形状得上下滚半天，那就不是图了。压到 78px 步距，同样的树一屏能看完大半。
-  const cardWidth = 156;
-  const cardHeight = 52;
-  const gapX = 18;
-  const gapY = 26;
+  // 结构图的用处是「一眼看出形状」，所以节点画成点加一行标题，而不是卡片。
+  // 卡片版一个节点占 156×52 加间距，27 条就是 1000px 高；点式把纵向步距压到 34px，
+  // 同一棵树一屏基本能看完 —— 这也是 v1 那张轨道图的做法（它的行高是 28）。
+  const cardWidth = 22;
+  const cardHeight = 22;
+  const gapX = 10;
+  const gapY = 12;
   const padding = 14;
   Object.values(positions).forEach(position => {
     position.left = padding + position.column * (cardWidth + gapX);
@@ -3462,12 +3470,17 @@ function graphSectionHtml(chapter, nodes, showChapter = false) {
     const child = layout.positions[node.id];
     const parent = node.parent_id && layout.positions[node.parent_id];
     if (!parent) return '';
-    const x1 = parent.left + layout.cardWidth / 2;
-    const y1 = parent.top + layout.cardHeight;
-    const x2 = child.left + layout.cardWidth / 2;
-    const y2 = child.top;
-    const middle = y1 + (y2 - y1) / 2;
-    return `<path d="M ${x1} ${y1} V ${middle} H ${x2} V ${y2}"></path>`;
+    // 点式之后边连的是点心，不是卡片边缘。同列直上直下，换列走一个圆角肘弯 ——
+    // 和列表左侧那条装订线同一套语汇，不用另外教人认。
+    const dot = layout.cardWidth / 2;
+    const x1 = parent.left + dot;
+    const y1 = parent.top + layout.cardHeight / 2;
+    const x2 = child.left + dot;
+    const y2 = child.top + layout.cardHeight / 2;
+    if (x1 === x2) return `<path d="M ${x1} ${y1} V ${y2}"></path>`;
+    const radius = Math.min(12, Math.abs(y2 - y1) / 2);
+    const direction = x2 > x1 ? 1 : -1;
+    return `<path d="M ${x1} ${y1} V ${y2 - radius} Q ${x1} ${y2} ${x1 + direction * radius} ${y2} H ${x2}"></path>`;
   }).join('');
   const cards = ordered.map(node => {
     const position = layout.positions[node.id];
@@ -3478,10 +3491,10 @@ function graphSectionHtml(chapter, nodes, showChapter = false) {
       <button class="graph-node ${reviewClass} ${selected ? 'selected' : ''} ${unresolved ? 'needs-review' : ''}"
         type="button" data-select-node="${esc(node.id)}" aria-pressed="${selected}"
         aria-label="记录 ${ordinal.get(node.id)}：${esc(node.title)}，${esc(reviewLabel)}"
-        title="${esc(node.id)}" style="left:${position.left}px;top:${position.top}px">
-        <span class="graph-node-meta"><span>${ordinal.get(node.id)}</span><time>${fmt(node.occurred_at)}</time></span>
-        <strong>${esc(node.title)}</strong>
-        <span class="graph-node-state">${esc(reviewLabel)}${unresolved ? ' · 有待处理纠正' : ''}</span>
+        data-title="${esc(node.title)}"
+        title="${esc(node.title)}" style="left:${position.left}px;top:${position.top}px">
+        <span class="graph-dot" aria-hidden="true"></span>
+        <span class="graph-idx">${ordinal.get(node.id)}</span>
       </button>
     `;
   }).join('');
@@ -3639,6 +3652,8 @@ function dataflowKeyLabel(kind) {
    Chapter 只作为节点卡片上的一行标签出现。
    存储层允许出现环（它只做一次键 join，不按时间过滤方向），深度计算因此必须
    自带环保护：一条 A→B→A 不能让页面转不出来。 */
+/* 数据流和结构图共用 .graph-node 的尺寸，布局常量必须跟着一起改，
+   否则点会落在标签外面。 */
 function layoutDataflowNodes(nodes, edges) {
   const byId = new Map(nodes.map(node => [node.id, node]));
   const incoming = new Map(nodes.map(node => [node.id, []]));
@@ -3664,8 +3679,8 @@ function layoutDataflowNodes(nodes, edges) {
   const ordered = [...nodes].sort(nodeOrder);
   ordered.forEach(node => depthOf(node.id));
 
-  const cardWidth = 184;
-  const cardHeight = 88;
+  const cardWidth = 22;       // 与结构图一致：两张图共用 .graph-node
+  const cardHeight = 22;
   const gapX = 26;
   const gapY = 62;
   const padding = 20;
@@ -3750,10 +3765,10 @@ function dataflowSectionHtml() {
       <button class="graph-node flow-node ${selected ? 'selected' : ''}" type="button"
         data-select-node="${esc(node.id)}" aria-pressed="${selected}"
         aria-label="数据流节点 ${ordinal.get(node.id)}：${esc(node.title)}，属于 ${esc(chapter)}"
-        title="${esc(node.id)}" style="left:${position.left}px;top:${position.top}px">
-        <span class="graph-node-meta"><span>${ordinal.get(node.id)}</span><time>${fmt(node.occurred_at)}</time></span>
-        <strong>${esc(node.title)}</strong>
-        <span class="graph-node-state">${esc(chapter)}</span>
+        data-title="${esc(node.title)}"
+        title="${esc(node.title)}" style="left:${position.left}px;top:${position.top}px">
+        <span class="graph-dot" aria-hidden="true"></span>
+        <span class="graph-idx">${ordinal.get(node.id)}</span>
       </button>
     `;
   }).join('');
