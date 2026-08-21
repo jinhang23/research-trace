@@ -29,6 +29,16 @@
   现场报错：`SessionEnd hook [...] failed: Plugin option "recorder_fork_window" isn't set.`
   改成放项目 marker（`.research-trace.json` 的 `recorder_fork_window`），hook 本来就要读它，
   缺键即默认值。并加一条守卫：`hooks.json` 只允许引用一个冻结的选项名单。
+- **原始历史看得懂了。** 此前每一条都是 `JSON.stringify(payload)` 倒进 `<pre>`：东西确实
+  都存下来了，但没人翻得动。现在按类型抽出真正承载信息的那个字段做摘要 —— 你说的话、
+  跑的命令、命令的输出（带耗时）、这一轮的回答、哪个子任务结束了 —— 排成一条带类型色点
+  的时间线，原始 JSON 收进 `<details>`，逐字核对时它一直在。
+- **「对话原文」真的渲染成对话了。** 那一段此前显示的是 `search_text[:1000]`，一段按字符
+  硬截断的 JSONL，连一个完整 JSON 行都不保证有（实测前 1000 字里换行数为 0）。解析改到
+  服务端做（`Store._transcript_turns`），按角色渲染；Claude Code 里工具输出是 user 角色，
+  所以单独标成「工具」，否则整页都是「你说：（工具输出）」。子 agent 的回合压低一档显示。
+  解析不出对话时说明情况，**不再退回原始 JSON**。
+
 ## 2.0.0-alpha.10
 
 - **修一个自我维持的反馈环。** Recorder fork 的回合写在同一个 transcript 文件里，而

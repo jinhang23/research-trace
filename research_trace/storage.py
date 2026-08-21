@@ -1771,6 +1771,64 @@ class Store:
         selected.sort(key=order, reverse=True)
         return SearchResult(selected, totals=totals, limit=limit, scope=scope)
 
+    @staticmethod
+    def _transcript_turns(text: str, limit: int = 4) -> list[dict[str, Any]]:
+        """从一段 transcript JSONL 里抽出前几轮，供界面直接显示。
+
+        在服务端做而不是丢给浏览器：`preview` 是按字符硬截断的，客户端拿到的往往是半条
+        JSON，怎么都解析不出来。而「对话原文」恰恰是原始历史里最该被读到的一块，
+        让它显示成一坨 JSON 等于白存。
+
+        Claude Code 里工具输出是 user 角色，所以要和人真正说的话分开标注，
+        否则整页都是「你说：（工具输出）」。
+        """
+        turns: list[dict[str, Any]] = []
+        for line in str(text or "").splitlines():
+            if len(turns) >= limit:
+                break
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                value = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(value, dict) or value.get("type") not in ("user", "assistant"):
+                continue
+            message = value.get("message")
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            pieces: list[str] = []
+            is_tool_result = False
+            if isinstance(content, str):
+                pieces.append(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    kind = block.get("type")
+                    if kind == "text":
+                        pieces.append(str(block.get("text") or ""))
+                    elif kind == "tool_use":
+                        pieces.append("→ " + str(block.get("name") or "工具"))
+                    elif kind == "tool_result":
+                        is_tool_result = True
+                    elif kind == "image":
+                        pieces.append("［图片］")
+            body = " ".join(part.strip() for part in pieces if part.strip())
+            if not body:
+                if not is_tool_result:
+                    continue
+                body = "（工具输出）"
+            who = "助手" if value.get("type") == "assistant" else ("工具" if is_tool_result else "你")
+            turns.append({
+                "who": who,
+                "sidechain": bool(value.get("isSidechain")),
+                "text": " ".join(body.split())[:200],
+            })
+        return turns
+
     def raw_timeline(self, project_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
         """Return a bounded, newest-first session/agent timeline without inflating full transcripts."""
         limit = max(1, min(int(limit), 500))
@@ -1798,6 +1856,7 @@ class Store:
             content = value.pop("search_text")
             value["kind"] = "transcript"
             value["preview"] = content[:1000]
+            value["turns"] = self._transcript_turns(content)
             value["truncated"] = len(content) > 1000
             value["at"] = value["created_at"]
             items.append(value)
