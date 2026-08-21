@@ -21,7 +21,11 @@ from tests.test_trace_hook import PROTOCOL, bind, event  # noqa: E402
 
 
 def one_batch(project, data, agent_id, window=""):
-    """跑完一个批次：Stop 派发 → fork 起来 → fork 结束。返回 Stop 那一下的指令。"""
+    """跑完一个批次：Stop 派发 → fork 起来 → fork 结束。返回 Stop 那一下的指令。
+
+    窗口通过项目 marker 传，而不是 hook 参数 —— 插件配置项走 `${user_config.…}` 展开，
+    未设置时会让整个 hook 执行失败，老安装升上来就是采集全停。
+    """
     H.handle(event("UserPromptSubmit", project, prompt="做事"), data, PROTOCOL, "", window)
     out = H.handle(event("Stop", project), data, PROTOCOL, "", window)
     H.handle(event("PreToolUse", project, tool_name="Agent",
@@ -29,6 +33,11 @@ def one_batch(project, data, agent_id, window=""):
     H.handle(event("SubagentStart", project, agent_id=agent_id), data, PROTOCOL, "", window)
     H.handle(event("SubagentStop", project, agent_id=agent_id), data, PROTOCOL, "", window)
     return str(out or "")
+
+
+def bind_with_window(tmp_path, name, window):
+    """在 marker 里写上窗口 —— 这是它真正的来源。"""
+    return bind(tmp_path, name, recorder_fork_window=window)
 
 
 def asks_for_fork(text):
@@ -73,3 +82,20 @@ def test_window_of_zero_never_reforks(tmp_path):
     one_batch(project, data, "a1", "0")
     for _ in range(3):
         assert "Use SendMessage once with to=" in one_batch(project, data, "a1", "0")
+
+
+def test_the_window_comes_from_the_project_marker(tmp_path):
+    """marker 是 hook 本来就要读的东西；插件配置项那条路会让老安装的 hook 直接失败。"""
+    project = bind_with_window(tmp_path, "from-marker", "3")
+    data = tmp_path / "data"
+    assert asks_for_fork(one_batch(project, data, "a1"))
+    assert "Use SendMessage once with to=" in one_batch(project, data, "a1")
+    assert "Use SendMessage once with to=" in one_batch(project, data, "a1")
+    assert asks_for_fork(one_batch(project, data, "a4")), "第 4 批应当重新 fork"
+
+
+def test_a_marker_without_the_key_falls_back_to_every_batch(tmp_path):
+    """老 marker 里没有这个键 —— 必须照常工作，而不是报错。"""
+    project, data = bind(tmp_path, "old-marker"), tmp_path / "data"
+    one_batch(project, data, "a1")
+    assert asks_for_fork(one_batch(project, data, "a2"))

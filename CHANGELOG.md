@@ -4,6 +4,16 @@
 `research_trace/server.py`、`research_trace/mcp.py`、两个 `.claude-plugin/*.json`），
 有测试守它们一致。**改动插件包里的东西之后必须 bump**，否则已安装的机器拿不到。
 
+## 2.0.0-alpha.11
+
+- **修 alpha.9 引入的一个会让采集全停的故障。** 那一版把 `recorder_fork_window` 做成插件
+  配置项并在 `hooks.json` 里引用 `${user_config.recorder_fork_window}`。这个展开发生在 hook
+  启动**之前**，**未设置的选项会让整个 hook 执行失败** —— 不是降级、不是取默认值，是采集
+  直接停掉；plugin.json 里写 `default` 也不算数，因为升级上来的机器 settings 里根本没有这个键。
+  现场报错：`SessionEnd hook [...] failed: Plugin option "recorder_fork_window" isn't set.`
+  改成放项目 marker（`.research-trace.json` 的 `recorder_fork_window`），hook 本来就要读它，
+  缺键即默认值。并加一条守卫：`hooks.json` 只允许引用一个冻结的选项名单。
+
 ## 2.0.0-alpha.10
 
 - **修一个自我维持的反馈环。** Recorder fork 的回合写在同一个 transcript 文件里，而
