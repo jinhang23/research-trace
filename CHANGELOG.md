@@ -4,6 +4,24 @@
 `research_trace/server.py`、`research_trace/mcp.py`、两个 `.claude-plugin/*.json`），
 有测试守它们一致。**改动插件包里的东西之后必须 bump**，否则已安装的机器拿不到。
 
+## 2.0.0-alpha.19
+
+- **环的真正成因找到了：`agent_id` 在工具事件上根本不存在。** 现场数据库统计：
+  `SubagentStop` 上 agent_id 有 110/110，而 `PreToolUse`/`PostToolUse`/`Stop`/
+  `UserPromptSubmit` 上 **0/195**，`SubagentStart` 这个类型一条都没有过。
+  而 `is_recorder` 和 `_recorder_tool_guard` 都靠 `payload["agent_id"] == recorder_id`
+  判断 —— 于是 Recorder 自己调 `trace_attach` 时判不出来，那次调用被当成主 agent 的普通
+  事件写进事件层；事件就是素材，素材就开新批，新批再派一个 Recorder。
+  现场对得上：05:24–05:26 泄漏 8 次 `trace_attach`，attachments 恰好 276 → 284，
+  修订记录里 actor 是 `recorder`。
+- alpha.18 的 `_has_material` 拦不住它：`trace_attach` 是 `PreToolUse`，不是生命周期事件。
+- **改法：Research Trace 自己的 MCP 调用一律不进事件层，且不看 agent_id、按工具名判。**
+  记录系统在运转，不等于研究在推进。代价是主 agent 手动调 `trace_*` 时也不落事件 ——
+  可以接受，那同样是记录系统在运转。
+- 同一个洞还有第二个后果：`_recorder_tool_guard` 在这类宿主上**从未生效过**，
+  Recorder 的只读边界形同虚设（它其实能用 Bash/Edit）。本版先断环；
+  身份判定不依赖 agent_id 的加固另开一版。
+
 ## 2.0.0-alpha.18
 
 - **恒为 0 产出的批次不再存在。** 现场报告：批次每两分钟出一个，内容全是 recorder

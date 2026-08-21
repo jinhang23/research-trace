@@ -814,6 +814,17 @@ def _is_trace_orchestration(
             state.pop("recorder_agent_id", None)
         return True
 
+    # Research Trace 自己的 MCP 调用永远不是研究材料——记录系统在运转，不等于研究在推进。
+    # 这一条**不看 agent_id**，因为 agent_id 靠不住：实测某些 Claude Code 版本只在
+    # SubagentStop 上给 agent_id，PreToolUse / PostToolUse 上一个都没有（现场 195 条
+    # 工具事件全是空）。于是 Recorder 自己调 trace_attach 时 is_recorder 判不出来，
+    # 那次调用被当成主 agent 的普通事件写进事件层 —— 而事件就是「素材」，素材就开新批，
+    # 新批再派一个 Recorder。环就是这么闭合的，且因为它是 PreToolUse 而非生命周期事件，
+    # `_has_material` 也拦不住。
+    # 代价是主 agent 手动调 trace_* 时也不落事件：可以接受——那同样是记录系统在运转。
+    if tool.rsplit("__", 1)[-1] in RECORDER_TRACE_TOOLS:
+        return True
+
     recorder_id = str(state.get("recorder_agent_id") or "")
     is_recorder = bool(recorder_id) and str(payload.get("agent_id") or "") == recorder_id
     if event == "SubagentStop" and is_recorder:
