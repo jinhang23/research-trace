@@ -356,6 +356,56 @@ def _drop_thinking(value: Any, depth: int = 0) -> tuple[Any, bool]:
     return value, False
 
 
+#: transcript 里这些行是编辑器/会话的运行期状态，不是研究材料。实测一份 130 MB 的采集里
+#: file-history-snapshot 一项就占 31.7 MB（24%）——它是 Claude Code 自己的文件快照，
+#: 全额进了 outbox、投递带宽和 GitHub 备份，却没有任何溯源价值。
+#: 注意这不影响提示缓存：缓存是 API 那一侧按 prompt 前缀算的，跟这里抄多少字节无关。
+NOISE_TYPES = ("file-history-snapshot", "queue-operation", "bridge-session", "custom-title", "mode")
+#: 用完整的 `"type":"..."` 形态匹配，而不是裸类型名——"mode" 这种词在正文里太常见。
+#: 写法带空格时会匹配不上，那时这一行被保留：失败方向故意选「多存点噪声」而不是「误删内容」。
+NOISE_MARKERS = tuple(f'"type":"{name}"'.encode("utf-8") for name in NOISE_TYPES)
+
+
+#: Claude Code 给工具输出留了第二份结构化拷贝 `toolUseResult`。读图片时它里面的
+#: `file.base64` 和 `message.content` 里的图片块是**同一份字节**——实测 50 行、26.2 MB，
+#: 100% 都能在同一行的 message.content 里找到副本，占整份采集的 20%。
+#: 只剥这一层，不动整个 toolUseResult：`structuredPatch` / `filePath` / `numLines`
+#: 是「这次编辑改了什么」的证据，几百 KB 但有溯源价值。
+BASE64_HINT = b'"base64"'
+
+
+def _strip_duplicate_base64(value: dict[str, Any]) -> bool:
+    """把 toolUseResult.file.base64 换成一条只有长度和 hash 的占位。
+
+    不直接删：留下「这里曾经有一张多大的图、它的 sha256 是什么」这个事实，
+    和剥 thinking 时留占位是同一个道理——缺口本身也是溯源信息。
+    """
+    result = value.get("toolUseResult")
+    if not isinstance(result, dict):
+        return False
+    file_value = result.get("file")
+    if not isinstance(file_value, dict):
+        return False
+    raw = file_value.get("base64")
+    if not isinstance(raw, str) or not raw:
+        return False
+    encoded = raw.encode("utf-8", "replace")
+    file_value["base64"] = None
+    file_value["research_trace_base64_omitted"] = {
+        "reason": "duplicate of the image block in message.content",
+        "bytes": len(encoded),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+    return True
+
+
+def _is_ui_noise(line: bytes) -> bool:
+    for marker in NOISE_MARKERS:
+        if marker in line:
+            return True
+    return False
+
+
 def _remember_recorder_id(state: dict[str, Any], agent_id: str | None) -> None:
     """记住这个会话里所有当过 Recorder 的 agent id。
 
@@ -381,6 +431,16 @@ def _scrub_line(line: bytes, recorder_ids: frozenset[str] = frozenset()) -> byte
     含该字样但解析不了的行不能放行（无法确认里面没有隐藏推理），也不能静默消失，
     所以换成一条只有长度和 hash 的占位记录：留下缺口证据，不留下原文。
     """
+    if _is_ui_noise(line):
+        return None
+    if BASE64_HINT in line:
+        try:
+            value = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            value = None
+        if isinstance(value, dict) and _strip_duplicate_base64(value):
+            # 重新序列化之后仍要走下面的 thinking 检查，所以不在这里 return。
+            line = (json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
     # Recorder 自己的回合不是研究材料，而且它们跟事件层走的是两条路：事件被
     # _is_trace_orchestration 挡住了，transcript 却是照单全收的。而 fork 的回合就写在
     # 同一个 transcript 文件里，于是「recorder 跑完 → transcript 变长 → 新 chunk →
