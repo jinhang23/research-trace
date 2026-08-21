@@ -16,9 +16,7 @@
               "--capture-enabled",
               "${user_config.capture}",
               "--url",
-              "${user_config.url}",
-              "--recorder-fork-window",
-              "${user_config.recorder_fork_window}"
+              "${user_config.url}"
             ],
             "timeout": 10
           }
@@ -40,9 +38,7 @@
               "--capture-enabled",
               "${user_config.capture}",
               "--url",
-              "${user_config.url}",
-              "--recorder-fork-window",
-              "${user_config.recorder_fork_window}"
+              "${user_config.url}"
             ],
             "timeout": 10
           }
@@ -65,9 +61,7 @@
               "--capture-enabled",
               "${user_config.capture}",
               "--url",
-              "${user_config.url}",
-              "--recorder-fork-window",
-              "${user_config.recorder_fork_window}"
+              "${user_config.url}"
             ],
             "timeout": 10
           }
@@ -90,9 +84,7 @@
               "--capture-enabled",
               "${user_config.capture}",
               "--url",
-              "${user_config.url}",
-              "--recorder-fork-window",
-              "${user_config.recorder_fork_window}"
+              "${user_config.url}"
             ],
             "timeout": 10
           }
@@ -115,9 +107,7 @@
               "--capture-enabled",
               "${user_config.capture}",
               "--url",
-              "${user_config.url}",
-              "--recorder-fork-window",
-              "${user_config.recorder_fork_window}"
+              "${user_config.url}"
             ],
             "timeout": 10
           }
@@ -140,9 +130,7 @@
               "--capture-enabled",
               "${user_config.capture}",
               "--url",
-              "${user_config.url}",
-              "--recorder-fork-window",
-              "${user_config.recorder_fork_window}"
+              "${user_config.url}"
             ],
             "timeout": 10
           }
@@ -165,9 +153,7 @@
               "--capture-enabled",
               "${user_config.capture}",
               "--url",
-              "${user_config.url}",
-              "--recorder-fork-window",
-              "${user_config.recorder_fork_window}"
+              "${user_config.url}"
             ],
             "timeout": 10
           }
@@ -189,9 +175,7 @@
               "--capture-enabled",
               "${user_config.capture}",
               "--url",
-              "${user_config.url}",
-              "--recorder-fork-window",
-              "${user_config.recorder_fork_window}"
+              "${user_config.url}"
             ],
             "timeout": 10
           }
@@ -214,9 +198,7 @@
               "--capture-enabled",
               "${user_config.capture}",
               "--url",
-              "${user_config.url}",
-              "--recorder-fork-window",
-              "${user_config.recorder_fork_window}"
+              "${user_config.url}"
             ],
             "timeout": 10
           }
@@ -239,9 +221,7 @@
               "--capture-enabled",
               "${user_config.capture}",
               "--url",
-              "${user_config.url}",
-              "--recorder-fork-window",
-              "${user_config.recorder_fork_window}"
+              "${user_config.url}"
             ],
             "timeout": 10
           }
@@ -264,9 +244,7 @@
               "--capture-enabled",
               "${user_config.capture}",
               "--url",
-              "${user_config.url}",
-              "--recorder-fork-window",
-              "${user_config.recorder_fork_window}"
+              "${user_config.url}"
             ],
             "timeout": 10
           }
@@ -289,9 +267,7 @@
               "--capture-enabled",
               "${user_config.capture}",
               "--url",
-              "${user_config.url}",
-              "--recorder-fork-window",
-              "${user_config.recorder_fork_window}"
+              "${user_config.url}"
             ],
             "timeout": 10
           }

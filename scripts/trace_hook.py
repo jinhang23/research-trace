@@ -653,6 +653,10 @@ def _fork_window(configured: str = "") -> int:
     1 = 每批都重新 fork（最新鲜）。调大 = 窗口内复用同一个 Recorder，它的上下文逐渐
     变旧，但省下那些读取。0 / 空 / 非数字 = 整个会话只 fork 一次（最省，最旧）。
     """
+    #: 这个值来自项目 marker（`.research-trace.json` 的 `recorder_fork_window`），不是插件
+    #: 配置项。插件配置项走 hooks.json 的 `${user_config.…}` 展开，而**未设置的选项会让整个
+    #: hook 执行失败**——老安装升级上来时它们的 settings 里根本没有这个键，于是采集全停。
+    #: marker 是 hook 本来就要读的东西，缺这个键就用默认值，不会有任何东西展开失败。
     raw = str(configured or os.environ.get("TRACE_RECORDER_FORK_WINDOW") or "").strip()
     if not raw and str(os.environ.get("TRACE_RECORDER_REUSE") or "").strip().lower() in {
         "1", "true", "yes", "on"
@@ -878,8 +882,10 @@ def handle(
         state = _read_json(state_path, {})
         if not isinstance(state, dict):
             state = {}
-        if fork_window:
-            state["fork_window"] = fork_window
+        # 窗口跟着项目走：marker 里没有这个键就是默认值。
+        window = fork_window or str(binding.get("recorder_fork_window") or "")
+        if window:
+            state["fork_window"] = window
         _capture_transcripts(root, payload, state)
         internal = _is_trace_orchestration(root, payload, state)
         if not internal:
@@ -908,7 +914,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--data-dir", required=True)
     parser.add_argument("--protocol", required=True)
     parser.add_argument("--capture-enabled", default="on")
-    parser.add_argument("--recorder-fork-window", default="")
     parser.add_argument("--url", default=os.environ.get("TRACE_URL", ""))
     args = parser.parse_args(argv)
     if str(args.capture_enabled).strip().lower() in {"0", "false", "off", "no"}:
@@ -918,8 +923,7 @@ def main(argv: list[str] | None = None) -> int:
         payload = json.loads(raw)
         if not isinstance(payload, dict):
             return 0
-        output = handle(payload, Path(args.data_dir), Path(args.protocol), str(args.url or ""),
-                        fork_window=str(args.recorder_fork_window or ""))
+        output = handle(payload, Path(args.data_dir), Path(args.protocol), str(args.url or ""))
         if output:
             print(json.dumps(output, ensure_ascii=False, separators=(",", ":")))
     except Exception as exc:  # fail-open by design; stderr is debug-only on exit 0
