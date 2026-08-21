@@ -181,6 +181,7 @@ def test_marker_project_identity_travels_with_the_directory(tmp_path: Path):
 def test_stop_hook_continues_only_once_per_turn(tmp_path: Path):
     cwd = bind(tmp_path)
     data = tmp_path / "plugin-data"
+    H.handle(event("UserPromptSubmit", cwd, prompt="做点事"), data, PROTOCOL)
     first = H.handle(event(
         "Stop", cwd, stop_hook_active=False, last_assistant_message="done", background_tasks=[]
     ), data, PROTOCOL)
@@ -196,6 +197,7 @@ def test_stop_hook_continues_only_once_per_turn(tmp_path: Path):
 def test_recorder_fork_is_remembered_resumed_and_closes_its_batch(tmp_path: Path):
     cwd = bind(tmp_path)
     data = tmp_path / "plugin-data"
+    H.handle(event("UserPromptSubmit", cwd, prompt="做点事"), data, PROTOCOL)
     output = H.handle(event(
         "Stop", cwd, stop_hook_active=False, last_assistant_message="done", background_tasks=[]
     ), data, PROTOCOL)
@@ -215,6 +217,7 @@ def test_recorder_fork_is_remembered_resumed_and_closes_its_batch(tmp_path: Path
     state = json.loads((session_root(data) / "state.json").read_text(encoding="utf-8"))
     assert state["recorder_agent_id"] == "agent-recorder"
 
+    H.handle(event("UserPromptSubmit", cwd, prompt="接着做"), data, PROTOCOL)
     resume = H.handle(event(
         "Stop", cwd, stop_hook_active=False, last_assistant_message="next", background_tasks=[]
     ), data, PROTOCOL)
@@ -230,7 +233,7 @@ def test_recorder_fork_is_remembered_resumed_and_closes_its_batch(tmp_path: Path
     root = session_root(data)
     assert not (root / "batches" / f"{batch_id}.json").exists()
     assert (root / "batches" / "done" / f"{batch_id}.json").exists()
-    assert len(list((root / "pending").glob("*.json"))) == 2, "raw events stay pending until delivered"
+    assert len(list((root / "pending").glob("*.json"))) == 4, "raw events stay pending until delivered"
     assert not (root / "awaiting_upload").exists(), "awaiting_upload/ is gone for good"
 
 
@@ -238,6 +241,7 @@ def test_a_subagent_that_claims_a_receipt_is_not_promoted_to_recorder(tmp_path: 
     """①：回执机制取消后，任何自称都不能让普通子 agent 变成 Recorder 并被封杀工具。"""
     cwd = bind(tmp_path)
     data = tmp_path / "plugin-data"
+    H.handle(event("UserPromptSubmit", cwd, prompt="做点事"), data, PROTOCOL)
     output = H.handle(event(
         "Stop", cwd, stop_hook_active=False, last_assistant_message="done", background_tasks=[]
     ), data, PROTOCOL)

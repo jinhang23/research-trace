@@ -43,6 +43,7 @@ def test_the_second_batch_asks_for_a_new_fork_not_a_message(tmp_path):
     first = run_a_batch(project, data)
     assert "subagent_type='fork'" in dispatch_text(first)
 
+    H.handle(event("UserPromptSubmit", project, prompt="接着做"), data, PROTOCOL)
     second = H.handle(event("Stop", project), data, PROTOCOL)
     text = dispatch_text(second)
     assert "subagent_type='fork'" in text, "第二批还是该重新 fork，拿当下的上下文"
@@ -55,6 +56,7 @@ def test_reuse_can_be_restored_for_deployments_without_prompt_caching(tmp_path, 
     monkeypatch.setenv("TRACE_RECORDER_REUSE", "1")
     project, data = bind(tmp_path, "project-b"), tmp_path / "data"
     run_a_batch(project, data)
+    H.handle(event("UserPromptSubmit", project, prompt="接着做"), data, PROTOCOL)
     second = dispatch_text(H.handle(event("Stop", project), data, PROTOCOL))
     assert "Use SendMessage once with to=" in second
     assert "subagent_type='fork'" not in second

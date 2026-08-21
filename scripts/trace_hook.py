@@ -42,6 +42,15 @@ RECORDER_TRACE_TOOLS = {
 
 MARKER_NAME = ".research-trace.json"
 
+#: 这些 hook 事件本身不携带任何研究材料，它们只说「一轮结束了」「会话开始了」。
+#: 一个 batch 如果**只**由它们组成，这一批就没有东西可记——而派一次 Recorder 是一次完整
+#: fork（实测首轮读入约 60 万 token）。此前的判据是 `events or chunks`：任何新东西都开批，
+#: 于是一个只含 Stop 的 batch 也照付全价，Recorder 正确地记下 0 条，下一轮再来一次。
+#: 恒为 0 产出的那种批次不该存在，而不是该被 Recorder 判断掉——判断本身就是那 60 万。
+LIFECYCLE_EVENTS = frozenset({
+    "Stop", "StopFailure", "SessionStart", "SessionEnd", "PreCompact", "PostCompact",
+})
+
 # outbox 里装着完整对话和带令牌的命令原文。在多用户 HPC 节点上默认 0755/0644 等于
 # 同机任何人可读；凭证文件早就是 0600，这里照抄同一个标准。Windows 上 chmod 基本无效，
 # 所以是 best-effort，不影响流程。
@@ -659,7 +668,7 @@ def _ensure_batch(
     chunks.sort(key=lambda item: item[0])
 
     open_batches = _open_manifests(root)
-    if events or chunks:
+    if _has_material(root, events):
         batch_id = f"{int(time.time())}-{uuid.uuid4().hex[:10]}"
         manifest = {
             "schema": "research-trace.batch.v1",
@@ -683,6 +692,30 @@ def _ensure_batch(
             chunk_cursor[key] = max(int(chunk_cursor.get(key, 0) or 0), end)
         open_batches.append((manifest_path, manifest))
     return open_batches[0] if open_batches else None
+
+
+def _has_material(root: Path, events: list[tuple[str, str]]) -> bool:
+    """这一批里有没有「真的发生过什么」。
+
+    判据是**事件**而不是 transcript 长度：用户说了话（UserPromptSubmit）、调了工具
+    （Pre/PostToolUse）、子 agent 跑完（SubagentStart/Stop）——这些都写事件；而 Recorder
+    自己那一段被 `_is_trace_orchestration` 挡在事件层之外，一个事件都不写。所以
+    「只剩生命周期事件」和「这段时间里只有 Recorder 在动」是同一件事。
+
+    transcript 不能当判据：Recorder 的回合就写在同一个 transcript 文件里，chunk 照样变长
+    （scrub 只按 agentId 精确匹配丢行，漏一行就够开一批），于是 `events or chunks` 会把
+    Recorder 自己的活动当成新素材，再派一次 fork。
+
+    跳过时**不推进游标**：这些事件会留到下一批真有内容时一起带上，什么都不会丢。
+    原始投递跟这里无关——它由投递器按中央 2xx 决定，本来就不经过 batch。
+    """
+    for name, rel in events:
+        record = _read_json(root / rel, {})
+        if not isinstance(record, dict):
+            return True     # 读不出来就当它有内容：宁可多派一次，也不要静默漏记
+        if str(record.get("hook_event") or "") not in LIFECYCLE_EVENTS:
+            return True
+    return False
 
 
 def _close_batch(root: Path, batch_id: str) -> None:
