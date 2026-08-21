@@ -4,6 +4,22 @@
 `research_trace/server.py`、`research_trace/mcp.py`、两个 `.claude-plugin/*.json`），
 有测试守它们一致。**改动插件包里的东西之后必须 bump**，否则已安装的机器拿不到。
 
+## 2.0.0-alpha.18
+
+- **恒为 0 产出的批次不再存在。** 现场报告：批次每两分钟出一个，内容全是 recorder
+  plumbing，Recorder 每次正确地记下 0 条 —— 但**判断「没东西可记」本身就要先付一次完整
+  fork**（首轮读入约 60 万 token）。一轮多烧七十多万 token，换一个必然为空的结论。
+- 判据从 `events or chunks` 改成 `_has_material(events)`：**transcript 长度不能当判据**。
+  Recorder 自己的回合就写在同一个 transcript 文件里，chunk 照样变长，而 scrub 只按
+  `agentId` 精确匹配丢行 —— 漏一行就够开一批。于是「Recorder 跑完 → transcript 变长 →
+  新 chunk → 开批 → 再派一次 Recorder」自己转起来。
+- 改看**事件**：用户说话（`UserPromptSubmit`）、调工具（`Pre/PostToolUse`）、子 agent
+  跑完（`SubagentStart/Stop`）都写事件；而 Recorder 那一段被 `_is_trace_orchestration`
+  挡在事件层之外，一个事件都不写。所以「只剩生命周期事件」和「这段时间里只有 Recorder
+  在动」是同一件事。跳过时**不推进游标**，那些事件留到下一批一起带上，一条都不丢；
+  原始投递本来就不经过 batch，完全不受影响。
+- 读不出来的事件一律当作有内容：分不清的时候多派一次，比静默漏记便宜得多。
+
 ## 2.0.0-alpha.17
 
 - **给 Node 正文定了一个框架**：先回答三个问题，再写细节 —— **结论**（一到三句，能单独
