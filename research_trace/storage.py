@@ -793,11 +793,37 @@ class Store:
                 (pid,),
             ).fetchone()
             detail["raw_cursor"] = dict(cursor)
+            detail["structure"] = self._structure_summary_locked(pid)
         if include_dataflow:
             # 默认不算：数据流是可选派生视图（§8），而 context 是每个 batch 都要拉的
             # 热路径，不该为一个多数项目是空图的视图付出一次全表 join。
             detail["dataflow"] = self.dataflow(pid)
         return {"matched": True, "project": detail}
+
+    def _structure_summary_locked(self, project_id: str) -> dict[str, Any]:
+        """这个项目的结构字段被填到了什么程度。
+
+        和 dataflow 里的 unkeyed / unlabeled_direction 是同一句话：**视图会数出你漏掉的**。
+        一张空的结构图有两种读法——「这项目就是一堆互不相干的记录」，或者「没人填过
+        parent_id」。这三个数把两者分开，而且是在写下一条记录**之前**看到。
+        """
+        totals = self._db.execute(
+            "SELECT COUNT(*) nodes, "
+            "       SUM(parent_id IS NOT NULL) linked, "
+            "       SUM(source_event_ids_json IS NOT NULL AND source_event_ids_json NOT IN ('','[]')) sourced "
+            "FROM nodes WHERE project_id=?",
+            (project_id,),
+        ).fetchone()
+        artifacts = self._db.execute(
+            "SELECT COUNT(*) n FROM attachments WHERE project_id=? AND target_type='node'", (project_id,),
+        ).fetchone()["n"]
+        nodes = int(totals["nodes"] or 0)
+        return {
+            "nodes": nodes,
+            "linked_to_a_parent": int(totals["linked"] or 0),
+            "with_source_event_ids": int(totals["sourced"] or 0),
+            "artifacts_registered": int(artifacts),
+        }
 
     def add_workspace_keys(self, project_id: str, keys: Sequence[str]) -> None:
         normalized = [normalize_workspace_key(key) for key in keys]
@@ -928,7 +954,7 @@ class Store:
                     all(existing_signature.get(key) == desired_signature.get(key) for key in compare_keys)
                     and current_codes == desired_codes
                 ):
-                    return self._expand_node_locked(db, existing)
+                    return self._with_structure_gaps_locked(db, pid, existing)
                 if created_by == "recorder":
                     latest = db.execute(
                         "SELECT actor_type FROM semantic_revisions "
@@ -968,7 +994,59 @@ class Store:
             self._save_revision_locked(
                 db, pid, "node", node_id, version, snapshot, created_by, None, source_ids, False,
             )
-            return self._expand_node_locked(db, row)
+            return self._with_structure_gaps_locked(db, pid, row)
+
+    def _with_structure_gaps_locked(self, db, project_id: str, row) -> dict[str, Any]:
+        """把这条记录**漏掉的结构字段**当场回给写它的人。
+
+        为什么要在响应里说，而不是只写在文档和 schema 里：协议文档在 fork 时读一次，
+        schema 在调用时看一眼，两者都在「这一条具体的记录到底填没填」之前。而这里是
+        写完之后、下一条记录之前，说的是已经发生的事实，不是规则。
+
+        代价必须是零：漏掉这些字段**照样写成功**。这是回执，不是校验——一条 400 会让
+        Recorder 去猜怎么讨好接口，而它该做的是判断这次到底有没有延续关系。
+
+        真出过事：RNAPreprocessPipeline 的 14 条记录，parent_id 全空、artifact 一个
+        没登记，于是结构图是 14 个孤儿、数据流视图整个不出现。正文里其实连输入输出表格
+        都写全了——信息都在，只是没有一样进到系统能用的字段里。
+        """
+        node = self._expand_node_locked(db, row)
+        if node.get("created_by") == "human":
+            return node   # 人写的根节点是个决定，不是遗漏
+        gaps: list[str] = []
+        if not node.get("parent_id"):
+            siblings = db.execute(
+                "SELECT COUNT(*) n FROM nodes WHERE project_id=? AND id<>?", (project_id, node["id"]),
+            ).fetchone()["n"]
+            if siblings:
+                gaps.append(
+                    f"recorded as a root while {siblings} other node(s) exist: the structure view is "
+                    "built from parent_id and nothing else, so this record is drawn unconnected. "
+                    "If it continues earlier work, set parent_id to that node's id "
+                    "(trace_context returns recent_nodes). A root is fine when the work genuinely starts here."
+                )
+        if not node.get("source_event_ids"):
+            gaps.append(
+                "no source_event_ids: this node has no edge back to the raw history that produced it, "
+                "so its 原始历史 button falls back to the project's latest events."
+            )
+        artifacts = db.execute(
+            "SELECT COUNT(*) n FROM attachments WHERE target_type='node' AND target_id=?", (node["id"],),
+        ).fetchone()["n"]
+        if not artifacts:
+            total = db.execute(
+                "SELECT COUNT(*) n FROM attachments WHERE project_id=? AND target_type='node'", (project_id,),
+            ).fetchone()["n"]
+            if not total:
+                gaps.append(
+                    "no artifact registered anywhere in this project yet: the data-flow view is derived "
+                    "purely by joining registered artifacts on sha256/uri/machine+path, so it stays hidden. "
+                    "If this run read or wrote a file worth naming, register it with trace_attach and set "
+                    "direction (the default 'reference' joins on neither side)."
+                )
+        if gaps:
+            node["structure_gaps"] = gaps
+        return node
 
     def update_node(
         self,

@@ -45,7 +45,7 @@ METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
 
-SERVER_INFO = {"name": "research-trace", "version": "2.0.0-alpha.16"}
+SERVER_INFO = {"name": "research-trace", "version": "2.0.0-alpha.17"}
 INSTRUCTIONS = (
     "Research Trace has a raw-history layer and a selective semantic layer. "
     "Capture is opt-in per project: a directory without a .research-trace.json marker records "
@@ -119,20 +119,67 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "trace_record",
-        "description": "Create or retry one valuable unreviewed Node in an existing human-defined Chapter; omit chapter_id for Inbox.",
+        "description": ("Create or retry one valuable unreviewed Node in an existing human-defined Chapter; "
+                        "omit chapter_id for Inbox. Set parent_id when this continues earlier work - "
+                        "the structure view is built from that field alone."),
         "inputSchema": {
             "type": "object",
             "required": ["project_id", "idempotency_key", "title"],
             "properties": {
                 "project_id": {"type": "string"},
                 "idempotency_key": {"type": "string"},
-                "title": {"type": "string"},
-                "body": {"type": "string"},
+                "title": {
+                    "type": "string",
+                    "description": (
+                        "One line that states the outcome, not the activity. "
+                        "'Pocket cut at 8 A, 6,767 -> 4,554 pairs' is a title; 'Ran step 5' is not. "
+                        "It is what a reader scans in the structure view, so put the number in it."
+                    ),
+                },
+                "body": {
+                    "type": "string",
+                    "description": (
+                        "Answer three questions, in this order, before any detail:\n"
+                        "1. CLAIM - one to three sentences a reader can act on without reading further. "
+                        "The single thing this record asserts.\n"
+                        "2. BASIS - what it rests on: the command, the numbers, the file, the citation. "
+                        "Mark anything not directly observed as inference or hypothesis in those words; "
+                        "an inference written in the voice of an observation is the one error nobody "
+                        "downstream can detect.\n"
+                        "3. CONSEQUENCE - what is now settled, what is still open, and which earlier "
+                        "record this overturns (name it).\n"
+                        "Then any amount of detail: method, parameters, input/output tables, pitfalls.\n"
+                        "Use headings in the record's own language; do not translate the record itself. "
+                        "The three answers are what makes a Node readable a year later - the detail "
+                        "below them is what makes it reproducible, and it is optional in a way they are not."
+                    ),
+                },
                 "chapter_id": {"type": "string"},
-                "parent_id": {"type": "string"},
+                "parent_id": {
+                    "type": "string",
+                    "description": (
+                        "The id of the Node this one continues - normally the record whose result this "
+                        "work started from. Take it from trace_context's recent_nodes.\n"
+                        "The structure view is built from this field and nothing else: order in time, "
+                        "similar titles and shared files infer nothing. Omit it and the record is drawn "
+                        "as an unconnected root forever, and no later pass repairs it.\n"
+                        "A root is a real and useful thing to record - a new line of work, an "
+                        "independent finding - but it is a claim that nothing preceded this, so make it "
+                        "on purpose rather than by leaving the field out. Same Chapter only."
+                    ),
+                },
                 "labels": {"type": "array", "items": {"type": "string"}},
                 "occurred_at": {"type": "string"},
-                "source_event_ids": {"type": "array", "items": {"type": "string"}},
+                "source_event_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "The manifest event ids this Node was written from. This is the only edge from a "
+                        "semantic record back to the raw history behind it: without it the Node's "
+                        "raw-history button degrades to 'the project's most recent events', and the "
+                        "promise that any record can be checked against its source stops being true."
+                    ),
+                },
                 "code_evidence": {
                     "type": "array",
                     "items": {

@@ -83,8 +83,13 @@ the copy in this file reaches a reader who cannot act on it.
    returned by `trace_context`; never invent or create a Chapter. Put the Node in `Inbox` by omitting
    `chapter_id` whenever placement is uncertain or the material cannot be cleanly split by track.
    All Recorder-created Nodes remain `unreviewed` until a human confirms their content and placement.
-   Set `parent_id` only for an actual continuation inside the same Chapter; a new idea can be a root.
-6. Use `trace_record` idempotency keys derived from `batch_id`, such as
+6. **Set `parent_id` when this record continues earlier work.** The structure view is built from
+   this field and nothing else — order in time, similar titles and shared files infer nothing. Take
+   the id from `trace_context`'s `recent_nodes`. A root is a real and useful thing to record (a new
+   line of work, an independent finding), but it is a *claim that nothing preceded this*, so make it
+   on purpose rather than by leaving the field out: omitting it draws the record unconnected forever
+   and no later pass repairs it. The parent must be in the same Chapter.
+7. Use `trace_record` idempotency keys derived from `batch_id`, such as
    `semantic:<batch_id>:0`. A retry must reuse the same keys. Never reuse a key in a later batch to
    revise a Node. If a human has edited, moved, confirmed or corrected the Node, a conflicting retry
    must preserve the human revision; do not evade the conflict with a new key.
@@ -92,12 +97,12 @@ the copy in this file reaches a reader who cannot act on it.
    list is the only edge from a semantic record back to the raw history that produced it: without
    it the web UI's "原始历史" button on that Node degrades to "the project's most recent events",
    and the claim that any record can be checked against its source stops being true.
-7. For key implementations, record purpose, method, design reason, validation and limitations.
+8. For key implementations, record purpose, method, design reason, validation and limitations.
    Add selected Code Evidence: repo/commit when available, file path, symbol, a short diff or
    snippet, and a separate annotation. Do not attach every changed file. If parallel agents shared
    a working tree and authorship cannot be proved, set attribution to `ambiguous`; never infer a
    final-file author from a shared `git diff`.
-8. Update a Chapter summary or Project Overview with `trace_curate` only when current understanding
+9. Update a Chapter summary or Project Overview with `trace_curate` only when current understanding
    materially changed. Overview holds active project-level hypotheses, open questions, decisions,
    lessons and milestones, not a chronological dump. Human corrections returned by
    `trace_context` have highest priority. Never overwrite one; pass its id in `resolve_comment_ids`
@@ -107,7 +112,51 @@ the copy in this file reaches a reader who cannot act on it.
    You cannot set `actor_type`, `actor_id`, `created_by` or `review_state` on anything. The server
    derives all four from the credential and ignores the request body, so a Recorder write is always
    `recorder` and always `unreviewed`; confirmations and corrections are 403 for you.
-9. Preserve the original language. Research Trace has no bilingual-copy workflow.
+10. Preserve the original language. Research Trace has no bilingual-copy workflow.
+
+## What a Node looks like
+
+A Node is read by someone who has forgotten everything, possibly a year later, possibly not you.
+Answer three questions in this order **before any detail**, and the record survives that reader:
+
+1. **Claim** — one to three sentences they can act on without reading further: the single thing this
+   record asserts. `口袋按 8 Å 切,空口袋剪枝后 6,767 → 4,554 对,样本集合在这里首次定型。`
+2. **Basis** — what the claim rests on: the command, the numbers, the file, the citation. Anything
+   you did not directly observe must say so in those words — *inferred*, *hypothesis*, *the user
+   decided*. An inference written in the voice of an observation is the one error nobody downstream
+   can detect, because the record looks exactly the same either way.
+3. **Consequence** — what is now settled, what is still open, and which earlier record this
+   overturns. Name that record: "this supersedes an earlier note" helps nobody.
+
+Then any amount of detail: method, parameters, input/output tables, the pitfalls you hit. Detail is
+what makes a Node reproducible; the three answers are what make it findable and trustworthy, and
+they are not optional the way detail is. Use headings in the record's own language.
+
+The title carries the same load. It states an outcome, not an activity: `步骤 5 · 8 Å 口袋切割,
+6,767 → 4,554` is a title; `跑了 step5` is not. It is what a reader scans in the structure view,
+so the number belongs in it.
+
+### The three fields that are not prose
+
+A Node's prose can be perfect and the project still have no structure. These three carry everything
+the views are built from, and **nothing recovers them afterwards**:
+
+| field | what it feeds | if you omit it |
+|---|---|---|
+| `parent_id` | the structure view | the record is drawn as an unconnected root, forever |
+| `trace_attach` key + `direction` | the data-flow view | no edge, ever — see the next section |
+| `source_event_ids` | that Node's raw-history button | it degrades to "the project's latest events" |
+
+This has actually gone wrong. One project accumulated 14 Nodes whose bodies carried full input and
+output tables with absolute paths and sizes — and `parent_id` empty on all 14, zero artifacts
+registered, `source_event_ids` on 3 of them. Every fact was present; none of it was in a field
+anything could use. The structure view was 14 orphans and the data-flow view never appeared.
+**Writing the paths into a markdown table is not registering them.**
+
+`trace_record` tells you when this happens: its response carries `structure_gaps` naming what that
+record left out. It is a receipt, not a validation — the write already succeeded — so read it and
+decide, rather than filling fields to silence it. `trace_context` reports the same for the whole
+project under `structure`, before you write anything.
 
 ## What belongs where
 
