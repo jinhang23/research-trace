@@ -236,27 +236,18 @@ ANONYMOUS_READ_WARNING = (
 )
 
 
-NO_BACKUP_WARNING = (
-    "!!! Research Trace: running with --no-backup. The SQLite database and the object\n"
-    "!!! directory on this machine are the ONLY copy of every record and every raw\n"
-    "!!! transcript. One disk failure ends the project's history.\n"
-    "!!! Configure --backup-repo <a PRIVATE git worktree> as soon as this is more than a trial."
-)
-
-MISSING_BACKUP = (
-    "refusing to start without a backup destination.\n"
-    "\n"
-    "A provenance system whose only copy lives on one disk is not a provenance system.\n"
-    "Point --backup-repo (or TRACE_BACKUP_REPO) at a git worktree whose remote is a\n"
-    "PRIVATE repository -- the export carries raw transcripts:\n"
-    "\n"
-    "  trace-server --data-dir <dir> --backup-repo /srv/research-trace/private-backup\n"
-    "\n"
-    "Only the named subdirectory is staged and committed, so pointing this at a repo you\n"
-    "already use for something else does not sweep up its other changes.\n"
-    "\n"
-    "If you really mean to run without any backup (a local trial, a throwaway instance),\n"
-    "say so explicitly with --no-backup or TRACE_NO_BACKUP=true."
+#: 备份默认关闭。一个把原始 transcript 往外推的功能，不该在没人要求的情况下自己开起来
+#: —— 备份目的地是别人的仓库，推上去就不完全在本地掌控之内了，那必须是一次明确的选择。
+#: 早先的版本反过来：不配备份就拒绝启动。理由（唯一副本在一块盘上，通常要到盘坏才发现）
+#: 依然成立，所以这里仍然说一句；但它是提示，不是关卡。
+NO_BACKUP_NOTE = (
+    "Research Trace: no backup destination configured, so this machine's SQLite database"
+    " and object directory are the only copy of every record and raw transcript.\n"
+    "To turn backup on, point --backup-repo (or TRACE_BACKUP_REPO) at a git worktree whose"
+    " remote is a PRIVATE repository -- the export carries raw transcripts. Only the named"
+    " subdirectory is staged and committed, so a repo you already use for something else"
+    " does not get its other changes swept up.\n"
+    "Pass --no-backup (or TRACE_NO_BACKUP=true) to silence this note."
 )
 
 
@@ -426,7 +417,7 @@ def create_app(
                 await task
             store.close()
 
-    app = FastAPI(title="Research Trace", version="2.0.0-alpha.19", lifespan=lifespan,
+    app = FastAPI(title="Research Trace", version="2.0.0-alpha.20", lifespan=lifespan,
                   root_path=base)
     app.state.base_path = base
     app.state.store = store
@@ -1309,7 +1300,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="把服务挂在一个路径前缀下，例如 /trace；前缀之外一律 404")
     parser.add_argument("--backup-repo", default=os.environ.get("TRACE_BACKUP_REPO"))
     parser.add_argument("--no-backup", action="store_true", default=_env_bool("TRACE_NO_BACKUP"),
-                        help="明确表示这个实例不要备份（本地试用/一次性实例）")
+                        help="不备份（本来就是默认行为），并且不要每次启动都提醒")
     parser.add_argument("--backup-interval-hours", type=float,
                         default=float(os.environ.get("TRACE_BACKUP_INTERVAL_HOURS", "24")))
     parser.add_argument("--backup-subdirectory",
@@ -1338,13 +1329,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--insecure-cookies", action="store_true",
                         default=_env_bool("TRACE_INSECURE_COOKIES"))
     args = parser.parse_args(argv)
-    # 备份不是可选项，而是必须做出的一个选择。默认什么都不配就跑起来，等于让每个部署
-    # 都默默停在「唯一副本在一块盘上」这个状态 —— 而这件事通常要到盘坏了才被发现。
+    # 备份默认不开：往一个 git remote 推原始 transcript 是一件外向的事，必须有人明确要求。
+    # --no-backup 保留下来，含义从「豁免那道关卡」变成「我知道没有备份，别再提醒」。
     if not str(args.backup_repo or "").strip() and not args.no_backup:
-        print("trace-server: " + MISSING_BACKUP, file=os.sys.stderr)
-        return 2
-    if args.no_backup:
-        print(NO_BACKUP_WARNING, file=os.sys.stderr)
+        print(NO_BACKUP_NOTE, file=os.sys.stderr)
     try:
         import uvicorn
     except ImportError:

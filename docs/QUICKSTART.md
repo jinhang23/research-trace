@@ -19,17 +19,26 @@ Git 仓库是可验证的灾备副本。
 ```bash
 python -m pip install -e ".[server]"
 trace-server --data-dir /srv/research-trace/data \
+  --host 127.0.0.1 --port 8765 --token "<long-random-token>"
+```
+
+**Git 备份默认不开。** 它会把导出往一个 git remote 推，而导出里带**完整原始 transcript**
+—— 这是一件外向的事，不该在没人要求的情况下自己跑起来。
+
+要开就加 `--backup-repo`（或环境变量 `TRACE_BACKUP_REPO`），指向一个 git 工作树：
+
+```bash
+trace-server --data-dir /srv/research-trace/data \
   --backup-repo /srv/research-trace/private-backup \
   --host 127.0.0.1 --port 8765 --token "<long-random-token>"
 ```
 
-**`--backup-repo` 是必填的**（或环境变量 `TRACE_BACKUP_REPO`）。不给就拒绝启动 ——
-默认能跑起来的话，每个部署都会默默停在「唯一副本在一块盘上」这个状态，而这件事通常
-要到盘坏了才被发现。那个仓库的 remote **必须是私有的**：导出里带完整原始 transcript。
-只有指定的子目录会被 stage 和 commit，所以指向一个你已经在用的仓库不会把它其它改动卷进来。
+那个仓库的 remote **必须是私有的**，理由同上。只有指定的子目录会被 stage 和 commit，
+所以指向一个你已经在用的仓库，不会把它其它改动卷进来。
 
-本地试用或一次性实例可以明确说不要：`--no-backup`（或 `TRACE_NO_BACKUP=true`）。
-它会在启动时打印一段醒目的警告，这是有意的。
+不配的话，本机的 `trace.sqlite3` 和 `objects/` 就是**唯一副本**，启动时会提醒一句 ——
+一块盘坏掉就是整个项目历史的终点，而这件事通常要到盘坏了才被发现。
+明确不需要备份时用 `--no-backup`（或 `TRACE_NO_BACKUP=true`）把提醒也关掉。
 
 不配置 OAuth 时，浏览器打开 `http://127.0.0.1:8765/`；读取兼容旧的公开模式，写操作使用
 Bearer token。团队部署应按下一节配置 GitHub OAuth 和 HTTPS。启用后，Project、原始历史、
