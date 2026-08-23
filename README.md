@@ -82,11 +82,12 @@ cd research-trace
 python -m pip install -e ".[server]"
 
 trace-server --data-dir /srv/research-trace/data \
-  --backup-repo /srv/research-trace/private-backup \
   --host 127.0.0.1 --port 8765
 ```
 
-`--backup-repo` 是必填的，不给会拒绝启动；本地试用可以用 `--no-backup` 明确放弃。
+**备份默认不开。** 加 `--backup-repo <一个私有 git 工作树>`（或 `TRACE_BACKUP_REPO`）
+才会往那个仓库推 —— 导出里有原始 transcript，所以那个仓库**必须是私有的**。
+不配就只有本机这一份副本，启动时会提醒一句；`--no-backup` 把提醒也关掉。
 团队部署要配 HTTPS 和 GitHub OAuth，见[快速开始](docs/QUICKSTART.md)。
 
 ### 客户端
