@@ -8,6 +8,15 @@
 它记的不只是实验。论文检索、想法讨论、对数据的理解、失败的方案、关键实现、指标、
 图片、产物路径和阶段性结论，都是项目知识的一部分。
 
+## 当前进度
+
+当前实现为 **2.0.0a26**：已集成通用框架、Entire/Git 被动取证，并为现有 Recorder
+增加防循环限制。下面的工作流程描述的是当前代码。
+
+下一阶段已确定为**独立模型增量整理（方案 3）**，使用 Claude Code 订阅内额度，优先
+复用 Claude-Mem 的观察与解析代码。这个后台 Recorder 尚未接入，当前仍由主 agent 派发 fork。
+具体未完成事项见[待办清单](docs/TODO.md)，源码接入方案见[Recorder 复用方案](docs/RECORDER_REUSE_PLAN.md)。
+
 ## 它是怎么工作的
 
 不需要你记得去记录 —— 这是整件事的前提。四个部件各管一段：
@@ -15,7 +24,7 @@
 **① Hook：把发生过的事写到本机硬盘上。**
 你在 Claude Code 里正常干活。每当一件事发生（你提了个问题、跑了个命令、子任务结束），
 插件里的 hook 就把它同步写进本机一个待发目录，然后立刻返回。
-它**不联网**，所以网断了、服务挂了都不影响你干活，东西也不会丢。
+它**不联网**，网断时材料留在本机待投递；启用代码捕获后，阶段结束会保存 Git 快照。
 
 **② 投递器：把待发目录送上中央服务。**
 一个叫 `trace-deliver` 的独立进程负责上传，**只有中央确认收到（HTTP 2xx）才把文件挪进已发目录**。
@@ -30,7 +39,16 @@
 
 **④ 中央服务：存起来，给人读。**
 SQLite 加内容寻址的附件目录是在线真相源，网页上能看结构图、记录、原始历史和搜索。
-另外每隔一段时间导出一份确定性快照，commit 并 push 到一个**私有** Git 仓库当灾备。
+代码快照和运行证据随原始记录保存；GitHub 定时备份已移除，按需保留本地导出/恢复工具。
+
+中央服务可选连接 **MLflow** 与 **Basic Memory**：前者把已绑定实验中的 run / trace 保存为
+带来源的证据快照，后者为 Overview、Chapter 和 Node 建 hybrid 检索索引。它们都不会改写
+人工确认的结论；检索命中会回到中央存储读取最新版本。配置与部署见[框架集成](docs/INTEGRATIONS.md)。
+
+当前版本已集成 **Entire + Git、官方 MCP SDK、markdown-it、Dagre、SQLAlchemy/Alembic、Authlib**。
+Entire 提供主会话与阶段代码证据。Agent 照常训练、提交 sbatch，并负责保持实验原目录和公共代码不变；
+记录系统只保存观察到的命令、结果、对话与代码版本。Submitit 和实验执行管理已移除。
+安装、复现命令和已验证边界见[运行集成指南](docs/RUNTIME_INTEGRATION.md)；具体替换位置见[源码复用清单](docs/SOURCE_REUSE.md)。
 
 ```mermaid
 flowchart LR
@@ -43,14 +61,16 @@ flowchart LR
     MCP --> Server
     Server --> Store["SQLite + 附件"]
     Server --> UI["网页"]
-    Server --> GitHub["私有 Git 备份"]
+    Code["Entire / Git · 代码证据"] --> Outbox
+    Server -.-> MLflow["MLflow 证据（可选）"]
+    Server -.-> Memory["Basic Memory 索引（可选）"]
 ```
 
 三条边界值得单独记住：
 
 - **采集是按项目 opt-in 的。** 只有放了 `.research-trace.json` 标记的目录会被记录；
   没有标记时 hook 在建任何目录之前就返回，一个字节都不写。
-- **隐藏推理不出本机。** transcript 在写盘前逐行剥掉 `thinking` 块。
+- **Research Trace 仅保存可见内容。** 原始 hook 在写入 outbox 前过滤隐藏推理；Entire 导入也过滤，但 Entire 自身的本机存储遵循上游行为。
 - **人的判断高于 Recorder。** Recorder 建的记录一律是「未确认」；人可以改、可以评论、
   可以纠正，而 Recorder 的重试覆盖不了更新的人类版本。
 
@@ -85,10 +105,7 @@ trace-server --data-dir /srv/research-trace/data \
   --host 127.0.0.1 --port 8765
 ```
 
-**备份默认不开。** 加 `--backup-repo <一个私有 git 工作树>`（或 `TRACE_BACKUP_REPO`）
-才会往那个仓库推 —— 导出里有原始 transcript，所以那个仓库**必须是私有的**。
-不配就只有本机这一份副本，启动时会提醒一句；`--no-backup` 把提醒也关掉。
-团队部署要配 HTTPS 和 GitHub OAuth，见[快速开始](docs/QUICKSTART.md)。
+GitHub 每日备份已移除；服务无需备份配置即可启动。
 
 ### 客户端
 

@@ -1,9 +1,8 @@
 # Research Trace 快速开始
 
-系统由四部分组成：一台中央服务、每台 Claude Code 机器上的插件（hook + MCP）、
-每台机器上的独立投递器 `trace-deliver`，以及服务端的私有 Git 备份仓库。
-中央服务是在线真相源；插件 outbox 是断网缓冲；投递器负责把 outbox 送上去；
-Git 仓库是可验证的灾备副本。
+系统包括中央服务、Claude 插件（hook + MCP）、独立投递器和代码证据捕获器。
+中央服务保存记录，outbox 缓冲离线材料；`trace-code` 启用代码取证。提交、运行与保持实验目录不变由 Agent 负责。
+具体接入见[运行集成指南](RUNTIME_INTEGRATION.md)。GitHub 每日备份已移除。
 
 两件事先说清楚，它们决定了下面每一步：
 
@@ -22,23 +21,7 @@ trace-server --data-dir /srv/research-trace/data \
   --host 127.0.0.1 --port 8765 --token "<long-random-token>"
 ```
 
-**Git 备份默认不开。** 它会把导出往一个 git remote 推，而导出里带**完整原始 transcript**
-—— 这是一件外向的事，不该在没人要求的情况下自己跑起来。
-
-要开就加 `--backup-repo`（或环境变量 `TRACE_BACKUP_REPO`），指向一个 git 工作树：
-
-```bash
-trace-server --data-dir /srv/research-trace/data \
-  --backup-repo /srv/research-trace/private-backup \
-  --host 127.0.0.1 --port 8765 --token "<long-random-token>"
-```
-
-那个仓库的 remote **必须是私有的**，理由同上。只有指定的子目录会被 stage 和 commit，
-所以指向一个你已经在用的仓库，不会把它其它改动卷进来。
-
-不配的话，本机的 `trace.sqlite3` 和 `objects/` 就是**唯一副本**，启动时会提醒一句 ——
-一块盘坏掉就是整个项目历史的终点，而这件事通常要到盘坏了才被发现。
-明确不需要备份时用 `--no-backup`（或 `TRACE_NO_BACKUP=true`）把提醒也关掉。
+服务不再包含定时备份任务或自动 Git push；无需配置备份即可启动。
 
 不配置 OAuth 时，浏览器打开 `http://127.0.0.1:8765/`；读取兼容旧的公开模式，写操作使用
 Bearer token。团队部署应按下一节配置 GitHub OAuth 和 HTTPS。启用后，Project、原始历史、
@@ -344,7 +327,7 @@ Hook 把 event 与 transcript 增量写进
 它**不发任何网络请求**，所以中央挂了、DNS 挂了、凭证过期了，都不会让你的主任务变慢或失败。
 
 transcript 增量在落盘之前逐行剥掉 `thinking` / `redacted_thinking` 块：隐藏推理不进 outbox，
-自然也不会上传中央或进入每日备份。
+自然也不会上传中央。
 
 Recorder 是当前 Claude Code 主会话的 fork：首次继承当时上下文，之后按 agent id 恢复并只接收
 增量 batch；它不跨主会话常驻，长期状态在中央服务里。Hook 会根据 recorder agent id 拒绝 Bash、
@@ -465,96 +448,16 @@ outbox 与 Recorder 两格里。
 `conflicts` 非零表示中央按 `event_id` / `chunk_id` 去重时发现同一个 id 但内容不同，保留了
 它已经存下的那一份。这不是正常重放，说明发送端复用了 id，应当排查。
 
-## 6. 配置每日私有 Git 备份
+## 6. 手动导出记录（可选）
 
-先在服务器上克隆一个专用的 private repository，并配置好无需交互的 push 凭据。然后给
-服务增加参数：
-
-```bash
-trace-server --data-dir /srv/research-trace/data \
-  --backup-repo /srv/research-trace/private-backup \
-  --backup-branch main --backup-interval-hours 24
-```
-
-服务启动后会先执行一次，随后按间隔导出、校验、仅在内容变化时 commit，并用普通 push
-上传；不会 force-push。失败不会阻断记录服务，状态可在 `/api/health` 查看。
-
-### 和项目代码同仓
-
-备份仓库不必是专用的空仓库 —— 指向项目自己的代码仓，记录和实现就住在一起，
-`git clone` 一次同时拿到「怎么做的」和「为什么这么做」：
+GitHub 每日备份已移除。需要本地副本时按需执行，不会联网推送：
 
 ```bash
-trace-server --data-dir /srv/research-trace/data \
-  --backup-repo /srv/checkouts/my-project \
-  --backup-subdirectory research-trace-backup --backup-branch main
+trace-backup export --data-dir /srv/research-trace/data --target /srv/research-trace/export
 ```
 
-两件事让它成立：
-
-- **只有 `--backup-subdirectory` 那一个目录会被 stage 和 commit**，所以这个工作副本里
-  别的改动不会被卷进备份提交（子目录等于仓库根时直接拒绝）。
-- **push 之前会 `fetch` 并把本轮备份 commit rebase 到远端之上**，所以别的机器往同一个
-  分支推代码不会让备份从此推不上去。真的发生冲突（有人手改了备份文件）时，rebase 会被
-  中止、这一轮报错、本地 commit 保留 —— 宁可晚一轮备份，也不把别人的提交搅乱。
-
-**代码仓必须是私有的。** 导出里带完整原始 transcript；推进一个公开仓库是不可逆的。
-不确定的话就用专用私有仓库，别和公开代码混在一起。
-
-也可以交给 cron/SLURM 定时任务单独执行：
-
-```bash
-trace-backup sync-git --data-dir /srv/research-trace/data \
-  --repo /srv/research-trace/private-backup --branch main
-```
-
-### 6.1 分卷与容量阈值
-
-导出树**先按年分卷、年内再按容量切分片**：
-
-```text
-research-trace-backup/
-├── index.json                     每卷的 manifest 校验和、字节数、最大文件与行数
-├── .gitattributes
-└── volumes/
-    ├── base/                      没有 created_at 的行（schema_meta）
-    ├── 2025/
-    │   ├── manifest.json
-    │   ├── tables/events.0000.jsonl
-    │   ├── tables/events.0001.jsonl
-    │   ├── transcripts/<chunk_id>.zlib
-    │   └── objects/<sha 前缀路径>
-    └── 2026/…
-```
-
-按年切是为了让去年的卷写定之后**再也不被重写**：一行的 `created_at` 永不改变，所以 Git 不必
-每天重新打包全部历史，而且某一年太大时可以整卷搬走。年内再按字节切分片，是因为托管方的限制
-有两个量级：单文件 50 MiB 警告 / 100 MiB 拒绝 push，仓库 1 GiB 建议 / 5 GiB 附近受限；只按年
-切压得住仓库增速，压不住「某一年的 events 表本身 300 MB」。分片预算默认 32 MiB。
-
-容量告警随每次 `export` / `sync-git` 的结果返回（`capacity`），服务端把它写进 `/api/health`
-的 `backup.capacity`，level 是 `warn` / `critical` 时另打一行 stderr。它**只报不拦**——容量
-到顶时最不该做的事就是停止备份。
-
-| 环境变量 | 默认 | 作用 |
-|---|---|---|
-| `TRACE_BACKUP_PART_BYTES` | `33554432`（32 MiB） | 卷内每个分片文件的字节预算，也可用 `--part-bytes` |
-| `TRACE_BACKUP_FILE_WARN_BYTES` | `52428800`（50 MiB） | 单文件告警线 |
-| `TRACE_BACKUP_FILE_CRITICAL_BYTES` | `94371840`（90 MiB） | 单文件严重线（离 GitHub 的 100 MiB 硬拒留 10% 余量） |
-| `TRACE_BACKUP_REPO_WARN_BYTES` | `1073741824`（1 GiB） | 仓库总量告警线（`git count-objects -v`，含历史） |
-| `TRACE_BACKUP_REPO_CRITICAL_BYTES` | `4294967296`（4 GiB） | 仓库总量严重线 |
-
-`trace-server` 没有单独的 `--backup-part-bytes` 参数，给服务进程设 `TRACE_BACKUP_PART_BYTES`
-即可，备份模块自己读它。
-
-**升级提示**：从旧的全量树升上来之后，第一次 sync 会删掉整棵旧树、写出分卷树，因此产生一个
-体量很大的 commit（内容等价、路径全变）。这是一次性的；之后只有当年的卷会变。旧的备份仓库
-不需要重建，旧 commit 里的旧格式树用当前代码 restore 依然可读。
-
-备份包含确定性 JSONL、zlib transcript chunks、小附件、GitHub 用户/角色、设备名称与设备
-凭证哈希、manifest 和 SHA-256。大产物只保存机器、路径、大小和校验和等引用，不复制产物
-本身。运行中的 `trace.sqlite3`、WAL、待批准 device code、网页 session、设备凭证原文、
-GitHub access token 和所有 secret 都不会进入备份。
+导出包含记录、修订、压缩会话和附件，外部大数据只保存引用；不复制运行中的 SQLite/WAL。
+文件按年份/容量分卷。`trace-backup sync-git` 仅保留为旧部署的手动兼容命令，服务不会调用它。
 
 ## 7. 验证与从空库恢复
 
@@ -589,7 +492,7 @@ Restore 只接受空数据目录，并在事务内检查外键。它先把**所�
 
 导出时如果某个附件对象在数据卷上已经不存在，导出不会中止：缺口记进卷 manifest 与 `index.json`
 的 `missing_objects` 并继续（restore 同样跳过并报出来）。否则从那天起所有新增历史都永远进不了
-备份。这个列表也会出现在 `/api/health` 的 `backup.missing_objects` 里。
+备份。导出和校验命令的结果会列出这些缺失对象。
 
 ## 8. 紧急清除敏感内容
 
@@ -675,8 +578,7 @@ batch 都要拉的热路径，多数项目这张图是空的，不该为它付�
 - 网页已有 Project、Overview、Comment/Correction、Chapter、Node、Chapter 内结构图/记录列表、
   存在 artifact 关系时的数据流视图、附件显示、原始历史按需展开、修订历史、全文搜索、
   GitHub OAuth 与团队角色。
-- 网页“状态”面板显示中央存储、GitHub 备份（含远端落后几个 commit、容量告警与导出时缺失的
-  附件对象数）、以及各机器上报的 outbox 与 Recorder 未处理量。从来没有机器上报过时显示“未上报”，不画假绿灯；
+- 网页“状态”面板显示中央存储、组件连接、各机器 outbox 和 Recorder 未处理量。
   本机情况随时可以用 `trace-deliver --status` 或 `outbox/delivery-status.json` 直接看。
 - 网页 OAuth 与设备凭证均来自同一 GitHub 白名单和实时角色；设备凭证有到期时间；旧的共享
   `TRACE_TOKEN` 只为迁移兼容，建议新部署不再配置。
@@ -685,10 +587,7 @@ batch 都要拉的热路径，多数项目这张图是空的，不该为它付�
 - 默认永久保存可能包含命令、路径或 transcript 中的敏感信息。现在已经有三层控制（不绑定、
   `trace-project disable`、`capture=off`）、`sent/` 的保留期与磁盘告警，以及管理员紧急 purge
   （CLI 与 `POST /api/admin/purge`）。
-- 备份已按年份/容量分卷并带容量阈值告警（第 6.1 节）。仍然没有的：把某一整卷搬去另一个仓库的
-  搬迁工具（`index.json` 的结构允许，但没有 CLI），以及对已有备份仓库做历史瘦身——旧 commit
-  里的全量树仍占仓库体积，唯一能重写历史的路径仍然只有 purge 之后的 `rewrite-history`。
-  容量告警在 `/api/health`、服务日志和网页备份卡片上都能看到。
+- 手动导出保留分卷和旧格式读取；定时备份、GitHub 状态卡片已移除。
 - 数据流已实现（第 9 节），网页上作为项目视图的第三种呈现方式出现。存量数据大多没有可比对的
   键，所以多数项目现在仍然是空图；`stats.unkeyed` 与 `stats.unlabeled_direction` 用来区分
   「没有产物」「登记时忘了给键」「键给对了但方向还是默认的 reference」三件事。

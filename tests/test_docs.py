@@ -49,10 +49,18 @@ def test_every_command_the_docs_mention_is_a_real_console_script():
         re.findall(r"^([\w-]+)\s*=", (ROOT / "pyproject.toml").read_text(encoding="utf-8"), re.M)
     )
     for name, text in DOCS.items():
+        if name == 'CHANGELOG.md':
+            # Historical releases may describe commands intentionally retired
+            # later. Check the current release's instructions, not old history.
+            releases=list(re.finditer(r'^# \d+\.\d+\.',text,re.M))
+            if len(releases)>1:
+                text=text[:releases[1].start()]
         # 前面不能是词字符或连字符：否则 `[research-trace-recorder]` 这种自有标记里会被
         # 切出一个并不存在的命令 `trace-recorder`，把一条正确的文档判成错的。
-        for command in set(re.findall(r"(?<![\w-])trace-[a-z]+\b", text)):
-            assert command in scripts, f"{name} mentions {command}, which pyproject does not install"
+        for line in text.splitlines():
+            for command in set(re.findall(r"(?<![\w-])trace-[a-z]+\b", line)):
+                retired_notice=command=='trace-run' and any(word in line for word in ('移除','撤回','退役'))
+                assert command in scripts or retired_notice, f"{name} mentions {command}, which pyproject does not install"
 
 
 def test_every_environment_variable_the_docs_mention_exists_in_the_code():

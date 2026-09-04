@@ -21,7 +21,7 @@ def test_the_renderer_is_embedded_between_markers_the_js_tests_slice_on():
     assert BEGIN in WEBAPP and END in WEBAPP
     body = WEBAPP.split(BEGIN, 1)[1].split(END, 1)[0]
     assert "globalThis" in body or "global.md" in body
-    assert len(body) > 5000, "抠出来的渲染器太短，标记多半错位了"
+    assert "global.markdownit" in body, "the upstream renderer must be connected"
 
 
 def test_prose_goes_through_the_renderer():

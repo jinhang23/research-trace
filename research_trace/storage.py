@@ -348,16 +348,16 @@ class Store:
         self.db_path = self.data_dir / "trace.sqlite3"
         self.attachment_limit = int(attachment_limit)
         self._lock = threading.RLock()
-        self._db = sqlite3.connect(self.db_path, check_same_thread=False, isolation_level=None)
-        self._db.row_factory = sqlite3.Row
-        self._db.execute("PRAGMA foreign_keys=ON")
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA synchronous=FULL")
-        self._init_schema()
+        from .database import open_database
+        self._engine = open_database(self.db_path)
+        # SQLAlchemy owns the pool; SQLite's row/transaction API preserves the
+        # domain operations and IMMEDIATE locking used by the existing Store.
+        self._db = self._engine.raw_connection()
 
     def close(self) -> None:
         with self._lock:
             self._db.close()
+            self._engine.dispose()
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -371,282 +371,6 @@ class Store:
             else:
                 self._db.commit()
 
-    def _init_schema(self) -> None:
-        with self._lock:
-            self._db.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS schema_meta (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS projects (
-                    id TEXT PRIMARY KEY,
-                    slug TEXT NOT NULL UNIQUE,
-                    name TEXT NOT NULL,
-                    overview TEXT NOT NULL DEFAULT '',
-                    overview_version INTEGER NOT NULL DEFAULT 1,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS workspace_keys (
-                    workspace_key TEXT PRIMARY KEY,
-                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                    kind TEXT NOT NULL DEFAULT 'unknown',
-                    confirmed INTEGER NOT NULL DEFAULT 1,
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS chapters (
-                    id TEXT PRIMARY KEY,
-                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                    slug TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    summary TEXT NOT NULL DEFAULT '',
-                    summary_version INTEGER NOT NULL DEFAULT 1,
-                    is_inbox INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    UNIQUE(project_id, slug)
-                );
-
-                CREATE TABLE IF NOT EXISTS nodes (
-                    id TEXT PRIMARY KEY,
-                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                    chapter_id TEXT NOT NULL REFERENCES chapters(id) ON DELETE RESTRICT,
-                    parent_id TEXT REFERENCES nodes(id) ON DELETE SET NULL,
-                    title TEXT NOT NULL,
-                    body TEXT NOT NULL DEFAULT '',
-                    labels_json TEXT NOT NULL DEFAULT '[]',
-                    review_state TEXT NOT NULL DEFAULT 'unreviewed',
-                    occurred_at TEXT NOT NULL,
-                    created_by TEXT NOT NULL DEFAULT 'recorder',
-                    idempotency_key TEXT,
-                    source_event_ids_json TEXT NOT NULL DEFAULT '[]',
-                    version INTEGER NOT NULL DEFAULT 1,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    UNIQUE(project_id, idempotency_key)
-                );
-
-                CREATE TABLE IF NOT EXISTS semantic_revisions (
-                    id TEXT PRIMARY KEY,
-                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                    target_type TEXT NOT NULL,
-                    target_id TEXT NOT NULL,
-                    version INTEGER NOT NULL,
-                    snapshot_json TEXT NOT NULL,
-                    actor_type TEXT NOT NULL,
-                    actor_id TEXT,
-                    source_event_ids_json TEXT NOT NULL DEFAULT '[]',
-                    milestone INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL,
-                    UNIQUE(target_type, target_id, version)
-                );
-
-                CREATE TABLE IF NOT EXISTS comments (
-                    id TEXT PRIMARY KEY,
-                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                    target_type TEXT NOT NULL,
-                    target_id TEXT NOT NULL,
-                    anchor_json TEXT NOT NULL DEFAULT '{}',
-                    kind TEXT NOT NULL DEFAULT 'comment',
-                    body TEXT NOT NULL,
-                    author_type TEXT NOT NULL DEFAULT 'human',
-                    author_id TEXT,
-                    created_at TEXT NOT NULL,
-                    resolved_at TEXT,
-                    resolved_by TEXT,
-                    -- Recorder 的「我读过并已并入」与人的「这条了结了」是两件事。
-                    -- 合并成 resolved_at 会让机器一次 curate 就把人的纠正从界面和
-                    -- 后续 Recorder 上下文里抹掉（§3.4 / §4）。
-                    acknowledged_at TEXT,
-                    acknowledged_by TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS code_evidence (
-                    id TEXT PRIMARY KEY,
-                    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
-                    repo_url TEXT,
-                    commit_hash TEXT,
-                    file_path TEXT NOT NULL,
-                    symbol TEXT,
-                    start_line INTEGER,
-                    end_line INTEGER,
-                    snippet TEXT,
-                    diff TEXT,
-                    annotation TEXT,
-                    content_sha256 TEXT,
-                    attribution TEXT NOT NULL DEFAULT 'unknown',
-                    contributor_agent_ids_json TEXT NOT NULL DEFAULT '[]',
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS attachments (
-                    id TEXT PRIMARY KEY,
-                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                    target_type TEXT NOT NULL,
-                    target_id TEXT NOT NULL,
-                    direction TEXT NOT NULL DEFAULT 'reference',
-                    name TEXT NOT NULL,
-                    mime_type TEXT,
-                    size INTEGER,
-                    sha256 TEXT,
-                    object_path TEXT,
-                    uri TEXT,
-                    machine TEXT,
-                    external_path TEXT,
-                    metadata_json TEXT NOT NULL DEFAULT '{}',
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS sessions (
-                    id TEXT PRIMARY KEY,
-                    project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
-                    source TEXT NOT NULL DEFAULT 'unknown',
-                    host TEXT,
-                    cwd TEXT,
-                    parent_session_id TEXT,
-                    started_at TEXT,
-                    ended_at TEXT,
-                    metadata_json TEXT NOT NULL DEFAULT '{}',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS agents (
-                    id TEXT PRIMARY KEY,
-                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                    parent_agent_id TEXT,
-                    agent_type TEXT,
-                    name TEXT,
-                    metadata_json TEXT NOT NULL DEFAULT '{}',
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS events (
-                    event_id TEXT PRIMARY KEY,
-                    batch_id TEXT NOT NULL,
-                    project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
-                    session_id TEXT,
-                    agent_id TEXT,
-                    event_type TEXT NOT NULL,
-                    captured_at TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS transcript_chunks (
-                    chunk_id TEXT PRIMARY KEY,
-                    batch_id TEXT NOT NULL,
-                    project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
-                    session_id TEXT,
-                    agent_id TEXT,
-                    source_path TEXT,
-                    start_offset INTEGER,
-                    end_offset INTEGER,
-                    sha256 TEXT NOT NULL,
-                    compressed_content BLOB NOT NULL,
-                    search_text TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS ingest_batches (
-                    batch_id TEXT PRIMARY KEY,
-                    project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
-                    event_count INTEGER NOT NULL,
-                    transcript_chunk_count INTEGER NOT NULL,
-                    created_at TEXT NOT NULL,
-                    delivered_by TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS auth_users (
-                    id TEXT PRIMARY KEY,
-                    github_id INTEGER NOT NULL UNIQUE,
-                    login TEXT NOT NULL,
-                    display_name TEXT,
-                    avatar_url TEXT,
-                    role TEXT NOT NULL DEFAULT 'reader' CHECK(role IN ('reader','member','admin')),
-                    disabled INTEGER NOT NULL DEFAULT 0 CHECK(disabled IN (0,1)),
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    last_login_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS web_sessions (
-                    session_hash TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
-                    expires_at TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    last_seen_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS device_credentials (
-                    id TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
-                    name TEXT NOT NULL,
-                    token_hash TEXT NOT NULL UNIQUE,
-                    created_at TEXT NOT NULL,
-                    last_used_at TEXT,
-                    revoked_at TEXT,
-                    expires_at TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS device_authorizations (
-                    device_code_hash TEXT PRIMARY KEY,
-                    user_code TEXT NOT NULL UNIQUE,
-                    device_name TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved')),
-                    user_id TEXT REFERENCES auth_users(id) ON DELETE CASCADE,
-                    expires_at TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    approved_at TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS purge_audit (
-                    id TEXT PRIMARY KEY,
-                    actor_id TEXT NOT NULL,
-                    reason TEXT NOT NULL,
-                    selector_json TEXT NOT NULL,
-                    removed_json TEXT NOT NULL,
-                    objects_removed INTEGER NOT NULL DEFAULT 0,
-                    generation INTEGER NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_chapters_project ON chapters(project_id);
-                CREATE INDEX IF NOT EXISTS idx_nodes_chapter_time ON nodes(chapter_id, occurred_at);
-                CREATE INDEX IF NOT EXISTS idx_nodes_project_time ON nodes(project_id, occurred_at);
-                CREATE INDEX IF NOT EXISTS idx_comments_target ON comments(target_type, target_id, created_at);
-                CREATE INDEX IF NOT EXISTS idx_events_project_time ON events(project_id, captured_at);
-                CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, captured_at);
-                CREATE INDEX IF NOT EXISTS idx_transcript_project ON transcript_chunks(project_id, created_at);
-                CREATE INDEX IF NOT EXISTS idx_auth_users_login ON auth_users(login);
-                CREATE INDEX IF NOT EXISTS idx_web_sessions_expiry ON web_sessions(expires_at);
-                CREATE INDEX IF NOT EXISTS idx_device_credentials_user ON device_credentials(user_id,revoked_at);
-                CREATE INDEX IF NOT EXISTS idx_device_authorizations_expiry ON device_authorizations(expires_at);
-                """
-            )
-            # CREATE TABLE IF NOT EXISTS 对已经存在的表什么也不做，所以新增列必须显式补。
-            # 每一条都是可空的追加列，老库补上之后语义与新库一致，不需要数据迁移。
-            for table, column, definition in (
-                ("comments", "acknowledged_at", "TEXT"),
-                ("comments", "acknowledged_by", "TEXT"),
-                ("device_credentials", "expires_at", "TEXT"),
-                ("ingest_batches", "delivered_by", "TEXT"),
-            ):
-                self._add_column_locked(table, column, definition)
-            self._db.execute(
-                "INSERT OR REPLACE INTO schema_meta(key,value) VALUES('schema_version',?)",
-                (str(SCHEMA_VERSION),),
-            )
-
-    def _add_column_locked(self, table: str, column: str, definition: str) -> None:
-        existing = {row["name"] for row in self._db.execute(f"PRAGMA table_info({table})")}
-        if column in existing:
-            return
-        self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def _unique_slug(self, db: sqlite3.Connection, table: str, base: str, project_id: str | None = None) -> str:
         slug = slugify(base)
@@ -738,6 +462,7 @@ class Store:
             ]
             result["chapters"] = [dict(row) for row in chapters]
             result["comments"] = self._comments_locked(self._db, pid)
+            result["recent_runs"] = self.research_runs(pid)
             if include_nodes:
                 nodes = self._db.execute(
                     "SELECT * FROM nodes WHERE project_id=? ORDER BY occurred_at,id", (pid,)
@@ -903,6 +628,7 @@ class Store:
         review_state: str = "unreviewed",
         source_event_ids: Sequence[str] = (),
         code_evidence: Sequence[dict[str, Any]] = (),
+        run_ids: Sequence[str] = (),
     ) -> dict[str, Any]:
         if not str(idempotency_key or "").strip():
             raise ValidationError("idempotency_key is required")
@@ -923,6 +649,19 @@ class Store:
                 (pid, idempotency_key),
             ).fetchone()
             node_id = existing["id"] if existing else _id("node")
+            if run_ids:
+                requested=set(run_ids)
+                if len(requested)>500 or any(not isinstance(item,str) for item in requested):
+                    raise ValidationError('Use at most 500 run IDs')
+                runs=self.research_runs(pid,run_ids=requested,limit=500)
+                if {run['id'] for run in runs}!=requested:
+                    raise ValidationError('Run IDs must already belong to this project')
+                previous_sources=self._source_events(pid,_loads(existing['source_event_ids_json'],[])) if existing else []
+                known={item['payload']['research_run']['id']:item['id'] for item in previous_sources
+                       if isinstance(item['payload'].get('research_run'),dict) and item['payload']['research_run'].get('id')}
+                # A status change must not manufacture a new semantic revision
+                # when the Recorder retries the same research group.
+                source_ids=sorted(set(source_ids)|{known.get(run['id'],run['source_event_id']) for run in runs})
             if existing and not chapter_id and not chapter_name:
                 chapter = db.execute("SELECT * FROM chapters WHERE id=?", (existing["chapter_id"],)).fetchone()
             else:
@@ -1023,12 +762,12 @@ class Store:
                     f"recorded as a root while {siblings} other node(s) exist: the structure view is "
                     "built from parent_id and nothing else, so this record is drawn unconnected. "
                     "If it continues earlier work, set parent_id to that node's id "
-                    "(trace_context returns recent_nodes). A root is fine when the work genuinely starts here."
+                    "(trace_context returns recent_nodes). Independent ideas and unknown relationships are valid roots."
                 )
         if not node.get("source_event_ids"):
             gaps.append(
                 "no source_event_ids: this node has no edge back to the raw history that produced it, "
-                "so its 原始历史 button falls back to the project's latest events."
+                "so its 原始历史 button reports an explicit evidence gap, without substituting recent events."
             )
         artifacts = db.execute(
             "SELECT COUNT(*) n FROM attachments WHERE target_type='node' AND target_id=?", (node["id"],),
@@ -1161,7 +900,53 @@ class Store:
             ).fetchall()
         ]
         value["comments"] = self._comments_locked(db, row["project_id"], "node", row["id"])
+        sources = self._source_events(row['project_id'], value['source_event_ids'])
+        run_ids = {item['payload']['research_run']['id'] for item in sources
+                   if isinstance(item['payload'].get('research_run'), dict) and item['payload']['research_run'].get('id')}
+        value['runs'] = self.research_runs(row['project_id'], run_ids=run_ids,limit=len(run_ids)) if run_ids else []
+        value['code_snapshots'] = [item['payload']['code_snapshot'] for item in sources
+                                   if isinstance(item['payload'].get('code_snapshot'), dict)]
         return value
+
+    def _source_events(self, project_id, source_ids):
+        items=[]
+        source_ids=list(dict.fromkeys(source_ids))
+        with self._lock:
+            for offset in range(0,len(source_ids),400):
+                group=source_ids[offset:offset+400]
+                rows=self._db.execute('SELECT event_id id,event_type,captured_at,payload_json,session_id,agent_id FROM events WHERE project_id=? AND event_id IN ('+','.join('?' for _ in group)+')', [project_id,*group]).fetchall()
+                for row in rows:
+                    item=dict(row); item['payload']=_loads(item.pop('payload_json'),{})
+                    item.update(kind='event',at=item['captured_at']); items.append(item)
+        return sorted(items,key=lambda item:(item['at'],item['id']))
+
+    def node_sources(self, node_id):
+        with self._lock:
+            row=self._db.execute('SELECT project_id,source_event_ids_json FROM nodes WHERE id=?',(node_id,)).fetchone()
+            if not row: raise NotFound('node not found')
+            ids=_loads(row['source_event_ids_json'],[])
+            items=self._source_events(row['project_id'],ids)
+            found={item['id'] for item in items}
+            return {'items':items,'missing_event_ids':[item for item in ids if item not in found]}
+
+    def research_runs(self, project_id, *, run_ids=None, limit=50):
+        with self._lock:
+            pid=self._project_row(self._db,project_id)['id']
+            clauses=["project_id=?", "json_type(payload_json,'$.research_run')='object'"]
+            args=[pid]
+            if run_ids is not None:
+                if not run_ids: return []
+                clauses.append("json_extract(payload_json,'$.research_run.id') IN ("+','.join('?' for _ in run_ids)+')')
+                args.extend(sorted(run_ids))
+            rows=self._db.execute('SELECT * FROM (SELECT event_id,payload_json,captured_at, ROW_NUMBER() OVER (PARTITION BY json_extract(payload_json,\'$.research_run.id\') ORDER BY CAST(json_extract(payload_json,\'$.research_run.revision\') AS INTEGER) DESC,captured_at DESC,event_id DESC) latest FROM events WHERE '+' AND '.join(clauses)+') WHERE latest=1 ORDER BY captured_at DESC LIMIT ?', [*args,max(1,min(int(limit),500))]).fetchall()
+            result=[]
+            for row in rows:
+                run=_loads(row['payload_json'],{}).get('research_run') or {}
+                run['source_event_id']=row['event_id']
+                snapshot=run.get('snapshot') or {}
+                run['code_file_count']=len(snapshot.pop('files',{}))
+                result.append(run)
+            return result
 
     def _insert_code_evidence_locked(
         self, db: sqlite3.Connection, node_id: str, items: Sequence[dict[str, Any]], timestamp: str
@@ -1618,6 +1403,14 @@ class Store:
                 exists = True
             if not exists:
                 raise NotFound(f"attachment target not found: {actual_target}")
+            capture_key = (metadata or {}).get('capture_key')
+            if capture_key:
+                previous = db.execute("SELECT * FROM attachments WHERE project_id=? AND target_type=? AND target_id=? AND json_extract(metadata_json,'$.capture_key')=?",
+                                      (pid,target_type,actual_target,str(capture_key))).fetchone()
+                if previous:
+                    if previous['sha256'] != sha256 or previous['uri'] != uri:
+                        raise Conflict('Capture key already refers to different evidence')
+                    return self._expand_attachment(previous)
             attachment_id = _id("att")
             db.execute(
                 "INSERT INTO attachments(id,project_id,target_type,target_id,direction,name,mime_type,size,sha256,"

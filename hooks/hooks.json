@@ -177,7 +177,7 @@
               "--url",
               "${user_config.url}"
             ],
-            "timeout": 10
+            "timeout": 120
           }
         ]
       }
@@ -269,7 +269,7 @@
               "--url",
               "${user_config.url}"
             ],
-            "timeout": 10
+            "timeout": 120
           }
         ]
       }

@@ -19,6 +19,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import httpx
+from authlib.integrations.httpx_client import OAuth2Client
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -415,42 +417,35 @@ class GitHubOAuthClient:
         self.timeout = timeout
 
     def authorize_url(self, *, state: str, challenge: str) -> str:
-        query = urllib.parse.urlencode({
-            "client_id": self.config.client_id,
-            "redirect_uri": self.config.callback_url,
-            "scope": self.config.scopes,
-            "state": state,
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-        })
-        return f"{self.AUTHORIZE_URL}?{query}"
+        with self._client() as client:
+            url, _ = client.create_authorization_url(
+                self.AUTHORIZE_URL, state=state, code_challenge=challenge, code_challenge_method='S256')
+            return url
+
+    def _client(self, token=None):
+        return OAuth2Client(client_id=self.config.client_id, client_secret=self.config.client_secret,
+                            redirect_uri=self.config.callback_url, scope=self.config.scopes,
+                            token_endpoint_auth_method='client_secret_post', token=token,
+                            timeout=self.timeout, headers={'Accept': 'application/json', 'User-Agent': 'research-trace'})
 
     def _json_request(
         self, url: str, *, data: dict[str, str] | None = None, token: str | None = None
     ) -> dict[str, Any]:
-        encoded = urllib.parse.urlencode(data).encode("utf-8") if data is not None else None
-        headers = {
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "research-trace",
-            "X-GitHub-Api-Version": "2022-11-28",
-        }
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        request = urllib.request.Request(url, data=encoded, headers=headers, method="POST" if data else "GET")
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError) as exc:
+            with self._client({'access_token': token, 'token_type': 'Bearer'} if token else None) as client:
+                response = client.get(url, headers={'X-GitHub-Api-Version': '2022-11-28'})
+                response.raise_for_status()
+                return response.json()
+        except (httpx.HTTPError, TimeoutError, ValueError) as exc:
             raise OAuthError(f"GitHub OAuth request failed ({type(exc).__name__})") from exc
 
     def exchange_code(self, *, code: str, verifier: str) -> str:
-        value = self._json_request(self.TOKEN_URL, data={
-            "client_id": self.config.client_id,
-            "client_secret": self.config.client_secret,
-            "code": code,
-            "redirect_uri": self.config.callback_url,
-            "code_verifier": verifier,
-        })
+        try:
+            with self._client() as client:
+                value = client.fetch_token(self.TOKEN_URL, code=code, code_verifier=verifier,
+                                           grant_type='authorization_code')
+        except Exception as exc:
+            raise OAuthError(f'GitHub OAuth token exchange failed ({type(exc).__name__})') from exc
         token = str(value.get("access_token") or "")
         if not token:
             raise OAuthError("GitHub did not return an access token")

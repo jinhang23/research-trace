@@ -36,6 +36,9 @@ SCHEMA = "research-trace.event.v1"
 RECORDER_MARKER = "[research-trace-recorder]"
 BATCH_MARKER = "[research-trace-batch:"
 RECORDER_READ_TOOLS = {"Read", "Grep", "Glob"}
+# A background completion can start another parent turn with stop_hook_active=False.
+# Bound that cross-turn feedback even when the host omits Recorder identity fields.
+MAX_RECORDER_DISPATCHES_PER_PROMPT = 3
 RECORDER_TRACE_TOOLS = {
     "trace_context", "trace_ingest", "trace_record", "trace_curate", "trace_attach", "trace_search",
 }
@@ -43,12 +46,13 @@ RECORDER_TRACE_TOOLS = {
 MARKER_NAME = ".research-trace.json"
 
 #: 这些 hook 事件本身不携带任何研究材料，它们只说「一轮结束了」「会话开始了」。
-#: 一个 batch 如果**只**由它们组成，这一批就没有东西可记——而派一次 Recorder 是一次完整
-#: fork（实测首轮读入约 60 万 token）。此前的判据是 `events or chunks`：任何新东西都开批，
-#: 于是一个只含 Stop 的 batch 也照付全价，Recorder 正确地记下 0 条，下一轮再来一次。
-#: 恒为 0 产出的那种批次不该存在，而不是该被 Recorder 判断掉——判断本身就是那 60 万。
+#: Lifecycle notifications and recorder diagnostics never independently justify model work.
+#: Their raw evidence remains available; transcript growth alone is not a dispatch trigger.
 LIFECYCLE_EVENTS = frozenset({
     "Stop", "StopFailure", "SessionStart", "SessionEnd", "PreCompact", "PostCompact",
+})
+RECORDING_DIAGNOSTICS = frozenset({
+    "TranscriptCaptureError", "CodeCaptureError", "RecorderDispatchPaused",
 })
 
 # outbox 里装着完整对话和带令牌的命令原文。在多用户 HPC 节点上默认 0755/0644 等于
@@ -508,6 +512,91 @@ def _read_scrubbed(
     return consumed, b"".join(parts)
 
 
+@contextmanager
+def _entire_capture_stream(root, repository, session_id):
+    staged = []
+    try:
+        with repository.session_stream(session_id) as stream:
+            yield stream, staged
+        # Publish only after upstream succeeds. A failed partial export cannot
+        # leave overlapping chunks for the independent delivery worker to ingest.
+        for temporary, metadata in staged:
+            destination = root / metadata['path']
+            _mkdir(destination.parent)
+            os.replace(_long(temporary), _long(destination))
+            _atomic_json(root / 'transcripts' / 'meta' / (destination.name+'.json'), metadata)
+    finally:
+        for temporary, _ in staged:
+            _long(temporary).unlink(missing_ok=True)
+
+
+def _capture_entire_transcript(root, payload, state, binding, config, chunk_size=512 * 1024):
+    """Consume the upstream session export; Trace only filters and queues deltas.
+
+    Do not fall back to reading a guessed main-session path on provider failure.
+    Existing physical offsets give upgraded/resumed sessions a fresh boundary.
+    Subagent transcripts remain a compatibility path until Entire exports them
+    as individually addressable sessions.
+    """
+    package_root = str(Path(__file__).resolve().parents[1])
+    if package_root not in sys.path:
+        sys.path.insert(0, package_root)
+    from research_trace.entire_evidence import EntireRepository, EvidenceError
+    sid = str(payload.get('session_id') or '')
+    key = hashlib.sha256(('entire:' + sid).encode()).hexdigest()[:20]
+    source = str(payload.get('transcript_path') or '')
+    legacy_key = hashlib.sha256(os.path.normcase(str(Path(source).expanduser())).encode()).hexdigest()[:20]
+    start = int(state.get('entire_offsets', {}).get(key, state.get('transcript_offsets', {}).get(legacy_key, 0)))
+    recorder_ids = frozenset(str(x) for x in state.get('recorder_ids', []))
+    captured = []
+    repository = EntireRepository(binding['project_dir'], config['entire_executable'])
+    with _entire_capture_stream(root, repository, sid) as (stream, staged):
+        skipped = 0
+        last = b''
+        while skipped < start:
+            raw = stream.read(min(65536, start-skipped))
+            if not raw:
+                raise EvidenceError('Entire export is shorter than its saved cursor; old history was not reimported')
+            skipped += len(raw)
+            last = raw[-1:]
+        offset = start
+        # The fresh boundary may cut a partially written row. Skip that row,
+        # rather than importing its old prefix or treating its suffix as JSON.
+        if last and last != b'\n':
+            offset += len(stream.readline())
+        eof = False
+        while not eof:
+            begin = offset
+            parts = []
+            while offset-begin < chunk_size:
+                line = stream.readline(16 * 1024 * 1024 + 1)
+                if not line:
+                    eof = True
+                    break
+                if not line.endswith(b'\n') or len(line) > 16 * 1024 * 1024:
+                    raise EvidenceError('Entire export contains an incomplete or oversized JSONL row')
+                if not isinstance(json.loads(line), dict):
+                    raise EvidenceError('Entire export row must be an object')
+                offset += len(line)
+                scrubbed = _scrub_line(line, recorder_ids)
+                if scrubbed:
+                    parts.append(scrubbed)
+            if parts:
+                raw = b''.join(parts)
+                sha = hashlib.sha256(raw).hexdigest()
+                filename = f'{key}_{begin:016d}_{offset:016d}_{sha[:16]}.jsonl'
+                metadata = {'path':f'transcripts/pending/{filename}', 'chunk_id':f'claude-transcript-{sha}',
+                            'session_id':sid, 'agent_id':None, 'source_path':'entire:session:'+sid,
+                            'provider':'entire', 'start_offset':begin, 'end_offset':offset, 'sha256':sha}
+                temporary=root / 'transcripts' / 'staging' / (uuid.uuid4().hex+'.tmp')
+                _atomic_bytes(temporary, raw)
+                staged.append((temporary, metadata))
+                captured.append(metadata)
+    # Advance only after the upstream process has completed successfully.
+    state.setdefault('entire_offsets', {})[key] = offset
+    return captured
+
+
 def _capture_transcripts(
     root: Path, payload: dict[str, Any], state: dict[str, Any], chunk_size: int = 512 * 1024
 ) -> list[dict[str, Any]]:
@@ -698,9 +787,9 @@ def _has_material(root: Path, events: list[tuple[str, str]]) -> bool:
     """这一批里有没有「真的发生过什么」。
 
     判据是**事件**而不是 transcript 长度：用户说了话（UserPromptSubmit）、调了工具
-    （Pre/PostToolUse）、子 agent 跑完（SubagentStart/Stop）——这些都写事件；而 Recorder
-    自己那一段被 `_is_trace_orchestration` 挡在事件层之外，一个事件都不写。所以
-    「只剩生命周期事件」和「这段时间里只有 Recorder 在动」是同一件事。
+    （Pre/PostToolUse）、研究子 agent 跑完（SubagentStart/Stop）——这些都写事件。
+    已识别的 Recorder 活动在事件层被过滤；生命周期和采集诊断不单独触发整理。
+    身份缺失时仍可能混入 Recorder 操作，所以 handle 另有跨回合派发上限。
 
     transcript 不能当判据：Recorder 的回合就写在同一个 transcript 文件里，chunk 照样变长
     （scrub 只按 agentId 精确匹配丢行，漏一行就够开一批），于是 `events or chunks` 会把
@@ -713,7 +802,7 @@ def _has_material(root: Path, events: list[tuple[str, str]]) -> bool:
         record = _read_json(root / rel, {})
         if not isinstance(record, dict):
             return True     # 读不出来就当它有内容：宁可多派一次，也不要静默漏记
-        if str(record.get("hook_event") or "") not in LIFECYCLE_EVENTS:
+        if str(record.get("hook_event") or "") not in LIFECYCLE_EVENTS | RECORDING_DIAGNOSTICS:
             return True
     return False
 
@@ -739,12 +828,10 @@ def _close_batch(root: Path, batch_id: str) -> None:
 def _fork_window(configured: str = "") -> int:
     """每处理多少个批次重新 fork 一次 Recorder。
 
-    fork 的意义是继承主 agent **此刻**的完整上下文。但实测下来，很多批次的全部内容
-    就是「某个子 agent 结束了」——为这种批次付一次完整 fork 不划算：实测一次 fork
-    首轮读入约 60 万 token（命中率 99.7–99.9%，所以是便宜的那种 token，但底数不是零）。
-
-    1 = 每批都重新 fork（最新鲜）。调大 = 窗口内复用同一个 Recorder，它的上下文逐渐
-    变旧，但省下那些读取。0 / 空 / 非数字 = 整个会话只 fork 一次（最省，最旧）。
+    1 = 每批重新 fork，继承主 agent 当前上下文。大于 1 = 窗口内复用；0 = 持续复用。
+    复用只保留 Recorder 自己的历史，必须读取新批次材料才能获知主会话之后的变化。
+    缺省 / 非数字使用 1。相同前缀有利于缓存，但实际成本取决于宿主、命中及调用次数；
+    此开关本身不能证明 token 节省，不把历史单次测量当作当前集成的效果。
     """
     #: 这个值来自项目 marker（`.research-trace.json` 的 `recorder_fork_window`），不是插件
     #: 配置项。插件配置项走 hooks.json 的 `${user_config.…}` 展开，而**未设置的选项会让整个
@@ -780,11 +867,35 @@ def _remember_recorder(state: dict[str, Any], agent_id: str | None) -> None:
 
 
 def _is_trace_orchestration(
-    root: Path, payload: dict[str, Any], state: dict[str, Any]
+    root: Path, payload: dict[str, Any], state: dict[str, Any], protocol_path: Path | None = None,
 ) -> bool:
     event = str(payload.get("hook_event_name") or "")
     tool = str(payload.get("tool_name") or "")
     tool_blob = _json_text(payload.get("tool_input"))
+
+    if event == "UserPromptSubmit" and str(payload.get("prompt") or "").lstrip().startswith(
+        (RECORDER_MARKER, BATCH_MARKER)
+    ):
+        return True
+
+    # On older hosts tool hooks may omit agent_id. Reading our own protocol/outbox
+    # is still recorder plumbing, never a fresh research finding. Do not broadly
+    # discard anonymous reads of project files: retain them and rely on the cap.
+    if tool in RECORDER_READ_TOOLS and isinstance(payload.get("tool_input"), dict):
+        values = payload["tool_input"]
+        raw_path = values.get("file_path") if tool == "Read" else values.get("path")
+        if isinstance(raw_path, str) and raw_path:
+            try:
+                target = Path(raw_path).expanduser()
+                if not target.is_absolute():
+                    target = Path(str(payload.get("cwd") or ".")) / target
+                target = target.resolve()
+                if target.is_relative_to(root.resolve()) or (
+                    protocol_path is not None and target == protocol_path.resolve()
+                ):
+                    return True
+            except (OSError, ValueError, RuntimeError):
+                pass  # Retain unresolvable evidence; never guess its owner.
 
     if event == "SessionStart" and payload.get("source") == "clear":
         state.pop("recorder_agent_id", None)
@@ -826,7 +937,8 @@ def _is_trace_orchestration(
         return True
 
     recorder_id = str(state.get("recorder_agent_id") or "")
-    is_recorder = bool(recorder_id) and str(payload.get("agent_id") or "") == recorder_id
+    actor_id = str(payload.get("agent_id") or "")
+    is_recorder = bool(recorder_id) and actor_id == recorder_id
     if event == "SubagentStop" and is_recorder:
         # Recorder 身份只来自它被派发时记下的 agent id，绝不来自收尾消息里的自称文本：
         # 旧实现认任何带 batch_id 的 TRACE_RECEIPT，普通子 agent 因此会被误认成 Recorder
@@ -837,14 +949,11 @@ def _is_trace_orchestration(
         if window and state["forked_batches"] >= window:
             state["forked_batches"] = 0
             state["retired_recorder_id"] = recorder_id
-            # 下一批重新 fork。复用等于「保留了 fork 这个昂贵机制，却只享受了第一批的收益」：
-            # 后续批次通过 SendMessage 送过去的只有一个 manifest 路径，Recorder 手里是
-            # fork 那一刻的陈旧快照加它自己的记录历史，唯独没有这一批真正发生了什么。
-            # 而重 fork 的前缀与主 agent 完全一致，本来就该命中提示缓存 —— 边际成本是
-            # 缓存读取，不是全量重算。
+            # 下一批重新 fork，获得主会话当前上下文。旧 fork 的主会话快照不会自动更新；
+            # 显式复用时，协议要求读取新材料。缓存是否命中仍由宿主/服务端决定。
             state.pop("recorder_agent_id", None)
         return True
-    if is_recorder:
+    if is_recorder or (actor_id and actor_id in state.get("recorder_ids", [])):
         return True
     if event == "Stop" and payload.get("stop_hook_active"):
         return True
@@ -903,6 +1012,10 @@ def _nudge(
         "the user, then finish with one short line and no raw logs."
     )
     if recorder_id:
+        batch_message += (
+            " This resumes your own Recorder history, not the parent's current context. "
+            "Read the new event and transcript files listed in this manifest before summarizing."
+        )
         action = (
             f"Use SendMessage once with to={recorder_id!r} and this message:\n{batch_message}"
         )
@@ -920,9 +1033,9 @@ def _nudge(
         "wait for the background recorder. If fork or SendMessage is unavailable, do not retry "
         "this turn; the batch remains safely queued."
     )
-    # Stop hooks do not support hookSpecificOutput.additionalContext.  The documented
-    # continuation mechanism is a top-level block decision whose reason becomes the
-    # agent's next instruction.  stop_hook_active prevents a second continuation.
+    # Keep the top-level block response for compatibility with existing hosts.
+    # stop_hook_active guards the immediate continuation; handle also bounds
+    # dispatch across separate turns caused by background completions.
     return {"decision": "block", "reason": guidance}
 
 
@@ -990,9 +1103,51 @@ def handle(
         window = fork_window or str(binding.get("recorder_fork_window") or "")
         if window:
             state["fork_window"] = window
-        _capture_transcripts(root, payload, state)
-        internal = _is_trace_orchestration(root, payload, state)
+        capture_config=_read_json(Path(binding['marker_path']),{}).get('code_capture') or {}
+        if capture_config.get('enabled') and not state.get('code_capture_started'):
+            # Enabling on a resumed conversation establishes a forward-only
+            # boundary. The current hook payload is still recorded below.
+            transcript=payload.get('transcript_path')
+            if transcript:
+                source=Path(transcript).expanduser()
+                if source.is_file():
+                    key=hashlib.sha256(os.path.normcase(str(source)).encode('utf-8')).hexdigest()[:20]
+                    state.setdefault('transcript_offsets',{}).setdefault(key,source.stat().st_size)
+            state['code_capture_started']=_now()
+        if capture_config.get('entire_executable'):
+            try:
+                _capture_entire_transcript(root, payload, state, binding, capture_config)
+            except Exception as exc:
+                _write_event(root, {**payload, 'hook_event_name':'TranscriptCaptureError',
+                                   'transcript_capture_error':str(exc)[:1000], 'provider':'entire'}, binding)
+            _capture_transcripts(root, {**payload, 'transcript_path':None}, state)
+        else:
+            _capture_transcripts(root, payload, state)
+        internal = _is_trace_orchestration(root, payload, state, protocol_path)
+        if (not internal and payload.get("hook_event_name") == "UserPromptSubmit"
+                and not payload.get("agent_id")):
+            # Only fresh user input replenishes the automatic dispatch budget.
+            # Agent completions, tools, SessionStart and hook continuations cannot.
+            state["recorder_dispatches_since_prompt"] = 0
+            state["recorder_dispatched_batches_since_prompt"] = []
+            state.pop("recorder_dispatch_paused", None)
         if not internal:
+            if (payload.get("hook_event_name") in {"Stop", "SessionEnd"} and not payload.get("stop_hook_active")
+                    and (_read_json(Path(binding['marker_path']), {}).get('code_capture') or {}).get('enabled')):
+                try:
+                    # The hook remains offline. Git/Entire evidence is queued;
+                    # the existing delivery worker uploads the retained bytes.
+                    package_root = str(Path(__file__).resolve().parents[1])
+                    if package_root not in sys.path:
+                        sys.path.insert(0, package_root)
+                    from research_trace.workspace import capture_phase
+                    snapshot = capture_phase(binding, payload.get("session_id"))
+                    if snapshot and snapshot['commit_hash'] != state.get('last_code_commit'):
+                        _write_event(root, {**payload, 'hook_event_name':'CodeCheckpoint', 'code_snapshot':snapshot}, binding)
+                        state['last_code_commit'] = snapshot['commit_hash']
+                except Exception as exc:
+                    _write_event(root, {**payload, 'hook_event_name':'CodeCaptureError',
+                                       'code_capture_error':str(exc)[:1000]}, binding)
             _write_event(root, payload, binding)
 
         # Stop 也要拉一次：一轮对话刚结束，batch 正好写完。只挂在 SessionStart/SessionEnd
@@ -1002,12 +1157,39 @@ def handle(
             _spawn_deliver(data_dir, url, state)
 
         result = _recorder_tool_guard(payload, state)
-        if result is None and payload.get("hook_event_name") == "Stop" and not payload.get("stop_hook_active"):
+        if (result is None and payload.get('hook_event_name')=='SessionStart'
+                and (_read_json(Path(binding['marker_path']),{}).get('code_capture') or {}).get('enabled')):
+            result={'hookSpecificOutput':{'hookEventName':'SessionStart','additionalContext':
+                'Research Trace passively records this project. Continue using your normal training and sbatch commands. '
+                'The research agent is responsible for keeping submitted experiment directories and their referenced '
+                'shared code unchanged. Research Trace does not submit jobs, create execution directories, rewrite paths '
+                'or enforce that rule. It preserves observed commands, outputs, conversations and code evidence. '
+                'When recording a meaningful experiment group, use source_event_ids for observed commands/results and '
+                'code checkpoints; use run_ids only for run records that actually exist. '
+                'Keep W&B as a curve link in the research record; never upload code to W&B. '
+                'Untried ideas and unknown predecessor relationships are valid; keep summaries short and mark uncertainty.'}}
+        if (result is None and not internal and payload.get("hook_event_name") == "Stop"
+                and not payload.get("stop_hook_active")):
             selected = _ensure_batch(root, payload, state, binding)
             recorder_id = state.get("recorder_agent_id")
             if selected and not _recorder_running(payload, recorder_id):
-                state["dispatched_batch"] = selected[1]["batch_id"]
-                result = _nudge(selected[0], selected[1], recorder_id, protocol_path)
+                batch_id = selected[1]["batch_id"]
+                attempts = int(state.get("recorder_dispatches_since_prompt") or 0)
+                if attempts >= MAX_RECORDER_DISPATCHES_PER_PROMPT:
+                    if not state.get("recorder_dispatch_paused"):
+                        _write_event(root, {
+                            **payload, "hook_event_name": "RecorderDispatchPaused",
+                            "dispatch_count": attempts,
+                            "reason": "automatic dispatch limit reached; resume after new user input",
+                        }, binding)
+                        state["recorder_dispatch_paused"] = True
+                elif batch_id not in state.get("recorder_dispatched_batches_since_prompt", []):
+                    # Persist before returning to the model. A repeated Stop cannot
+                    # keep retrying a spawn or SendMessage for the same batch.
+                    state["dispatched_batch"] = batch_id
+                    state.setdefault("recorder_dispatched_batches_since_prompt", []).append(batch_id)
+                    state["recorder_dispatches_since_prompt"] = attempts + 1
+                    result = _nudge(selected[0], selected[1], recorder_id, protocol_path)
         state["updated_at"] = _now()
         _atomic_json(state_path, state)
         return result

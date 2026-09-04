@@ -19,7 +19,12 @@ claude_logs/
 __pycache__/
 *.pyc
 .pytest_cache/
+pytest-cache-files-*/
 .venv/
+.venv-basic-memory/
+.test-tmp/
+.integration-demo/
+integrations.local.json
 
 # 打包产物
 *.egg-info/

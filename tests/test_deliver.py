@@ -23,7 +23,7 @@ def make_session(data: Path, workspace: str, session: str, events: int = 1, chun
         )
     for index in range(chunks):
         name = f"{'a' * 20}_{index:016d}_{index + 1:016d}_{'b' * 16}.jsonl"
-        (root / "transcripts" / "pending" / name).write_text('{"message":"x"}\n', encoding="utf-8")
+        D.long_path(root / "transcripts" / "pending" / name).write_text('{"message":"x"}\n', encoding="utf-8")
     return root
 
 
@@ -94,7 +94,7 @@ def test_legacy_awaiting_upload_is_recovered_into_pending(tmp_path: Path, monkey
     )
     (root / "transcripts" / "awaiting_upload").mkdir(parents=True)
     name = f"{'c' * 20}_{0:016d}_{16:016d}_{'d' * 16}.jsonl"
-    (root / "transcripts" / "awaiting_upload" / name).write_text('{"m":"old"}\n', encoding="utf-8")
+    D.long_path(root / "transcripts" / "awaiting_upload" / name).write_text('{"m":"old"}\n', encoding="utf-8")
 
     accept = recorder(200)
     monkeypatch.setattr(D, "_post_json", accept)
@@ -274,7 +274,7 @@ def test_sent_is_reclaimed_by_age_but_pending_is_never_touched(tmp_path: Path, m
 
     old = time.time() - 40 * 86400
     for path in list((root / "sent").glob("*")) + list((root / "transcripts" / "sent").glob("*")):
-        os.utime(path, (old, old))
+        os.utime(D.long_path(path), (old, old))
     # 同时放一条还没投出去的、同样"很旧"的 pending，确认回收碰不到它
     stale_pending = root / "pending" / "0000000000000000000_claude-never-sent.json"
     stale_pending.write_text('{"event_id":"claude-never-sent"}', encoding="utf-8")

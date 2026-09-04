@@ -33,7 +33,6 @@ from .auth import (
     normalize_base_path,
     safe_return_to,
 )
-from .backup import sync_git_backup
 from .deliver import workspace_key_problem
 from .storage import (
     SCHEMA_VERSION,
@@ -236,31 +235,11 @@ ANONYMOUS_READ_WARNING = (
 )
 
 
-#: 备份默认关闭。一个把原始 transcript 往外推的功能，不该在没人要求的情况下自己开起来
-#: —— 备份目的地是别人的仓库，推上去就不完全在本地掌控之内了，那必须是一次明确的选择。
-#: 早先的版本反过来：不配备份就拒绝启动。理由（唯一副本在一块盘上，通常要到盘坏才发现）
-#: 依然成立，所以这里仍然说一句；但它是提示，不是关卡。
-NO_BACKUP_NOTE = (
-    "Research Trace: no backup destination configured, so this machine's SQLite database"
-    " and object directory are the only copy of every record and raw transcript.\n"
-    "To turn backup on, point --backup-repo (or TRACE_BACKUP_REPO) at a git worktree whose"
-    " remote is a PRIVATE repository -- the export carries raw transcripts. Only the named"
-    " subdirectory is staged and committed, so a repo you already use for something else"
-    " does not get its other changes swept up.\n"
-    "Pass --no-backup (or TRACE_NO_BACKUP=true) to silence this note."
-)
-
-
 def create_app(
     data_dir: str | os.PathLike[str] | None = None,
     *,
     token: str | None = None,
-    attachment_limit: int = 10 * 1024 * 1024,
-    backup_repo: str | os.PathLike[str] | None = None,
-    backup_interval_hours: float = 24,
-    backup_subdirectory: str = "research-trace-backup",
-    backup_remote: str = "origin",
-    backup_branch: str = "main",
+    attachment_limit: int = 100 * 1024 * 1024,
     base_path: str | None = None,
     github_client_id: str | None = None,
     github_client_secret: str | None = None,
@@ -277,6 +256,7 @@ def create_app(
     trust_proxy_headers: bool | None = None,
     insecure_cookies: bool | None = None,
     oauth_client: Any | None = None,
+    integrations_config: str | os.PathLike[str] | None = None,
 ):
     if FastAPI is None:  # pragma: no cover
         raise RuntimeError("server requires fastapi; install research-trace[server]")
@@ -310,6 +290,8 @@ def create_app(
     )
     root = Path(data_dir or os.environ.get("TRACE_DATA") or ".trace-data")
     store = Store(root, attachment_limit=attachment_limit)
+    from .integrations import Integrations
+    integrations = Integrations(store, config_path=(integrations_config or os.environ.get("TRACE_INTEGRATIONS_CONFIG")))
     write_token = token if token is not None else os.environ.get("TRACE_TOKEN", "")
     pending_oauth = PendingOAuthStore()
     github = oauth_client or (GitHubOAuthClient(oauth_config) if oauth_config else None)
@@ -353,76 +335,32 @@ def create_app(
                 pins=identity_pins,
             ) is None:
                 store.revoke_user_credentials(str(account.get("id") or ""))
-    backup_state: dict[str, Any] = {
-        "enabled": bool(backup_repo), "running": False, "last_attempt_at": None,
-        "last_success_at": None, "error": None, "changed": None, "pushed": None,
-        # 上一轮 commit 成功但 push 失败时这里 > 0：否则"远端落后几周"在健康页上
-        # 看起来和一切正常完全一样。
-        "unpushed_commits": None,
-        # §13 的容量阈值告警。备份撞上 GitHub 的上限是**渐进**发生的：等到 push
-        # 被拒才知道，就已经有一轮备份没写进去了。sync_git_backup 每轮都算这个，
-        # 服务端必须把它带到 /api/health，否则那次计算谁也看不见。
-        "capacity": None,
-        # 大产物只备份引用元数据，但小附件的对象文件确实可能在数据卷上丢了。
-        # 这不该让整轮备份失败，可是也绝不能悄悄过去。
-        "missing_objects": None,
-    }
     # 每台工作站最近一次 trace-deliver 的自述。它是客户端上报的，不是中央推断的，
     # 所以只作为健康显示，不参与任何正确性判断。
     outbox_reports: dict[str, dict[str, Any]] = {}
-    stop_backup = asyncio.Event()
-
-    async def backup_loop() -> None:
-        interval = max(float(backup_interval_hours), 1 / 60) * 3600
-        while not stop_backup.is_set():
-            backup_state.update(running=True, last_attempt_at=now_utc(), error=None)
-            try:
-                result = await asyncio.to_thread(
-                    sync_git_backup, store, backup_repo,
-                    subdirectory=backup_subdirectory, remote=backup_remote, branch=backup_branch,
-                )
-                capacity = result.get("capacity") or None
-                backup_state.update(
-                    last_success_at=now_utc(), changed=result["changed"], pushed=result["pushed"],
-                    unpushed_commits=result.get("unpushed_commits"),
-                    capacity=capacity,
-                    missing_objects=list(result.get("missing_objects") or []),
-                )
-                # 无人值守的部署没人开网页。容量告警至少要落进服务日志一次。
-                if capacity and capacity.get("level") in {"warn", "critical"}:
-                    print(
-                        "research-trace backup capacity "
-                        f"{capacity.get('level')}: " + "; ".join(
-                            str(item) for item in (capacity.get("warnings") or [])
-                        ),
-                        file=sys.stderr, flush=True,
-                    )
-            except Exception as exc:
-                backup_state["error"] = f"{type(exc).__name__}: {exc}"
-            finally:
-                backup_state["running"] = False
-            try:
-                await asyncio.wait_for(stop_backup.wait(), timeout=interval)
-            except asyncio.TimeoutError:
-                pass
-
     @asynccontextmanager
     async def lifespan(_app):
-        task = asyncio.create_task(backup_loop()) if backup_repo else None
+        index_task = asyncio.create_task(integrations.run()) if integrations.memory else None
         try:
             yield
         finally:
-            stop_backup.set()
-            if task:
-                await task
+            integrations.stop_event.set()
+            if index_task:
+                index_task.cancel()
+                try:
+                    await index_task
+                except asyncio.CancelledError:
+                    pass
+            if integrations.memory:
+                await integrations.memory.close()
             store.close()
 
-    app = FastAPI(title="Research Trace", version="2.0.0-alpha.20", lifespan=lifespan,
+    app = FastAPI(title="Research Trace", version="2.0.0-alpha.26", lifespan=lifespan,
                   root_path=base)
     app.state.base_path = base
     app.state.store = store
+    app.state.integrations = integrations
     app.state.write_token = write_token
-    app.state.backup_status = backup_state
     app.state.oauth_config = oauth_config
     app.state.team_map = team_map
 
@@ -1013,7 +951,7 @@ $('approve').onclick=async()=>{{
         value["write_protected"] = bool(write_token or oauth_config)
         value["oauth_enabled"] = bool(oauth_config)
         value["anonymous_read"] = not bool(oauth_config)
-        value["backup"] = dict(backup_state)
+        value["integrations"] = integrations.health()
         # 没有任何一台机器上报过就不给这一格，网页据此显示"未上报"而不是画个假绿灯。
         if outbox_reports:
             machines = list(outbox_reports.values())
@@ -1071,6 +1009,9 @@ $('approve').onclick=async()=>{{
         def decorate(value: dict[str, Any]) -> dict[str, Any]:
             if rejected:
                 value["rejected_workspace_keys"] = rejected
+            project = value.get('project') or {}
+            if project.get('id'):
+                value['recent_runs'] = store.research_runs(project['id'],limit=recent_limit)
             return value
 
         result = store.context(
@@ -1180,7 +1121,8 @@ $('approve').onclick=async()=>{{
             labels=body.get("labels") or [], occurred_at=body.get("occurred_at"),
             created_by=actor_type,
             review_state=(body.get("review_state") or "unreviewed") if actor_type == "human" else "unreviewed",
-            source_event_ids=body.get("source_event_ids") or [], code_evidence=body.get("code_evidence") or [],
+            source_event_ids=body.get('source_event_ids') or [], code_evidence=body.get("code_evidence") or [],
+            run_ids=body.get('run_ids') or [],
         )
 
     @app.patch("/api/nodes/{node_id}")
@@ -1262,6 +1204,13 @@ $('approve').onclick=async()=>{{
     @app.post("/api/attach", dependencies=[Depends(require_write)])
     async def attach(request: Request):
         body = await request.json()
+        if body.get("integration"):
+            if body["integration"] != "mlflow" or body.get("target_type") != "node":
+                raise ValidationError("external evidence currently supports MLflow on an existing Node")
+            return await integrations.import_evidence(
+                body.get("project_id"), kind=body.get("external_kind"),
+                external_id=body.get("external_id"), node_id=body.get("target_id"), name=body.get("name"),
+            )
         return store.attach(
             body.get("project_id"), target_type=body.get("target_type"), target_id=body.get("target_id"),
             name=body.get("name"), direction=body.get("direction") or "reference",
@@ -1276,11 +1225,41 @@ $('approve').onclick=async()=>{{
         return FileResponse(path, media_type=mime or "application/octet-stream", filename=name)
 
     @app.get("/api/search", dependencies=[Depends(require_read)])
-    def search(q: str, project_id: str | None = None, scope: str = "all", limit: int = 50):
+    async def search(q: str, project_id: str | None = None, scope: str = "all", limit: int = 50):
         # as_dict() 是旧结构的超集（仍带 hits），额外带 totals / returned / omitted /
         # truncated。存储层早就算出"还有多少条没显示"，以前在这一行被丢掉，
         # 于是界面永远看不出自己只拿到了一部分。
-        return store.search(q, project_id=project_id, scope=scope, limit=limit).as_dict()
+        return await integrations.search(q, project_id=project_id, scope=scope, limit=limit)
+
+    @app.get("/api/integrations", dependencies=[Depends(require_read)])
+    def integration_status():
+        return integrations.health()
+
+    @app.post("/api/integrations/sync", dependencies=[Depends(require_write)])
+    async def integration_sync():
+        return await integrations.sync()
+
+    @app.post("/api/integrations/mlflow/evidence", dependencies=[Depends(require_write)])
+    async def integration_evidence(request: Request):
+        body = await request.json()
+        return await integrations.import_evidence(
+            body.get("project_id"), kind=body.get("kind"), external_id=body.get("external_id"),
+            node_id=body.get("node_id"), name=body.get("name"),
+        )
+
+    @app.get('/api/nodes/{node_id}/sources', dependencies=[Depends(require_read)])
+    def node_sources(node_id: str):
+        return store.node_sources(node_id)
+
+    @app.get('/api/projects/{project_id}/runs', dependencies=[Depends(require_read)])
+    def project_runs(project_id: str, limit: int = 50):
+        return {'items':store.research_runs(project_id,limit=limit)}
+
+    @app.get('/assets/{name}', dependencies=[Depends(require_read)])
+    def asset(name: str):
+        if name not in {'markdown-it.min.js','dagre.min.js'}:
+            raise HTTPException(status_code=404)
+        return FileResponse(Path(__file__).parent/'static'/name,media_type='text/javascript')
 
     @app.get("/", response_class=HTMLResponse)
     def index():
@@ -1298,15 +1277,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--token", default=os.environ.get("TRACE_TOKEN", ""))
     parser.add_argument("--base-path", default=os.environ.get("TRACE_BASE_PATH", ""),
                         help="把服务挂在一个路径前缀下，例如 /trace；前缀之外一律 404")
-    parser.add_argument("--backup-repo", default=os.environ.get("TRACE_BACKUP_REPO"))
-    parser.add_argument("--no-backup", action="store_true", default=_env_bool("TRACE_NO_BACKUP"),
-                        help="不备份（本来就是默认行为），并且不要每次启动都提醒")
-    parser.add_argument("--backup-interval-hours", type=float,
-                        default=float(os.environ.get("TRACE_BACKUP_INTERVAL_HOURS", "24")))
-    parser.add_argument("--backup-subdirectory",
-                        default=os.environ.get("TRACE_BACKUP_SUBDIRECTORY", "research-trace-backup"))
-    parser.add_argument("--backup-remote", default=os.environ.get("TRACE_BACKUP_REMOTE", "origin"))
-    parser.add_argument("--backup-branch", default=os.environ.get("TRACE_BACKUP_BRANCH", "main"))
+    # Compatibility only: the old disable switch is harmless and hidden.
+    parser.add_argument("--no-backup", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--public-url", default=os.environ.get("TRACE_PUBLIC_URL"))
     parser.add_argument("--github-client-id", default=os.environ.get("TRACE_GITHUB_CLIENT_ID"))
     parser.add_argument("--github-client-secret", default=os.environ.get("TRACE_GITHUB_CLIENT_SECRET"))
@@ -1329,10 +1301,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--insecure-cookies", action="store_true",
                         default=_env_bool("TRACE_INSECURE_COOKIES"))
     args = parser.parse_args(argv)
-    # 备份默认不开：往一个 git remote 推原始 transcript 是一件外向的事，必须有人明确要求。
-    # --no-backup 保留下来，含义从「豁免那道关卡」变成「我知道没有备份，别再提醒」。
-    if not str(args.backup_repo or "").strip() and not args.no_backup:
-        print(NO_BACKUP_NOTE, file=os.sys.stderr)
     try:
         import uvicorn
     except ImportError:
@@ -1340,11 +1308,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     uvicorn.run(
         create_app(
-            args.data_dir, token=args.token, backup_repo=args.backup_repo,
-            backup_interval_hours=args.backup_interval_hours,
-            backup_subdirectory=args.backup_subdirectory, backup_remote=args.backup_remote,
-            backup_branch=args.backup_branch, base_path=args.base_path,
-            public_url=args.public_url,
+            args.data_dir, token=args.token, base_path=args.base_path,
             github_client_id=args.github_client_id, github_client_secret=args.github_client_secret,
             session_secret=args.session_secret, github_admins=args.github_admins,
             github_allowed_users=args.github_allowed_users, github_allowed_org=args.github_allowed_org,

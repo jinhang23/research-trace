@@ -521,6 +521,7 @@ def test_new_columns_are_added_to_a_database_created_before_this_round(tmp_path)
     store.close()
     database = tmp_path / "trace.sqlite3"
     raw = sqlite3.connect(database)
+    raw.execute("DROP TABLE alembic_version")  # a pre-Alembic database
     for table, column in (
         ("comments", "acknowledged_at"), ("comments", "acknowledged_by"),
         ("device_credentials", "expires_at"), ("ingest_batches", "delivered_by"),

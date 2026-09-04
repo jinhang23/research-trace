@@ -4,16 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "research-trace"
-version = "2.0.0a20"
+version = "2.0.0a26"
 description = "团队研究与项目记忆：完整 agent 历史与精选语义记录"
 readme = "README.md"
 requires-python = ">=3.10"
 
-# MCP 那一侧零运行时依赖。MCP 是一份开放协议规范，`mcp` 那个 pip 包只是它的官方
-# Python SDK；stdio 侧就是换行分隔的 JSON-RPC 2.0，直接说协议即可，不必依赖 SDK。
-# 于是也不会再被 SDK 的破坏性改版牵连（mcp 2.0 删掉了 1.x 的整套装饰器 API）。
-# 中央服务另需 fastapi/uvicorn，见下面的 optional-dependencies。
-dependencies = []
+# Pin the supported SDK major; protocol transport belongs to the upstream SDK.
+dependencies = ["mcp>=1.29,<2", "filelock>=3.16,<4"]
 
 [project.urls]
 Homepage = "https://github.com/jinhang23/research-trace"
@@ -29,16 +26,21 @@ trace-login = "research_trace.device_login:main"
 # 只有中央返回 2xx 才把文件搬进 sent/。trace-project 是采集的 opt-in 绑定入口。
 trace-deliver = "research_trace.deliver:main"
 trace-project = "research_trace.deliver:project_main"
+trace-code = "research_trace.workspace:main"
 
 [project.optional-dependencies]
-server = ["fastapi>=0.110", "uvicorn>=0.27"]
-dev = ["pytest"]
+server = ["fastapi>=0.110", "uvicorn>=0.27", "sqlalchemy>=2,<3", "alembic>=1.13,<2", "authlib>=1.6,<2", "httpx>=0.28,<1"]
+dev = ["pytest", "httpx>=0.27,<1"]
+integrations = ["mlflow-skinny>=3.14,<4", "mcp>=1.20,<2"]
 
 [tool.setuptools]
 packages = ["research_trace"]
 # 根目录那三个 .py 只是薄薄的入口转发（给不想用 console script 的人直接
 # `python trace_server.py` 用），本体全在 research_trace 包里。
 py-modules = ["trace_mcp", "trace_server", "trace_login"]
+
+[tool.setuptools.package-data]
+research_trace = ["static/*", "migrations/*.py", "migrations/versions/*.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

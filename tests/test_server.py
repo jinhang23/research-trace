@@ -11,6 +11,8 @@ from fastapi.testclient import TestClient
 from research_trace.server import TeamProjectMap, create_app
 from research_trace.webapp import INDEX_HTML
 
+VENDOR_JS = 'globalThis.markdownit = require("C:\\\\Users\\\\Administrator\\\\Documents\\\\ChatGPT\\\\New project\\\\research-trace\\\\research_trace\\\\static\\\\markdown-it.min.js");\nglobalThis.dagre = require("C:\\\\Users\\\\Administrator\\\\Documents\\\\ChatGPT\\\\New project\\\\research-trace\\\\research_trace\\\\static\\\\dagre.min.js");\n'
+
 
 def test_http_flow_and_write_auth(tmp_path):
     app = create_app(tmp_path, token="secret")
@@ -156,11 +158,11 @@ def test_web_ui_keeps_structure_and_record_detail_together(tmp_path):
     assert 'data-work-view="list"' in page
     assert 'id="fieldChapter"' in page
     assert 'id="fieldReview"' in page
-    assert '新的起点（无 parent）' in page
+    assert '独立探索或前序关系待核实' in page
     assert "function layoutGraphNodes" in page
     assert 'data-select-node="' in page
     assert "连线仅表示明确的 parent 关系" in page
-    assert "node.parent_id && byId.has(node.parent_id)" in page
+    assert "dagre.layout(graph)" in page
 
 
 def test_graph_layout_is_deterministic_and_respects_parent_depth(tmp_path):
@@ -194,11 +196,13 @@ if (first.positions.c.left - first.positions.b.left < first.cardWidth) throw Err
 // 每一层各自紧排：b 有孩子、c 没有，两者仍在同一层且只隔一个间距。
 if (first.positions.b.top !== first.positions.c.top) throw Error('siblings must share a row');
 // 孤儿是另一棵树，必须整个躲开第一棵，而不是压在它上面。
-const firstTreeRight = Math.max(first.positions.a.left, first.positions.c.left) + first.cardWidth;
-if (first.positions.orphan.left < firstTreeRight) throw Error('a second tree must clear the first');
+const boxes=Object.values(first.positions);
+for(let i=0;i<boxes.length;i++) for(let j=i+1;j<boxes.length;j++) {
+  if(Math.abs(boxes[i].left-boxes[j].left)<first.cardWidth && Math.abs(boxes[i].top-boxes[j].top)<first.cardHeight) throw Error('nodes must not overlap');
+}
 """
     result = subprocess.run(
-        [node, "-"], input=functions + check, text=True, capture_output=True, check=False
+        [node, "-"], input=VENDOR_JS + functions + check, text=True, capture_output=True, check=False
     )
     assert result.returncode == 0, result.stderr
 
@@ -236,7 +240,7 @@ if (fmt('') !== '') throw Error('empty stays empty');
 if (fmt(null) !== '') throw Error('null stays empty');
 """
     result = subprocess.run(
-        [node, "-"], input=source + check, text=True, encoding="utf-8", capture_output=True, check=False
+        [node, "-"], input=VENDOR_JS + source + check, text=True, encoding="utf-8", capture_output=True, check=False
     )
     assert result.returncode == 0, result.stderr
 
@@ -247,7 +251,7 @@ def test_web_shows_outbox_recorder_and_backup_health():
     assert "$('#healthBtn').onclick" in INDEX_HTML
     assert "async function showHealth()" in INDEX_HTML
     assert "await api('/api/health')" in INDEX_HTML
-    for name in ("outboxHealthHtml", "recorderHealthHtml", "backupHealthHtml"):
+    for name in ("outboxHealthHtml", "recorderHealthHtml", "integrationHealthHtml"):
         assert f"function {name}(" in INDEX_HTML
     # 投递器还没上报时必须说"未上报"，不能画一个绿灯
     assert "还没有投递器上报 outbox 状态。" in INDEX_HTML
@@ -264,7 +268,7 @@ def _run_js(source: str, check: str) -> None:
     if not node:
         pytest.skip("node is not installed")
     result = subprocess.run(
-        [node, "-"], input=source + check, text=True, encoding="utf-8",
+        [node, "-"], input=VENDOR_JS + source + check, text=True, encoding="utf-8",
         capture_output=True, check=False,
     )
     assert result.returncode == 0, result.stderr
@@ -275,7 +279,7 @@ def _dataflow_js(*extra: str) -> str:
     source = "var S = {project: {chapters: []}, dataflow: null, workView: 'graph', selectedNodeId: null};\n"
     source += _js_slice("const esc = value =>", "function file64")
     for name in ("nodeOrder", "dataflowAvailable", "effectiveWorkView",
-                 "dataflowKeyLabel", "layoutDataflowNodes", "dataflowSectionHtml", *extra):
+                 "dataflowKeyLabel", "dagreLayout", "layoutDataflowNodes", "dataflowSectionHtml", *extra):
         source += _js_function(INDEX_HTML, name)
     return source
 
@@ -458,41 +462,6 @@ if (dataflowKeyLabel(attack).includes('<')) throw Error('an unknown key_kind is 
 """)
 
 
-def test_web_backup_capacity_alarm_and_missing_objects_are_visible():
-    """§13「Git 接近容量阈值时告警」的落点。sync_git_backup 每轮都算 capacity，
-    界面不渲染的话那次计算等于没做。"""
-    source = "var S = {};\n"
-    source += _js_slice("const esc = value =>", "function file64")
-    source += _js_slice("const HEALTH_STATE_PILL", "function healthCardHtml")
-    for name in ("healthCardHtml", "bytesLabel", "backupCapacityLines", "backupHealthHtml"):
-        source += _js_function(INDEX_HTML, name)
-    _run_js(source, r"""
-const ok = backupHealthHtml({backup: {enabled: true, last_success_at: '2026-08-18T00:00:00Z',
-  unpushed_commits: 0, capacity: {level: 'ok', export_bytes: 1024, volumes: 2, warnings: []},
-  missing_objects: []}});
-if (!ok.includes('正常')) throw Error('a healthy backup must not be painted as a problem');
-if (!ok.includes('2 个分卷')) throw Error('volume count is the shape of the new backup tree');
-
-const bad = backupHealthHtml({backup: {enabled: true, last_success_at: '2026-08-18T00:00:00Z',
-  unpushed_commits: 0,
-  capacity: {level: 'critical', export_bytes: 1073741824, repository_bytes: 5368709120, volumes: 4,
-    largest_file: 'volumes/2026/tables/events.0001.jsonl', largest_file_bytes: 99614720,
-    limits: {}, warnings: ['largest backup file <img src=x> is 99614720 bytes']},
-  missing_objects: ['ab/cd/ef']}});
-if (!bad.includes('严重')) throw Error('a critical capacity level must escalate the card');
-if (!bad.includes('95.0 MiB')) throw Error('the largest file size must be readable');
-if (!bad.includes('5.0 GiB')) throw Error('repository size must be shown');
-if (!bad.includes('4 个分卷')) throw Error('volume count missing');
-if (!bad.includes('99614720 bytes')) throw Error('the warning text itself must be shown');
-if (bad.includes('<img')) throw Error('a backup warning reached innerHTML unescaped');
-if (!bad.includes('附件对象在导出时已不存在')) throw Error('missing attachment objects must be surfaced');
-
-const warn = backupHealthHtml({backup: {enabled: true, last_success_at: '2026-08-18T00:00:00Z',
-  unpushed_commits: 0, capacity: {level: 'warn', export_bytes: 0, volumes: 1, warnings: ['close']},
-  missing_objects: []}});
-if (!warn.includes('需要注意')) throw Error('a warn level must not read as healthy');
-if (bytesLabel('nonsense') !== '—') throw Error('an unparsable size must not be echoed back');
-""")
 
 
 def test_dataflow_endpoint_feeds_the_web_view(tmp_path):
@@ -619,13 +588,12 @@ def test_a_raw_batch_records_which_credential_delivered_it(tmp_path):
     assert row["delivered_by"] == "alice@hpg-node-7"
 
 
-def test_web_surfaces_truncation_expiry_and_an_unpushed_backup():
+def test_web_surfaces_truncation_and_expiry():
     """三件以前只存在于 JSON 里、界面上完全看不出来的事。"""
     assert "function searchTruncationHtml(" in INDEX_HTML
     assert "value.truncated" in INDEX_HTML
     assert "未显示" in INDEX_HTML
-    assert "backup.unpushed_commits" in INDEX_HTML
-    assert "远端落后" in INDEX_HTML
+    assert "GitHub 每日备份" not in INDEX_HTML
     assert "function deviceExpiringSoon(" in INDEX_HTML
     assert "trace-login --renew" in INDEX_HTML
     assert "value.anonymous_read" in INDEX_HTML
@@ -783,35 +751,6 @@ def test_a_wildcard_only_rule_is_refused(tmp_path):
             assert denied.status_code == 400, pattern
 
 
-def test_the_backup_capacity_alert_reaches_health_and_the_service_log(tmp_path, monkeypatch, capsys):
-    """§13：「Git 接近容量阈值时告警。」备份那一层每轮都算了这个数，服务端不把它
-    带进 /api/health 的话，那次计算谁也看不见——健康卡片依旧一片正常，直到某天
-    push 被拒。"""
-    from research_trace import server as S
-
-    repo = tmp_path / "repo"
-    (repo / ".git").mkdir(parents=True)
-    capacity = {"level": "critical", "warnings": ["export is 5 GiB, above the repository limit"],
-                "export_bytes": 5 * 1024 ** 3}
-
-    def fake_sync(store, backup_repo, **_kwargs):
-        return {"changed": True, "pushed": True, "unpushed_commits": 0,
-                "capacity": capacity, "missing_objects": ["sha256:deadbeef"]}
-
-    monkeypatch.setattr(S, "sync_git_backup", fake_sync)
-    app = create_app(tmp_path / "data", token="t", backup_repo=repo, backup_interval_hours=24)
-    with TestClient(app) as client:
-        # 备份循环是后台任务，第一轮要经过一次线程跳转；轮询而不是赌它已经跑完。
-        for _ in range(100):
-            backup = client.get("/api/health", headers={"Authorization": "Bearer t"}).json()["backup"]
-            if backup.get("capacity"):
-                break
-            time.sleep(0.02)
-
-    assert backup["capacity"]["level"] == "critical"
-    assert backup["capacity"]["warnings"] == capacity["warnings"]
-    assert backup["missing_objects"] == ["sha256:deadbeef"]
-    assert "backup capacity critical" in capsys.readouterr().err, "无人值守的部署也要看得见"
 
 
 def test_the_dataflow_view_is_reachable_over_http_and_stays_opt_in(tmp_path):

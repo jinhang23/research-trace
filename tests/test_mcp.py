@@ -7,14 +7,10 @@ import pytest
 
 from research_trace import mcp
 from research_trace.mcp import (
-    PROTOCOL_VERSION,
-    SUPPORTED_PROTOCOL_VERSIONS,
     TOOLS,
     _manifest_payload,
     call_tool,
     force_utf8_stdio,
-    handle,
-    serve,
 )
 
 
@@ -201,94 +197,21 @@ def test_a_manifest_pointing_only_outside_the_session_is_still_refused(tmp_path)
 # 手写 JSON-RPC 就得自己守住这些规矩，所以每一条都得有测试盯着。
 
 
-def test_a_notification_shaped_tools_call_neither_answers_nor_writes():
-    """JSON-RPC §4.1：通知不回复。更要紧的是它不能执行——没有 id 的 tools/call
-    以前会照常 POST 进中央库，调用方却永远拿不到回执。"""
-    remote = FakeRemote()
-    message = _call("trace_record", {"project_id": "p", "idempotency_key": "k", "title": "t"})
-    message.pop("id")
-    assert handle(remote, message) is None
-    assert remote.calls == []
 
 
-def test_request_id_must_not_be_null():
-    """MCP 在 JSON-RPC 之上收紧了：请求的 id 不能是 null，官方客户端解析不了。"""
-    response = handle(FakeRemote(), {"jsonrpc": "2.0", "id": None, "method": "ping"})
-    assert response["error"]["code"] == mcp.INVALID_REQUEST
-    assert response["id"] is None  # 错误响应的 id 只能是 null，这是允许的
 
 
-def test_ping_is_answered_and_unknown_methods_use_method_not_found():
-    assert handle(FakeRemote(), {"jsonrpc": "2.0", "id": 3, "method": "ping"})["result"] == {}
-    unknown = handle(FakeRemote(), {"jsonrpc": "2.0", "id": 4, "method": "resources/list"})
-    assert unknown["error"]["code"] == mcp.METHOD_NOT_FOUND
-    # 同一个方法名作为通知发来时仍然不回复
-    assert handle(FakeRemote(), {"jsonrpc": "2.0", "method": "resources/list"}) is None
 
 
-@pytest.mark.parametrize("requested,expected", [
-    ("2025-06-18", "2025-06-18"),
-    ("2024-11-05", "2024-11-05"),
-    ("1999-01-01", PROTOCOL_VERSION),
-    (None, PROTOCOL_VERSION),
-])
-def test_initialize_negotiates_the_protocol_version(requested, expected):
-    params = {} if requested is None else {"protocolVersion": requested}
-    response = handle(FakeRemote(), {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params})
-    assert response["result"]["protocolVersion"] == expected
-    assert expected in SUPPORTED_PROTOCOL_VERSIONS
 
 
-def test_bad_arguments_are_invalid_params_and_tool_failures_are_isError():
-    remote = FakeRemote()
-    for bad in ([1, 2], "字符串", 42):
-        response = handle(remote, _call(arguments=bad))
-        assert response["error"]["code"] == mcp.INVALID_PARAMS
-    assert remote.calls == []
-
-    # 工具内部失败必须走 isError：回成 JSON-RPC error 会被客户端当成传输故障，
-    # 模型看不到原因，也就没法自己纠正。
-    failing = FakeRemote(error=RuntimeError("Research Trace HTTP 401"))
-    response = handle(failing, _call())
-    assert "error" not in response
-    assert response["result"]["isError"] is True
-    assert "RuntimeError" in response["result"]["content"][0]["text"]
 
 
-def test_serve_reports_parse_errors_and_skips_notifications_inside_a_batch():
-    remote = FakeRemote()
-    lines = "\n".join([
-        "{ 这不是 JSON",
-        json.dumps([
-            {"jsonrpc": "2.0", "id": 1, "method": "ping"},
-            {"jsonrpc": "2.0", "method": "tools/call",
-             "params": {"name": "trace_record", "arguments": {"title": "批量通知"}}},
-        ]),
-    ]) + "\n"
-    sink = io.StringIO()
-    serve(remote, io.StringIO(lines), sink)
-    parse_error, batch = [json.loads(line) for line in sink.getvalue().splitlines()]
-    assert parse_error["error"]["code"] == mcp.PARSE_ERROR and parse_error["id"] is None
-    assert [item["id"] for item in batch] == [1]
-    assert remote.calls == []
 
 
 # --------------------------------------------------------------- stdio 编码
 
 
-def test_chinese_survives_the_protocol_channel_as_pure_ascii():
-    """中文标题必须原样到达 HTTP 层；发回去的那一行必须是纯 ASCII，
-    这样任何控制台/管道编码都改不了协议内容。"""
-    remote = FakeRemote(result={"title": "检查 batch effect"})
-    line = json.dumps(_call("trace_record", {
-        "project_id": "p", "idempotency_key": "k", "title": "检查 batch effect", "body": "结论：可用",
-    }), ensure_ascii=False)
-    sink = io.StringIO()
-    serve(remote, io.StringIO(line + "\n"), sink)
-    assert remote.calls[0][2]["title"] == "检查 batch effect"
-    out = sink.getvalue()
-    out.encode("ascii")  # 非 ASCII 会在这里抛出来
-    assert "检查 batch effect" in json.loads(out)["result"]["content"][0]["text"]
 
 
 def test_force_utf8_stdio_pins_both_ends_to_utf8(monkeypatch):

@@ -12,7 +12,7 @@
 - **采集是按项目 opt-in 的**：只有放了 `.research-trace.json` marker 的目录会被记录（§6、§7、§13）。
 - **原始投递由独立进程 `trace-deliver` 负责**，不经过 Recorder、不经过 hook 的网络调用（§6、§12）。
 - 备份导出按年份/容量分卷（格式版本 3；版本 2 的旧树仍可 verify/restore）并带容量阈值告警（§13），
-  告警显示在健康视图的备份卡片上；数据流派生视图（§8）在网页项目视图里作为第三种呈现方式出现；
+  告警随手动导出返回；数据流派生视图（§8）在网页项目视图里作为第三种呈现方式出现；
   团队配置映射（§7.1）已实现，但它的**网页管理界面**仍【未实现】，目前靠 REST 或直接编辑
   数据目录里的 JSON。
 - 文档中标注【未实现】的条目是待办，不是错误描述：它们仍然是验收目标。
@@ -166,7 +166,7 @@ Hook 的任何失败都 fail-open：退出码恒为 0，不输出会阻断主任
 
 **隐藏 chain-of-thought 不采集。** transcript 增量按行解析，`thinking` 与 `redacted_thinking`
 块（含 `signature`）在**写进 outbox 之前**就被丢弃，因此隐藏推理不进本机 outbox、不上传中央、
-也不进每日备份。单行解析失败不得让 hook 崩溃、也不得因此丢掉整个文件：无法解析又含该字样的行
+也不进入手动导出。单行解析失败不得让 hook 崩溃、也不得因此丢掉整个文件：无法解析又含该字样的行
 替换成只含长度与哈希的占位记录，留下缺口证据而不留原文。只保存宿主实际暴露的可见内容。
 
 ### 6.2 投递权威：独立投递器，不是 Recorder，也不是模型
@@ -187,8 +187,8 @@ Hook 的任何失败都 fail-open：退出码恒为 0，不输出会阻断主任
 ### 6.3 Recorder fork
 
 - Claude Code 推荐 `2.1.232+`。
-- 每个主会话首次派发时创建一个 fork Recorder；它继承主会话当时的实际上下文和 prompt cache。
-- 后续恢复同一 recorder agent id，只发送增量 batch。
+- 默认每个 batch 派发一个新的 fork Recorder，继承主会话当时的实际上下文；中央记录提供长期记忆。
+- 显式选择 legacy reuse 模式时，后续恢复同一 recorder agent id，只发送增量 batch。
 - Recorder 身份只来自派发时记录的 agent id，不得从任何消息文本中推断。
 - Recorder 不跨主会话常驻；中央服务保存长期状态。
 - fork 虽继承主会话工具，但 Hook 按 recorder agent id 强制只允许只读检查和 Research Trace MCP，
@@ -339,14 +339,11 @@ Comments 的人工操作走网页 REST；不为每个网页动作增加 MCP 工�
 - Node 内联评论和修订历史。
 - 原始 session/agent timeline 默认折叠，可从语义记录跳转。
 - 跨项目全文搜索。
-- outbox、Recorder 和 GitHub backup 健康状态。三格都有数据源：投递器每轮结束时
+- outbox、Recorder 和框架集成健康状态。状态都有数据源：投递器每轮结束时
   `POST /api/telemetry/outbox` 上报本机的 pending/sent 计数、最老一条 pending 的时间、
   最近一次错误和 Recorder 未处理的 batch 数；`GET /api/health` 把最近一次结果放在
   `outbox.machines[]` 与 `recorder` 里。没有任何机器上报过时界面显示「未上报」，不画假绿灯。
   同一份统计也写在本机 `outbox/delivery-status.json`，`trace-deliver --status` 不联网就能读。
-  备份卡片额外显示 `unpushed_commits`，「本地 commit 成功但远端落后几周」因此看得见；
-  同一张卡片显示 `backup.capacity`（导出体积、仓库体积、分卷数、最大文件与逐条告警，
-  `critical` 把整张卡片提到 danger）与 `backup.missing_objects` 的条数（§13）。
 - 数据流只在存在明确 artifact 关系时显示：项目视图的结构面板有第三个切换「数据流」，
   **只有真的连出边时才出现**，并且上一个项目选过它、下一个项目没有关系时自动退回结构图。
   边只来自 `GET /api/projects/{project_id}/dataflow`（agent 侧是 `trace_context` 的
@@ -404,66 +401,17 @@ outbox/
   结果，有 pending 时退出码为 1。插件数据目录默认保留。
 - outbox 里是完整对话和可能含令牌的命令原文，因此目录 `0700`、文件 `0600`（Windows 上 best-effort）。
 
-## 13. 中央存储与 GitHub 备份
+## 13. 中央存储与手动恢复
 
-- 中央服务永久保存原始历史和语义记录；默认无 30/90 天 TTL。
-- SQLite WAL 只由单个服务实例访问；小附件按 SHA-256 内容寻址保存。
-- 每日向专用 private GitHub repository 导出确定性的 JSON/JSONL、压缩 transcript chunks、
-  小附件、manifest 和校验和；不提交运行中的 SQLite/WAL。
-- 大产物只备份引用元数据。
-- 常规备份只追加/正常 push，不 force-push；必须支持 verify 和从空数据库 restore。
-  上一轮 push 失败但 commit 已成功时，下一轮即使没有新数据也要补 push。
-- Git 接近容量阈值时告警，并支持按年份/容量分卷。
-
-导出树是**先按年、年内再按容量**的分卷结构（备份格式版本 3）：
-
-```text
-research-trace-backup/
-├── index.json                     每卷的 manifest 校验和、字节数、最大文件与行数
-├── .gitattributes
-└── volumes/<年 | base>/
-    ├── manifest.json              format=research-trace-backup-volume
-    ├── tables/<table>.NNNN.jsonl  年内按字节切的分片
-    ├── transcripts/<chunk_id>.zlib
-    └── objects/<sha 前缀路径>
-```
-
-按年是主轴，因为一行的 `created_at` 永不改变：去年的卷一旦写定就再也不被重写，Git 不必
-每天重新打包全部历史，某一年太大时可以整卷搬走。纯按容量切做不到这点——中间插一行会推移
-其后所有分片边界，等于每天重写整棵树。年内再按字节切分片，是因为托管方的限制有两个量级：
-单文件 50 MiB 警告 / 100 MiB 拒绝 push，仓库 1 GiB 建议 / 5 GiB 附近受限；按年只压得住
-仓库增速，压不住「某年 events 表本身 300 MB」的单文件超限。分片预算默认 32 MiB
-（`TRACE_BACKUP_PART_BYTES` / `--part-bytes`）。没有 `created_at` 的行（`schema_meta`）
-进 `volumes/base`。
-
-- verify 有三种粒度：整体（校验根文件、每卷 manifest 的 sha、逐卷内容，并核对 `volumes/`
-  下的目录集合与索引完全一致、各表行数逐卷求和等于索引总数）、`--volume <年>` 只验一卷、
-  或直接把 `--source` 指到卷目录。
-- restore 与卷的顺序无关：先把所有卷的所有表读进来合并，再按固定顺序一次性写库。否则
-  2027 年的 Node 指向 2026 年的 Chapter 会撞外键。
-- **旧格式（版本 2 的全量单树）仍然可以 verify 和 restore**：写入端只写当前版本，读取端
-  永不退役。备份的全部意义是「几年后还能读回来」，一次不兼容的升级就把之前所有备份变成废纸。
-  对旧树原地重新导出会把它升级成分卷并删掉根 `manifest.json`。
-- 容量告警只报不拦——容量到顶时最不该做的事就是停止备份。`export_backup` 与
-  `sync_git_backup` 的返回值都带 `capacity = {level: ok|warn|critical, warnings[], limits,
-  export_bytes, largest_file, largest_file_bytes, volumes}`，sync 额外带 `repository_bytes`
-  （`git count-objects -v`，含历史）。看三样东西：单文件、仓库总量、以及没有仓库尺寸时用
-  导出树总量兜底。四个阈值都可用 `TRACE_BACKUP_{FILE,REPO}_{WARN,CRITICAL}_BYTES` 覆盖，
-  因为自建 Gitea / GHE 的数字不一样。`repository_bytes` 故意不写进 `index.json`，否则每次
-  push 后仓库尺寸变化都会让索引变，每轮产生一个「内容没变」的 commit。
-  统计口径包含每个卷的 `manifest.json`：它不在自己的 `files` 表里（没法给自己算校验和），
-  但它是树里真实存在的一个文件，而且每个文件一条记录——一个有几十万附件对象的卷，manifest
-  本身就能越过单文件硬拒线。只有 `index.json` 不计，因为它内含 `export_bytes`，自我引用。
-- 服务把 `capacity` 与 `missing_objects` 写进 `/api/health` 的 `backup`，level 为
-  warn/critical 时另打一行 stderr（无人值守部署没人开网页）；网页备份卡片渲染同一份数据，
-  `critical` 把整张卡片提到 danger（§10）。
-- 附件对象在导出时已不存在不再中止整次导出：缺口登记进卷 manifest 与索引的
-  `missing_objects` 并继续；restore 同样跳过并报出来。否则从那天起所有新增历史都进不了备份。
-- push 之后重新数一遍积压：`unpushed_commits` 是 push 之后的数字（补推成功后为 0），
-  push 之前的那个数字叫 `retried_commits`。否则刚补推成功的那一轮会和真的落后长得一样。
-- `git add` 之后用 `git ls-files --cached` 与 `backup_file_paths()` 对账，备份仓的
-  `.gitignore` 吞掉文件时抛错而不是报成功——verify 只看工作树，这是唯一能回答
-  「推上去的那份是不是完整的」的一步。
+- 中央服务永久保存原始历史、语义记录、修订和代码/日志附件；不设自动 TTL。
+- SQLite 连接由 SQLAlchemy 管理，Alembic 负责事务内迁移。业务查询仍保留显式 SQL。
+- GitHub 每日备份及其后台调度、参数、健康面板已移除；不启用 restic 等替代服务。
+- 保留 `trace-backup export/verify/restore` 的手动本地路径，以及旧版手动 Git 同步兼容命令。
+- 备份格式版本为 3，按年份/容量分卷；版本 2 的全量旧树仍可 verify/restore。
+- 导出保留 transcript、代码及日志附件；大型数据/模型输出仅引用。校验结果报告缺失对象。
+- 不提交运行中的 SQLite/WAL、会话密钥或原始设备凭证。
+- 在新代码路径中，Entire 管理提交的会话 checkpoint，Git 对象保存未提交代码；并行运行的源目录
+  独立。W&B 只连接曲线。来源不完整时显示缺口，不虚构依赖图。
 
 默认永久保存不等于无法清除敏感内容：管理员必须有紧急 purge 能力。紧急 purge 可以重写备份、
 轮换仓库或加密密钥，并留下不含原文的审计记录。系统不自动脱敏，但提供三层「不采集」控制：
@@ -514,7 +462,7 @@ CLI（`trace-backup purge` / `rewrite-history`）与管理员 REST（`POST /api/
 - 【已实现】人工 correction 会进入后续 Recorder 上下文且不会被自动摘要覆盖。
 - 【已实现】多人并发编辑不会静默丢内容（版本号 + revisions）。
 - 【已实现】关键代码记录包含可独立理解的 snippet/diff，而不是依赖可能消失的 branch。
-- 【已实现】GitHub 备份可以从空数据库恢复并通过 manifest/hash 校验；备份格式版本为 3，
+- 【已实现】手动导出可以从空数据库恢复并通过 manifest/hash 校验；备份格式版本为 3，
   且版本 2 的旧全量树仍然可以 `verify` 和 `restore`（读取端永不退役）。
 - 【已实现】搜索不被原始事件淹没：存储层给语义层保底名额并算出截断信息，`/api/search`
   返回 `SearchResult.as_dict()`（旧的 `hits` 键仍在，另带 `totals` / `returned` / `omitted` /
@@ -530,8 +478,7 @@ CLI（`trace-backup purge` / `rewrite-history`）与管理员 REST（`POST /api/
   长路径，否则 260 字符的 MAX_PATH 会让每一次落盘失败而退出码仍是 0。
 - 【已实现】按年份/容量分卷（§13）：导出树是 `volumes/<年>/…` + 顶层 `index.json`，
   每卷自足、可单独 `verify --volume <年>`，restore 与卷顺序无关；去年的卷写定后不再被重写。
-- 【已实现】备份容量告警：单文件 / 仓库总量 / 导出树三个口径，阈值可用环境变量覆盖，
-  告警只报不拦，结果进 `/api/health`、服务日志与网页备份卡片。
+- 【已实现】手动导出返回容量/缺失对象信息；服务不再运行定时备份。
 - 【已实现】数据流（§8）：`Store.dataflow()` 按明确登记的 sha256 / uri / machine+path 键
   join，`reference` 不参与，不从自然语言猜生产者与消费者；没有 artifact 关系的项目是空图
   而不是错误，缺键的登记如实记在 `unkeyed` 里并在界面上说出来。入口是
@@ -544,6 +491,13 @@ CLI（`trace-backup purge` / `rewrite-history`）与管理员 REST（`POST /api/
   规则的增删有 `created_by`（取自凭证）与 history 审计。【未实现】网页上的映射管理界面
   与待确认状态界面（§10）。
 - 【未实现】Codex CLI / Codex Desktop 的自动采集适配（§2）。
+
+## 实验执行边界（用户最新确认）
+
+实验提交后保持原目录和所引用公共代码不变，由研究 Agent 负责。记录系统只负责被动采集、
+版本证据与可读研究记忆，不承担 Slurm 提交/轮询、训练执行/重跑、运行目录复制、路径重写或文件锁定。
+无需专门提交接口就能留下普通 sbatch 命令及其输出；保存代码证据不等于系统接管实验目录。
+alpha.24 撤回 Submitit 和 trace-run 执行组件，旧记录与附件仍保留可读。
 
 ## 16. 命名与历史包袱
 

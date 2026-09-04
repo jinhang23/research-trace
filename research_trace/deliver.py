@@ -601,6 +601,12 @@ def deliver_session(
             continue
         names = [p.name for p in good_events] + [p.name for p in good_chunks]
         payload = _batch_payload(session_dir, loaded_events, loaded_chunks, names, identity)
+        # Evidence uploads are idempotent and precede the event acknowledgement.
+        # Any failure keeps the original event pending for independent retry.
+        if any(isinstance(e.get('payload'), dict) and
+               ('research_run' in e['payload'] or 'code_snapshot' in e['payload']) for e in loaded_events):
+            from .run_evidence import publish_evidence
+            publish_evidence(payload, url, token, timeout)
         status, body = _post_json(url, "/api/ingest", payload, token, timeout)
         if status in {401, 403}:
             raise DeliveryError(
