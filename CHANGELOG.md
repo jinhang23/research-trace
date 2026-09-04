@@ -1,3 +1,13 @@
+# 2.0.0a27 — 独立订阅 Recorder（方案 3）
+
+- Stop 只原子落盘、生成语义 batch 并分离启动 `trace-recorder`；删除主 agent 的 fork、Agent/SendMessage、阻塞和复用窗口运行路径。
+- 独立 Claude Code CLI 仅接收新增证据、精简项目背景、人工纠正、近期及相关旧记录；无工具、无 MCP、无项目设置，每项目复用 12 批后轮换的独立会话。
+- 适配固定 Claude-Mem 源码的观察者提示结构、输出分类、额度事件和 hardened observer 边界；保留 Apache-2.0 LICENSE、NOTICE、固定提交与修改说明。CLI 启动方式参考 Entire 的隔离调用路径。
+- 使用官方 `--json-schema` 输出；程序严格校验来源、Chapter、parent、run 和摘要版本，先保存计划，再用 `semantic:<batch>:<index>` 幂等写 Node。Overview/Chapter curation 用乐观版本，并能识别“中央已写、响应丢失”的重试。
+- 调用前拒绝 API key、Bedrock、Vertex、Foundry 和非订阅认证；不配置 fallback。启用需确认账户 Extra usage 已关闭。quota 按 reset 时间等待，overage 自动重试永久停止，材料不删除。
+- 本机及中央健康状态新增 Recorder 状态、暂停时间、最近处理、错误和真实 input/output/cache token 计数；现有 Web 增加状态显示。
+- 新增独立 CLI、部分失败恢复、成功零记录、格式校验、quota/overage、会话轮换和无感 Stop 测试。测试未调用真实模型；UF 订阅、长会话和科学记录质量仍列为 P1。
+
 # 2.0.0a26 — 限制 Recorder 异步反馈循环
 
 - 修复缺少 agent_id 的 Recorder 读取批次/协议时被当成新研究材料的问题；已退休 Recorder 的迟到事件也按内部活动过滤。
@@ -242,7 +252,7 @@
 - **Recorder 重新 fork 的间隔可配**（插件配置 `recorder_fork_window`，默认 1 = 每批）。
   依据是真实数据：一次 fork 首轮读入约 60 万 token（缓存命中率 99.7–99.9%），而很多批次
   的全部内容就是「某个子 agent 结束了」—— 一份样本里 137 个事件中 `SubagentStop` 占 56 个。
-  为这种批次付一次完整 fork 不划算。`0` 等价于旧的 `TRACE_RECORDER_REUSE=1`。
+  为这种批次付一次完整 fork 不划算。`0` 等价于当时的旧复用环境开关。
 
 ## 2.0.0-alpha.8
 
@@ -263,7 +273,7 @@
 - **Recorder 每一批都重新 fork**，拿当下的完整上下文。此前只有第一批享受到 fork 的
   好处：后续批次通过 `SendMessage` 只收到一个 manifest 路径，手里是 fork 那一刻的
   陈旧快照。重 fork 的前缀与主 agent 一致，本来就该命中提示缓存。
-  `TRACE_RECORDER_REUSE=1` 可退回旧行为。
+  当时也可用旧复用环境开关退回旧行为。
 - 退休过的 Recorder agent id 不会被后到的 `PostToolUse` 复活 —— 否则下一批会被发给
   一个已经停掉的 Recorder。
 

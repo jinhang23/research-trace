@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "research-trace"
-version = "2.0.0a26"
+version = "2.0.0a27"
 description = "团队研究与项目记忆：完整 agent 历史与精选语义记录"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -25,6 +25,7 @@ trace-login = "research_trace.device_login:main"
 # 投递权威是这个独立进程，不是 hook、也不是 Recorder：它扫 outbox 全部 session，
 # 只有中央返回 2xx 才把文件搬进 sent/。trace-project 是采集的 opt-in 绑定入口。
 trace-deliver = "research_trace.deliver:main"
+trace-recorder = "research_trace.recorder:main"
 trace-project = "research_trace.deliver:project_main"
 trace-code = "research_trace.workspace:main"
 
@@ -40,7 +41,7 @@ packages = ["research_trace"]
 py-modules = ["trace_mcp", "trace_server", "trace_login"]
 
 [tool.setuptools.package-data]
-research_trace = ["static/*", "migrations/*.py", "migrations/versions/*.py"]
+research_trace = ["static/*", "migrations/*.py", "migrations/versions/*.py", "third_party/claude_mem/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

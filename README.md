@@ -10,12 +10,10 @@
 
 ## 当前进度
 
-当前实现为 **2.0.0a26**：已集成通用框架、Entire/Git 被动取证，并为现有 Recorder
-增加防循环限制。下面的工作流程描述的是当前代码。
-
-下一阶段已确定为**独立模型增量整理（方案 3）**，使用 Claude Code 订阅内额度，优先
-复用 Claude-Mem 的观察与解析代码。这个后台 Recorder 尚未接入，当前仍由主 agent 派发 fork。
-具体未完成事项见[待办清单](docs/TODO.md)，源码接入方案见[Recorder 复用方案](docs/RECORDER_REUSE_PLAN.md)。
+当前实现为 **2.0.0a27**：通用框架、Entire/Git 被动取证和**独立模型增量整理（方案 3）**
+已经接入。Recorder 使用 Claude Code 订阅登录，读取新增材料、简短项目背景和相关旧记录，
+维护自己的有界会话；主 agent 不再派发 fork。源码接缝见
+[Recorder 复用方案](docs/RECORDER_REUSE_PLAN.md)，UF 真实环境与质量验收见[待办清单](docs/TODO.md)。
 
 ## 它是怎么工作的
 
@@ -32,10 +30,9 @@
 某个模型记不记得调用一个工具。
 
 **③ Recorder：从原始过程里挑出值得记住的。**
-一轮对话结束时，hook 让主 agent fork 一个后台副本。fork 会继承主 agent 此刻的完整上下文，
-所以它知道刚才发生了什么。这个副本被限制成只能读、只能通过 Research Trace 的工具写，
-它把这一轮里真正有价值的内容整理成记录 —— 也可能一条都不写，那是正常的。
-**每一批都重新 fork**，拿的都是当下的上下文。
+一轮对话结束时，hook 只生成持久批次并分离启动 `trace-recorder`，不会阻塞或唤起主 agent。
+独立 Claude 会话只有给定证据和精简项目记忆，没有工具、MCP 或项目设置；它输出结构化计划，
+Python 程序校验来源后通过现有 API 幂等写入。它也可能一条都不写，那是正常的。
 
 **④ 中央服务：存起来，给人读。**
 SQLite 加内容寻址的附件目录是在线真相源，网页上能看结构图、记录、原始历史和搜索。
@@ -56,9 +53,8 @@ flowchart LR
     Hook -->|"只写本机，不联网"| Outbox["待发目录"]
     Outbox --> Deliver["trace-deliver"]
     Deliver -->|"2xx 才算送达"| Server["中央服务"]
-    Main --> Recorder["Recorder（完整上下文 fork）"]
-    Recorder --> MCP["Research Trace MCP"]
-    MCP --> Server
+    Outbox --> Recorder["trace-recorder（独立订阅会话）"]
+    Recorder -->|"校验后幂等写入"| Server
     Server --> Store["SQLite + 附件"]
     Server --> UI["网页"]
     Code["Entire / Git · 代码证据"] --> Outbox
@@ -120,6 +116,8 @@ python -m pip install "research-trace @ git+https://github.com/jinhang23/researc
 trace-login --url https://trace.example.org --device-name my-laptop
 cd /path/to/my-project
 trace-project bind --url https://trace.example.org --create --name "我的项目"
+# 先在 Claude 账户关闭 Extra usage，再启用语义整理
+trace-project recorder-enable . --model sonnet --confirm-extra-usage-disabled
 ```
 
 `trace-login` 会打印一个 8 位验证码，你在网页 `/device` 上手工输入并批准。
@@ -130,7 +128,7 @@ trace-project bind --url https://trace.example.org --create --name "我的项目
 
 ## MCP 工具
 
-Recorder 用六个研究工具，另有一个登录工具：
+主 agent 可用六个研究工具，另有一个登录工具；独立 Recorder 不直接调用工具：
 
 | 工具 | 用途 |
 |---|---|
@@ -187,8 +185,9 @@ node --test tests/md.test.js # 也可以单独跑
 ```text
 research_trace/             中央服务、存储、MCP、OAuth、备份与网页
 research_trace/deliver.py   投递器 trace-deliver 与项目绑定 trace-project
+research_trace/recorder.py  独立订阅 Recorder、配额状态与幂等写入
 hooks/                      Claude Code Hook 清单与 Recorder 协议
-scripts/trace_hook.py       本机待发目录、批次与 Recorder 调度（不联网）
+scripts/trace_hook.py       本机待发目录、批次与分离进程启动（不联网）
 skills/research-trace/      主 agent 侧的使用说明
 docs/                       设计理念、部署、完整需求
 ```
@@ -198,7 +197,7 @@ docs/                       设计理念、部署、完整需求
 - [设计理念](docs/DESIGN.md) —— 每个取舍背后的理由
 - [快速开始](docs/QUICKSTART.md) —— 部署、绑定、投递与登录
 - [完整需求](docs/REQUIREMENTS.md) —— 需求、不变量和验收标准
-- [Recorder 协议](hooks/RECORDER_PROTOCOL.md) —— 只有 Recorder fork 会读
+- [Recorder 协议](hooks/RECORDER_PROTOCOL.md) —— 独立模型边界、订阅限制与记录规则
 - [变更记录](CHANGELOG.md)
 
 ## License

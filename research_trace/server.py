@@ -355,7 +355,7 @@ def create_app(
                 await integrations.memory.close()
             store.close()
 
-    app = FastAPI(title="Research Trace", version="2.0.0-alpha.26", lifespan=lifespan,
+    app = FastAPI(title="Research Trace", version="2.0.0-alpha.27", lifespan=lifespan,
                   root_path=base)
     app.state.base_path = base
     app.state.store = store
@@ -934,6 +934,10 @@ $('approve').onclick=async()=>{{
             "last_delivered_at": str(body.get("last_delivered_at") or "") or None,
             "last_error": str(body.get("last_error") or "") or None,
             "recorder_pending_batches": int(body.get("recorder_pending_batches") or 0),
+            "recorder_status": str(body.get("recorder_status") or "") or None,
+            "recorder_last_processed_at": str(body.get("recorder_last_processed_at") or "") or None,
+            "recorder_last_error": str(body.get("recorder_last_error") or "") or None,
+            "recorder_pause_until": body.get("recorder_pause_until"),
             "reported_at": now_utc(),
         }
         while len(outbox_reports) > 200:  # 有界：别让伪造的 machine 名把内存吃光
@@ -958,13 +962,23 @@ $('approve').onclick=async()=>{{
             value["outbox"] = {"machines": machines}
             # §11：Recorder 未处理的游标。中央自己看不见它——语义 batch manifest
             # 只存在于每台机器本地的 outbox/<ws>/<session>/batches/。
-            latest = max(machines, key=lambda item: str(item.get("reported_at") or ""))
+            recorder_reports = [
+                item for item in machines
+                if item.get("recorder_status") or item.get("recorder_last_processed_at")
+                or item.get("recorder_last_error") or item.get("recorder_pending_batches")
+            ]
+            latest = max(
+                recorder_reports or machines,
+                key=lambda item: str(item.get("reported_at") or ""),
+            )
             value["recorder"] = {
                 "pending_batches": sum(
                     int(item.get("recorder_pending_batches") or 0) for item in machines
                 ),
-                "last_processed_at": latest.get("reported_at"),
-                "last_error": latest.get("last_error"),
+                "status": latest.get("recorder_status"),
+                "last_processed_at": latest.get("recorder_last_processed_at"),
+                "last_error": latest.get("recorder_last_error"),
+                "pause_until": latest.get("recorder_pause_until"),
             }
         return value
 

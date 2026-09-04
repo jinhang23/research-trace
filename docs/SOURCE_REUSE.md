@@ -1,11 +1,11 @@
 # 上游源码与功能接管
 
-alpha.26 延续被动取证边界、alpha.25 的 Claude-Mem 提示词借鉴，并限制 Recorder 自动派发循环。
+alpha.27 延续被动取证边界，并以独立订阅 Recorder 替换 alpha.26 的主会话 fork 派发。
 最大化复用不等于把实验执行也纳入产品。
 
-用户现已选择独立模型增量整理（方案 3）。新的源码级复用审计在
-[Recorder 复用方案](RECORDER_REUSE_PLAN.md)。下表仍描述 alpha.26 的实际运行状态，
-不能把待接入模块视为已经安装的 Claude-Mem worker。
+方案 3 的源码级复用审计和实际接缝在 [Recorder 复用方案](RECORDER_REUSE_PLAN.md)。
+没有安装 Claude-Mem 服务或引入它的 Redis/Postgres 部署；固定源码中的观察、隔离、分类和
+限流方式被适配到现有持久 outbox 与 Node API。
 
 | 项目 | 实际使用方式 | 仍由本项目负责 |
 | --- | --- | --- |
@@ -14,10 +14,10 @@ alpha.26 延续被动取证边界、alpha.25 的 Claude-Mem 提示词借鉴，�
 | SQLAlchemy + Alembic | 连接管理、事务内 schema 迁移 | 业务 SQL、项目隔离、人工修订规则 |
 | Authlib | OAuth 客户端 | 角色与项目访问规则 |
 | markdown-it + Dagre | Markdown 解析、图布局 | 原有 Web 阅读交互 |
-| Claude-Mem 固定版本提示词 | 学习观察者角色、事实与解释、记忆续接、选择性记录和按需读取 | 研究专用提示词、fork 派发、存储及证据规则；未接入其 worker |
+| Claude-Mem 固定版本 | 适配观察者提示、输出分类、额度/overage 状态、无工具隔离与有界独立会话 | 研究字段、持久队列、严格 ID 校验、幂等写入及人工权威 |
 
 Claude-Mem 的逐项来源、采用范围和未采用内容见 [Recorder 借鉴说明](RECORDER_DESIGN.md)。
-此项属于设计与提示词借鉴，不宣称直接运行了它的后台服务或缓存实现。
+运行时使用 Python 适配实现，不宣称直接运行 Claude-Mem 的 TypeScript 服务或缓存数据库。
 
 Submitit 曾在 alpha.23 中实际接管 Slurm 执行接口；用户明确任务提交与原目录保持不变由研究
 Agent 负责后，alpha.24 删除了 Submitit 依赖和调度适配器。没有保留另一套自研 Slurm 执行器。

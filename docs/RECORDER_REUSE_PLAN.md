@@ -4,8 +4,8 @@
 默认不 fork 主会话。只使用现有 Claude Code 订阅内额度，额度不足则等待，不转 API 或
 额外付费。保留现有 Web、研究节点、人工纠正、原始证据和 Entire/Git 关联。
 
-此文件是已选方向下的源码复用审计与接入方案，尚未替换运行中的 Recorder。当前代码仍为
-alpha.26 的主 agent 派发 fork。没有运行真实模型、迁移数据或升级 UF 插件。
+alpha.27 已按此方案替换运行路径：Stop 只落持久批次并启动 `trace-recorder`，不再让主 agent
+派发 fork。实现和测试没有调用真实模型、迁移数据或升级 UF 插件；真实 UF 与订阅额度验证仍待执行。
 
 ## 已读的上游实现
 
@@ -17,12 +17,12 @@ alpha.26 的主 agent 派发 fork。没有运行真实模型、迁移数据或�
 
 | 模块 | 源码事实 | 接入方式 |
 | --- | --- | --- |
-| `src/sdk/prompts.ts` | `buildInitPrompt`、`buildObservationPrompt`、`buildSummaryPrompt`、`buildContinuationPrompt`，通过 mode 配置组织观察者提示词 | 优先复用构造器，提供研究 mode，保留 alpha.25 的事实/推断/假设区分、实验分组和零记录规则 |
-| `src/sdk/parser.ts` | `parseAgentXml` 解析 observation/summary/skip_summary；依赖 ModeManager 和 logger | 可复用解析代码，适配 mode/日志及研究来源字段；不能把默认软件类型或宽松解析直接当成研究节点验证 |
-| `src/sdk/output-classifier.ts` | 区分 XML、空响应、普通文字及额度/认证/上下文错误 | 复用判断，增加与官方 CLI 结构化错误的映射；格式错误不能默认为已成功整理并删除待处理材料 |
-| `src/services/worker/RateLimitStore.ts` | 接受新旧限流事件形状，按额度窗口维护状态并提供暂停判断 | 复用事件解析和状态判断；适配到持久化待处理批次。额度事件是观测，不是账户无超额计费的保证 |
-| `src/services/worker/ClaudeProvider.ts` | 独立 SDK observer，通过消息生成器接收增量，有模型选择、用量统计与上下文轮换 | 适配观察流程；调用/认证层使用官方 Claude Code CLI，不能原封不动继承多后端及凭据管理 |
-| `src/sdk/hardened-options.ts` | observer 没有工具、没有 MCP、不加载用户项目设置；文本输出交给程序处理 | 沿用只整理给定证据的边界，映射为 CLI 可用配置；程序负责保存，不让 Recorder 执行实验 |
+| `src/sdk/prompts.ts` | `buildInitPrompt`、`buildObservationPrompt`、`buildSummaryPrompt`、`buildContinuationPrompt`，通过 mode 配置组织观察者提示词 | 已将其观察者、独立事实、选择性记录和连续叙事结构适配为 `SYSTEM_PROMPT` + 每批 packet；研究字段和人工权威继续使用本项目规则 |
+| `src/sdk/parser.ts` | `parseAgentXml` 解析 observation/summary/skip_summary；依赖 ModeManager 和 logger | 未复制宽松 XML parser；改用官方 CLI `--json-schema`，再由 Python 严格验证来源、Chapter、parent、run 和 curation 版本 |
+| `src/sdk/output-classifier.ts` | 区分 XML、空响应、普通文字及额度/认证/上下文错误 | 已适配为 `classify_cli_output`；空输出、格式错误、认证、quota、overage 与成功 skip 分开处理 |
+| `src/services/worker/RateLimitStore.ts` | 接受新旧限流事件形状，按额度窗口维护状态并提供暂停判断 | 已适配新旧字段、reset 时间及 overage 检测到持久 batch/global 状态；正常 allowed 事件不会被误判为耗尽 |
+| `src/services/worker/ClaudeProvider.ts` | 独立 SDK observer，通过消息生成器接收增量，有模型选择、用量统计与上下文轮换 | 已适配为官方 Claude Code CLI 的项目级独立会话、12 批轮换和 cache/input/output token 计数；未引入其多后端凭据层 |
+| `src/sdk/hardened-options.ts` | observer 没有工具、没有 MCP、不加载用户项目设置；文本输出交给程序处理 | 已映射为 `--tools ""`、`--setting-sources ""`、空 strict MCP、`dontAsk` 和独立 cwd；程序负责写入 |
 | `src/services/worker/agents/ResponseProcessor.ts` | 解析后耦合上游数据库、广播、文件更新及通知 | 拆出解析/转换接缝，对接现有 Node/Overview/来源校验与人工修订规则，不能整体直接调用 |
 
 ## 不能直接照搬的部分
@@ -49,7 +49,7 @@ alpha.26 的主 agent 派发 fork。没有运行真实模型、迁移数据或�
 
 ## 目标数据流和需要保留的业务适配
 
-采集 hook → 当前持久化 outbox → 独立模型的增量材料 → Claude-Mem 观察/解析模块 →
+采集 hook → 当前持久化 outbox → 独立模型的增量材料 → 适配后的观察/分类模块 →
 研究字段及来源验证 → 现有研究节点与 Web。
 
 主 agent 不再因记录任务收到 Stop 阻塞指令，也不再负责 Agent/SendMessage 派发。
@@ -59,7 +59,7 @@ alpha.26 的主 agent 派发 fork。没有运行真实模型、迁移数据或�
 人工修订优先；批次与输出幂等；额度暂停及恢复；将结果映射为现有 Node/Chapter/Overview。
 未处理、额度不足、格式错误、等待补充证据与成功零记录必须有不同状态。
 
-模型默认候选为账号订阅内可用的 Sonnet 级模型；具体 host、有效模型和计费路径需验证。
+模型默认使用账号订阅内的 Sonnet 别名，也允许显式选 Haiku；具体 UF host、有效模型和计费路径需验证。
 固定模型/提示词维护自己的缓存，不再追求主模型缓存；不能承诺具体订阅额度节省比例。
 上下文重建使用已保存研究记忆和未处理增量，不自动导入启用前的一年历史。
 

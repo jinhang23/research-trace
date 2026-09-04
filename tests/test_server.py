@@ -567,11 +567,20 @@ def test_the_deliverer_can_report_outbox_health_and_health_shows_it(tmp_path):
         client.post("/api/telemetry/outbox", headers=headers, json={
             "machine": "hpg-node-7", "pending": 3, "sent": 41,
             "oldest_pending_at": "2026-08-19T00:00:00Z",
+            "recorder_pending_batches": 2, "recorder_status": "quota",
+            "recorder_last_processed_at": "2026-09-04T10:00:00Z",
+            "recorder_last_error": "subscription quota exhausted",
+            "recorder_pause_until": 2_000_000_000,
         }).raise_for_status()
         health = client.get("/api/health", headers=headers).json()
     machine = health["outbox"]["machines"][0]
     assert machine["machine"] == "hpg-node-7"
     assert machine["pending"] == 3 and machine["sent"] == 41
+    assert health["recorder"] == {
+        "pending_batches": 2, "status": "quota",
+        "last_processed_at": "2026-09-04T10:00:00Z",
+        "last_error": "subscription quota exhausted", "pause_until": 2_000_000_000,
+    }
 
 
 def test_a_raw_batch_records_which_credential_delivered_it(tmp_path):

@@ -125,7 +125,7 @@ def test_plugin_hooks_cover_the_loss_boundaries_and_reuse_configured_python():
                 assert "${user_config.url}" in hook["args"]
 
 
-def test_prompt_tool_and_stop_are_staged_before_the_recorder_runs(tmp_path: Path):
+def test_prompt_tool_and_stop_are_staged_without_blocking_the_main_agent(tmp_path: Path):
     cwd = bind(tmp_path)
     data = tmp_path / "plugin-data"
     assert H.handle(event("UserPromptSubmit", cwd, prompt="test hypothesis A"), data, PROTOCOL) is None
@@ -143,10 +143,7 @@ def test_prompt_tool_and_stop_are_staged_before_the_recorder_runs(tmp_path: Path
         "Stop", cwd, stop_hook_active=False, last_assistant_message="AUC is 0.91",
         background_tasks=[],
     ), data, PROTOCOL)
-    assert output and output["decision"] == "block"
-    guidance = output["reason"]
-    assert "subagent_type='fork'" in guidance
-    assert "complete current context" in guidance
+    assert output is None
     assert len(pending(data)) == 4
 
     manifests = list((session_root(data) / "batches").glob("*.json"))
@@ -154,6 +151,9 @@ def test_prompt_tool_and_stop_are_staged_before_the_recorder_runs(tmp_path: Path
     manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
     assert manifest["event_count"] == 4
     assert manifest["workspace_keys"] == ["rt-ws-project-a"]
+    assert "recorder_agent_id" not in json.loads(
+        (session_root(data) / "state.json").read_text(encoding="utf-8")
+    )
 
 
 def test_an_unbound_directory_is_never_touched(tmp_path: Path):
@@ -202,256 +202,65 @@ def test_marker_project_identity_travels_with_the_directory(tmp_path: Path):
     assert record["workspace_keys"] == ["rt-ws-shared"]
 
 
-def test_stop_hook_continues_only_once_per_turn(tmp_path: Path):
+def test_stop_is_always_non_blocking_and_does_not_batch_lifecycle_only(tmp_path: Path):
     cwd = bind(tmp_path)
     data = tmp_path / "plugin-data"
     H.handle(event("UserPromptSubmit", cwd, prompt="做点事"), data, PROTOCOL)
-    first = H.handle(event(
+    assert H.handle(event(
         "Stop", cwd, stop_hook_active=False, last_assistant_message="done", background_tasks=[]
-    ), data, PROTOCOL)
-    assert first
+    ), data, PROTOCOL) is None
+    root = session_root(data)
+    assert len(list((root / "batches").glob("*.json"))) == 1
     before = len(pending(data))
-    second = H.handle(event(
+    assert H.handle(event(
         "Stop", cwd, stop_hook_active=True, last_assistant_message="done", background_tasks=[]
-    ), data, PROTOCOL)
-    assert second is None
-    assert len(pending(data)) == before, "the hook's own continuation must not create a loop"
+    ), data, PROTOCOL) is None
+    assert len(pending(data)) == before
+    assert len(list((root / "batches").glob("*.json"))) == 1
 
 
-def test_recorder_fork_is_remembered_resumed_and_closes_its_batch(tmp_path: Path):
-    cwd = bind(tmp_path)
+def test_enabled_recorder_is_spawned_as_an_independent_process(tmp_path: Path, monkeypatch):
+    cwd = bind(tmp_path, recorder={
+        "enabled": True, "mode": "independent", "model": "sonnet",
+        "extra_usage_disabled": True,
+    })
     data = tmp_path / "plugin-data"
+    calls = []
+    monkeypatch.delenv("TRACE_HOOK_NO_SPAWN", raising=False)
+    monkeypatch.delenv("TRACE_RECORDER_NO_SPAWN", raising=False)
+    monkeypatch.setattr(H.subprocess, "Popen", lambda command, **options: calls.append((command, options)))
+    monkeypatch.setattr(H, "_spawn_deliver", lambda *a, **k: False)
     H.handle(event("UserPromptSubmit", cwd, prompt="做点事"), data, PROTOCOL)
-    output = H.handle(event(
-        "Stop", cwd, stop_hook_active=False, last_assistant_message="done", background_tasks=[]
-    ), data, PROTOCOL)
-    assert output
-    manifest_path = next((session_root(data) / "batches").glob("*.json"))
-    batch_id = json.loads(manifest_path.read_text(encoding="utf-8"))["batch_id"]
-
-    spawn_prompt = f"{H.RECORDER_MARKER} {H.BATCH_MARKER}{batch_id}] process"
-    assert H.handle(event(
-        "PreToolUse", cwd, tool_name="Agent", tool_use_id="spawn-1",
-        tool_input={"subagent_type": "fork", "prompt": spawn_prompt},
-    ), data, PROTOCOL) is None
-    assert H.handle(event(
-        "SubagentStart", cwd, agent_id="agent-recorder", agent_type="fork"
-    ), data, PROTOCOL) is None
-
-    state = json.loads((session_root(data) / "state.json").read_text(encoding="utf-8"))
-    assert state["recorder_agent_id"] == "agent-recorder"
-
-    H.handle(event("UserPromptSubmit", cwd, prompt="接着做"), data, PROTOCOL)
-    resume = H.handle(event(
-        "Stop", cwd, stop_hook_active=False, last_assistant_message="next", background_tasks=[]
-    ), data, PROTOCOL)
-    assert resume
-    assert "SendMessage" in resume["reason"]
-    assert "agent-recorder" in resume["reason"]
-
-    # 语义 batch 由 Recorder 的 SubagentStop 关闭；原始文件的去向与它无关。
-    assert H.handle(event(
-        "SubagentStop", cwd, agent_id="agent-recorder", agent_type="fork",
-        last_assistant_message="recorded batch: 0 nodes",
-    ), data, PROTOCOL) is None
-    root = session_root(data)
-    assert not (root / "batches" / f"{batch_id}.json").exists()
-    assert (root / "batches" / "done" / f"{batch_id}.json").exists()
-    assert len(list((root / "pending").glob("*.json"))) == 4, "raw events stay pending until delivered"
-    assert not (root / "awaiting_upload").exists(), "awaiting_upload/ is gone for good"
+    assert H.handle(event("Stop", cwd), data, PROTOCOL, "http://trace") is None
+    assert len(calls) == 1
+    command, options = calls[0]
+    assert command[:3] == [H.sys.executable, "-m", "research_trace.recorder"]
+    assert "--watch" in command and "--quiet" in command
+    assert options["stdin"] is H.subprocess.DEVNULL
 
 
-def test_a_subagent_that_claims_a_receipt_is_not_promoted_to_recorder(tmp_path: Path):
-    """①：回执机制取消后，任何自称都不能让普通子 agent 变成 Recorder 并被封杀工具。"""
+def test_recorder_without_extra_usage_confirmation_only_queues(tmp_path: Path, monkeypatch):
+    cwd = bind(tmp_path, recorder={"enabled": True, "model": "sonnet"})
+    data = tmp_path / "plugin-data"
+    calls = []
+    monkeypatch.delenv("TRACE_HOOK_NO_SPAWN", raising=False)
+    monkeypatch.setattr(H.subprocess, "Popen", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(H, "_spawn_deliver", lambda *a, **k: False)
+    H.handle(event("UserPromptSubmit", cwd, prompt="hypothesis"), data, PROTOCOL)
+    assert H.handle(event("Stop", cwd), data, PROTOCOL) is None
+    assert calls == []
+    assert list((session_root(data) / "batches").glob("*.json")), "material stays queued"
+
+
+def test_trace_mcp_calls_do_not_become_research_material(tmp_path: Path):
     cwd = bind(tmp_path)
     data = tmp_path / "plugin-data"
-    H.handle(event("UserPromptSubmit", cwd, prompt="做点事"), data, PROTOCOL)
-    output = H.handle(event(
-        "Stop", cwd, stop_hook_active=False, last_assistant_message="done", background_tasks=[]
-    ), data, PROTOCOL)
-    batch_id = json.loads(next((session_root(data) / "batches").glob("*.json")).read_text("utf-8"))["batch_id"]
-    assert output
-
-    claim = 'TRACE_RECEIPT ' + json.dumps({"batch_id": batch_id, "status": "stored", "project": None})
-    H.handle(event(
-        "SubagentStop", cwd, agent_id="innocent-worker", agent_type="Explore",
-        last_assistant_message=claim,
-    ), data, PROTOCOL)
-
-    state = json.loads((session_root(data) / "state.json").read_text(encoding="utf-8"))
-    assert "recorder_agent_id" not in state
-    allowed = H.handle(event(
-        "PreToolUse", cwd, agent_id="innocent-worker", tool_name="Edit",
-        tool_input={"file_path": "/work/main.py"},
-    ), data, PROTOCOL)
-    assert allowed is None, "the main task must not be blocked by a forged receipt"
-    assert (session_root(data) / "batches" / f"{batch_id}.json").exists()
-
-
-def test_recorder_internal_tools_are_not_recorded_but_other_subagents_are(tmp_path: Path):
-    cwd = bind(tmp_path)
-    data = tmp_path / "plugin-data"
-    H.handle(event(
-        "PreToolUse", cwd, tool_name="Agent", tool_use_id="spawn-1",
-        tool_input={"subagent_type": "fork", "prompt": H.RECORDER_MARKER},
-    ), data, PROTOCOL)
-    H.handle(event("SubagentStart", cwd, agent_id="rec-1", agent_type="fork"), data, PROTOCOL)
-    before = len(pending(data))
-
-    H.handle(event(
-        "PostToolUse", cwd, agent_id="rec-1", agent_type="fork", tool_name="Read",
-        tool_use_id="inside-recorder", tool_input={"file_path": "/tmp/batch.json"},
-        tool_response={"ok": True},
-    ), data, PROTOCOL)
-    assert len(pending(data)) == before
-
-    denied = H.handle(event(
-        "PreToolUse", cwd, agent_id="rec-1", agent_type="fork", tool_name="Bash",
-        tool_use_id="recorder-shell", tool_input={"command": "git status"},
-    ), data, PROTOCOL)
-    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
-    assert "read-only" in denied["hookSpecificOutput"]["permissionDecisionReason"]
-    assert len(pending(data)) == before
-
-    assert H.handle(event(
-        "PreToolUse", cwd, agent_id="rec-1", agent_type="fork",
-        tool_name="mcp__plugin_research-trace_trace__trace_record",
-        tool_use_id="recorder-trace", tool_input={"title": "safe"},
-    ), data, PROTOCOL) is None
-    assert len(pending(data)) == before
-
-    H.handle(event(
-        "PostToolUse", cwd, agent_id="worker-2", agent_type="Explore", tool_name="Read",
-        tool_use_id="inside-worker", tool_input={"file_path": "/work/data.csv"},
-        tool_response={"ok": True},
-    ), data, PROTOCOL)
-    assert len(pending(data)) == before + 1
-
-
-def test_clear_forgets_an_unaddressable_old_recorder(tmp_path: Path):
-    cwd = bind(tmp_path)
-    data = tmp_path / "plugin-data"
-    H.handle(event(
-        "PreToolUse", cwd, tool_name="Agent", tool_input={"prompt": H.RECORDER_MARKER}
-    ), data, PROTOCOL)
-    H.handle(event("SubagentStart", cwd, agent_id="old-recorder", agent_type="fork"), data, PROTOCOL)
-    H.handle(event("SessionStart", cwd, source="clear"), data, PROTOCOL)
-    state = json.loads((session_root(data) / "state.json").read_text(encoding="utf-8"))
-    assert "recorder_agent_id" not in state
-
-
-def _finish_recorder_batch(cwd, data, agent_id, *, read_path=None, anonymous=False):
-    """Simulate a background recorder; no Claude session or model call is started."""
-    root = session_root(data)
-    state = json.loads((root / "state.json").read_text(encoding="utf-8"))
-    batch_id = state["dispatched_batch"]
-    H.handle(event(
-        "PreToolUse", cwd, tool_name="Agent",
-        tool_input={"subagent_type": "fork", "prompt":
-                    f"{H.RECORDER_MARKER} {H.BATCH_MARKER}{batch_id}] process"},
-    ), data, PROTOCOL)
-    H.handle(event("SubagentStart", cwd, agent_id=agent_id, agent_type="fork"), data, PROTOCOL)
-    if read_path is not None:
-        actor = {} if anonymous else {"agent_id": agent_id}
+    for name in ("PreToolUse", "PostToolUse"):
         H.handle(event(
-            "PostToolUse", cwd, tool_name="Read", tool_use_id=f"read-{agent_id}",
-            tool_input={"file_path": str(read_path)}, tool_response={"text": "evidence"}, **actor,
+            name, cwd, tool_name="mcp__plugin_research-trace_trace__trace_record",
+            tool_input={"title": "plumbing"},
         ), data, PROTOCOL)
-    H.handle(event(
-        "SubagentStop", cwd, agent_id=agent_id, agent_type="fork",
-        last_assistant_message="recorded batch: 0 nodes",
-    ), data, PROTOCOL)
-
-
-def test_repeated_stop_without_task_registry_does_not_retry_the_same_batch(tmp_path):
-    cwd, data = bind(tmp_path), tmp_path / "plugin-data"
-    H.handle(event("UserPromptSubmit", cwd, prompt="check hypothesis"), data, PROTOCOL)
-    assert H.handle(event("Stop", cwd, stop_hook_active=False), data, PROTOCOL)
-    root = session_root(data)
-    batch = next((root / "batches").glob("*.json"))
-    # The host may omit its task registry even if dispatch failed or is still running.
-    for _ in range(5):
-        assert H.handle(event("Stop", cwd, stop_hook_active=False), data, PROTOCOL) is None
-    assert batch.exists(), "do not claim the unprocessed batch is complete"
-    assert len(pending(data)) == 7, "raw capture continues when semantic dispatch is held"
-    H.handle(event("UserPromptSubmit", cwd, prompt="try again"), data, PROTOCOL)
-    assert H.handle(event("Stop", cwd, stop_hook_active=False), data, PROTOCOL)
-
-
-@pytest.mark.parametrize("read_target", ["manifest", "protocol"])
-def test_anonymous_recorder_read_does_not_feed_back_into_a_new_batch(tmp_path, read_target):
-    cwd, data = bind(tmp_path), tmp_path / "plugin-data"
-    H.handle(event("UserPromptSubmit", cwd, prompt="check hypothesis"), data, PROTOCOL)
-    assert H.handle(event("Stop", cwd, stop_hook_active=False), data, PROTOCOL)
-    root = session_root(data)
-    read_path = next((root / "batches").glob("*.json")) if read_target == "manifest" else PROTOCOL
-    _finish_recorder_batch(cwd, data, "recorder-1", read_path=read_path, anonymous=True)
-    # A background completion starts a separate main turn, not a stop_hook_active continuation.
-    for _ in range(5):
-        assert H.handle(event(
-            "Stop", cwd, stop_hook_active=False, background_tasks=[],
-        ), data, PROTOCOL) is None
-    assert len(list((root / "batches" / "done").glob("*.json"))) == 1
-    assert not list((root / "batches").glob("*.json"))
-
-
-def test_ambiguous_anonymous_reads_are_retained_but_feedback_is_bounded(tmp_path):
-    cwd, data = bind(tmp_path), tmp_path / "plugin-data"
-    project_file = cwd / "model.py"
-    project_file.write_text("# research evidence", encoding="utf-8")
-    H.handle(event("UserPromptSubmit", cwd, prompt="check hypothesis"), data, PROTOCOL)
-    dispatches = 0
-    for _ in range(10):
-        output = H.handle(event("Stop", cwd, stop_hook_active=False, background_tasks=[]), data, PROTOCOL)
-        if output:
-            dispatches += 1
-            _finish_recorder_batch(
-                cwd, data, f"recorder-{dispatches}", read_path=project_file, anonymous=True,
-            )
-    assert dispatches == 3, "one initial dispatch plus at most two background follow-ups"
-    root = session_root(data)
-    records = [json.loads(p.read_text(encoding="utf-8")) for p in pending(data)]
-    assert sum(r["payload"].get("tool_name") == "Read" for r in records) == dispatches
-    assert sum(r["hook_event"] == "RecorderDispatchPaused" for r in records) == 1
-    assert list((root / "batches").glob("*.json")), "unprocessed research evidence stays queued"
-
-    # System/agent activity cannot replenish the budget, even a marked Recorder prompt.
-    for payload in (
-        event("SessionStart", cwd, source="clear"),
-        event("SubagentStart", cwd, agent_id="research-worker", agent_type="Explore"),
-        event("SubagentStop", cwd, agent_id="research-worker", agent_type="Explore"),
-        event("UserPromptSubmit", cwd, prompt=H.RECORDER_MARKER + " process batch"),
-        event("UserPromptSubmit", cwd, agent_id="research-worker", prompt="worker continuation"),
-    ):
-        H.handle(payload, data, PROTOCOL)
-    assert H.handle(event("Stop", cwd, stop_hook_active=False), data, PROTOCOL) is None
-
-    H.handle(event("UserPromptSubmit", cwd, prompt="continue the research"), data, PROTOCOL)
-    assert H.handle(event("Stop", cwd, stop_hook_active=False), data, PROTOCOL)
-    state = json.loads((root / "state.json").read_text(encoding="utf-8"))
-    assert state["recorder_dispatches_since_prompt"] == 1
-    assert not state.get("recorder_dispatch_paused")
-
-
-def test_retired_recorder_events_do_not_become_new_research(tmp_path):
-    cwd, data = bind(tmp_path), tmp_path / "plugin-data"
-    H.handle(event("UserPromptSubmit", cwd, prompt="check hypothesis"), data, PROTOCOL)
-    assert H.handle(event("Stop", cwd, stop_hook_active=False), data, PROTOCOL)
-    _finish_recorder_batch(cwd, data, "retired-recorder")
-    before = len(pending(data))
-    for name in ("PostToolUse", "Stop"):
-        H.handle(event(
-            name, cwd, agent_id="retired-recorder", tool_name="Read",
-            tool_input={"file_path": str(cwd / "model.py")}, stop_hook_active=False,
-        ), data, PROTOCOL)
-    assert len(pending(data)) == before
-    H.handle(event(
-        "PostToolUse", cwd, agent_id="research-worker", tool_name="Read",
-        tool_input={"file_path": str(cwd / "model.py")},
-    ), data, PROTOCOL)
-    assert len(pending(data)) == before + 1
-    assert H.handle(event("Stop", cwd, stop_hook_active=False), data, PROTOCOL)
-
+    assert not list((data / "outbox").glob("*/*/pending/*.json"))
 
 @pytest.mark.parametrize("diagnostic", ["TranscriptCaptureError", "CodeCaptureError"])
 def test_capture_diagnostics_alone_do_not_start_a_recorder(tmp_path, diagnostic):
@@ -514,7 +323,7 @@ def test_transcript_content_is_copied_incrementally_into_the_batch(tmp_path: Pat
         tmp_path / "plugin-data",
         PROTOCOL,
     )
-    assert output and output["decision"] == "block"
+    assert output is None
     root = session_root(tmp_path / "plugin-data")
     manifest_path = next((root / "batches").glob("*.json"))
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))

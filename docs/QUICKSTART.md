@@ -230,37 +230,47 @@ trace-project status --url https://trace.example.org
 - **先有人登录过网页。** 批准页要求一个已登录、且在白名单里的 GitHub 账号。
 - **写入要 member 或 admin。** `reader` 角色的设备凭证读得到、写不了（403）。
 
-### Recorder 多久重新 fork 一次
+### 启用独立 Recorder
 
-Recorder 以 fork 方式继承主 agent **此刻**的完整上下文 —— 这是它知道「刚才发生了什么」的
-唯一途径。代价是每次 fork 首轮读入约 60 万 token（实测缓存命中率 99.7–99.9%，所以是便宜的
-那种 token，但底数不是零）。
+原始采集在 `trace-project bind` 后立即开始。语义 Recorder 另做一次项目级启用：
 
-而实测下来很多批次的全部内容就是「某个子 agent 结束了」（一份真实样本里，137 个采集事件中
-`SubagentStop` 占 56 个），为这种批次付一次完整 fork 不划算。在项目 marker
-（`.research-trace.json`）里加一个键控制这个节奏：
+```bash
+# 先在 Claude 账户中关闭 Extra usage，再运行：
+trace-project recorder-enable . --model sonnet --confirm-extra-usage-disabled
+```
+
+命令在现有 marker 中合并 Recorder 配置，形状如下（不要手工复制示例中的 workspace key）：
 
 ```json
 {
   "schema": "research-trace.project.v1",
   "workspace_key": "rt-ws-…",
   "capture": true,
-  "recorder_fork_window": "4"
+  "recorder": {
+    "enabled": true,
+    "mode": "independent",
+    "model": "sonnet",
+    "extra_usage_disabled": true
+  }
 }
 ```
 
-| 取值 | 含义 |
-|---|---|
-| 不写（默认） | 每批都重新 fork，最新鲜 |
-| `4` | 每 4 批 fork 一次，窗口内复用；上下文逐渐变旧，省下那些读取 |
-| `0` | 整个会话只 fork 一次，最省也最旧 |
+之后每轮 Stop 只把材料写进持久批次并分离启动 `trace-recorder`；主 agent 不会收到阻塞、
+Agent 或 SendMessage 指令。Recorder 读取新增材料、简短项目背景和少量相关旧记录。每个项目
+复用自己的独立 Claude 会话，12 批后轮换；这可以利用独立会话的缓存，但不继承主 agent
+上下文或缓存。
 
-环境变量 `TRACE_RECORDER_FORK_WINDOW` 同样生效；旧的 `TRACE_RECORDER_REUSE=1` 等价于 `0`。
+模型进程使用 `--setting-sources ""`、`--tools ""` 和空 MCP 配置。程序拒绝 API key、
+Bedrock、Vertex、Foundry 和额外用量事件；订阅额度不足时批次留在本机，等待额度恢复。
+Claude CLI 无法读取账户的 Extra usage 开关，所以启用命令要求一次显式确认。要暂停语义模型
+调用而保留队列，运行：
 
-**为什么不是插件配置项**：插件配置项在 `hooks.json` 里走 `${user_config.…}` 展开，
-而**未设置的选项会让整个 hook 执行失败** —— 不是降级，是采集全停。升级上来的机器
-settings 里没有新键，就会集体停摆。marker 是 hook 本来就要读的东西，缺键即默认值。
+```bash
+trace-project recorder-disable .
+```
 
+查看本机状态用 `trace-recorder --status --data-dir <插件数据目录>`。后台整理的实际规则和
+状态含义见 [Recorder 协议](../hooks/RECORDER_PROTOCOL.md)。
 ## 4. 安装 Claude Code 插件
 
 ```text
@@ -329,9 +339,8 @@ Hook 把 event 与 transcript 增量写进
 transcript 增量在落盘之前逐行剥掉 `thinking` / `redacted_thinking` 块：隐藏推理不进 outbox，
 自然也不会上传中央。
 
-Recorder 是当前 Claude Code 主会话的 fork：首次继承当时上下文，之后按 agent id 恢复并只接收
-增量 batch；它不跨主会话常驻，长期状态在中央服务里。Hook 会根据 recorder agent id 拒绝 Bash、
-Edit、Write、Agent、外部搜索和无关 MCP，只允许只读检查与 Research Trace MCP。
+Recorder 在独立 Claude Code CLI 会话中整理增量 batch，不继承或唤起主会话。模型没有工具、MCP 或项目设置；
+Python 程序验证结构化输出并通过现有中央 API 幂等写入，长期状态仍在中央服务里。
 
 **Recorder 不负责上传原始历史**，也不该为 hook batch 调用 `trace_ingest`：那是 `trace-deliver`
 的事（第 5 节）。Recorder 只按价值判断是否创建语义 Node，一次 batch 创建零个 Node 完全正常。

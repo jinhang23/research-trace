@@ -32,7 +32,7 @@ from .device_login import (
 )
 
 
-SERVER_INFO = {"name": "research-trace", "version": "2.0.0-alpha.26"}
+SERVER_INFO = {"name": "research-trace", "version": "2.0.0-alpha.27"}
 INSTRUCTIONS = (
     "Research Trace has a raw-history layer and a selective semantic layer. "
     "Capture is opt-in per project: a directory without a .research-trace.json marker records "

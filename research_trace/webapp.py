@@ -4280,7 +4280,17 @@ function recorderHealthHtml(value) {
     lines.push('Recorder 未处理游标尚未上报；一批 batch 不产生 Node 本身是正常的。');
     return healthCardHtml('Recorder', 'unknown', lines);
   }
-  lines.push(`未处理 batch ${esc(recorder.pending_batches ?? '—')} · 最近处理 ${fmt(recorder.last_processed_at)}`);
+  const recorderStates = {
+    idle: '空闲', quota: '订阅额度暂停', overage: '额外用量已阻止', auth: '等待登录',
+    paid_credentials: '检测到 API/云凭证', config: '配置错误', blocked_config: '等待启用确认',
+    storage_or_network_error: '中央暂不可用', retry_requested: '已请求重试'
+  };
+  lines.push(`状态 ${esc(recorderStates[recorder.status] || recorder.status || '—')} · 未处理 batch ${esc(recorder.pending_batches ?? '—')} · 最近处理 ${fmt(recorder.last_processed_at)}`);
+  if (recorder.pause_until) {
+    const rawPause = Number(recorder.pause_until);
+    const pauseAt = Number.isFinite(rawPause) && rawPause < 1000000000000 ? rawPause * 1000 : recorder.pause_until;
+    lines.push(`预计恢复 ${fmt(pauseAt)}`);
+  }
   if (recorder.last_error) lines.push(`<span class="danger">${esc(recorder.last_error)}</span>`);
   return healthCardHtml('Recorder', recorder.last_error || Number(recorder.pending_batches || 0) > 0 ? 'warn' : 'ok', lines);
 }

@@ -240,6 +240,27 @@ def test_write_marker_merges_instead_of_clobbering(tmp_path: Path):
     ]
 
 
+def test_independent_recorder_requires_extra_usage_confirmation(tmp_path: Path, capsys):
+    project = tmp_path / "repo"
+    project.mkdir()
+    D.write_marker(project, workspace_key="rt-ws-1", project_id="prj_9", capture=True)
+    assert D.project_main(["recorder-enable", str(project)]) == 2
+    assert "Extra usage" in capsys.readouterr().err
+    assert not D.project_binding(project)["recorder"]
+
+    assert D.project_main([
+        "recorder-enable", str(project), "--model", "sonnet",
+        "--confirm-extra-usage-disabled",
+    ]) == 0
+    config = D.project_binding(project)["recorder"]
+    assert config == {
+        "enabled": True, "mode": "independent", "model": "sonnet",
+        "claude_executable": "claude", "extra_usage_disabled": True,
+    }
+    assert D.project_main(["recorder-disable", str(project)]) == 0
+    assert D.project_binding(project)["recorder"]["enabled"] is False
+
+
 def test_a_2xx_that_reports_reused_ids_is_not_a_clean_success(tmp_path: Path, monkeypatch):
     """中央按 id 去重，所以「200」不等于「你发的那份存下来了」。
 
@@ -294,6 +315,10 @@ def test_status_answers_without_the_network_and_deliver_reports_health(
     """§12 的「卸载前显示未同步数量」与 §10 的 outbox 健康上报。"""
     data = tmp_path / "plugin-data"
     make_session(data, "ws-a", "session-1", events=3)
+    (data / "outbox" / "recorder-status.json").write_text(json.dumps({
+        "status": "quota", "last_processed_at": "2026-09-04T10:00:00Z",
+        "last_error": "subscription quota exhausted", "pause_until": 2_000_000_000,
+    }), encoding="utf-8")
 
     # --status 不联网：中央挂着也答得出还有多少没传
     assert D.main(["--data-dir", str(data), "--status"]) == 1
@@ -312,6 +337,8 @@ def test_status_answers_without_the_network_and_deliver_reports_health(
     assert report["reported"] is True
     assert telemetry[0]["pending"] == 0 and telemetry[0]["sent"] == 3
     assert telemetry[0]["machine"]
+    assert telemetry[0]["recorder_status"] == "quota"
+    assert telemetry[0]["recorder_pause_until"] == 2_000_000_000
 
     assert D.main(["--data-dir", str(data), "--status"]) == 0
     after = json.loads(capsys.readouterr().out)

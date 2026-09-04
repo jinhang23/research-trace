@@ -1,5 +1,5 @@
 {
-  "description": "Durably stage Claude Code events and transcript deltas for explicitly bound projects only, then hand completed main turns to one reusable forked Recorder. Central upload is done by the independent trace-deliver process, never by this hook.",
+  "description": "Durably stage visible Claude Code events and transcript deltas for explicitly bound projects. Independent trace-deliver and trace-recorder processes handle upload and semantic recording without waking or blocking the main agent.",
   "hooks": {
     "SessionStart": [
       {
@@ -11,8 +11,6 @@
               "${CLAUDE_PLUGIN_ROOT}/scripts/trace_hook.py",
               "--data-dir",
               "${CLAUDE_PLUGIN_DATA}",
-              "--protocol",
-              "${CLAUDE_PLUGIN_ROOT}/hooks/RECORDER_PROTOCOL.md",
               "--capture-enabled",
               "${user_config.capture}",
               "--url",
@@ -33,8 +31,6 @@
               "${CLAUDE_PLUGIN_ROOT}/scripts/trace_hook.py",
               "--data-dir",
               "${CLAUDE_PLUGIN_DATA}",
-              "--protocol",
-              "${CLAUDE_PLUGIN_ROOT}/hooks/RECORDER_PROTOCOL.md",
               "--capture-enabled",
               "${user_config.capture}",
               "--url",
@@ -56,8 +52,6 @@
               "${CLAUDE_PLUGIN_ROOT}/scripts/trace_hook.py",
               "--data-dir",
               "${CLAUDE_PLUGIN_DATA}",
-              "--protocol",
-              "${CLAUDE_PLUGIN_ROOT}/hooks/RECORDER_PROTOCOL.md",
               "--capture-enabled",
               "${user_config.capture}",
               "--url",
@@ -79,8 +73,6 @@
               "${CLAUDE_PLUGIN_ROOT}/scripts/trace_hook.py",
               "--data-dir",
               "${CLAUDE_PLUGIN_DATA}",
-              "--protocol",
-              "${CLAUDE_PLUGIN_ROOT}/hooks/RECORDER_PROTOCOL.md",
               "--capture-enabled",
               "${user_config.capture}",
               "--url",
@@ -102,8 +94,6 @@
               "${CLAUDE_PLUGIN_ROOT}/scripts/trace_hook.py",
               "--data-dir",
               "${CLAUDE_PLUGIN_DATA}",
-              "--protocol",
-              "${CLAUDE_PLUGIN_ROOT}/hooks/RECORDER_PROTOCOL.md",
               "--capture-enabled",
               "${user_config.capture}",
               "--url",
@@ -125,8 +115,6 @@
               "${CLAUDE_PLUGIN_ROOT}/scripts/trace_hook.py",
               "--data-dir",
               "${CLAUDE_PLUGIN_DATA}",
-              "--protocol",
-              "${CLAUDE_PLUGIN_ROOT}/hooks/RECORDER_PROTOCOL.md",
               "--capture-enabled",
               "${user_config.capture}",
               "--url",
@@ -148,8 +136,6 @@
               "${CLAUDE_PLUGIN_ROOT}/scripts/trace_hook.py",
               "--data-dir",
               "${CLAUDE_PLUGIN_DATA}",
-              "--protocol",
-              "${CLAUDE_PLUGIN_ROOT}/hooks/RECORDER_PROTOCOL.md",
               "--capture-enabled",
               "${user_config.capture}",
               "--url",
@@ -170,14 +156,12 @@
               "${CLAUDE_PLUGIN_ROOT}/scripts/trace_hook.py",
               "--data-dir",
               "${CLAUDE_PLUGIN_DATA}",
-              "--protocol",
-              "${CLAUDE_PLUGIN_ROOT}/hooks/RECORDER_PROTOCOL.md",
               "--capture-enabled",
               "${user_config.capture}",
               "--url",
               "${user_config.url}"
             ],
-            "timeout": 120
+            "timeout": 10
           }
         ]
       }
@@ -193,8 +177,6 @@
               "${CLAUDE_PLUGIN_ROOT}/scripts/trace_hook.py",
               "--data-dir",
               "${CLAUDE_PLUGIN_DATA}",
-              "--protocol",
-              "${CLAUDE_PLUGIN_ROOT}/hooks/RECORDER_PROTOCOL.md",
               "--capture-enabled",
               "${user_config.capture}",
               "--url",
@@ -216,8 +198,6 @@
               "${CLAUDE_PLUGIN_ROOT}/scripts/trace_hook.py",
               "--data-dir",
               "${CLAUDE_PLUGIN_DATA}",
-              "--protocol",
-              "${CLAUDE_PLUGIN_ROOT}/hooks/RECORDER_PROTOCOL.md",
               "--capture-enabled",
               "${user_config.capture}",
               "--url",
@@ -239,8 +219,6 @@
               "${CLAUDE_PLUGIN_ROOT}/scripts/trace_hook.py",
               "--data-dir",
               "${CLAUDE_PLUGIN_DATA}",
-              "--protocol",
-              "${CLAUDE_PLUGIN_ROOT}/hooks/RECORDER_PROTOCOL.md",
               "--capture-enabled",
               "${user_config.capture}",
               "--url",
@@ -262,14 +240,12 @@
               "${CLAUDE_PLUGIN_ROOT}/scripts/trace_hook.py",
               "--data-dir",
               "${CLAUDE_PLUGIN_DATA}",
-              "--protocol",
-              "${CLAUDE_PLUGIN_ROOT}/hooks/RECORDER_PROTOCOL.md",
               "--capture-enabled",
               "${user_config.capture}",
               "--url",
               "${user_config.url}"
             ],
-            "timeout": 120
+            "timeout": 10
           }
         ]
       }

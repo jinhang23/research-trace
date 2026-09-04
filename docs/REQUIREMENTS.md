@@ -184,19 +184,24 @@ Hook 的任何失败都 fail-open：退出码恒为 0，不输出会阻断主任
 系统也不存在任何由模型输出文本承载的投递回执——那样等于让「模型说存上了」变成「存上了」，
 并且任何子 agent 的收尾文本都可能被误认成 Recorder 身份。
 
-### 6.3 Recorder fork
+### 6.3 独立 Recorder
 
-- Claude Code 推荐 `2.1.232+`。
-- 默认每个 batch 派发一个新的 fork Recorder，继承主会话当时的实际上下文；中央记录提供长期记忆。
-- 显式选择 legacy reuse 模式时，后续恢复同一 recorder agent id，只发送增量 batch。
-- Recorder 身份只来自派发时记录的 agent id，不得从任何消息文本中推断。
-- Recorder 不跨主会话常驻；中央服务保存长期状态。
-- fork 虽继承主会话工具，但 Hook 按 recorder agent id 强制只允许只读检查和 Research Trace MCP，
-  禁止 Bash、Edit、Write、Agent、外部搜索及无关 MCP。
-- Hook、fork、MCP 或网络故障不得阻断主任务；batch 留在 outbox 由投递器重放。
+- Hook 只原子写事件、生成 batch 并分离启动后台进程；Stop 始终放行，不向主 agent 返回 fork、
+  Agent 或 SendMessage 指令。
+- Recorder 使用独立 Claude Code CLI 会话，每次输入为新增材料、简短项目背景、人工纠正、少量近期及
+  相关旧记录。每个项目单独复用有界会话，然后轮换；不继承主会话上下文或缓存。
+- 模型没有工具、MCP、项目设置或文件访问。它只输出结构化计划；程序校验来源、Chapter、parent、run
+  后通过现有 API 幂等写入。
+- 调用只允许 Claude 订阅/OAuth 登录及白名单模型，拒绝 API key、Bedrock、Vertex、Foundry 和 fallback。
+  账户 Extra usage 必须由操作者关闭并一次确认；额度不足保留 batch 到恢复时间，overage 信号永久暂停
+  自动重试，直到操作者修复后显式解除。
+- 计划在首条写入前持久化，部分写入后按 `semantic:<batch>:<index>` 恢复；成功零记录、格式错误、
+  额度暂停、认证错误、中央故障和未绑定项目必须是不同状态。
+- Hook、Recorder、CLI 或网络故障不得阻断主任务；batch 留在 outbox 重放。
 - 语义整理的取材范围不受投递影响：投递器把文件从 `pending/` 搬进 `sent/` 不得让任何一段历史
   永远进不了语义 batch。
-- 正确性不能依赖 prompt cache、模型是否记得调用工具或一次派发是否成功。
+- 正确性不能依赖 prompt cache、模型是否记得调用工具或一次调用是否成功；缓存只用于降低独立会话
+  的重复前缀成本，并记录真实 cache read/create 与输入输出 token 供验收。
 
 ## 7. 项目识别
 
@@ -453,6 +458,8 @@ CLI（`trace-backup purge` / `rewrite-history`）与管理员 REST（`POST /api/
   也不导致整份 transcript 被丢弃。
 - 【已实现】主 agent 和所有子 agent 的可见历史可永久检索（限已绑定项目）。
 - 【已实现】Recorder 可以对无价值 batch 选择不建 Node。
+- 【已实现】Stop 不再唤起主 agent 派发 fork；独立 `trace-recorder` 使用订阅登录、无工具 CLI、
+  有界项目会话和持久计划，额度/overage/格式/写入失败均保留 batch。
 - 【已实现】想法、论文、数据理解、实验、关键实现和失败都能用同一 Node 表达。
 - 【已实现】Recorder 不能创建 Chapter、不能自我确认，也不能用旧幂等重试覆盖人类移动或修改过的
   Node：写入身份来自凭证而非请求体，只有浏览器会话算 `human`，机器凭证发 confirmation/correction
@@ -470,7 +477,7 @@ CLI（`trace-backup purge` / `rewrite-history`）与管理员 REST（`POST /api/
 - 【已实现】管理员可以紧急 purge 并留下不含原文的审计记录（CLI 与 `POST /api/admin/purge`）。
 - 【已实现】`sent/` 的 30 天保留、磁盘阈值告警、`trace-deliver --status` 的未同步计数（§12）。
 - 【已实现】网页显示 outbox 与 Recorder 健康状态：投递器 `POST /api/telemetry/outbox`
-  上报，`/api/health` 返回 `outbox` 与 `recorder`（§10、§11）。
+  上报，`/api/health` 返回待处理量、状态、最近处理、暂停时间和错误（§10、§11）。
 - 【已实现】人工 correction 不会被机器悄悄了结：Recorder 在 `resolve_comment_ids` 里回填的
   id 只记为 acknowledgement（解开 curate 闸门，不再被同一条永久挡住），`resolved_at` 只有
   真人能写，纠正在界面与后续 `trace_context` 里保持未处理直到有人关掉它。

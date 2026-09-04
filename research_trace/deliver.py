@@ -181,11 +181,9 @@ def project_binding(cwd: str | os.PathLike[str] | None = None) -> dict[str, Any]
         "workspace_key": keys[0] if keys else None,
         "project_id": project_id,
         "project_name": str(value.get("project_name") or "").strip() or None,
-        # 每处理几个批次重新 fork 一次 Recorder。放 marker 而不是插件配置项：插件配置项走
-        # hooks.json 的 `${user_config.…}` 展开，而**未设置的选项会让整个 hook 执行失败** ——
-        # 老安装升级上来时 settings 里根本没有这个键，结果是采集全停。marker 缺这个键就用
-        # 默认值，不会有任何东西展开失败。顺带它也确实该按项目走。
-        "recorder_fork_window": str(value.get("recorder_fork_window") or "").strip() or None,
+        # 独立 Recorder 是项目级 opt-in。extra_usage_disabled 是操作者对 Claude 账户设置的
+        # 一次性确认；CLI 没有读取这个账户开关的接口，所以没确认就只排队、不调用模型。
+        "recorder": dict(value.get("recorder") or {}) if isinstance(value.get("recorder"), dict) else {},
     }
 
 
@@ -229,6 +227,7 @@ def write_marker(
     project_id: str | None = None,
     project_name: str | None = None,
     capture: bool | None = None,
+    recorder: dict[str, Any] | None = None,
 ) -> Path:
     """创建/更新 marker。已有字段只在显式传入时覆盖，绝不丢掉别人写的键。"""
     target = marker_path_for(directory)
@@ -252,6 +251,8 @@ def write_marker(
         value["project_name"] = project_name
     if capture is not None:
         value["capture"] = bool(capture)
+    if recorder is not None:
+        value["recorder"] = dict(recorder)
     target.parent.mkdir(parents=True, exist_ok=True)
     temp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
     temp.write_text(
@@ -759,6 +760,7 @@ def outbox_stats(outbox: Path) -> dict[str, Any]:
                 sent += len(list(directory.glob(suffix)))
             except OSError:
                 pass
+    recorder_state = _read_json(outbox / "recorder-status.json")
     return {
         "pending": pending,
         "sent": sent,
@@ -768,6 +770,10 @@ def outbox_stats(outbox: Path) -> dict[str, Any]:
         # 语义层的游标：`batches/` 里还开着的 manifest 就是 Recorder 还没处理的批次
         # （处理完会被归档进 `batches/done`）。§11 要求界面能看见这个数。
         "recorder_pending_batches": recorder_backlog(outbox),
+        "recorder_status": recorder_state.get("status"),
+        "recorder_last_processed_at": recorder_state.get("last_processed_at"),
+        "recorder_last_error": recorder_state.get("last_error"),
+        "recorder_pause_until": recorder_state.get("pause_until"),
     }
 
 
@@ -813,6 +819,10 @@ def report_outbox_status(
         "last_delivered_at": report.get("finished_at") if report.get("delivered_batches") else None,
         "last_error": report.get("last_error"),
         "recorder_pending_batches": stats.get("recorder_pending_batches"),
+        "recorder_status": stats.get("recorder_status"),
+        "recorder_last_processed_at": stats.get("recorder_last_processed_at"),
+        "recorder_last_error": stats.get("recorder_last_error"),
+        "recorder_pause_until": stats.get("recorder_pause_until"),
     }
     try:
         status, _ = _post_json(url, "/api/telemetry/outbox", payload, token, timeout)
@@ -1012,6 +1022,22 @@ def project_main(argv: list[str] | None = None) -> int:
     disable = sub.add_parser("disable", help="keep the marker but exclude the project from capture")
     disable.add_argument("path", nargs="?", default=".")
 
+    recorder_enable = sub.add_parser(
+        "recorder-enable", help="enable the independent subscription-only Recorder for this project"
+    )
+    recorder_enable.add_argument("path", nargs="?", default=".")
+    recorder_enable.add_argument("--model", choices=["sonnet", "haiku"], default="sonnet")
+    recorder_enable.add_argument("--claude", default="claude", help="Claude Code CLI executable")
+    recorder_enable.add_argument(
+        "--confirm-extra-usage-disabled", action="store_true",
+        help="confirm that extra usage is disabled in the Claude account before model calls",
+    )
+
+    recorder_disable = sub.add_parser(
+        "recorder-disable", help="pause semantic Recorder calls while retaining queued batches"
+    )
+    recorder_disable.add_argument("path", nargs="?", default=".")
+
     args = parser.parse_args(argv)
     directory = Path(args.path).expanduser().resolve()
 
@@ -1034,6 +1060,38 @@ def project_main(argv: list[str] | None = None) -> int:
     if args.command == "disable":
         target = write_marker(directory, capture=False)
         print(f"capture disabled for {directory} (marker: {target})")
+        return 0
+
+    if args.command in {"recorder-enable", "recorder-disable"}:
+        marker = find_marker(directory)
+        if marker is None:
+            print(
+                f"not bound: run `trace-project bind {directory}` before configuring the Recorder",
+                file=sys.stderr,
+            )
+            return 2
+        current = read_marker(marker)
+        recorder = dict(current.get("recorder") or {}) if isinstance(current.get("recorder"), dict) else {}
+        if args.command == "recorder-disable":
+            recorder["enabled"] = False
+            target = write_marker(marker.parent, recorder=recorder)
+            print(f"independent Recorder paused; queued batches were retained (marker: {target})")
+            return 0
+        if not args.confirm_extra_usage_disabled:
+            print(
+                "refusing to enable model calls: disable Extra usage in the Claude account, then "
+                "repeat with --confirm-extra-usage-disabled",
+                file=sys.stderr,
+            )
+            return 2
+        recorder.update({
+            "enabled": True, "mode": "independent", "model": args.model,
+            "claude_executable": args.claude,
+            "extra_usage_disabled": True,
+        })
+        target = write_marker(marker.parent, recorder=recorder)
+        print(f"independent Recorder enabled with {args.model} (marker: {target})")
+        print("It will process queued batches without waking the main agent.")
         return 0
 
     existing = read_marker(marker_path_for(directory))
