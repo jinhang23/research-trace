@@ -62,6 +62,74 @@ flowchart LR
     Server -.-> Memory["Basic Memory 索引（可选）"]
 ```
 
+## 独立 Recorder 是不是一个独立 App
+
+它是一个**独立运行的后台 worker，但不是另一套独立 App**。安装 Research Trace 后，
+`trace-recorder` 和 hook、投递器、中央服务一起来自同一个 Python 包；它没有自己的网页、数据库、
+账号系统或常驻 HTTP 服务。这里的“独立”具体指：
+
+| 边界 | 当前实现 |
+|---|---|
+| 操作系统进程 | hook 用分离子进程启动 `python -m research_trace.recorder --watch --quiet`；主 Claude Code 会话不等待它，也不会收到 Recorder 的回复 |
+| 模型会话 | 每个 Research Trace 项目分配一个独立 Claude Code session UUID，不使用主 agent 的 session，不读取主 agent 完整上下文 |
+| 工作目录 | 模型运行在 `${CLAUDE_PLUGIN_DATA}/recorder-workspace`，不进入研究仓库，因此不会触发项目 hook |
+| 权限 | `--setting-sources ""`、`--tools ""`、空的 strict MCP 配置和 `dontAsk` 共同关闭项目设置、工具与 MCP；模型只能返回 JSON |
+| 写入 | 模型不直接调用 Research Trace。Python 先校验 event、Chapter、parent、run、人工纠正和版本，再调用中央 API |
+| 生命周期 | worker 可随时退出；未处理材料、模型计划和已完成写入序号都在 outbox sidecar 中，恢复不依赖模型记忆 |
+
+一次调用的实际顺序是：
+
+1. Stop/SessionEnd hook 把本轮新增 event 和可见 transcript 增量封成持久 batch。
+2. worker 检查项目仍启用 Recorder，并拒绝 API key、Bedrock、Vertex、Foundry、Azure 等可能转向额外计费的认证环境。
+3. worker 只运行 `claude auth status --json` 确认当前 Claude CLI 是 Claude 订阅/OAuth 登录；这个检查不发模型请求。
+4. 第一次处理某项目时生成 UUID，并调用 `claude --print ... --session-id <uuid>`；后续调用使用 `--resume <uuid>`。
+5. 模型收到固定 system prompt、固定 JSON schema、新增证据、精简项目记忆和少量相关旧记录，返回零个或多个 Node/摘要更新计划。
+6. Python 保存计划，再逐项幂等写入；中途掉线时从 sidecar 继续，不会为了同一计划再次调用模型。
+7. 同一项目成功使用 12 轮后轮换 session；模型选择或提示词/schema 改变时也立即轮换，避免把不兼容上下文继续接下去。
+
+“自己的缓存”需要准确理解。Research Trace 保存的是
+`${CLAUDE_PLUGIN_DATA}/outbox/recorder-status.json` 里的 session UUID、模型、提示词签名、成功轮数和
+`input_tokens`、`output_tokens`、`cache_read_input_tokens`、`cache_creation_input_tokens` 统计；
+Claude Code 保存并恢复该独立会话；实际 prompt cache 由 Claude 服务管理。Research Trace
+**没有实现一份本地模型缓存，也不能保证缓存一定命中或承诺节省比例**。固定提示词、schema、模型并
+连续 `--resume`，只是给这个独立会话创造可复用前缀的条件。它不会继承或复用主 agent 的 cache。
+即使缓存完全不命中，持久队列、幂等和人工版本保护仍然成立。
+
+## 从 Claude-Mem 借鉴了什么
+
+Recorder 的上游参考固定在 Claude-Mem 提交
+[`be44b6c8e238a7e2bc5b3403c05afac071a59ead`](https://github.com/thedotmack/claude-mem/tree/be44b6c8e238a7e2bc5b3403c05afac071a59ead)，
+许可证为 Apache-2.0。Research Trace 没有把 Claude-Mem 当作运行依赖，也没有启动它的服务；
+这里的“适配”是读固定源码后，把适合本项目的逻辑重新接到现有 outbox、Node 和 Web 数据模型。
+
+下面列出当前 Recorder 审计和借鉴过的全部 Claude-Mem 功能：
+
+| Claude-Mem 源码 | 上游功能 | Research Trace 中的处理 |
+|---|---|---|
+| `plugin/modes/code.json` | 定义面向未来会话的 observer：结果既有可独立理解的事实，也有解释意义的 narrative | **已适配。** 改为研究记录语言：保留实验条件、比较、证据边界、失败、未探索方向和下一步验证；不记录 Recorder 自己的动作 |
+| `src/sdk/prompts.ts` | 构造 init、observation、summary、continuation prompt；已有记忆用于续接、去重和形成连续叙事 | **已适配。** 固定 `SYSTEM_PROMPT` 加每批 packet；先比较 Overview、Chapter、近期 Node、人工纠正和相关旧记录，再决定写或成功跳过 |
+| `src/cli/handlers/observation.ts` | hook 把工具事件交给后台 observer，而不是在前台同步总结 | **沿用这种职责分离。** Research Trace hook 只写本地 outbox；现有持久批次替代上游在线 worker 投递路径 |
+| `src/cli/handlers/summarize.ts` | Stop 提供最后一段可见回答，允许后台形成阶段总结 | **已适配。** Stop/SessionEnd 封存从上次游标之后的可见 transcript 和事件；不阻塞主 agent，也不对每个工具调用单独生成 Node |
+| `src/sdk/output-classifier.ts` | 先识别错误，再区分有效结构、空响应、普通文本、认证、限额和上下文错误 | **已适配。** `classify_cli_output` 将成功、成功零记录、empty、malformed、auth、quota、overage 和普通错误分开，避免把异常当作“没有内容值得记录” |
+| `src/services/worker/RateLimitStore.ts` | 兼容不同 rate-limit event 形状，读取 reset 时间和 overage 状态，并决定暂停 | **已适配为持久状态。** 正常 `allowed` 不误判；quota 保留 batch 到恢复时间；overage 硬停止，必须人工修正账户设置后显式重试 |
+| `src/services/worker/ClaudeProvider.ts` | 独立 observer provider、增量输入、模型选择、token 用量统计和会话轮换 | **适配了运行形状。** 使用官方 `claude --print`，每项目独立 session，12 轮轮换，并保存 input/output/cache read/cache creation 统计；没有采用它的多 provider 凭据层 |
+| `src/sdk/hardened-options.ts` | observer 不加载用户设置、没有工具或 MCP，输出交给普通程序处理 | **直接映射为 CLI 隔离参数。** 空 settings、空 tools、空 MCP、`dontAsk`、独立 cwd；模型没有写数据库或运行命令的能力 |
+| `src/sdk/parser.ts` | 解析宽松 XML observation、summary 和 `skip_summary` | **没有复制 XML parser。** 使用 Claude CLI `--json-schema`，再由 Python 严格验证来源 ID、结构关系和版本；零记录仍是显式 `status=skip` |
+| `src/services/worker/agents/ResponseProcessor.ts` | 把解析结果连接到 Claude-Mem 的数据库、文件、广播和通知 | **只参考处理阶段划分。** 写入端改接 Research Trace 的 Node/Overview/Chapter API、幂等键和人工修订规则，没有复制其数据库耦合代码 |
+| `src/services/worker/session/recycle-conversation.ts` | 上下文过大时丢弃 observer conversation，用已有 observations 重建新一代上下文，并限制连续重启 | **采用同一原则，未复制实现。** Research Trace 按 12 轮、模型或 prompt/schema 变化轮换；新 session 从中央精选记忆重建，而不是把旧完整对话塞回来 |
+| `src/services/worker/retry.ts` | 按错误类别决定是否重试，rate limit 尊重恢复时间，瞬时错误指数退避 | **采用分类重试原则。** batch sidecar 保存 attempts/retry_at；认证、配置、quota、overage、网络和格式错误使用不同恢复方式；写入重放依赖幂等 |
+| `src/services/worker/SessionManager.ts` | 管理每个内容会话的 observer 状态、pending 消息、累计 token 和重启状态 | **只借鉴状态边界。** Research Trace 使用每项目 session 状态和跨进程 JSON sidecar，不使用上游进程内 SessionManager |
+| `src/services/worker/SessionMessageBuffer.ts` | 进程内 pending 队列与 toolUseId 去重，崩溃恢复依赖 transcript replay | **明确没有采用。** 内存队列不能满足 HPC 杀进程后的可靠性；现有磁盘 outbox、batch manifest 和中央幂等继续作为权威恢复路径 |
+| `src/server/jobs/ServerJobQueue.ts` | BullMQ/Redis server job 队列，另以 PostgreSQL outbox 作为权威记录 | **明确没有采用。** 不为 Recorder 再部署 Redis/PostgreSQL，也不让它替换当前已经工作的磁盘队列 |
+| `src/server/generation/providers/shared/prompt-builder.ts` | 将一组事件做隐私过滤和长度限制，构造单次 observer 请求，允许显式 skip | **适配了批量、截断和显式 skip 思路。** Research Trace 在落盘前过滤隐藏推理；Recorder packet 对单事件、transcript 和项目上下文分别设界限，并保留省略标记 |
+| `src/server/generation/providers/ClaudeObservationProvider.ts` | 用 Anthropic API key 直接调用 Messages API | **明确没有采用。** 这会绕过“只用 Claude Code 订阅额度”的要求；Recorder 检测到 API/云 provider 凭据会在模型调用前停止 |
+
+CLI 隔离还参考了 Entire CLI 固定提交
+[`52207b6d2961009115f557d87aef5ff564aa810d`](https://github.com/entireio/cli/tree/52207b6d2961009115f557d87aef5ff564aa810d)
+中 `generate.go` 的 `claude --print`、隔离配置与 JSON 错误处理方式。没有采用其中的 API key/helper
+认证路径。上游许可证、NOTICE、逐文件接入范围和修改说明保存在
+[第三方说明](THIRD_PARTY_NOTICES.md)与[Recorder 复用方案](docs/RECORDER_REUSE_PLAN.md)。
+
 三条边界值得单独记住：
 
 - **采集是按项目 opt-in 的。** 只有放了 `.research-trace.json` 标记的目录会被记录；
