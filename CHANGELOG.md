@@ -1,3 +1,10 @@
+# 2.0.0a28 — Hook 与独立 Recorder 生命周期彻底分离
+
+- 修正方案 3 的触发边界：Hook 只保存事件、transcript 增量和语义 batch，不启动、唤醒或管理模型进程。
+- `trace-recorder --watch` 改为单独启动的长期消费者；空队列时继续等待，之后自动消费新增 batch。停止期间积压留在 outbox。
+- `trace-project recorder-enable` 只写项目开关并明确提示单独启动 watcher，不隐式产生模型调用。
+- README、快速开始、需求和协议明确区分持久采集与独立 AI 整理，不再把 Hook 的 fire-and-forget 与方案 3 混为一谈。
+
 # 2.0.0a27 — 独立订阅 Recorder（方案 3）
 
 - Stop 只原子落盘、生成语义 batch 并分离启动 `trace-recorder`；删除主 agent 的 fork、Agent/SendMessage、阻塞和复用窗口运行路径。

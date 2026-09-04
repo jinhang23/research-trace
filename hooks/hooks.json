@@ -1,5 +1,5 @@
 {
-  "description": "Durably stage visible Claude Code events and transcript deltas for explicitly bound projects. Independent trace-deliver and trace-recorder processes handle upload and semantic recording without waking or blocking the main agent.",
+  "description": "Durably stage visible Claude Code events, transcript deltas and semantic batches for explicitly bound projects. The hook may start the non-model trace-deliver uploader, but never starts or manages the separately operated trace-recorder model consumer.",
   "hooks": {
     "SessionStart": [
       {

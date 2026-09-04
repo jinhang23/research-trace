@@ -186,8 +186,10 @@ Hook 的任何失败都 fail-open：退出码恒为 0，不输出会阻断主任
 
 ### 6.3 独立 Recorder
 
-- Hook 只原子写事件、生成 batch 并分离启动后台进程；Stop 始终放行，不向主 agent 返回 fork、
-  Agent 或 SendMessage 指令。
+- Hook 只原子写事件并生成 batch；它不得启动、唤醒或管理 Recorder 模型进程。Stop 始终放行，
+  不向主 agent 返回 fork、Agent 或 SendMessage 指令。
+- Recorder 由独立命令或进程管理器启动。`trace-recorder --watch` 在空队列时继续等待，发现新 batch
+  后消费；worker 停止期间的 batch 留在 outbox，重启后继续。
 - Recorder 使用独立 Claude Code CLI 会话，每次输入为新增材料、简短项目背景、人工纠正、少量近期及
   相关旧记录。每个项目单独复用有界会话，然后轮换；不继承主会话上下文或缓存。
 - 模型没有工具、MCP、项目设置或文件访问。它只输出结构化计划；程序校验来源、Chapter、parent、run

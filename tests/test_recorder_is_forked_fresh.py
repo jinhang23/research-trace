@@ -10,6 +10,7 @@ WORKER = (ROOT / "research_trace" / "recorder.py").read_text(encoding="utf-8")
 def test_stop_path_never_blocks_or_asks_the_main_agent_to_fork():
     handle = HOOK[HOOK.index("def handle("):]
     assert "_nudge(" not in handle
+    assert "_spawn_recorder" not in HOOK
     assert '"decision": "block"' not in handle
     assert "SendMessage" not in handle
     assert "subagent_type='fork'" not in handle

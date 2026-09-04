@@ -7,7 +7,9 @@ remain untested. It describes the research rather than its own recording work.
 ## Runtime boundary
 
 The Recorder is an independent Claude Code CLI conversation. It does not fork or wake the main
-agent and does not inherit the main conversation. Each call receives only:
+agent and does not inherit the main conversation. The capture hook only seals durable batches; it
+never starts or manages the model process. A separately launched `trace-recorder --watch` consumer
+waits for and processes those batches. Each model call receives only:
 
 1. the new durable batch;
 2. a concise Project Overview, human-defined Chapters and unresolved human corrections;

@@ -1091,7 +1091,8 @@ def project_main(argv: list[str] | None = None) -> int:
         })
         target = write_marker(marker.parent, recorder=recorder)
         print(f"independent Recorder enabled with {args.model} (marker: {target})")
-        print("It will process queued batches without waking the main agent.")
+        print("This only enables the project; hooks will not start a model.")
+        print("Run trace-recorder --watch separately against the same plugin data directory.")
         return 0
 
     existing = read_marker(marker_path_for(directory))

@@ -10,7 +10,7 @@
 
 ## 当前进度
 
-当前实现为 **2.0.0a27**：通用框架、Entire/Git 被动取证和**独立模型增量整理（方案 3）**
+当前实现为 **2.0.0a28**：通用框架、Entire/Git 被动取证和**独立模型增量整理（方案 3）**
 已经接入。Recorder 使用 Claude Code 订阅登录，读取新增材料、简短项目背景和相关旧记录，
 维护自己的有界会话；主 agent 不再派发 fork。源码接缝见
 [Recorder 复用方案](docs/RECORDER_REUSE_PLAN.md)，UF 真实环境与质量验收见[待办清单](docs/TODO.md)。
@@ -30,8 +30,9 @@
 某个模型记不记得调用一个工具。
 
 **③ Recorder：从原始过程里挑出值得记住的。**
-一轮对话结束时，hook 只生成持久批次并分离启动 `trace-recorder`，不会阻塞或唤起主 agent。
-独立 Claude 会话只有给定证据和精简项目记忆，没有工具、MCP 或项目设置；它输出结构化计划，
+一轮对话结束时，hook 只生成持久批次，不调用或启动任何模型。另行启动的
+`trace-recorder --watch` 从 outbox 消费批次；它的 Claude 会话只有给定证据和精简项目记忆，
+没有工具、MCP 或项目设置；它输出结构化计划，
 Python 程序校验来源后通过现有 API 幂等写入。它也可能一条都不写，那是正常的。
 
 **④ 中央服务：存起来，给人读。**
@@ -64,13 +65,13 @@ flowchart LR
 
 ## 独立 Recorder 是不是一个独立 App
 
-它是一个**独立运行的后台 worker，但不是另一套独立 App**。安装 Research Trace 后，
-`trace-recorder` 和 hook、投递器、中央服务一起来自同一个 Python 包；它没有自己的网页、数据库、
-账号系统或常驻 HTTP 服务。这里的“独立”具体指：
+它是一个**独立运行的后台 worker，但不是另一套独立 App**。`trace-recorder`、投递器和中央服务
+来自同一个 Research Trace Python 包，hook 来自同仓库、同版本的 Claude Code 插件；它没有自己的
+网页、数据库、账号系统或常驻 HTTP 服务。这里的“独立”具体指：
 
 | 边界 | 当前实现 |
 |---|---|
-| 操作系统进程 | hook 用分离子进程启动 `python -m research_trace.recorder --watch --quiet`；主 Claude Code 会话不等待它，也不会收到 Recorder 的回复 |
+| 操作系统进程 | `trace-recorder --watch` 由人或进程管理器单独启动并长期等待 outbox；hook 不创建、唤醒或管理这个进程 |
 | 模型会话 | 每个 Research Trace 项目分配一个独立 Claude Code session UUID，不使用主 agent 的 session，不读取主 agent 完整上下文 |
 | 工作目录 | 模型运行在 `${CLAUDE_PLUGIN_DATA}/recorder-workspace`，不进入研究仓库，因此不会触发项目 hook |
 | 权限 | `--setting-sources ""`、`--tools ""`、空的 strict MCP 配置和 `dontAsk` 共同关闭项目设置、工具与 MCP；模型只能返回 JSON |
@@ -79,13 +80,14 @@ flowchart LR
 
 一次调用的实际顺序是：
 
-1. Stop/SessionEnd hook 把本轮新增 event 和可见 transcript 增量封成持久 batch。
-2. worker 检查项目仍启用 Recorder，并拒绝 API key、Bedrock、Vertex、Foundry、Azure 等可能转向额外计费的认证环境。
-3. worker 只运行 `claude auth status --json` 确认当前 Claude CLI 是 Claude 订阅/OAuth 登录；这个检查不发模型请求。
-4. 第一次处理某项目时生成 UUID，并调用 `claude --print ... --session-id <uuid>`；后续调用使用 `--resume <uuid>`。
-5. 模型收到固定 system prompt、固定 JSON schema、新增证据、精简项目记忆和少量相关旧记录，返回零个或多个 Node/摘要更新计划。
-6. Python 保存计划，再逐项幂等写入；中途掉线时从 sidecar 继续，不会为了同一计划再次调用模型。
-7. 同一项目成功使用 12 轮后轮换 session；模型选择或提示词/schema 改变时也立即轮换，避免把不兼容上下文继续接下去。
+1. Stop/SessionEnd hook 把本轮新增 event 和可见 transcript 增量封成持久 batch，然后返回；即使 Recorder 没运行，batch 也留在磁盘上。
+2. 单独运行的 worker 扫描 outbox。`--watch` 在空队列时继续等待；不需要常驻时也可以不带 `--watch` 只处理当前积压。
+3. worker 检查项目仍启用 Recorder，并拒绝 API key、Bedrock、Vertex、Foundry、Azure 等可能转向额外计费的认证环境。
+4. worker 只运行 `claude auth status --json` 确认当前 Claude CLI 是 Claude 订阅/OAuth 登录；这个检查不发模型请求。
+5. 第一次处理某项目时生成 UUID，并调用 `claude --print ... --session-id <uuid>`；后续调用使用 `--resume <uuid>`。
+6. 模型收到固定 system prompt、固定 JSON schema、新增证据、精简项目记忆和少量相关旧记录，返回零个或多个 Node/摘要更新计划。
+7. Python 保存计划，再逐项幂等写入；中途掉线时从 sidecar 继续，不会为了同一计划再次调用模型。
+8. 同一项目成功使用 12 轮后轮换 session；模型选择或提示词/schema 改变时也立即轮换，避免把不兼容上下文继续接下去。
 
 “自己的缓存”需要准确理解。Research Trace 保存的是
 `${CLAUDE_PLUGIN_DATA}/outbox/recorder-status.json` 里的 session UUID、模型、提示词签名、成功轮数和
@@ -186,6 +188,9 @@ cd /path/to/my-project
 trace-project bind --url https://trace.example.org --create --name "我的项目"
 # 先在 Claude 账户关闭 Extra usage，再启用语义整理
 trace-project recorder-enable . --model sonnet --confirm-extra-usage-disabled
+
+# 在单独的终端、tmux 或进程管理器中启动一次；之后它持续等待新 batch
+trace-recorder --watch --data-dir /path/to/claude-plugin-data --url https://trace.example.org
 ```
 
 `trace-login` 会打印一个 8 位验证码，你在网页 `/device` 上手工输入并批准。
@@ -255,7 +260,7 @@ research_trace/             中央服务、存储、MCP、OAuth、备份与网�
 research_trace/deliver.py   投递器 trace-deliver 与项目绑定 trace-project
 research_trace/recorder.py  独立订阅 Recorder、配额状态与幂等写入
 hooks/                      Claude Code Hook 清单与 Recorder 协议
-scripts/trace_hook.py       本机待发目录、批次与分离进程启动（不联网）
+scripts/trace_hook.py       本机待发目录与语义批次；不启动模型（不联网）
 skills/research-trace/      主 agent 侧的使用说明
 docs/                       设计理念、部署、完整需求
 ```

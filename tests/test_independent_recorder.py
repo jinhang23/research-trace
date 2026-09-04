@@ -327,3 +327,18 @@ def test_disabling_a_project_retains_its_batch_and_reports_a_clean_pause(tmp_pat
     assert result["pending_batches"] == 1
     assert worker.state["status"] == "disabled"
     assert path.exists()
+
+
+def test_watch_is_a_separate_long_lived_consumer_even_when_queue_is_empty(monkeypatch, tmp_path):
+    sleeps = []
+
+    def stop_after_first_idle_wait(delay):
+        sleeps.append(delay)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(R.time, "sleep", stop_after_first_idle_wait)
+    result = R.main([
+        "--data-dir", str(tmp_path / "data"), "--watch", "--interval", "7", "--quiet",
+    ])
+    assert result == 130
+    assert sleeps == [7.0]

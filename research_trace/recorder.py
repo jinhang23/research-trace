@@ -988,7 +988,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--credential-file", default=os.environ.get("TRACE_CREDENTIAL_FILE"))
     parser.add_argument("--claude", default=os.environ.get("TRACE_RECORDER_CLAUDE", "claude"))
     parser.add_argument("--timeout", type=float, default=MODEL_TIMEOUT)
-    parser.add_argument("--watch", action="store_true", help="stay alive while quota/network-deferred batches remain")
+    parser.add_argument(
+        "--watch", action="store_true",
+        help="run as an independent long-lived consumer, including while the queue is empty",
+    )
     parser.add_argument("--interval", type=float, default=60.0)
     parser.add_argument("--status", action="store_true", help="show local Recorder state without model or network calls")
     parser.add_argument(
@@ -1027,16 +1030,16 @@ def main(argv: list[str] | None = None) -> int:
             report = worker.run_once()
             if not args.quiet:
                 print(json.dumps(report, ensure_ascii=False, indent=2))
-            if not args.watch or not report["pending_batches"]:
+            if not args.watch:
                 return 0 if not report["pending_batches"] else 1
             status = str(worker.state.get("status") or "")
-            if status == "disabled":
-                return 0
-            if status in {"overage", "paid_credentials", "auth", "config", "blocked_config"}:
+            if status in {"overage", "paid_credentials", "auth", "config"}:
                 return 1
             retry = _next_retry(data_dir)
             delay = max(float(args.interval), (retry - time.time()) if retry else float(args.interval))
             time.sleep(min(max(5.0, delay), 300.0))
+    except KeyboardInterrupt:
+        return 130
     finally:
         lock.release()
 

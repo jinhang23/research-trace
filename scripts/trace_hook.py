@@ -61,7 +61,6 @@ THINKING_HINT = b"thinking"
 
 # 同一个 session 两次 SessionStart 之间不重复拉起投递器（/clear 会连发）。
 DELIVER_SPAWN_INTERVAL = 60.0
-RECORDER_SPAWN_INTERVAL = 15.0
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 if str(_PLUGIN_ROOT) not in sys.path:
@@ -808,47 +807,6 @@ def _spawn_deliver(data_dir: Path, url: str, state: dict[str, Any]) -> bool:
         return False
 
 
-def _spawn_recorder(
-    data_dir: Path, url: str, state: dict[str, Any], binding: dict[str, Any]
-) -> bool:
-    """Start the isolated Recorder without waking or blocking the main agent."""
-    config = binding.get("recorder") if isinstance(binding.get("recorder"), dict) else {}
-    if not config.get("enabled") or config.get("extra_usage_disabled") is not True:
-        return False
-    if os.environ.get("TRACE_HOOK_NO_SPAWN") or os.environ.get("TRACE_RECORDER_NO_SPAWN"):
-        return False
-    now = time.time()
-    last = float(state.get("recorder_spawned_at") or 0.0)
-    if 0 <= now - last < RECORDER_SPAWN_INTERVAL:
-        return False
-    state["recorder_spawned_at"] = now
-    command = [
-        sys.executable, "-m", "research_trace.recorder", "--data-dir", str(data_dir),
-        "--watch", "--quiet",
-    ]
-    if url:
-        command += ["--url", url]
-    env = dict(os.environ)
-    env["PYTHONPATH"] = str(_PLUGIN_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
-    options: dict[str, Any] = {
-        "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
-        # This directory is outside every bound research project. Combined with
-        # --setting-sources "" and --tools "" in the worker, Recorder activity
-        # cannot trigger project hooks or enter its own evidence stream.
-        "cwd": str(_PLUGIN_ROOT), "env": env,
-    }
-    if os.name == "nt":
-        options["creationflags"] = 0x00000008 | 0x08000000
-    else:
-        options["start_new_session"] = True
-    try:
-        subprocess.Popen(command, **options)
-        return True
-    except Exception as exc:
-        print(f"research-trace hook: could not start independent Recorder: {exc}", file=sys.stderr)
-        return False
-
-
 def handle(
     payload: dict[str, Any], data_dir: Path, protocol_path: Path, url: str = "",
 ) -> dict[str, Any] | None:
@@ -928,9 +886,11 @@ def handle(
                 'Untried ideas and unknown predecessor relationships are valid; keep summaries short and mark uncertainty.'}}
         if (not internal and payload.get("hook_event_name") in {"Stop", "SessionEnd"}
                 and not payload.get("stop_hook_active")):
-            selected = _ensure_batch(root, payload, state, binding)
-            if selected:
-                _spawn_recorder(data_dir, url, state, binding)
+            # Recorder execution has a separate lifecycle. The hook only seals
+            # durable input; a separately started `trace-recorder --watch`
+            # process discovers it. This boundary keeps model startup, quota
+            # waits and failures completely outside the observed agent session.
+            _ensure_batch(root, payload, state, binding)
         state["updated_at"] = _now()
         _atomic_json(state_path, state)
         return result

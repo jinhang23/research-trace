@@ -219,31 +219,25 @@ def test_stop_is_always_non_blocking_and_does_not_batch_lifecycle_only(tmp_path:
     assert len(list((root / "batches").glob("*.json"))) == 1
 
 
-def test_enabled_recorder_is_spawned_as_an_independent_process(tmp_path: Path, monkeypatch):
+def test_enabled_recorder_only_seals_a_batch_and_never_starts_model_process(tmp_path: Path, monkeypatch):
     cwd = bind(tmp_path, recorder={
         "enabled": True, "mode": "independent", "model": "sonnet",
         "extra_usage_disabled": True,
     })
     data = tmp_path / "plugin-data"
     calls = []
-    monkeypatch.delenv("TRACE_HOOK_NO_SPAWN", raising=False)
-    monkeypatch.delenv("TRACE_RECORDER_NO_SPAWN", raising=False)
     monkeypatch.setattr(H.subprocess, "Popen", lambda command, **options: calls.append((command, options)))
     monkeypatch.setattr(H, "_spawn_deliver", lambda *a, **k: False)
     H.handle(event("UserPromptSubmit", cwd, prompt="做点事"), data, PROTOCOL)
     assert H.handle(event("Stop", cwd), data, PROTOCOL, "http://trace") is None
-    assert len(calls) == 1
-    command, options = calls[0]
-    assert command[:3] == [H.sys.executable, "-m", "research_trace.recorder"]
-    assert "--watch" in command and "--quiet" in command
-    assert options["stdin"] is H.subprocess.DEVNULL
+    assert calls == []
+    assert list((session_root(data) / "batches").glob("*.json"))
 
 
 def test_recorder_without_extra_usage_confirmation_only_queues(tmp_path: Path, monkeypatch):
     cwd = bind(tmp_path, recorder={"enabled": True, "model": "sonnet"})
     data = tmp_path / "plugin-data"
     calls = []
-    monkeypatch.delenv("TRACE_HOOK_NO_SPAWN", raising=False)
     monkeypatch.setattr(H.subprocess, "Popen", lambda *a, **k: calls.append(a))
     monkeypatch.setattr(H, "_spawn_deliver", lambda *a, **k: False)
     H.handle(event("UserPromptSubmit", cwd, prompt="hypothesis"), data, PROTOCOL)

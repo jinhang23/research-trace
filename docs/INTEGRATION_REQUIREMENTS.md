@@ -68,7 +68,7 @@ MLflow 已有 Claude Code 可靠追踪机制，可作为后续采集来源。替
 
 ## 已发现的基线问题
 
-- alpha.26 以前曾使用主会话 fork Recorder；alpha.27 已统一为独立订阅会话、持久批次与程序写入。
+- alpha.26 以前曾使用主会话 fork Recorder；alpha.28 已统一为 hook 只保存持久批次、独立订阅 watcher 消费和程序写入。
 - 当前搜索的 semantic scope 指精选记录层，SQL 实现仍是 LIKE；不应称为向量语义搜索。
 - Codex 自动采集、团队映射管理页面等仍是原基线的未完成功能；接通外部框架本身不等于完成这些验收项。
 - Windows 初始基线运行：298 通过、5 失败；失败涉及长路径、路径表示差异及 Node 输出的默认 GBK 解码。与后续新增回归分别记录。

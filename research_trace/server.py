@@ -355,7 +355,7 @@ def create_app(
                 await integrations.memory.close()
             store.close()
 
-    app = FastAPI(title="Research Trace", version="2.0.0-alpha.27", lifespan=lifespan,
+    app = FastAPI(title="Research Trace", version="2.0.0-alpha.28", lifespan=lifespan,
                   root_path=base)
     app.state.base_path = base
     app.state.store = store

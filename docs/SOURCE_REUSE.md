@@ -1,6 +1,6 @@
 # 上游源码与功能接管
 
-alpha.27 延续被动取证边界，并以独立订阅 Recorder 替换 alpha.26 的主会话 fork 派发。
+alpha.28 延续被动取证边界，并以另行运行的独立订阅 Recorder 替换 alpha.26 的主会话 fork 派发；hook 只保存，不启动模型。
 最大化复用不等于把实验执行也纳入产品。
 
 方案 3 的源码级复用审计和实际接缝在 [Recorder 复用方案](RECORDER_REUSE_PLAN.md)。

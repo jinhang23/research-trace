@@ -239,6 +239,17 @@ trace-project status --url https://trace.example.org
 trace-project recorder-enable . --model sonnet --confirm-extra-usage-disabled
 ```
 
+这条命令只写项目配置，**不会调用 Claude，也不会让 hook 启动 Recorder**。在单独的终端、
+tmux、systemd user service 或其它进程管理器中启动消费者：
+
+```bash
+# 常驻：空队列时等待，之后自动消费新增 batch
+trace-recorder --watch --data-dir /path/to/claude-plugin-data --url https://trace.example.org
+
+# 一次性：只处理当前积压，然后退出
+trace-recorder --data-dir /path/to/claude-plugin-data --url https://trace.example.org
+```
+
 命令在现有 marker 中合并 Recorder 配置，形状如下（不要手工复制示例中的 workspace key）：
 
 ```json
@@ -255,8 +266,8 @@ trace-project recorder-enable . --model sonnet --confirm-extra-usage-disabled
 }
 ```
 
-之后每轮 Stop 只把材料写进持久批次并分离启动 `trace-recorder`；主 agent 不会收到阻塞、
-Agent 或 SendMessage 指令。Recorder 读取新增材料、简短项目背景和少量相关旧记录。每个项目
+之后每轮 Stop 只把材料写进持久批次；hook 不启动 Recorder，主 agent 也不会收到阻塞、
+Agent 或 SendMessage 指令。独立 watcher 读取新增材料、简短项目背景和少量相关旧记录。每个项目
 复用自己的独立 Claude 会话，12 批后轮换；这可以利用独立会话的缓存，但不继承主 agent
 上下文或缓存。
 
@@ -269,7 +280,8 @@ Claude CLI 无法读取账户的 Extra usage 开关，所以启用命令要求�
 trace-project recorder-disable .
 ```
 
-查看本机状态用 `trace-recorder --status --data-dir <插件数据目录>`。后台整理的实际规则和
+查看本机状态用 `trace-recorder --status --data-dir <插件数据目录>`。停止 watcher 不会删除积压；
+以后重新启动会继续处理。后台整理的实际规则和
 状态含义见 [Recorder 协议](../hooks/RECORDER_PROTOCOL.md)。
 ## 4. 安装 Claude Code 插件
 

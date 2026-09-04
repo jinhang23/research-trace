@@ -96,7 +96,7 @@ Frappe Framework 使用 [MIT 许可证](https://docs.frappe.io/legal/others/lice
 
 Outline 的 [开发者接口](https://www.getoutline.com/developers)覆盖多项文档能力，但 [Data Attributes](https://docs.getoutline.com/s/guide/doc/data-attributes-8nPrT7b6Qa)当前属于有版本/授权限制的功能，不能假设社区部署原生包含任意结构字段。[其当前 LICENSE](https://github.com/outline/outline/blob/main/LICENSE)也需纳入选型。Directus 的 [当前许可页](https://directus.com/license)采用 MSCL-1.0-GPL；不能继续引用早期 BSL 条款判断今天的使用条件。Django 的基础能力见 [认证系统](https://docs.djangoproject.com/en/5.2/topics/auth/) 与 [管理后台](https://docs.djangoproject.com/en/5.2/ref/contrib/admin/)。
 
-已有 Frappe 队列时，不默认再加入 LangGraph。只有 Recorder 确实需要更复杂的跨步骤编排时，才评估 [LangGraph persistence](https://docs.langchain.com/oss/python/langgraph/persistence)。alpha.27 的独立 Recorder 已用现有持久 outbox、处理 sidecar 和幂等写入满足暂停恢复；重放不会自动执行研究动作。
+已有 Frappe 队列时，不默认再加入 LangGraph。只有 Recorder 确实需要更复杂的跨步骤编排时，才评估 [LangGraph persistence](https://docs.langchain.com/oss/python/langgraph/persistence)。alpha.28 的独立 Recorder 已用现有持久 outbox、处理 sidecar 和幂等写入满足暂停恢复；hook 只保存，独立 watcher 重放不会自动执行研究动作。
 
 本轮没有发现需要同时部署 MLflow 与另一套同职责 tracing 服务的理由，也没有发现必须同时堆叠多个长期记忆/知识图谱后端的需求。
 
