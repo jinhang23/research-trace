@@ -26,6 +26,7 @@
 
 - 版本只剩一个来源（`research_trace/__init__.py`，pyproject 用 dynamic version 读它，server/mcp 引用 `PLUGIN_VERSION`），两份插件清单的 semver 写法由测试守着；pyproject 补齐 license/authors/classifiers/urls，extras 收成 `server` / `integrations` / `dev`，根目录三个入口 shim 不再打进 wheel；统一用 ruff（行宽 120）排版与检查，全仓库按它格式化。
 - 新增 [docs/FORMATS.md](docs/FORMATS.md)：磁盘/网络上每一种格式标识、写入方、读取方、位置与兼容规则，安装后的目录布局，数值版本与迁移，环境变量；`tests/test_formats_are_documented.py` 守着代码里的每个 `research-trace.*.vN` 都在表里。
+- README 从 334 行精简到约 190 行：只保留「一轮对话之后发生了什么」、三条边界、三层安装、日常使用和文档索引；独立 Recorder 的运行边界表、调用顺序和 Claude-Mem 逐文件借鉴表移到 `docs/RECORDER_REUSE_PLAN.md`。
 - README / QUICKSTART 的安装说明改写成"中央服务 / Claude Code 插件 / 客户端包"三层，并给出 `claude plugin install --config python=… --config url=…` 的一步到位写法；`skills/research-trace/SKILL.md` 删除已不存在的 Stop block decision / fork 派发说明；`docs/RECORDER_DESIGN.md`、`docs/TODO.md` 标明 alpha.26 的派发上限已随派发机制删除；`docs/DESIGN.md` 不再把 GitHub 当灾备。
 
 ## 验证工具（见 scripts/README.md）
