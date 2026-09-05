@@ -13,11 +13,13 @@ import secrets
 import sys
 import threading
 import urllib.parse
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
+from . import PLUGIN_VERSION
 from .auth import (
     ADMIN_BUCKET,
     MEMBER_BUCKET,
@@ -29,9 +31,13 @@ from .auth import (
     OAuthError,
     PendingOAuthStore,
     RateLimiter,
+    client_in_networks,
     csrf_token,
     normalize_base_path,
+    parse_networks,
     safe_return_to,
+    token_session_cookie,
+    token_session_user,
 )
 from .deliver import workspace_key_problem
 from .storage import (
@@ -48,7 +54,11 @@ from .storage import (
 try:
     from fastapi import Depends, FastAPI, HTTPException, Request
     from fastapi.responses import (
-        FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse,
+        FileResponse,
+        HTMLResponse,
+        JSONResponse,
+        PlainTextResponse,
+        RedirectResponse,
     )
 except ImportError:  # pragma: no cover
     Depends = FastAPI = HTTPException = Request = None  # type: ignore[assignment]
@@ -104,9 +114,8 @@ def usable_workspace_keys(raw: Sequence[Any]) -> tuple[list[str], list[dict[str,
             kept.append(normalized)
     if rejected and not kept:
         raise ValidationError(
-            "every workspace key was a filesystem path: " + "; ".join(
-                f"{item['workspace_key']} {item['reason']}" for item in rejected
-            )
+            "every workspace key was a filesystem path: "
+            + "; ".join(f"{item['workspace_key']} {item['reason']}" for item in rejected)
         )
     return kept, rejected
 
@@ -165,14 +174,20 @@ class TeamProjectMap:
         return [dict(rule) for rule in self._value["rules"]]
 
     def history(self, limit: int = 100) -> list[dict[str, Any]]:
-        window = self._value["history"][-max(1, min(int(limit), TEAM_MAP_HISTORY_LIMIT)):]
+        window = self._value["history"][-max(1, min(int(limit), TEAM_MAP_HISTORY_LIMIT)) :]
         return [dict(item) for item in reversed(window)]
 
     def _log(self, action: str, rule: dict[str, Any], actor: str) -> None:
-        self._value["history"].append({
-            "action": action, "rule_id": rule.get("id"), "pattern": rule.get("pattern"),
-            "project_id": rule.get("project_id"), "actor": actor, "at": now_utc(),
-        })
+        self._value["history"].append(
+            {
+                "action": action,
+                "rule_id": rule.get("id"),
+                "pattern": rule.get("pattern"),
+                "project_id": rule.get("project_id"),
+                "actor": actor,
+                "at": now_utc(),
+            }
+        )
         del self._value["history"][:-TEAM_MAP_HISTORY_LIMIT]
 
     def add(self, *, pattern: str, project_id: str, note: str, actor: str) -> dict[str, Any]:
@@ -191,9 +206,12 @@ class TeamProjectMap:
                     "delete that rule first rather than stacking an ambiguous second one"
                 )
             rule = {
-                "id": "map_" + secrets.token_hex(8), "pattern": normalized,
-                "project_id": project_id, "note": str(note or "")[:500],
-                "created_by": actor, "created_at": now_utc(),
+                "id": "map_" + secrets.token_hex(8),
+                "pattern": normalized,
+                "project_id": project_id,
+                "note": str(note or "")[:500],
+                "created_by": actor,
+                "created_at": now_utc(),
             }
             self._value["rules"].append(rule)
             self._log("add", rule, actor)
@@ -227,11 +245,12 @@ class TeamProjectMap:
 
 
 ANONYMOUS_READ_WARNING = (
-    "!!! Research Trace: GitHub OAuth is NOT configured. Every read endpoint is open to\n"
-    "!!! anyone who can reach this port, including raw transcripts, tool arguments and\n"
-    "!!! attachment downloads. TRACE_TOKEN only protects writes, never reads.\n"
-    "!!! Configure TRACE_GITHUB_CLIENT_ID / _SECRET / TRACE_PUBLIC_URL / TRACE_SESSION_SECRET,\n"
-    "!!! or bind the service to a loopback address that nothing else can reach."
+    "!!! Research Trace: reads are ANONYMOUS. Every read endpoint is open to anyone who can\n"
+    "!!! reach this port, including raw transcripts, tool arguments and attachment downloads;\n"
+    "!!! TRACE_TOKEN alone only protects writes.\n"
+    "!!! Intranet: set TRACE_PROTECT_READS=true (or run `trace-server --init`) so the same access\n"
+    "!!! key guards reads and the web asks for it. Team: configure GitHub OAuth + HTTPS.\n"
+    "!!! Or bind the service to a loopback address that nothing else can reach."
 )
 
 
@@ -255,6 +274,8 @@ def create_app(
     device_start_window_seconds: float | None = None,
     trust_proxy_headers: bool | None = None,
     insecure_cookies: bool | None = None,
+    protect_reads: bool | None = None,
+    allowed_networks: str | None = None,
     oauth_client: Any | None = None,
     integrations_config: str | os.PathLike[str] | None = None,
 ):
@@ -263,36 +284,47 @@ def create_app(
 
     # 挂载前缀。服务把整个前缀据为己有：不带前缀的请求一律 404（见下面的 base_guard），
     # 所以「靠不可猜路径隐藏」在绕过反向代理直连端口时同样成立。
-    base = normalize_base_path(base_path if base_path is not None
-                               else os.environ.get("TRACE_BASE_PATH"))
+    base = normalize_base_path(base_path if base_path is not None else os.environ.get("TRACE_BASE_PATH"))
     cookie_path = base or "/"
 
     oauth_config = GitHubOAuthConfig.build(
         base_path=base,
         client_id=github_client_id if github_client_id is not None else os.environ.get("TRACE_GITHUB_CLIENT_ID"),
-        client_secret=(github_client_secret if github_client_secret is not None
-                       else os.environ.get("TRACE_GITHUB_CLIENT_SECRET")),
+        client_secret=(
+            github_client_secret if github_client_secret is not None else os.environ.get("TRACE_GITHUB_CLIENT_SECRET")
+        ),
         public_url=public_url if public_url is not None else os.environ.get("TRACE_PUBLIC_URL"),
         session_secret=session_secret if session_secret is not None else os.environ.get("TRACE_SESSION_SECRET"),
         admins=github_admins if github_admins is not None else os.environ.get("TRACE_GITHUB_ADMINS"),
-        allowed_users=(github_allowed_users if github_allowed_users is not None
-                       else os.environ.get("TRACE_GITHUB_ALLOWED_USERS")),
-        allowed_org=(github_allowed_org if github_allowed_org is not None
-                     else os.environ.get("TRACE_GITHUB_ALLOWED_ORG")),
-        allow_all=(github_allow_all if github_allow_all is not None
-                   else _env_bool("TRACE_GITHUB_ALLOW_ALL")),
-        session_days=(session_days if session_days is not None
-                      else int(os.environ.get("TRACE_SESSION_DAYS", "30"))),
-        device_credential_days=(device_credential_days if device_credential_days is not None
-                                else int(os.environ.get("TRACE_DEVICE_CREDENTIAL_DAYS", "90"))),
-        insecure_cookies=(insecure_cookies if insecure_cookies is not None
-                          else _env_bool("TRACE_INSECURE_COOKIES")),
+        allowed_users=(
+            github_allowed_users if github_allowed_users is not None else os.environ.get("TRACE_GITHUB_ALLOWED_USERS")
+        ),
+        allowed_org=(
+            github_allowed_org if github_allowed_org is not None else os.environ.get("TRACE_GITHUB_ALLOWED_ORG")
+        ),
+        allow_all=(github_allow_all if github_allow_all is not None else _env_bool("TRACE_GITHUB_ALLOW_ALL")),
+        session_days=(session_days if session_days is not None else int(os.environ.get("TRACE_SESSION_DAYS", "30"))),
+        device_credential_days=(
+            device_credential_days
+            if device_credential_days is not None
+            else int(os.environ.get("TRACE_DEVICE_CREDENTIAL_DAYS", "90"))
+        ),
+        insecure_cookies=(insecure_cookies if insecure_cookies is not None else _env_bool("TRACE_INSECURE_COOKIES")),
     )
     root = Path(data_dir or os.environ.get("TRACE_DATA") or ".trace-data")
     store = Store(root, attachment_limit=attachment_limit)
     from .integrations import Integrations
+
     integrations = Integrations(store, config_path=(integrations_config or os.environ.get("TRACE_INTEGRATIONS_CONFIG")))
     write_token = token if token is not None else os.environ.get("TRACE_TOKEN", "")
+    # 内网模式：同一个访问密钥同时守读和写，网页用它登录。没有 OAuth 时的"锁上门"办法。
+    protect_reads_enabled = bool(write_token) and (
+        protect_reads if protect_reads is not None else _env_bool("TRACE_PROTECT_READS")
+    )
+    access_mode = "oauth" if oauth_config else ("token" if protect_reads_enabled else "open")
+    network_allowlist = parse_networks(
+        allowed_networks if allowed_networks is not None else os.environ.get("TRACE_ALLOWED_NETWORKS")
+    )
     pending_oauth = PendingOAuthStore()
     github = oauth_client or (GitHubOAuthClient(oauth_config) if oauth_config else None)
     # 用户名 -> GitHub 数字 id 的钉子和 SQLite 放在同一个数据目录，
@@ -301,14 +333,19 @@ def create_app(
     # §7 第三种 workspace key。和 identity-pins 一样是运维配置，放数据目录旁边。
     team_map = TeamProjectMap(root / TEAM_MAP_FILE)
     device_start_limiter = RateLimiter(
-        limit=(device_start_limit if device_start_limit is not None
-               else int(os.environ.get("TRACE_DEVICE_START_LIMIT", "10"))),
-        window_seconds=(device_start_window_seconds if device_start_window_seconds is not None
-                        else float(os.environ.get("TRACE_DEVICE_START_WINDOW_SECONDS", "600"))),
+        limit=(
+            device_start_limit
+            if device_start_limit is not None
+            else int(os.environ.get("TRACE_DEVICE_START_LIMIT", "10"))
+        ),
+        window_seconds=(
+            device_start_window_seconds
+            if device_start_window_seconds is not None
+            else float(os.environ.get("TRACE_DEVICE_START_WINDOW_SECONDS", "600"))
+        ),
     )
-    trust_proxy = (trust_proxy_headers if trust_proxy_headers is not None
-                   else _env_bool("TRACE_TRUST_PROXY_HEADERS"))
-    if not oauth_config:
+    trust_proxy = trust_proxy_headers if trust_proxy_headers is not None else _env_bool("TRACE_TRUST_PROXY_HEADERS")
+    if access_mode == "open":
         print(ANONYMOUS_READ_WARNING, file=sys.stderr, flush=True)
 
     if oauth_config and identity_pins:
@@ -320,7 +357,8 @@ def create_app(
             if not name or not github_id:
                 continue
             for bucket, principals in (
-                (ADMIN_BUCKET, oauth_config.admins), (MEMBER_BUCKET, oauth_config.allowed_users)
+                (ADMIN_BUCKET, oauth_config.admins),
+                (MEMBER_BUCKET, oauth_config.allowed_users),
             ):
                 if name in principals.logins and identity_pins.pinned_id(bucket, name) is None:
                     identity_pins.pin(bucket, name, int(github_id))
@@ -329,15 +367,19 @@ def create_app(
         # web_sessions / device_credentials 里的行会一直躺到自然过期。启动时把它们
         # 真正撤掉，这样"我已经移除他了"在数据库里也是真的。
         for account in store.list_auth_users():
-            if oauth_config.resolve_role(
-                login=str(account.get("login") or ""),
-                github_id=account.get("github_id"),
-                pins=identity_pins,
-            ) is None:
+            if (
+                oauth_config.resolve_role(
+                    login=str(account.get("login") or ""),
+                    github_id=account.get("github_id"),
+                    pins=identity_pins,
+                )
+                is None
+            ):
                 store.revoke_user_credentials(str(account.get("id") or ""))
     # 每台工作站最近一次 trace-deliver 的自述。它是客户端上报的，不是中央推断的，
     # 所以只作为健康显示，不参与任何正确性判断。
     outbox_reports: dict[str, dict[str, Any]] = {}
+
     @asynccontextmanager
     async def lifespan(_app):
         index_task = asyncio.create_task(integrations.run()) if integrations.memory else None
@@ -355,8 +397,7 @@ def create_app(
                 await integrations.memory.close()
             store.close()
 
-    app = FastAPI(title="Research Trace", version="2.0.0-alpha.28", lifespan=lifespan,
-                  root_path=base)
+    app = FastAPI(title="Research Trace", version=PLUGIN_VERSION, lifespan=lifespan, root_path=base)
     app.state.base_path = base
     app.state.store = store
     app.state.integrations = integrations
@@ -383,6 +424,8 @@ def create_app(
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
+        if network_allowlist and not client_in_networks(client_key(request), network_allowlist):
+            return JSONResponse({"error": "client address is not in TRACE_ALLOWED_NETWORKS"}, status_code=403)
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
@@ -394,9 +437,10 @@ def create_app(
         )
         route_path = request.url.path
         if base and route_path.startswith(base):
-            route_path = route_path[len(base):] or "/"
+            route_path = route_path[len(base) :] or "/"
         if (
-            route_path.startswith("/auth/") or route_path.startswith("/api/auth/")
+            route_path.startswith("/auth/")
+            or route_path.startswith("/api/auth/")
             or route_path.startswith("/api/device/")
         ):
             response.headers["Cache-Control"] = "no-store"
@@ -404,7 +448,15 @@ def create_app(
 
     @app.exception_handler(StoreError)
     async def store_error(_request: Request, exc: StoreError):
-        status = 404 if isinstance(exc, NotFound) else 409 if isinstance(exc, Conflict) else 400 if isinstance(exc, ValidationError) else 500
+        status = (
+            404
+            if isinstance(exc, NotFound)
+            else 409
+            if isinstance(exc, Conflict)
+            else 400
+            if isinstance(exc, ValidationError)
+            else 500
+        )
         return JSONResponse({"error": str(exc), "type": type(exc).__name__}, status_code=status)
 
     def still_whitelisted(user: dict[str, Any]) -> bool:
@@ -417,11 +469,14 @@ def create_app(
         """
         if not oauth_config or oauth_config.allow_all or oauth_config.allowed_org:
             return True
-        return oauth_config.resolve_role(
-            login=str(user.get("login") or ""),
-            github_id=user.get("github_id"),
-            pins=identity_pins,
-        ) is not None
+        return (
+            oauth_config.resolve_role(
+                login=str(user.get("login") or ""),
+                github_id=user.get("github_id"),
+                pins=identity_pins,
+            )
+            is not None
+        )
 
     def device_credential_expiry(identity: dict[str, Any]) -> datetime | None:
         """到期时间来自铸造时落库的那一列，不再按 created_at + 环境变量现算。
@@ -461,29 +516,34 @@ def create_app(
         return identity
 
     def browser_user(request: Request) -> dict[str, Any] | None:
-        if not oauth_config:
-            return None
-        user = store.web_session_user(request.cookies.get(SESSION_COOKIE))
-        if user and not still_whitelisted(user):
-            return None
-        return user
+        if oauth_config:
+            user = store.web_session_user(request.cookies.get(SESSION_COOKIE))
+            if user and not still_whitelisted(user):
+                return None
+            return user
+        if protect_reads_enabled:
+            return token_session_user(request.cookies.get(SESSION_COOKIE), write_token)
+        return None
+
+    def session_secret_for_csrf() -> str:
+        return oauth_config.session_secret if oauth_config else write_token
 
     def require_read(request: Request) -> dict[str, Any]:
         machine = bearer_identity(request)
         if machine:
             return machine
-        if not oauth_config:
+        if access_mode == "open":
             return {"kind": "public"}
         user = browser_user(request)
         if not user:
-            raise HTTPException(status_code=401, detail="GitHub login required")
+            detail = "GitHub login required" if oauth_config else "access key login or valid Bearer token required"
+            raise HTTPException(status_code=401, detail=detail)
         return {"kind": "user", "user": user}
 
     def _check_csrf(request: Request) -> None:
-        assert oauth_config is not None
         raw_session = request.cookies.get(SESSION_COOKIE, "")
         supplied = request.headers.get("X-CSRF-Token", "")
-        expected = csrf_token(oauth_config.session_secret, raw_session)
+        expected = csrf_token(session_secret_for_csrf(), raw_session)
         if not supplied or not secrets.compare_digest(supplied, expected):
             raise HTTPException(status_code=403, detail="valid CSRF token required")
 
@@ -494,6 +554,12 @@ def create_app(
                 raise HTTPException(status_code=403, detail="member role required")
             return machine
         if not oauth_config:
+            if protect_reads_enabled:
+                user = browser_user(request)
+                if not user:
+                    raise HTTPException(status_code=401, detail="access key login or valid Bearer token required")
+                _check_csrf(request)
+                return {"kind": "user", "user": user}
             if not write_token:
                 return {"kind": "unprotected"}
             raise HTTPException(status_code=401, detail="valid Bearer token required")
@@ -506,7 +572,7 @@ def create_app(
         return {"kind": "user", "user": user}
 
     def require_admin(request: Request) -> dict[str, Any]:
-        if not oauth_config:
+        if not oauth_config and not protect_reads_enabled:
             raise HTTPException(status_code=404, detail="GitHub OAuth is not enabled")
         user = browser_user(request)
         if not user:
@@ -554,25 +620,64 @@ def create_app(
 
     @app.get("/api/auth/config")
     def auth_config():
-        return {"enabled": bool(oauth_config),
-                "login_url": base + "/auth/github/login" if oauth_config else None}
+        return {
+            "enabled": access_mode != "open",
+            "mode": access_mode,
+            "login_url": base + "/auth/github/login" if oauth_config else None,
+        }
+
+    @app.post("/api/auth/token-login")
+    async def token_login(request: Request):
+        """Intranet mode: the browser presents the shared access key once, gets a signed cookie."""
+        if not protect_reads_enabled or oauth_config:
+            raise HTTPException(status_code=404, detail="access-key login is not enabled")
+        retry_after = device_start_limiter.hit("token-login:" + client_key(request))
+        if retry_after:
+            return JSONResponse(
+                {"error": "too many login attempts from this client; retry later"},
+                status_code=429,
+                headers={"Retry-After": str(int(retry_after) + 1)},
+            )
+        body = await request.json()
+        supplied = str(body.get("key") or body.get("token") or "")
+        if not supplied or not secrets.compare_digest(supplied, write_token):
+            raise HTTPException(status_code=401, detail="access key rejected")
+        name = re.sub(r"\s+", " ", str(body.get("name") or "")).strip()[:40] or "operator"
+        raw_session = token_session_cookie(name, write_token)
+        user = token_session_user(raw_session, write_token)
+        response = JSONResponse({"user": user, "csrf_token": csrf_token(write_token, raw_session)})
+        forwarded_proto = request.headers.get("X-Forwarded-Proto", "") if trust_proxy else ""
+        secure = request.url.scheme == "https" or forwarded_proto == "https"
+        response.set_cookie(
+            SESSION_COOKIE,
+            raw_session,
+            max_age=30 * 86400,
+            path=cookie_path,
+            httponly=True,
+            secure=secure,
+            samesite="lax",
+        )
+        return response
 
     @app.get("/auth/github/login")
     def github_login(return_to: str | None = None):
         if not oauth_config or not github:
             raise HTTPException(status_code=404, detail="GitHub OAuth is not enabled")
-        state, nonce, _verifier, challenge = pending_oauth.create(
-            safe_return_to(return_to, base))
+        state, nonce, _verifier, challenge = pending_oauth.create(safe_return_to(return_to, base))
         response = RedirectResponse(github.authorize_url(state=state, challenge=challenge), status_code=302)
         response.set_cookie(
-            OAUTH_NONCE_COOKIE, nonce, max_age=pending_oauth.ttl_seconds, httponly=True,
-            secure=oauth_config.secure_cookies, samesite="lax", path=cookie_path,
+            OAUTH_NONCE_COOKIE,
+            nonce,
+            max_age=pending_oauth.ttl_seconds,
+            httponly=True,
+            secure=oauth_config.secure_cookies,
+            samesite="lax",
+            path=cookie_path,
         )
         return response
 
     @app.get("/auth/github/callback")
-    def github_callback(request: Request, code: str | None = None, state: str | None = None,
-                        error: str | None = None):
+    def github_callback(request: Request, code: str | None = None, state: str | None = None, error: str | None = None):
         if not oauth_config or not github:
             raise HTTPException(status_code=404, detail="GitHub OAuth is not enabled")
         if error:
@@ -593,14 +698,14 @@ def create_app(
             # 白名单按不可变的 github_id 判定；用户名只是首次解析用的入口，
             # 解析后由 IdentityPins 钉住（见 auth.IdentityPins）。
             role_hint = oauth_config.resolve_role(
-                login=profile.get("login"), github_id=profile_github_id,
-                active_org_member=org_member, pins=identity_pins,
+                login=profile.get("login"),
+                github_id=profile_github_id,
+                active_org_member=org_member,
+                pins=identity_pins,
             )
             if not role_hint:
                 raise OAuthError("this GitHub account is not allowed to access Research Trace")
-            user = store.upsert_github_user(
-                profile, default_role=role_hint, force_admin=role_hint == "admin"
-            )
+            user = store.upsert_github_user(profile, default_role=role_hint, force_admin=role_hint == "admin")
             if user["disabled"]:
                 raise OAuthError("this Research Trace account is disabled")
             raw_session = secrets.token_urlsafe(48)
@@ -610,38 +715,47 @@ def create_app(
             raise HTTPException(status_code=403, detail=str(exc)) from exc
         response = RedirectResponse(attempt.return_to, status_code=303)
         response.set_cookie(
-            SESSION_COOKIE, raw_session, max_age=oauth_config.session_days * 86400, httponly=True,
-            secure=oauth_config.secure_cookies, samesite="lax", path=cookie_path,
+            SESSION_COOKIE,
+            raw_session,
+            max_age=oauth_config.session_days * 86400,
+            httponly=True,
+            secure=oauth_config.secure_cookies,
+            samesite="lax",
+            path=cookie_path,
         )
-        response.delete_cookie(OAUTH_NONCE_COOKIE, path=cookie_path,
-                               secure=oauth_config.secure_cookies, samesite="lax")
+        response.delete_cookie(OAUTH_NONCE_COOKIE, path=cookie_path, secure=oauth_config.secure_cookies, samesite="lax")
         return response
 
     @app.get("/api/auth/me")
     def auth_me(request: Request):
-        if not oauth_config:
-            raise HTTPException(status_code=404, detail="GitHub OAuth is not enabled")
+        if access_mode == "open":
+            raise HTTPException(status_code=404, detail="no login is configured")
         user = browser_user(request)
         if not user:
-            raise HTTPException(status_code=401, detail="GitHub login required")
-        public_user = {key: user.get(key) for key in (
-            "id", "github_id", "login", "display_name", "avatar_url", "role", "disabled"
-        )}
-        return {"user": public_user,
-                "csrf_token": csrf_token(oauth_config.session_secret, request.cookies[SESSION_COOKIE])}
+            raise HTTPException(status_code=401, detail="login required")
+        public_user = {
+            key: user.get(key)
+            for key in ("id", "github_id", "login", "display_name", "avatar_url", "role", "disabled", "kind")
+        }
+        return {
+            "user": public_user,
+            "csrf_token": csrf_token(session_secret_for_csrf(), request.cookies[SESSION_COOKIE]),
+        }
 
     @app.post("/api/auth/logout")
     def auth_logout(request: Request):
-        if not oauth_config:
-            raise HTTPException(status_code=404, detail="GitHub OAuth is not enabled")
+        if access_mode == "open":
+            raise HTTPException(status_code=404, detail="no login is configured")
         raw_session = request.cookies.get(SESSION_COOKIE, "")
         if not browser_user(request):
-            raise HTTPException(status_code=401, detail="GitHub login required")
+            raise HTTPException(status_code=401, detail="login required")
         _check_csrf(request)
-        store.delete_web_session(raw_session)
+        if oauth_config:
+            store.delete_web_session(raw_session)
         response = JSONResponse({"logged_out": True})
-        response.delete_cookie(SESSION_COOKIE, path=cookie_path,
-                               secure=oauth_config.secure_cookies, samesite="lax")
+        response.delete_cookie(
+            SESSION_COOKIE, path=cookie_path, secure=bool(oauth_config and oauth_config.secure_cookies), samesite="lax"
+        )
         return response
 
     def client_key(request: Request) -> str:
@@ -680,7 +794,8 @@ def create_app(
         if retry_after:
             return JSONResponse(
                 {"error": "too many device login attempts from this client; retry later"},
-                status_code=429, headers={"Retry-After": str(int(retry_after) + 1)},
+                status_code=429,
+                headers={"Retry-After": str(int(retry_after) + 1)},
             )
         body = await request.json()
         value = store.start_device_authorization(body.get("device_name"))
@@ -725,7 +840,8 @@ def create_app(
         if retry_after:
             return JSONResponse(
                 {"error": "this device is renewing too often; retry later"},
-                status_code=429, headers={"Retry-After": str(int(retry_after) + 1)},
+                status_code=429,
+                headers={"Retry-After": str(int(retry_after) + 1)},
             )
         started = store.start_device_authorization(identity["device"]["name"])
         store.approve_device_authorization(started["user_code"], user_id)
@@ -757,8 +873,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="GitHub OAuth is not enabled")
         user = browser_user(request)
         if not user:
-            login_url = base + "/auth/github/login?" + urllib.parse.urlencode(
-                {"return_to": base + "/device"})
+            login_url = base + "/auth/github/login?" + urllib.parse.urlencode({"return_to": base + "/device"})
             return RedirectResponse(login_url, status_code=303)
         safe_login = html.escape(str(user["login"]))
         page = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
@@ -866,31 +981,26 @@ $('approve').onclick=async()=>{{
                 continue  # 铸造时就写好了；只给本轮之前的老行补算
             created = _parse_timestamp(device.get("created_at"))
             if created:
-                device["expires_at"] = (
-                    created + timedelta(days=oauth_config.device_credential_days)
-                ).isoformat(timespec="milliseconds")
+                device["expires_at"] = (created + timedelta(days=oauth_config.device_credential_days)).isoformat(
+                    timespec="milliseconds"
+                )
         return {"devices": devices}
 
     @app.delete("/api/auth/devices/{device_id}")
     def auth_revoke_device(device_id: str, identity: dict[str, Any] = Depends(require_user_csrf)):
         user = identity["user"]
-        return store.revoke_device_credential(
-            device_id, requester_user_id=user["id"], is_admin=user["role"] == "admin"
-        )
+        return store.revoke_device_credential(device_id, requester_user_id=user["id"], is_admin=user["role"] == "admin")
 
     @app.delete("/api/device/self")
     def device_revoke_self(identity: dict[str, Any] = Depends(require_device)):
-        return store.revoke_device_credential(
-            identity["device"]["id"], requester_user_id=identity["user"]["id"]
-        )
+        return store.revoke_device_credential(identity["device"]["id"], requester_user_id=identity["user"]["id"])
 
     @app.get("/api/admin/users")
     def admin_users(_identity: dict[str, Any] = Depends(require_admin)):
         return {"users": store.list_auth_users()}
 
     @app.patch("/api/admin/users/{user_id}")
-    async def admin_update_user(user_id: str, request: Request,
-                                _identity: dict[str, Any] = Depends(require_admin)):
+    async def admin_update_user(user_id: str, request: Request, _identity: dict[str, Any] = Depends(require_admin)):
         body = await request.json()
         return store.update_auth_user(user_id, role=body.get("role"), disabled=body.get("disabled"))
 
@@ -946,15 +1056,21 @@ $('approve').onclick=async()=>{{
 
     @app.get("/api/health")
     def health(request: Request):
-        if oauth_config and not (bearer_identity(request) or browser_user(request)):
+        authenticated = bool(bearer_identity(request) or browser_user(request))
+        if access_mode != "open" and not authenticated:
             return {
-                "ok": True, "schema_version": SCHEMA_VERSION, "oauth_enabled": True,
+                "ok": True,
+                "schema_version": SCHEMA_VERSION,
+                "oauth_enabled": bool(oauth_config),
                 "authentication_required": True,
+                "access_mode": access_mode,
             }
         value = store.health()
         value["write_protected"] = bool(write_token or oauth_config)
         value["oauth_enabled"] = bool(oauth_config)
-        value["anonymous_read"] = not bool(oauth_config)
+        value["anonymous_read"] = access_mode == "open"
+        value["access_mode"] = access_mode
+        value["authenticated"] = authenticated
         value["integrations"] = integrations.health()
         # 没有任何一台机器上报过就不给这一格，网页据此显示"未上报"而不是画个假绿灯。
         if outbox_reports:
@@ -963,18 +1079,19 @@ $('approve').onclick=async()=>{{
             # §11：Recorder 未处理的游标。中央自己看不见它——语义 batch manifest
             # 只存在于每台机器本地的 outbox/<ws>/<session>/batches/。
             recorder_reports = [
-                item for item in machines
-                if item.get("recorder_status") or item.get("recorder_last_processed_at")
-                or item.get("recorder_last_error") or item.get("recorder_pending_batches")
+                item
+                for item in machines
+                if item.get("recorder_status")
+                or item.get("recorder_last_processed_at")
+                or item.get("recorder_last_error")
+                or item.get("recorder_pending_batches")
             ]
             latest = max(
                 recorder_reports or machines,
                 key=lambda item: str(item.get("reported_at") or ""),
             )
             value["recorder"] = {
-                "pending_batches": sum(
-                    int(item.get("recorder_pending_batches") or 0) for item in machines
-                ),
+                "pending_batches": sum(int(item.get("recorder_pending_batches") or 0) for item in machines),
                 "status": latest.get("recorder_status"),
                 "last_processed_at": latest.get("recorder_last_processed_at"),
                 "last_error": latest.get("recorder_last_error"),
@@ -990,8 +1107,7 @@ $('approve').onclick=async()=>{{
     async def create_project(request: Request):
         body = await request.json()
         keys, rejected = usable_workspace_keys(body.get("workspace_keys") or [])
-        value = store.create_project(body.get("name"), workspace_keys=keys,
-                                     overview=body.get("overview") or "")
+        value = store.create_project(body.get("name"), workspace_keys=keys, overview=body.get("overview") or "")
         if rejected:
             value["rejected_workspace_keys"] = rejected
         return value
@@ -1025,35 +1141,40 @@ $('approve').onclick=async()=>{{
                 value["rejected_workspace_keys"] = rejected
             project = value.get('project') or {}
             if project.get('id'):
-                value['recent_runs'] = store.research_runs(project['id'],limit=recent_limit)
+                value['recent_runs'] = store.research_runs(project['id'], limit=recent_limit)
             return value
 
         result = store.context(
-            project_id=body.get("project_id"), workspace_keys=keys,
-            create_if_missing=False, project_name=body.get("project_name"),
-            recent_limit=recent_limit, include_dataflow=include_dataflow,
+            project_id=body.get("project_id"),
+            workspace_keys=keys,
+            create_if_missing=False,
+            project_name=body.get("project_name"),
+            recent_limit=recent_limit,
+            include_dataflow=include_dataflow,
         )
         if result.get("matched") is not False:
             return decorate(result)
 
         # 规则指向的项目可能已经被 purge 掉了。这种规则不能算命中，否则整条
         # /api/context 会 404，这台机器就此停摆——而它其实只需要退回到「没有映射」。
-        matches = [rule for rule in team_map.match(keys)
-                   if _project_name_or_none(rule["project_id"]) is not None]
+        matches = [rule for rule in team_map.match(keys) if _project_name_or_none(rule["project_id"]) is not None]
         targets = {str(rule["project_id"]) for rule in matches}
         if len(targets) > 1:
             # §7 硬要求：不确定时进入待确认状态，**即使调用方传了 create_if_missing**。
             # 这里返回 200 而不是 409，因为「需要人来选一个」是一个正常的中间状态，
             # 客户端要拿着候选列表继续往下走，而不是把它当成一次失败。
-            return decorate({
-                "matched": False, "pending_confirmation": True,
-                "reason": "team_mapping_ambiguous", "workspace_keys": keys,
-                "candidates": [
-                    {**rule, "project_name": _project_name_or_none(rule["project_id"])}
-                    for rule in matches
-                ],
-                "projects": result.get("projects"),
-            })
+            return decorate(
+                {
+                    "matched": False,
+                    "pending_confirmation": True,
+                    "reason": "team_mapping_ambiguous",
+                    "workspace_keys": keys,
+                    "candidates": [
+                        {**rule, "project_name": _project_name_or_none(rule["project_id"])} for rule in matches
+                    ],
+                    "projects": result.get("projects"),
+                }
+            )
         if targets:
             pid = next(iter(targets))
             try:
@@ -1063,19 +1184,22 @@ $('approve').onclick=async()=>{{
                     store.add_workspace_keys(pid, keys)
             except StoreError:
                 pass
-            resolved = store.context(
-                project_id=pid, recent_limit=recent_limit, include_dataflow=include_dataflow
-            )
+            resolved = store.context(project_id=pid, recent_limit=recent_limit, include_dataflow=include_dataflow)
             resolved["resolved_by"] = "team_mapping"
             resolved["matched_rules"] = matches
             return decorate(resolved)
 
         if body.get("create_if_missing"):
-            return decorate(store.context(
-                project_id=body.get("project_id"), workspace_keys=keys,
-                create_if_missing=True, project_name=body.get("project_name"),
-                recent_limit=recent_limit, include_dataflow=include_dataflow,
-            ))
+            return decorate(
+                store.context(
+                    project_id=body.get("project_id"),
+                    workspace_keys=keys,
+                    create_if_missing=True,
+                    project_name=body.get("project_name"),
+                    recent_limit=recent_limit,
+                    include_dataflow=include_dataflow,
+                )
+            )
         return decorate(result)
 
     @app.get("/api/projects/{project_id}/dataflow", dependencies=[Depends(require_read)])
@@ -1098,8 +1222,7 @@ $('approve').onclick=async()=>{{
     @app.get("/api/team/mapping", dependencies=[Depends(require_read)])
     def team_mapping(history: int = 50):
         """团队映射的可读视图，也是「可分发的团队配置文件」的导出口。"""
-        return {"schema": TEAM_MAP_SCHEMA, "rules": team_map.rules(),
-                "history": team_map.history(history)}
+        return {"schema": TEAM_MAP_SCHEMA, "rules": team_map.rules(), "history": team_map.history(history)}
 
     @app.post("/api/team/mapping")
     async def team_mapping_add(request: Request, identity: dict[str, Any] = Depends(require_admin)):
@@ -1108,13 +1231,14 @@ $('approve').onclick=async()=>{{
         # 解析不出来的待确认状态，而他根本看不到规则是谁写错的。
         project = store.get_project(str(body.get("project_id") or ""), include_nodes=False)
         return team_map.add(
-            pattern=body.get("pattern"), project_id=str(project["id"]),
-            note=body.get("note") or "", actor=principal(identity, request)[1],
+            pattern=body.get("pattern"),
+            project_id=str(project["id"]),
+            note=body.get("note") or "",
+            actor=principal(identity, request)[1],
         )
 
     @app.delete("/api/team/mapping/{rule_id}")
-    def team_mapping_remove(rule_id: str, request: Request,
-                            identity: dict[str, Any] = Depends(require_admin)):
+    def team_mapping_remove(rule_id: str, request: Request, identity: dict[str, Any] = Depends(require_admin)):
         return team_map.remove(rule_id, actor=principal(identity, request)[1])
 
     @app.post("/api/projects/{project_id}/chapters", dependencies=[Depends(require_write)])
@@ -1129,31 +1253,37 @@ $('approve').onclick=async()=>{{
         # created_by 决定 storage 里那条 "recorder 的旧幂等重试不得覆盖人类改动"
         # 的闸门，所以只能来自凭证；review_state 同理，非人类一律 unreviewed。
         return store.record_node(
-            body.get("project_id"), idempotency_key=body.get("idempotency_key"), title=body.get("title"),
-            body=body.get("body") or "", chapter_id=body.get("chapter_id"),
-            chapter_name=body.get("chapter_name"), parent_id=body.get("parent_id"),
-            labels=body.get("labels") or [], occurred_at=body.get("occurred_at"),
+            body.get("project_id"),
+            idempotency_key=body.get("idempotency_key"),
+            title=body.get("title"),
+            body=body.get("body") or "",
+            chapter_id=body.get("chapter_id"),
+            chapter_name=body.get("chapter_name"),
+            parent_id=body.get("parent_id"),
+            labels=body.get("labels") or [],
+            occurred_at=body.get("occurred_at"),
             created_by=actor_type,
             review_state=(body.get("review_state") or "unreviewed") if actor_type == "human" else "unreviewed",
-            source_event_ids=body.get('source_event_ids') or [], code_evidence=body.get("code_evidence") or [],
+            source_event_ids=body.get('source_event_ids') or [],
+            code_evidence=body.get("code_evidence") or [],
             run_ids=body.get('run_ids') or [],
         )
 
     @app.patch("/api/nodes/{node_id}")
-    async def update_node(node_id: str, request: Request,
-                          identity: dict[str, Any] = Depends(require_write)):
+    async def update_node(node_id: str, request: Request, identity: dict[str, Any] = Depends(require_write)):
         body = await request.json()
         actor_type, actor_id = principal(identity, request)
         patch = body.get("patch") or {}
         if actor_type != "human" and isinstance(patch, dict) and "review_state" in patch:
             # 确认/纠正是人的动作。Recorder 不能自我确认（REQUIREMENTS §15），
             # 而 PATCH 里的 review_state 曾经是绕过它最直接的一条路。
-            raise HTTPException(
-                status_code=403, detail="only a signed-in human may change review_state"
-            )
+            raise HTTPException(status_code=403, detail="only a signed-in human may change review_state")
         return store.update_node(
-            node_id, patch, expect_version=body.get("expect_version"),
-            actor_type=actor_type, actor_id=actor_id,
+            node_id,
+            patch,
+            expect_version=body.get("expect_version"),
+            actor_type=actor_type,
+            actor_id=actor_id,
         )
 
     @app.post("/api/curate")
@@ -1161,11 +1291,16 @@ $('approve').onclick=async()=>{{
         body = await request.json()
         actor_type, actor_id = principal(identity, request)
         return store.curate(
-            body.get("project_id"), target_type=body.get("target_type"), target_id=body.get("target_id"),
-            body=body.get("body") or "", expect_version=body.get("expect_version"),
-            actor_type=actor_type, actor_id=actor_id,
+            body.get("project_id"),
+            target_type=body.get("target_type"),
+            target_id=body.get("target_id"),
+            body=body.get("body") or "",
+            expect_version=body.get("expect_version"),
+            actor_type=actor_type,
+            actor_id=actor_id,
             source_event_ids=body.get("source_event_ids") or [],
-            milestone=bool(body.get("milestone")), resolve_comment_ids=body.get("resolve_comment_ids") or [],
+            milestone=bool(body.get("milestone")),
+            resolve_comment_ids=body.get("resolve_comment_ids") or [],
         )
 
     @app.get("/api/revisions/{target_type}/{target_id}", dependencies=[Depends(require_read)])
@@ -1185,22 +1320,24 @@ $('approve').onclick=async()=>{{
                 detail="only a signed-in human may post a confirmation or correction",
             )
         return store.add_comment(
-            body.get("project_id"), target_type=body.get("target_type"), target_id=body.get("target_id"),
-            body=body.get("body"), kind=kind, anchor=body.get("anchor") or {},
-            author_type=author_type, author_id=author_id,
+            body.get("project_id"),
+            target_type=body.get("target_type"),
+            target_id=body.get("target_id"),
+            body=body.get("body"),
+            kind=kind,
+            anchor=body.get("anchor") or {},
+            author_type=author_type,
+            author_id=author_id,
         )
 
     @app.post("/api/comments/{comment_id}/resolve")
-    def resolve_comment(comment_id: str, request: Request,
-                        identity: dict[str, Any] = Depends(require_write)):
+    def resolve_comment(comment_id: str, request: Request, identity: dict[str, Any] = Depends(require_write)):
         actor_type, actor_id = principal(identity, request)
         if actor_type != "human":
             # 了结一条纠正是人的动作（§9：Comments 的人工操作走网页 REST）。
             # curate 那边已经把机器的"我读过了"降级成 acknowledgement 了，如果这条
             # 端点还敞着，Recorder 只要多调一次就能把人的纠正彻底抹掉。
-            raise HTTPException(
-                status_code=403, detail="only a signed-in human may resolve a comment"
-            )
+            raise HTTPException(status_code=403, detail="only a signed-in human may resolve a comment")
         return store.resolve_comment(comment_id, actor_id)
 
     @app.post("/api/ingest")
@@ -1209,8 +1346,11 @@ $('approve').onclick=async()=>{{
         # 投递已经和产生事件的那个 session 解耦了，所以「哪台机器推的这批」
         # 只能从凭证记下来，请求体说了不算。
         return store.ingest(
-            batch_id=body.get("batch_id"), project_id=body.get("project_id"), session=body.get("session"),
-            agents=body.get("agents") or [], events=body.get("events") or [],
+            batch_id=body.get("batch_id"),
+            project_id=body.get("project_id"),
+            session=body.get("session"),
+            agents=body.get("agents") or [],
+            events=body.get("events") or [],
             transcript_chunks=body.get("transcript_chunks") or [],
             delivered_by=principal(identity, request)[1],
         )
@@ -1222,15 +1362,26 @@ $('approve').onclick=async()=>{{
             if body["integration"] != "mlflow" or body.get("target_type") != "node":
                 raise ValidationError("external evidence currently supports MLflow on an existing Node")
             return await integrations.import_evidence(
-                body.get("project_id"), kind=body.get("external_kind"),
-                external_id=body.get("external_id"), node_id=body.get("target_id"), name=body.get("name"),
+                body.get("project_id"),
+                kind=body.get("external_kind"),
+                external_id=body.get("external_id"),
+                node_id=body.get("target_id"),
+                name=body.get("name"),
             )
         return store.attach(
-            body.get("project_id"), target_type=body.get("target_type"), target_id=body.get("target_id"),
-            name=body.get("name"), direction=body.get("direction") or "reference",
-            mime_type=body.get("mime_type"), data_base64=body.get("data_base64"), uri=body.get("uri"),
-            machine=body.get("machine"), external_path=body.get("external_path"), size=body.get("size"),
-            sha256=body.get("sha256"), metadata=body.get("metadata") or {},
+            body.get("project_id"),
+            target_type=body.get("target_type"),
+            target_id=body.get("target_id"),
+            name=body.get("name"),
+            direction=body.get("direction") or "reference",
+            mime_type=body.get("mime_type"),
+            data_base64=body.get("data_base64"),
+            uri=body.get("uri"),
+            machine=body.get("machine"),
+            external_path=body.get("external_path"),
+            size=body.get("size"),
+            sha256=body.get("sha256"),
+            metadata=body.get("metadata") or {},
         )
 
     @app.get("/api/attachments/{attachment_id}/content", dependencies=[Depends(require_read)])
@@ -1257,8 +1408,11 @@ $('approve').onclick=async()=>{{
     async def integration_evidence(request: Request):
         body = await request.json()
         return await integrations.import_evidence(
-            body.get("project_id"), kind=body.get("kind"), external_id=body.get("external_id"),
-            node_id=body.get("node_id"), name=body.get("name"),
+            body.get("project_id"),
+            kind=body.get("kind"),
+            external_id=body.get("external_id"),
+            node_id=body.get("node_id"),
+            name=body.get("name"),
         )
 
     @app.get('/api/nodes/{node_id}/sources', dependencies=[Depends(require_read)])
@@ -1267,30 +1421,105 @@ $('approve').onclick=async()=>{{
 
     @app.get('/api/projects/{project_id}/runs', dependencies=[Depends(require_read)])
     def project_runs(project_id: str, limit: int = 50):
-        return {'items':store.research_runs(project_id,limit=limit)}
+        return {'items': store.research_runs(project_id, limit=limit)}
 
     @app.get('/assets/{name}', dependencies=[Depends(require_read)])
     def asset(name: str):
-        if name not in {'markdown-it.min.js','dagre.min.js'}:
+        if name not in {'markdown-it.min.js', 'dagre.min.js'}:
             raise HTTPException(status_code=404)
-        return FileResponse(Path(__file__).parent/'static'/name,media_type='text/javascript')
+        return FileResponse(Path(__file__).parent / 'static' / name, media_type='text/javascript')
 
     @app.get("/", response_class=HTMLResponse)
     def index():
         from .webapp import render_index
+
         return HTMLResponse(render_index(base))
 
     return app
 
 
+def load_env_file(path: str | os.PathLike[str], environ: dict[str, str] | None = None) -> int:
+    """KEY=VALUE lines into the environment (existing variables win).  systemd EnvironmentFile shape."""
+    target_env = os.environ if environ is None else environ
+    loaded = 0
+    for line in Path(path).expanduser().read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if key and key not in target_env:
+            target_env[key] = value
+            loaded += 1
+    return loaded
+
+
+def write_init_env(data_dir: str | os.PathLike[str], *, host: str, port: int, token: str | None = None) -> Path:
+    """`trace-server --init`: one access key, reads and writes both guarded, written to a 0600 env file."""
+    root = Path(data_dir).expanduser()
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / "server.env"
+    if target.exists():
+        raise SystemExit(f"{target} already exists; delete it first if you really want a new access key")
+    key = token or ("rt_" + secrets.token_urlsafe(32))
+    target.write_text(
+        "# Research Trace central service — generated by `trace-server --init`.\n"
+        "# Start with:  trace-server --env-file " + str(target) + f" --host {host} --port {port}\n"
+        "# Clients:     trace-login --url http://<this-host>:"
+        + str(port)
+        + " --token   (paste the key once per machine)\n"
+        "# Web:         open http://<this-host>:" + str(port) + "/ and enter the key + your name\n"
+        f"TRACE_DATA={root}\n"
+        f"TRACE_TOKEN={key}\n"
+        "# The same key guards reads; the web asks for it. Remove to fall back to anonymous reads (never on a network).\n"
+        "TRACE_PROTECT_READS=true\n"
+        "# Optional: only accept clients from these networks (comma-separated CIDRs).\n"
+        "#TRACE_ALLOWED_NETWORKS=10.0.0.0/8,192.168.0.0/16\n"
+        "# Behind a reverse proxy that terminates TLS: read the client address from X-Forwarded-For.\n"
+        "#TRACE_TRUST_PROXY_HEADERS=true\n",
+        encoding="utf-8",
+    )
+    try:
+        os.chmod(target, 0o600)
+    except OSError:
+        pass
+    return target
+
+
 def main(argv: list[str] | None = None) -> int:
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--env-file")
+    pre_args, _rest = pre.parse_known_args(argv)
+    if pre_args.env_file:
+        load_env_file(pre_args.env_file)  # before the parser reads os.environ for its defaults
     parser = argparse.ArgumentParser(description="Research Trace central service")
+    parser.add_argument("--env-file", help="KEY=VALUE file (the one `--init` writes); existing environment wins")
+    parser.add_argument(
+        "--init",
+        action="store_true",
+        help="generate an access key and a server.env in --data-dir with reads+writes protected, then exit",
+    )
+    parser.add_argument(
+        "--protect-reads",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="require the access key (or a web login with it) for reads too; default on when --host is not loopback",
+    )
+    parser.add_argument(
+        "--allowed-networks",
+        default=os.environ.get("TRACE_ALLOWED_NETWORKS"),
+        help="comma-separated CIDRs allowed to connect, e.g. 10.0.0.0/8,192.168.1.0/24",
+    )
     parser.add_argument("--data-dir", default=os.environ.get("TRACE_DATA", ".trace-data"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--token", default=os.environ.get("TRACE_TOKEN", ""))
-    parser.add_argument("--base-path", default=os.environ.get("TRACE_BASE_PATH", ""),
-                        help="把服务挂在一个路径前缀下，例如 /trace；前缀之外一律 404")
+    parser.add_argument(
+        "--base-path",
+        default=os.environ.get("TRACE_BASE_PATH", ""),
+        help="把服务挂在一个路径前缀下，例如 /trace；前缀之外一律 404",
+    )
     # Compatibility only: the old disable switch is harmless and hidden.
     parser.add_argument("--no-backup", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--public-url", default=os.environ.get("TRACE_PUBLIC_URL"))
@@ -1300,40 +1529,69 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--github-admins", default=os.environ.get("TRACE_GITHUB_ADMINS"))
     parser.add_argument("--github-allowed-users", default=os.environ.get("TRACE_GITHUB_ALLOWED_USERS"))
     parser.add_argument("--github-allowed-org", default=os.environ.get("TRACE_GITHUB_ALLOWED_ORG"))
-    parser.add_argument("--github-allow-all", action="store_true",
-                        default=_env_bool("TRACE_GITHUB_ALLOW_ALL"))
-    parser.add_argument("--session-days", type=int,
-                        default=int(os.environ.get("TRACE_SESSION_DAYS", "30")))
-    parser.add_argument("--device-credential-days", type=int,
-                        default=int(os.environ.get("TRACE_DEVICE_CREDENTIAL_DAYS", "90")))
-    parser.add_argument("--device-start-limit", type=int,
-                        default=int(os.environ.get("TRACE_DEVICE_START_LIMIT", "10")))
-    parser.add_argument("--device-start-window-seconds", type=float,
-                        default=float(os.environ.get("TRACE_DEVICE_START_WINDOW_SECONDS", "600")))
-    parser.add_argument("--trust-proxy-headers", action="store_true",
-                        default=_env_bool("TRACE_TRUST_PROXY_HEADERS"))
-    parser.add_argument("--insecure-cookies", action="store_true",
-                        default=_env_bool("TRACE_INSECURE_COOKIES"))
+    parser.add_argument("--github-allow-all", action="store_true", default=_env_bool("TRACE_GITHUB_ALLOW_ALL"))
+    parser.add_argument("--session-days", type=int, default=int(os.environ.get("TRACE_SESSION_DAYS", "30")))
+    parser.add_argument(
+        "--device-credential-days", type=int, default=int(os.environ.get("TRACE_DEVICE_CREDENTIAL_DAYS", "90"))
+    )
+    parser.add_argument("--device-start-limit", type=int, default=int(os.environ.get("TRACE_DEVICE_START_LIMIT", "10")))
+    parser.add_argument(
+        "--device-start-window-seconds",
+        type=float,
+        default=float(os.environ.get("TRACE_DEVICE_START_WINDOW_SECONDS", "600")),
+    )
+    parser.add_argument("--trust-proxy-headers", action="store_true", default=_env_bool("TRACE_TRUST_PROXY_HEADERS"))
+    parser.add_argument("--insecure-cookies", action="store_true", default=_env_bool("TRACE_INSECURE_COOKIES"))
     args = parser.parse_args(argv)
     try:
         import uvicorn
     except ImportError:
         print("uvicorn is required: pip install 'research-trace[server]'", file=os.sys.stderr)
         return 2
+    if args.init:
+        target = write_init_env(args.data_dir, host=args.host, port=args.port, token=args.token or None)
+        print(f"wrote {target} (0600). Next:\n  trace-server --env-file {target} --host {args.host} --port {args.port}")
+        return 0
+    loopback = args.host in {"127.0.0.1", "localhost", "::1"}
+    oauth_ready = bool(args.github_client_id and args.github_client_secret)
+    protect = (
+        args.protect_reads
+        if args.protect_reads is not None
+        else (_env_bool("TRACE_PROTECT_READS") or (bool(args.token) and not loopback))
+    )
+    if not loopback and not oauth_ready and not (protect and args.token):
+        print(
+            f"!!! Research Trace is listening on {args.host}:{args.port} with ANONYMOUS reads: every read endpoint\n"
+            "!!! (raw transcripts, tool arguments, attachments) is open to anyone who can reach that address.\n"
+            "!!! Fix: `trace-server --init` (one access key guards reads and writes) or configure GitHub OAuth,\n"
+            "!!! or keep --host 127.0.0.1 behind an SSH tunnel / reverse proxy that does the authentication.",
+            file=sys.stderr,
+        )
     uvicorn.run(
         create_app(
-            args.data_dir, token=args.token, base_path=args.base_path,
-            github_client_id=args.github_client_id, github_client_secret=args.github_client_secret,
-            session_secret=args.session_secret, github_admins=args.github_admins,
-            github_allowed_users=args.github_allowed_users, github_allowed_org=args.github_allowed_org,
-            github_allow_all=args.github_allow_all, session_days=args.session_days,
+            args.data_dir,
+            token=args.token,
+            base_path=args.base_path,
+            public_url=args.public_url,
+            github_client_id=args.github_client_id,
+            github_client_secret=args.github_client_secret,
+            session_secret=args.session_secret,
+            github_admins=args.github_admins,
+            github_allowed_users=args.github_allowed_users,
+            github_allowed_org=args.github_allowed_org,
+            github_allow_all=args.github_allow_all,
+            session_days=args.session_days,
             device_credential_days=args.device_credential_days,
             device_start_limit=args.device_start_limit,
             device_start_window_seconds=args.device_start_window_seconds,
             trust_proxy_headers=args.trust_proxy_headers,
             insecure_cookies=args.insecure_cookies,
+            protect_reads=protect,
+            allowed_networks=args.allowed_networks,
         ),
-        host=args.host, port=args.port, workers=1,
+        host=args.host,
+        port=args.port,
+        workers=1,
     )
     return 0
 

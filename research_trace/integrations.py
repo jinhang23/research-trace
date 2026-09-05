@@ -9,8 +9,9 @@ import os
 import uuid
 from typing import Any
 
-from .frameworks import BasicMemory, MLflowEvidence, fingerprint, load_config, stable_json
+from .frameworks import BasicMemory, MLflowEvidence, load_config
 from .storage import NotFound, ValidationError, now_utc
+from .visible import fingerprint, stable_json
 
 
 def notes_for_project(project: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -21,14 +22,19 @@ def notes_for_project(project: dict[str, Any]) -> dict[str, dict[str, Any]]:
     items += [("chapter", c, c.get("summary", ""), c["name"]) for c in project["chapters"]]
     items += [("node", n, n.get("body", ""), n["title"]) for n in project["nodes"]]
     for kind, item, body, title in items:
-        comments = item.get("comments", []) if kind == "node" else [
-            c for c in project.get("comments", [])
-            if c["target_type"] == kind and c["target_id"] == item["id"]
-        ]
+        comments = (
+            item.get("comments", [])
+            if kind == "node"
+            else [c for c in project.get("comments", []) if c["target_type"] == kind and c["target_id"] == item["id"]]
+        )
         key = f"{pid}/{kind}/{item['id']}"
         hit = {
-            "id": item["id"], "project_id": pid, "scope": kind, "title": title,
-            "body": body, "version": item.get("version", 1),
+            "id": item["id"],
+            "project_id": pid,
+            "scope": kind,
+            "title": title,
+            "body": body,
+            "version": item.get("version", 1),
             "chapter_id": item.get("chapter_id"),
             "review_state": item.get("review_state"),
             "occurred_at": item.get("occurred_at") or item.get("updated_at"),
@@ -50,7 +56,9 @@ def notes_for_project(project: dict[str, Any]) -> dict[str, dict[str, Any]]:
         for attachment in item.get("attachments", []):
             content += f"\n\n附件：{attachment['name']}\n{attachment.get('uri') or ''}"
         notes[key] = {
-            "key": key, "hit": hit, "content": content,
+            "key": key,
+            "hit": hit,
+            "content": content,
             "fingerprint": fingerprint(content),
             "title": f"rt-{kind}-{item['id']}".replace("_", "-"),
             "directory": f"research-trace/{pid}",
@@ -83,10 +91,8 @@ class Integrations:
         self.store = store
         self.config = config if config is not None else load_config(config_path)
         self.bindings = self.config.get("projects", {})
-        self.memory = memory or (BasicMemory(self.config["basic_memory"])
-                                 if self.config.get("basic_memory") else None)
-        self.mlflow = mlflow or (MLflowEvidence(self.config["mlflow"])
-                                 if self.config.get("mlflow") else None)
+        self.memory = memory or (BasicMemory(self.config["basic_memory"]) if self.config.get("basic_memory") else None)
+        self.mlflow = mlflow or (MLflowEvidence(self.config["mlflow"]) if self.config.get("mlflow") else None)
         self.state_path = store.data_dir / "integration-index-state.json"
         self.state = {}
         # Binding changes should retire old managed notes on the same backend.
@@ -108,11 +114,18 @@ class Integrations:
         }
 
     def health(self):
-        return {**self.status, "bound_projects": list(self.bindings),
-                "capabilities": {pid: {"mlflow": bool(self.mlflow and b.get("mlflow_experiment_ids")),
-                                       "memory": bool(self.memory and b.get("memory_project"))}
-                                 for pid, b in self.bindings.items()},
-                "indexed_notes": len(self.state)}
+        return {
+            **self.status,
+            "bound_projects": list(self.bindings),
+            "capabilities": {
+                pid: {
+                    "mlflow": bool(self.mlflow and b.get("mlflow_experiment_ids")),
+                    "memory": bool(self.memory and b.get("memory_project")),
+                }
+                for pid, b in self.bindings.items()
+            },
+            "indexed_notes": len(self.state),
+        }
 
     def _save_state(self):
         temporary = self.state_path.with_name(f".{self.state_path.name}.{uuid.uuid4().hex}.tmp")
@@ -140,62 +153,90 @@ class Integrations:
             status.update(state="syncing", last_attempt_at=now_utc())
             try:
                 current = self._notes()
-                changes = [(key, note) for key, note in current.items()
-                           if self.state.get(key, {}).get("fingerprint") != note["fingerprint"]
-                           or self.state.get(key, {}).get("memory_project") != self.bindings[note["hit"]["project_id"]]["memory_project"]]
-                removals = [key for key in self.state if key not in current
-                            or self.state[key]["memory_project"] != self.bindings[current[key]["hit"]["project_id"]]["memory_project"]]
+                changes = [
+                    (key, note)
+                    for key, note in current.items()
+                    if self.state.get(key, {}).get("fingerprint") != note["fingerprint"]
+                    or self.state.get(key, {}).get("memory_project")
+                    != self.bindings[note["hit"]["project_id"]]["memory_project"]
+                ]
+                removals = [
+                    key
+                    for key in self.state
+                    if key not in current
+                    or self.state[key]["memory_project"]
+                    != self.bindings[current[key]["hit"]["project_id"]]["memory_project"]
+                ]
                 if changes or removals:
                     async with self.memory.session() as client:
                         for key in removals:
                             prior = self.state[key]
-                            result = await self.memory.call(client, "delete_note", {
-                                "project": prior["memory_project"], "identifier": prior["permalink"],
-                                "is_directory": False, "output_format": "json",
-                            })
+                            result = await self.memory.call(
+                                client,
+                                "delete_note",
+                                {
+                                    "project": prior["memory_project"],
+                                    "identifier": prior["permalink"],
+                                    "is_directory": False,
+                                    "output_format": "json",
+                                },
+                            )
                             # Upstream can return deleted=false as a successful
                             # MCP result. Only an explicit absent-note response
                             # is equivalent to a successful idempotent delete.
                             ack = next((d for d in dictionaries(result) if "deleted" in d), {})
-                            absent = (ack.get("deleted") is False and not ack.get("error")
-                                      and all(k in ack and ack[k] is None for k in ("title", "permalink", "file_path")))
+                            absent = (
+                                ack.get("deleted") is False
+                                and not ack.get("error")
+                                and all(k in ack and ack[k] is None for k in ("title", "permalink", "file_path"))
+                            )
                             if not (ack.get("deleted") is True or absent):
                                 raise RuntimeError("Basic Memory did not acknowledge managed note removal")
                             del self.state[key]
                             self._save_state()
                         for key, note in changes:
                             pid = note["hit"]["project_id"]
-                            result = await self.memory.call(client, "write_note", {
-                                "project": self.bindings[pid]["memory_project"],
-                                "title": note["title"], "directory": note["directory"],
-                                "content": note["content"], "note_type": "research_trace",
-                                "tags": ["research-trace", note["hit"]["scope"]],
-                                "metadata": {"research_trace_key": key,
-                                             "research_trace_version": note["hit"]["version"],
-                                             "research_trace_fingerprint": note["fingerprint"]},
-                                "overwrite": True, "output_format": "json",
-                            })
+                            result = await self.memory.call(
+                                client,
+                                "write_note",
+                                {
+                                    "project": self.bindings[pid]["memory_project"],
+                                    "title": note["title"],
+                                    "directory": note["directory"],
+                                    "content": note["content"],
+                                    "note_type": "research_trace",
+                                    "tags": ["research-trace", note["hit"]["scope"]],
+                                    "metadata": {
+                                        "research_trace_key": key,
+                                        "research_trace_version": note["hit"]["version"],
+                                        "research_trace_fingerprint": note["fingerprint"],
+                                    },
+                                    "overwrite": True,
+                                    "output_format": "json",
+                                },
+                            )
                             permalink = permalink_from(result)
                             if not permalink:
                                 raise RuntimeError("Basic Memory did not acknowledge a note permalink")
                             self.state[key] = {
-                                "project_id": pid, "memory_project": self.bindings[pid]["memory_project"],
-                                "permalink": permalink, "fingerprint": note["fingerprint"],
+                                "project_id": pid,
+                                "memory_project": self.bindings[pid]["memory_project"],
+                                "permalink": permalink,
+                                "fingerprint": note["fingerprint"],
                             }
                             self._save_state()
-                status.update(state="ready", last_success_at=now_utc(), error=None,
-                              pending=0, indexed_notes=len(self.state))
+                status.update(
+                    state="ready", last_success_at=now_utc(), error=None, pending=0, indexed_notes=len(self.state)
+                )
             except Exception as exc:
-                status.update(state="error", error=f"{type(exc).__name__}: knowledge index sync failed",
-                              pending=True)
+                status.update(state="error", error=f"{type(exc).__name__}: knowledge index sync failed", pending=True)
         return self.health()
 
     async def run(self):
         while not self.stop_event.is_set():
             await self.sync()
             try:
-                await asyncio.wait_for(self.stop_event.wait(),
-                                       float(self.config.get("sync_interval_seconds", 60)))
+                await asyncio.wait_for(self.stop_event.wait(), float(self.config.get("sync_interval_seconds", 60)))
             except asyncio.TimeoutError:
                 pass
 
@@ -212,7 +253,8 @@ class Integrations:
             for pid in dict.fromkeys(note["hit"]["project_id"] for note in current.values()):
                 response = await self.memory.search(self.bindings[pid]["memory_project"], query, 100)
                 aliases = {
-                    value["permalink"]: key for key, value in self.state.items()
+                    value["permalink"]: key
+                    for key, value in self.state.items()
                     if value["project_id"] == pid and key in current
                 }
                 seen = set()
@@ -230,9 +272,13 @@ class Integrations:
             result = self.store.search(query, project_id=project_id, scope=scope, limit=limit).as_dict()
             current = self._notes(project_id)
             resolved = [
-                {**current[key]["hit"], "retrieval_source": "basic_memory",
-                 "index_stale": self.state.get(key, {}).get("fingerprint") != current[key]["fingerprint"]}
-                for key in matched_keys if key in current
+                {
+                    **current[key]["hit"],
+                    "retrieval_source": "basic_memory",
+                    "index_stale": self.state.get(key, {}).get("fingerprint") != current[key]["fingerprint"],
+                }
+                for key in matched_keys
+                if key in current
             ]
             curated, raw, seen = [], [], set()
             for hit in [*resolved, *result["hits"]]:
@@ -249,17 +295,24 @@ class Integrations:
                 selected = curated[:curated_count] + raw[:raw_count]
             else:
                 selected = (curated or raw)[:limit]
-            result.update(hits=selected, returned={
-                name: sum(h["scope"] == name for h in selected)
-                for name in {h["scope"] for h in selected}
-            })
-            result["retrieval"] = {"backend": "basic_memory+local", "index_state": self.status["basic_memory"]["state"],
-                                   "external_matches": len(resolved), "totals_scope": "local_keyword_matches",
-                                   "candidate_omitted": len(curated) + len(raw) - len(selected)}
+            result.update(
+                hits=selected,
+                returned={name: sum(h["scope"] == name for h in selected) for name in {h["scope"] for h in selected}},
+            )
+            result["retrieval"] = {
+                "backend": "basic_memory+local",
+                "index_state": self.status["basic_memory"]["state"],
+                "external_matches": len(resolved),
+                "totals_scope": "local_keyword_matches",
+                "candidate_omitted": len(curated) + len(raw) - len(selected),
+            }
         except Exception as exc:
             result = self.store.search(query, project_id=project_id, scope=scope, limit=limit).as_dict()
-            result["retrieval"] = {"backend": "local", "fallback": True,
-                                   "error": f"{type(exc).__name__}: knowledge search unavailable"}
+            result["retrieval"] = {
+                "backend": "local",
+                "fallback": True,
+                "error": f"{type(exc).__name__}: knowledge search unavailable",
+            }
         return result
 
     async def import_evidence(self, project_id, *, kind, external_id, node_id=None, name=None):
@@ -286,11 +339,11 @@ class Integrations:
         session_id = "mlflow_" + fingerprint([project_id, snapshot["source_id"], kind, external_id])
         async with self.import_lock:
             ingest = self.store.ingest(
-                batch_id=event_id, project_id=project_id,
-                session={"id": session_id, "source": "mlflow",
-                         "metadata": {"kind": kind, "external_id": external_id}},
-                agents=[], events=[{"event_id": event_id, "event_type": f"MLflow{kind.title()}",
-                                    "payload": snapshot}],
+                batch_id=event_id,
+                project_id=project_id,
+                session={"id": session_id, "source": "mlflow", "metadata": {"kind": kind, "external_id": external_id}},
+                agents=[],
+                events=[{"event_id": event_id, "event_type": f"MLflow{kind.title()}", "payload": snapshot}],
                 delivered_by="integration:mlflow",
             )
             attachment = None
@@ -298,16 +351,30 @@ class Integrations:
                 node = next((n for n in self.store.get_project(project_id)["nodes"] if n["id"] == node_id), None)
                 if node is None:
                     raise NotFound("evidence target no longer exists")
-                attachment = next((a for a in node["attachments"]
-                                   if a["metadata"].get("source_event_id") == event_id), None)
+                attachment = next(
+                    (a for a in node["attachments"] if a["metadata"].get("source_event_id") == event_id), None
+                )
                 if not attachment:
                     attachment = self.store.attach(
-                        project_id, target_type="node", target_id=node_id,
-                        name=name or f"MLflow {kind} {external_id}", direction="reference",
-                        mime_type="application/json", data_base64=base64.b64encode(raw).decode("ascii"),
-                        metadata={"provider": "mlflow", "kind": kind, "external_id": external_id,
-                                  "source_event_id": event_id, "experiment_id": snapshot["experiment_id"]},
+                        project_id,
+                        target_type="node",
+                        target_id=node_id,
+                        name=name or f"MLflow {kind} {external_id}",
+                        direction="reference",
+                        mime_type="application/json",
+                        data_base64=base64.b64encode(raw).decode("ascii"),
+                        metadata={
+                            "provider": "mlflow",
+                            "kind": kind,
+                            "external_id": external_id,
+                            "source_event_id": event_id,
+                            "experiment_id": snapshot["experiment_id"],
+                        },
                     )
             self.status["mlflow"].update(state="ready", last_success_at=now_utc(), error=None)
-            return {"source_event_id": event_id, "duplicate": ingest.get("duplicate", False),
-                    "attachment": attachment, "evidence": snapshot}
+            return {
+                "source_event_id": event_id,
+                "duplicate": ingest.get("duplicate", False),
+                "attachment": attachment,
+                "evidence": snapshot,
+            }

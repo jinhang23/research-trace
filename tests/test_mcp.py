@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-import io
 import json
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -31,15 +33,22 @@ class FakeRemote:
 
 def _call(name="trace_context", arguments=None, request_id=1):
     return {
-        "jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "tools/call",
         "params": {"name": name, "arguments": {} if arguments is None else arguments},
     }
 
 
 def test_mcp_exposes_six_research_tools_plus_device_login():
     assert [tool["name"] for tool in TOOLS] == [
-        "trace_context", "trace_ingest", "trace_record", "trace_curate",
-        "trace_attach", "trace_search", "trace_login",
+        "trace_context",
+        "trace_ingest",
+        "trace_record",
+        "trace_curate",
+        "trace_attach",
+        "trace_search",
+        "trace_login",
     ]
 
 
@@ -60,10 +69,16 @@ def test_recorder_tool_cannot_create_chapters_or_advertise_identity_knobs():
         def request(self, method, path, payload=None):
             return {"method": method, "path": path, "payload": payload}
 
-    result = call_tool(Remote(), "trace_record", {
-        "project_id": "project-1", "idempotency_key": "batch-1:0", "title": "Result",
-        "chapter_name": "invented",
-    })
+    result = call_tool(
+        Remote(),
+        "trace_record",
+        {
+            "project_id": "project-1",
+            "idempotency_key": "batch-1:0",
+            "title": "Result",
+            "chapter_name": "invented",
+        },
+    )
     assert "chapter_name" not in result["payload"]
 
 
@@ -81,6 +96,7 @@ def test_instructions_do_not_send_the_recorder_at_raw_delivery():
 def test_trace_context_binds_a_directory_only_when_explicitly_asked(tmp_path):
     """§7 的 MCP 侧绑定入口。没传 bind_path 就一个 marker 都不许写——
     绑定是人的动作，agent 不能替用户决定录哪个目录。"""
+
     class Remote:
         def request(self, method, path, payload=None):
             self.last = payload
@@ -90,9 +106,14 @@ def test_trace_context_binds_a_directory_only_when_explicitly_asked(tmp_path):
     call_tool(remote, "trace_context", {"workspace_keys": ["rt-ws-abc"]})
     assert not (tmp_path / ".research-trace.json").exists()
 
-    result = call_tool(remote, "trace_context", {
-        "workspace_keys": ["rt-ws-abc"], "bind_path": str(tmp_path),
-    })
+    result = call_tool(
+        remote,
+        "trace_context",
+        {
+            "workspace_keys": ["rt-ws-abc"],
+            "bind_path": str(tmp_path),
+        },
+    )
     assert "bind_path" not in remote.last, "bind_path must not be forwarded to the server"
     marker = json.loads((tmp_path / ".research-trace.json").read_text(encoding="utf-8"))
     assert marker["project_id"] == "proj-7"
@@ -142,22 +163,28 @@ def test_manifest_loader_reads_raw_files_without_model_transcription(tmp_path):
     (root / "pending").mkdir()
     (root / "transcripts" / "pending").mkdir(parents=True)
     event = {
-        "event_id": "event-1", "session_id": "session-1", "agent_id": "agent-1",
-        "agent_type": "fork", "hook_event": "PostToolUse", "payload": {"ok": True},
+        "event_id": "event-1",
+        "session_id": "session-1",
+        "agent_id": "agent-1",
+        "agent_type": "fork",
+        "hook_event": "PostToolUse",
+        "payload": {"ok": True},
     }
     (root / "pending" / "event.json").write_text(json.dumps(event), encoding="utf-8")
-    (root / "transcripts" / "pending" / "chunk.jsonl").write_text(
-        '{"message":"verbatim"}\n', encoding="utf-8"
-    )
+    (root / "transcripts" / "pending" / "chunk.jsonl").write_text('{"message":"verbatim"}\n', encoding="utf-8")
     manifest = {
         "batch_id": "batch-1",
         "session_id": "session-1",
         "project_dir": "/work/project",
         "events": ["pending/event.json"],
-        "transcript_chunks": [{
-            "path": "transcripts/pending/chunk.jsonl", "chunk_id": "chunk-1",
-            "session_id": "session-1", "agent_id": "agent-1",
-        }],
+        "transcript_chunks": [
+            {
+                "path": "transcripts/pending/chunk.jsonl",
+                "chunk_id": "chunk-1",
+                "session_id": "session-1",
+                "agent_id": "agent-1",
+            }
+        ],
     }
     path = root / "batches" / "batch-1.json"
     path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -171,9 +198,7 @@ def test_manifest_loader_reads_raw_files_without_model_transcription(tmp_path):
     (root / "sent").mkdir()
     (root / "transcripts" / "sent").mkdir()
     (root / "pending" / "event.json").rename(root / "sent" / "event.json")
-    (root / "transcripts" / "pending" / "chunk.jsonl").rename(
-        root / "transcripts" / "sent" / "chunk.jsonl"
-    )
+    (root / "transcripts" / "pending" / "chunk.jsonl").rename(root / "transcripts" / "sent" / "chunk.jsonl")
     after = _manifest_payload(str(path), "project-1")
     assert after["events"][0]["event_id"] == "event-1"
     assert after["transcript_chunks"][0]["content"].endswith("verbatim\"}\n")
@@ -186,9 +211,16 @@ def test_a_manifest_pointing_only_outside_the_session_is_still_refused(tmp_path)
     outside = tmp_path / "secret.json"
     outside.write_text(json.dumps({"event_id": "leak"}), encoding="utf-8")
     path = root / "batches" / "b.json"
-    path.write_text(json.dumps({
-        "batch_id": "b", "session_id": "s", "events": ["../secret.json"],
-    }), encoding="utf-8")
+    path.write_text(
+        json.dumps(
+            {
+                "batch_id": "b",
+                "session_id": "s",
+                "events": ["../secret.json"],
+            }
+        ),
+        encoding="utf-8",
+    )
     with pytest.raises(RuntimeError):
         _manifest_payload(str(path))
 
@@ -197,25 +229,12 @@ def test_a_manifest_pointing_only_outside_the_session_is_still_refused(tmp_path)
 # 手写 JSON-RPC 就得自己守住这些规矩，所以每一条都得有测试盯着。
 
 
-
-
-
-
-
-
-
-
-
-
-
-
 # --------------------------------------------------------------- stdio 编码
-
-
 
 
 def test_force_utf8_stdio_pins_both_ends_to_utf8(monkeypatch):
     """Windows 上默认按本地 code page 解码 stdin，中文在进入工具之前就已经是乱码。"""
+
     class FakeStream:
         def __init__(self):
             self.kwargs = None
@@ -235,3 +254,29 @@ def test_force_utf8_stdio_pins_both_ends_to_utf8(monkeypatch):
 
     monkeypatch.setattr(mcp.sys, "stdout", Unreconfigurable())
     force_utf8_stdio()  # 流被换成不支持 reconfigure 的对象时不能炸掉进程
+
+
+# ------------------------------------------------------------- 解释器错配
+def _run_without_sdk(*argv: str) -> subprocess.CompletedProcess[str]:
+    """在一个 `mcp` 不可导入的解释器里跑 trace_mcp.py。插件的 `python` 默认是裸 `python3`，
+    UF/conda 上它常常不是 pip install 进去的那个；这时 Claude Code 只显示 CONNECTION_CLOSED。"""
+
+    script = Path(__file__).resolve().parents[1] / "trace_mcp.py"
+    code = (
+        "import sys, runpy; sys.modules['mcp'] = None; "
+        f"sys.argv = ['trace_mcp.py', *{list(argv)!r}]; runpy.run_path({str(script)!r}, run_name='__main__')"
+    )
+    return subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, input="", timeout=60)
+
+
+def test_selfcheck_fails_loudly_when_the_interpreter_has_no_mcp_sdk():
+    result = _run_without_sdk("--selfcheck", "--url", "http://127.0.0.1:1")
+    assert result.returncode == 2
+    assert "not importable" in result.stderr and "python" in result.stderr and "sys.executable" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_stdio_server_explains_the_missing_sdk_instead_of_dying_in_the_handshake():
+    result = _run_without_sdk()
+    assert result.returncode == 2
+    assert "research-trace MCP" in result.stderr and "Traceback" not in result.stderr

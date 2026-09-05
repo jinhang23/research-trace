@@ -19,11 +19,13 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from . import PLUGIN_VERSION
 from .device_login import (
     clear_pending_login,
     default_credential_file,
     load_device_credential,
     load_pending_login,
+    open_url,
     poll_login,
     request_json,
     save_device_credential,
@@ -31,8 +33,7 @@ from .device_login import (
     start_login,
 )
 
-
-SERVER_INFO = {"name": "research-trace", "version": "2.0.0-alpha.28"}
+SERVER_INFO = {"name": "research-trace", "version": PLUGIN_VERSION}
 INSTRUCTIONS = (
     "Research Trace has a raw-history layer and a selective semantic layer. "
     "Capture is opt-in per project: a directory without a .research-trace.json marker records "
@@ -65,7 +66,9 @@ TOOLS: list[dict[str, Any]] = [
                 "create_if_missing": {"type": "boolean", "default": False},
                 "project_name": {"type": "string"},
                 "recent_limit": {
-                    "type": "integer", "minimum": 1, "maximum": 100,
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
                     "description": "Start small (e.g. 6); search for relevant older records when needed. This recent list is not the complete history.",
                 },
                 "include_dataflow": {
@@ -109,10 +112,12 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "trace_record",
-        "description": ("Create or retry one valuable unreviewed Node in an existing human-defined Chapter; "
-                        "omit chapter_id for Inbox. Set parent_id when this continues earlier work - "
-                        "the structure view is built from that field alone. Group related experiments in one Node; "
-                        "untried ideas are valid records. Omit unknown links instead of guessing."),
+        "description": (
+            "Create or retry one valuable unreviewed Node in an existing human-defined Chapter; "
+            "omit chapter_id for Inbox. Set parent_id when this continues earlier work - "
+            "the structure view is built from that field alone. Group related experiments in one Node; "
+            "untried ideas are valid records. Omit unknown links instead of guessing."
+        ),
         "inputSchema": {
             "type": "object",
             "required": ["project_id", "idempotency_key", "title"],
@@ -148,8 +153,11 @@ TOOLS: list[dict[str, Any]] = [
                     ),
                 },
                 "labels": {"type": "array", "items": {"type": "string"}},
-                "run_ids": {"type":"array", "items":{"type":"string"},
-                            "description":"Existing IDs from trace_context.recent_runs. Associate multiple runs with this research narrative; code, job status and W&B links remain available."},
+                "run_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Existing IDs from trace_context.recent_runs. Associate multiple runs with this research narrative; code, job status and W&B links remain available.",
+                },
                 "occurred_at": {"type": "string"},
                 "source_event_ids": {
                     "type": "array",
@@ -235,10 +243,16 @@ TOOLS: list[dict[str, Any]] = [
                 "size": {"type": "integer"},
                 "sha256": {"type": "string"},
                 "metadata": {"type": "object"},
-                "integration": {"type": "string", "enum": ["mlflow"],
-                                "description": "Fetch a configured MLflow run/trace as verified source evidence on this Node; no need to copy metrics by hand."},
+                "integration": {
+                    "type": "string",
+                    "enum": ["mlflow"],
+                    "description": "Fetch a configured MLflow run/trace as verified source evidence on this Node; no need to copy metrics by hand.",
+                },
                 "external_kind": {"type": "string", "enum": ["run", "trace"]},
-                "external_id": {"type": "string", "description": "Exact MLflow run or trace id; its experiment must be bound to this project."},
+                "external_id": {
+                    "type": "string",
+                    "description": "Exact MLflow run or trace id; its experiment must be bound to this project.",
+                },
             },
         },
     },
@@ -278,12 +292,12 @@ TOOLS: list[dict[str, Any]] = [
 
 
 class Remote:
-    def __init__(
-        self, url: str, token: str = "", credential_file: str | os.PathLike[str] | None = None
-    ):
+    def __init__(self, url: str, token: str = "", credential_file: str | os.PathLike[str] | None = None):
         self.url = url.rstrip("/")
         self.explicit_token = token
-        self.credential_file = Path(credential_file).expanduser().resolve() if credential_file else default_credential_file()
+        self.credential_file = (
+            Path(credential_file).expanduser().resolve() if credential_file else default_credential_file()
+        )
 
     def auth_token(self) -> str:
         if self.explicit_token:
@@ -295,12 +309,11 @@ class Remote:
         if action == "start":
             current = load_device_credential(self.credential_file, self.url)
             if current:
-                status, health = request_json(
-                    self.url, "GET", "/api/health", credential=current["credential"]
-                )
+                status, health = request_json(self.url, "GET", "/api/health", credential=current["credential"])
                 if status == 200 and not health.get("authentication_required"):
                     return {
-                        "status": "connected", "user": current.get("user"),
+                        "status": "connected",
+                        "user": current.get("user"),
                         "device": current.get("device"),
                     }
             value = start_login(self.url, device_name or socket.gethostname())
@@ -325,12 +338,11 @@ class Remote:
         if not pending:
             current = load_device_credential(self.credential_file, self.url)
             if current:
-                status, health = request_json(
-                    self.url, "GET", "/api/health", credential=current["credential"]
-                )
+                status, health = request_json(self.url, "GET", "/api/health", credential=current["credential"])
                 if status == 200 and not health.get("authentication_required"):
                     return {
-                        "status": "connected", "user": current.get("user"),
+                        "status": "connected",
+                        "user": current.get("user"),
                         "device": current.get("device"),
                         "expires_at": current.get("expires_at"),
                     }
@@ -342,12 +354,15 @@ class Remote:
             clear_pending_login(self.credential_file, self.url)
             expires_at = value.get("expires_at") or (value.get("device") or {}).get("expires_at")
             return {
-                "status": "connected", "user": value.get("user"), "device": value.get("device"),
+                "status": "connected",
+                "user": value.get("user"),
+                "device": value.get("device"),
                 "expires_at": expires_at,
                 "next": (
-                    "This credential expires; renew it on the command line with "
-                    "`trace-login --renew` before then."
-                ) if expires_at else None,
+                    "This credential expires; renew it on the command line with `trace-login --renew` before then."
+                )
+                if expires_at
+                else None,
             }
         return {
             "status": "pending",
@@ -364,7 +379,7 @@ class Remote:
             headers["Authorization"] = f"Bearer {token}"
         request = urllib.request.Request(self.url + path, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
+            with open_url(request, timeout=60) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode("utf-8", errors="replace")
@@ -442,8 +457,7 @@ def _manifest_payload(path_value: str, project_id: str | None = None) -> dict[st
             }
     if not events and not chunks and missing:
         raise RuntimeError(
-            f"manifest {path} references {len(missing)} file(s) that no longer exist: "
-            + ", ".join(missing[:5])
+            f"manifest {path} references {len(missing)} file(s) that no longer exist: " + ", ".join(missing[:5])
         )
     return {
         "batch_id": manifest.get("batch_id"),
@@ -452,9 +466,10 @@ def _manifest_payload(path_value: str, project_id: str | None = None) -> dict[st
             "id": session_id,
             "source": "claude-code",
             "cwd": manifest.get("project_dir"),
-            "metadata": {"manifest": str(path), "missing_files": missing} if missing
-            else {"manifest": str(path)},
-        } if session_id else None,
+            "metadata": {"manifest": str(path), "missing_files": missing} if missing else {"manifest": str(path)},
+        }
+        if session_id
+        else None,
         "agents": list(agents.values()),
         "events": events,
         "transcript_chunks": chunks,
@@ -506,9 +521,7 @@ def call_tool(remote: Remote, name: str, args: dict[str, Any]) -> Any:
                 )
         if bind_path and isinstance(result, dict) and result.get("matched") is not False:
             result = dict(result)
-            result["bound"] = _bind_marker(
-                bind_path, result, [str(k) for k in (value.get("workspace_keys") or [])]
-            )
+            result["bound"] = _bind_marker(bind_path, result, [str(k) for k in (value.get("workspace_keys") or [])])
         return result
     if name == "trace_ingest":
         value = _manifest_payload(args["manifest_path"], args.get("project_id")) if args.get("manifest_path") else args
@@ -530,14 +543,18 @@ def call_tool(remote: Remote, name: str, args: dict[str, Any]) -> Any:
             value.setdefault("size", len(raw))
         return remote.request("POST", "/api/attach", value)
     if name == "trace_search":
-        query = urllib.parse.urlencode({
-            key: value for key, value in {
-                "q": args.get("query"),
-                "project_id": args.get("project_id"),
-                "scope": args.get("scope", "all"),
-                "limit": args.get("limit", 50),
-            }.items() if value is not None
-        })
+        query = urllib.parse.urlencode(
+            {
+                key: value
+                for key, value in {
+                    "q": args.get("query"),
+                    "project_id": args.get("project_id"),
+                    "scope": args.get("scope", "all"),
+                    "limit": args.get("limit", 50),
+                }.items()
+                if value is not None
+            }
+        )
         return remote.request("GET", "/api/search?" + query)
     if name == "trace_login":
         return remote.device_login(args.get("action") or "start", args.get("device_name"))
@@ -564,8 +581,9 @@ def force_utf8_stdio() -> None:
 
 
 def sdk_server(remote: Remote):
-    from mcp.server.lowlevel import Server
     import mcp.types as types
+    from mcp.server.lowlevel import Server
+
     server = Server(SERVER_INFO['name'], version=SERVER_INFO['version'], instructions=INSTRUCTIONS)
 
     @server.list_tools()
@@ -576,17 +594,46 @@ def sdk_server(remote: Remote):
     async def invoke(name: str, arguments: dict):
         try:
             value = await asyncio.to_thread(call_tool, remote, name, arguments)
-            return types.CallToolResult(content=[types.TextContent(type='text', text=json.dumps(value, ensure_ascii=False))])
+            return types.CallToolResult(
+                content=[types.TextContent(type='text', text=json.dumps(value, ensure_ascii=False))]
+            )
         except Exception as exc:
-            return types.CallToolResult(isError=True, content=[types.TextContent(type='text', text=f'{type(exc).__name__}: {exc}')])
+            return types.CallToolResult(
+                isError=True, content=[types.TextContent(type='text', text=f'{type(exc).__name__}: {exc}')]
+            )
+
     return server
 
 
 async def serve(remote: Remote):
     from mcp.server.stdio import stdio_server
+
     server = sdk_server(remote)
     async with stdio_server() as (incoming, outgoing):
         await server.run(incoming, outgoing, server.create_initialization_options())
+
+
+def sdk_missing_hint() -> str | None:
+    """One actionable line when this interpreter cannot serve MCP at all.
+
+    The plugin's `python` setting defaults to a bare `python3`, which on most
+    machines is not the interpreter `pip install research-trace` went into.
+    Claude Code then only shows "CONNECTION_CLOSED"; without this the
+    traceback dies inside the stdio handshake and `--selfcheck` used to pass
+    anyway because it never imported the SDK.
+    """
+    import importlib
+
+    try:
+        importlib.import_module("mcp.server.stdio")
+    except ImportError as exc:
+        return (
+            f"research-trace MCP: the 'mcp' SDK is not importable in {sys.executable} ({exc}). "
+            "Either install the package into this interpreter (python -m pip install "
+            "'research-trace[server]') or point the plugin's `python` setting at the interpreter "
+            "that has it: python -c \"import sys; print(sys.executable)\""
+        )
+    return None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -597,6 +644,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--selfcheck", action="store_true")
     args = parser.parse_args(argv)
     force_utf8_stdio()
+    hint = sdk_missing_hint()
+    if hint:
+        print(hint, file=sys.stderr)
+        return 2
     remote = Remote(args.url, args.token, args.credential_file)
     if args.selfcheck:
         try:
@@ -605,6 +656,7 @@ def main(argv: list[str] | None = None) -> int:
             if (health.get("write_protected") or health.get("authentication_required")) and not remote.auth_token():
                 print("device login or legacy write token is required", file=sys.stderr)
                 return 1
+            print(f"mcp SDK importable in {sys.executable}; central reachable", file=sys.stderr)
             return 0
         except Exception as exc:
             print(str(exc), file=sys.stderr)

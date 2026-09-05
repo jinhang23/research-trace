@@ -4,10 +4,9 @@ hook 拉起的投递进程 stdout/stderr 都是 DEVNULL，还额外带 --quiet�
 能回答「上一轮到底怎么了」的地方就是 outbox 根上那个 delivery-status.json。
 它不写，`--status` 里「从来没启动过」和「一启动就死」就长得一模一样（都是 null）。
 """
+
 import json
 from pathlib import Path
-
-import pytest
 
 from research_trace.deliver import deliver_once, main
 
@@ -26,8 +25,9 @@ def status_file(tmp_path: Path) -> dict:
 
 def test_a_crashing_run_still_writes_a_status_file(tmp_path, monkeypatch, capsys):
     outbox(tmp_path)
-    monkeypatch.setattr("research_trace.deliver.deliver_once",
-                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("DNS 挂了")))
+    monkeypatch.setattr(
+        "research_trace.deliver.deliver_once", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("DNS 挂了"))
+    )
     code = main(["--data-dir", str(tmp_path), "--url", "https://example.org", "--quiet"])
     assert code == 1
     value = status_file(tmp_path)
@@ -38,8 +38,9 @@ def test_a_crashing_run_still_writes_a_status_file(tmp_path, monkeypatch, capsys
 
 def test_status_surfaces_the_failure_instead_of_a_bare_null(tmp_path, monkeypatch, capsys):
     outbox(tmp_path)
-    monkeypatch.setattr("research_trace.deliver.deliver_once",
-                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("HTTP 401")))
+    monkeypatch.setattr(
+        "research_trace.deliver.deliver_once", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("HTTP 401"))
+    )
     main(["--data-dir", str(tmp_path), "--url", "https://example.org", "--quiet"])
     capsys.readouterr()
     main(["--data-dir", str(tmp_path), "--status"])
@@ -59,6 +60,7 @@ def test_losing_the_lock_is_recorded_too(tmp_path):
     """抢不到锁原本只往 stderr 说一句，而那条路上 stderr 是 DEVNULL。"""
     target = outbox(tmp_path)
     from research_trace.deliver import _DeliverLock
+
     with _DeliverLock(target) as acquired:
         assert acquired
         report = deliver_once(tmp_path, "https://example.org")

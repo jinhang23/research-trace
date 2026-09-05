@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 
-import research_trace.mcp as mcp
 import research_trace.device_login as device_login
+import research_trace.mcp as mcp
 from research_trace.device_login import (
     load_device_credential,
     remove_device_credential,
@@ -15,8 +15,7 @@ def issued(credential: str = "rtd_" + "x" * 64):
     return {
         "status": "authorized",
         "credential": credential,
-        "device": {"id": "dev_1", "name": "hipergator",
-                   "expires_at": "2026-11-16T00:00:00.000+00:00"},
+        "device": {"id": "dev_1", "name": "hipergator", "expires_at": "2026-11-16T00:00:00.000+00:00"},
         "user": {"id": "usr_1", "login": "alice", "role": "member"},
         "expires_at": "2026-11-16T00:00:00.000+00:00",
     }
@@ -76,10 +75,19 @@ def test_login_cli_never_offers_a_one_click_approval_link(tmp_path, monkeypatch,
     monkeypatch.setattr(device_login, "start_login", lambda url, name: dict(started))
     monkeypatch.setattr(device_login, "poll_login", lambda url, code: issued())
     monkeypatch.setattr(device_login.webbrowser, "open", lambda url: opened.append(url) or True)
-    assert device_login.main([
-        "--url", "https://trace.example", "--device-name", "hpc",
-        "--credential-file", str(path),
-    ]) == 0
+    assert (
+        device_login.main(
+            [
+                "--url",
+                "https://trace.example",
+                "--device-name",
+                "hpc",
+                "--credential-file",
+                str(path),
+            ]
+        )
+        == 0
+    )
     output = capsys.readouterr().out
     assert "https://trace.example/device" in output
     assert "ABCD-EFGH" in output
@@ -103,9 +111,18 @@ def test_login_cli_renews_an_existing_credential_in_place(tmp_path, monkeypatch,
         return dict(fresh)
 
     monkeypatch.setattr(device_login, "renew_login", fake_renew)
-    assert device_login.main([
-        "--url", "https://trace.example", "--renew", "--credential-file", str(path),
-    ]) == 0
+    assert (
+        device_login.main(
+            [
+                "--url",
+                "https://trace.example",
+                "--renew",
+                "--credential-file",
+                str(path),
+            ]
+        )
+        == 0
+    )
     assert seen == ["rtd_" + "x" * 64]
     assert load_device_credential(path, "https://trace.example")["credential"].endswith("y" * 64)
     assert "2027-01-01" in capsys.readouterr().out

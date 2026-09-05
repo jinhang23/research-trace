@@ -30,15 +30,16 @@ SEPARATORS = "line one line two paragraphnext"
 
 def _git(repo, *args, check=True):
     return subprocess.run(
-        [GIT, "-C", str(repo), *args], check=check, text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        [GIT, "-C", str(repo), *args],
+        check=check,
+        text=True,
+        capture_output=True,
     )
 
 
 def _init_repo(path):
     subprocess.run([GIT, "init", "-q", "-b", "main", str(path)], check=True)
-    for key, value in (("user.email", "t@example.com"), ("user.name", "trace test"),
-                       ("commit.gpgsign", "false")):
+    for key, value in (("user.email", "t@example.com"), ("user.name", "trace test"), ("commit.gpgsign", "false")):
         _git(path, "config", key, value)
     return path
 
@@ -81,20 +82,32 @@ def populated_store(path):
     project = store.create_project("RNA project", overview="Current understanding")
     chapter = store.create_chapter(project["id"], "Data understanding")
     first = store.record_node(
-        project["id"], idempotency_key="n1", chapter_id=chapter["id"],
-        title="Inspect counts", body="Found a batch-shaped pattern.",
+        project["id"],
+        idempotency_key="n1",
+        chapter_id=chapter["id"],
+        title="Inspect counts",
+        body="Found a batch-shaped pattern.",
     )
     store.record_node(
-        project["id"], idempotency_key="n2", chapter_id=chapter["id"],
-        parent_id=first["id"], title="Check confounding",
+        project["id"],
+        idempotency_key="n2",
+        chapter_id=chapter["id"],
+        parent_id=first["id"],
+        title="Check confounding",
     )
     store.attach(
-        project["id"], target_type="node", target_id=first["id"], name="pca.png",
-        data_base64=base64.b64encode(b"image bytes").decode("ascii"), mime_type="image/png",
+        project["id"],
+        target_type="node",
+        target_id=first["id"],
+        name="pca.png",
+        data_base64=base64.b64encode(b"image bytes").decode("ascii"),
+        mime_type="image/png",
     )
     store.ingest(
-        batch_id="b1", project_id=project["id"],
-        session={"id": "s1", "source": "claude-code"}, agents=[],
+        batch_id="b1",
+        project_id=project["id"],
+        session={"id": "s1", "source": "claude-code"},
+        agents=[],
         events=[{"event_id": "e1", "event_type": "Stop", "payload": {"message": "done"}}],
         transcript_chunks=[{"chunk_id": "t1", "content": '{"message":"raw history"}\n'}],
     )
@@ -165,15 +178,9 @@ def test_backup_is_deterministic_verified_and_restores_an_empty_store(tmp_path):
     source, project = populated_store(tmp_path / "source")
     target = tmp_path / "backup"
     first_manifest = export_backup(source, target)
-    first_bytes = {
-        str(path.relative_to(target)): path.read_bytes()
-        for path in target.rglob("*") if path.is_file()
-    }
+    first_bytes = {str(path.relative_to(target)): path.read_bytes() for path in target.rglob("*") if path.is_file()}
     second_manifest = export_backup(source, target)
-    second_bytes = {
-        str(path.relative_to(target)): path.read_bytes()
-        for path in target.rglob("*") if path.is_file()
-    }
+    second_bytes = {str(path.relative_to(target)): path.read_bytes() for path in target.rglob("*") if path.is_file()}
     assert first_manifest == second_manifest
     assert first_bytes == second_bytes
     verify_backup(target)
@@ -182,8 +189,9 @@ def test_backup_is_deterministic_verified_and_restores_an_empty_store(tmp_path):
     result = restore_backup(target, restored)
     assert result["restored"] is True
     assert restored.health()["counts"] == source.health()["counts"]
-    assert ([(node["id"], node["title"], node["parent_id"]) for node in project_nodes(restored, project)]
-            == [(node["id"], node["title"], node["parent_id"]) for node in project_nodes(source, project)])
+    assert [(node["id"], node["title"], node["parent_id"]) for node in project_nodes(restored, project)] == [
+        (node["id"], node["title"], node["parent_id"]) for node in project_nodes(source, project)
+    ]
     child = node_by_title(restored, project, "Check confounding")
     assert child["parent_id"] == node_by_title(restored, project, "Inspect counts")["id"]
     assert restored.search("raw history", project_id=project["id"])[0]["scope"] == "transcript"
@@ -208,11 +216,12 @@ def test_backup_verification_rejects_tampering_and_restore_rejects_nonempty_stor
 def test_restore_survives_line_and_paragraph_separator_characters(tmp_path):
     store = Store(tmp_path / "source")
     project = store.create_project("Project", overview="overview " + SEPARATORS)
-    store.record_node(
-        project["id"], idempotency_key="n1", title="Weird text", body=SEPARATORS
-    )
+    store.record_node(project["id"], idempotency_key="n1", title="Weird text", body=SEPARATORS)
     store.ingest(
-        batch_id="b1", project_id=project["id"], session={"id": "s1"}, agents=[],
+        batch_id="b1",
+        project_id=project["id"],
+        session={"id": "s1"},
+        agents=[],
         events=[{"event_id": "e1", "event_type": "Stop", "payload": {"text": SEPARATORS}}],
         transcript_chunks=[{"chunk_id": "c1", "content": SEPARATORS + "\n"}],
     )
@@ -231,10 +240,14 @@ def test_restore_survives_line_and_paragraph_separator_characters(tmp_path):
 def test_transcript_table_export_carries_no_plaintext_copy(tmp_path):
     store = Store(tmp_path / "source")
     project = store.create_project("Project")
-    content = ("readable transcript line with plenty of repetition\n" * 200)
+    content = "readable transcript line with plenty of repetition\n" * 200
     store.ingest(
-        batch_id="b1", project_id=project["id"], session={"id": "s1"}, agents=[],
-        events=[], transcript_chunks=[{"chunk_id": "c1", "content": content}],
+        batch_id="b1",
+        project_id=project["id"],
+        session={"id": "s1"},
+        agents=[],
+        events=[],
+        transcript_chunks=[{"chunk_id": "c1", "content": content}],
     )
     target = tmp_path / "backup"
     export_backup(store, target)
@@ -260,10 +273,12 @@ def _backdate(store, table, stamp):
 def test_export_splits_volumes_by_year_and_then_by_capacity(tmp_path):
     store, project = populated_store(tmp_path / "source")
     store.ingest(
-        batch_id="b2", project_id=project["id"], session={"id": "s1"}, agents=[],
+        batch_id="b2",
+        project_id=project["id"],
+        session={"id": "s1"},
+        agents=[],
         events=[
-            {"event_id": f"e{n}", "event_type": "PostToolUse",
-             "payload": {"text": "x" * 400, "n": n}}
+            {"event_id": f"e{n}", "event_type": "PostToolUse", "payload": {"text": "x" * 400, "n": n}}
             for n in range(2, 40)
         ],
         transcript_chunks=[],
@@ -281,9 +296,7 @@ def test_export_splits_volumes_by_year_and_then_by_capacity(tmp_path):
     # 年内再按容量切：一年的 events 撑不进一个 4 KiB 的分片
     parts = json.loads((target / volumes["2024"]["manifest"]).read_text("utf-8"))["table_files"]
     assert len(parts["events"]) > 1, parts
-    assert all(
-        (target / "volumes" / "2024" / rel).stat().st_size <= 4096 + 512 for rel in parts["events"]
-    )
+    assert all((target / "volumes" / "2024" / rel).stat().st_size <= 4096 + 512 for rel in parts["events"])
     verify_backup(target)
 
     restored = Store(tmp_path / "restored")
@@ -320,8 +333,9 @@ def test_restore_merges_volumes_in_any_order(tmp_path):
     result = restore_backup(target, restored)
     assert set(result["volumes"]) == {entry["volume"] for entry in index["volumes"]}
     assert restored.health()["counts"] == store.health()["counts"]
-    assert ([(node["id"], node["parent_id"]) for node in project_nodes(restored, project)]
-            == [(node["id"], node["parent_id"]) for node in project_nodes(store, project)])
+    assert [(node["id"], node["parent_id"]) for node in project_nodes(restored, project)] == [
+        (node["id"], node["parent_id"]) for node in project_nodes(store, project)
+    ]
     assert node_by_title(restored, project, "Check confounding")["parent_id"] is not None
 
 
@@ -409,20 +423,19 @@ def test_backup_tree_survives_a_clone_with_core_autocrlf_true(tmp_path):
     _git(repo, "commit", "-q", "-m", "backup")
 
     clone = tmp_path / "clone"
-    subprocess.run(
-        [GIT, "-c", "core.autocrlf=true", "clone", "-q", str(repo), str(clone)], check=True
-    )
+    subprocess.run([GIT, "-c", "core.autocrlf=true", "clone", "-q", str(repo), str(clone)], check=True)
     cloned = clone / "research-trace-backup"
     assert b"-text" in (cloned / ".gitattributes").read_bytes()
-    assert one_file(cloned, "nodes.0001.jsonl").read_bytes() == one_file(
-        target, "nodes.0001.jsonl"
-    ).read_bytes(), "Windows 默认 autocrlf=true 不得改写备份字节"
+    assert one_file(cloned, "nodes.0001.jsonl").read_bytes() == one_file(target, "nodes.0001.jsonl").read_bytes(), (
+        "Windows 默认 autocrlf=true 不得改写备份字节"
+    )
 
     verify_backup(cloned)
     restored = Store(tmp_path / "restored")
     restore_backup(cloned, restored)
-    assert ([node["title"] for node in project_nodes(restored, project)]
-            == [node["title"] for node in project_nodes(store, project)])
+    assert [node["title"] for node in project_nodes(restored, project)] == [
+        node["title"] for node in project_nodes(store, project)
+    ]
 
 
 @requires_git
@@ -454,12 +467,14 @@ def test_one_missing_attachment_object_does_not_abort_the_whole_export(tmp_path)
     store, project = populated_store(tmp_path / "source")
     node_id = node_by_title(store, project, "Check confounding")["id"]
     kept = store.attach(
-        project["id"], target_type="node", target_id=node_id, name="keep.txt",
-        data_base64=base64.b64encode(b"still here").decode("ascii"), mime_type="text/plain",
+        project["id"],
+        target_type="node",
+        target_id=node_id,
+        name="keep.txt",
+        data_base64=base64.b64encode(b"still here").decode("ascii"),
+        mime_type="text/plain",
     )
-    lost_object = store._db.execute(
-        "SELECT object_path FROM attachments WHERE name='pca.png'"
-    ).fetchone()[0]
+    lost_object = store._db.execute("SELECT object_path FROM attachments WHERE name='pca.png'").fetchone()[0]
     (store.objects_dir / str(lost_object)).unlink()
 
     target = tmp_path / "backup"
@@ -515,9 +530,7 @@ def test_emergency_purge_can_rewrite_the_backup_repository(tmp_path):
     with pytest.raises(ValidationError, match="confirm"):
         rewrite_backup_history(store, repo, reason="token leaked into a node")
 
-    result = rewrite_backup_history(
-        store, repo, confirm=True, reason="token leaked into a node"
-    )
+    result = rewrite_backup_history(store, repo, confirm=True, reason="token leaked into a node")
     assert result["rewritten"] is True
     assert result["purge_generation"] == 1
     assert _git(bare, "rev-list", "--count", "HEAD").stdout.strip() == "1", "远端只剩一个根 commit"

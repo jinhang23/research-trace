@@ -3,20 +3,21 @@
 This adapter does not install hooks, commit changes, submit jobs or generate
 research conclusions. The isolated smoke script exercises those boundaries.
 """
+
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
-from contextlib import contextmanager
 import hashlib
 import io
 import json
-from pathlib import Path, PurePosixPath
 import re
 import stat
 import subprocess
 import threading
 import zipfile
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path, PurePosixPath
 
 from .visible import visible_content
 
@@ -57,9 +58,14 @@ def extract_code_archive(archive: bytes, destination: Path, *, max_bytes: int = 
         for member in members:
             path = PurePosixPath(member.filename)
             mode = member.external_attr >> 16
-            if (not path.parts or path.is_absolute() or ".." in path.parts
-                    or "\\" in member.filename or ":" in member.filename
-                    or stat.S_ISLNK(mode)):
+            if (
+                not path.parts
+                or path.is_absolute()
+                or ".." in path.parts
+                or "\\" in member.filename
+                or ":" in member.filename
+                or stat.S_ISLNK(mode)
+            ):
                 raise EvidenceError("Code archive contains an unsafe path or symlink")
             if not (destination / member.filename).resolve().is_relative_to(destination):
                 raise EvidenceError("Code archive escapes destination")
@@ -89,8 +95,7 @@ class EntireRepository:
         self.executable = str(Path(executable).resolve())
 
     def _run(self, args: list[str]) -> bytes:
-        result = subprocess.run(args, cwd=self.repository, capture_output=True,
-                                timeout=60, check=False)
+        result = subprocess.run(args, cwd=self.repository, capture_output=True, timeout=60, check=False)
         if result.returncode:
             # stderr may contain paths/content; callers can inspect local CLI logs.
             raise EvidenceError(f"Evidence command failed ({result.returncode}): {args[0]}")
@@ -104,8 +109,12 @@ class EntireRepository:
         """Official live-session export owns path discovery and partial-line handling."""
         if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,199}', session_id):
             raise EvidenceError('Invalid Entire session ID')
-        process = subprocess.Popen([self.executable, 'session', 'info', session_id, '--transcript'],
-                                   cwd=self.repository, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        process = subprocess.Popen(
+            [self.executable, 'session', 'info', session_id, '--transcript'],
+            cwd=self.repository,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
         timer = threading.Timer(60, process.kill)
         timer.daemon = True
         timer.start()
@@ -137,7 +146,7 @@ class EntireRepository:
                 continue
             if since_ns:
                 try:
-                    created=datetime.fromisoformat(point['date'].replace('Z','+00:00')).timestamp()
+                    created = datetime.fromisoformat(point['date'].replace('Z', '+00:00')).timestamp()
                 except (KeyError, ValueError, TypeError):
                     continue
                 if created < since_ns // 1_000_000_000:
@@ -148,8 +157,11 @@ class EntireRepository:
             if not re.fullmatch(r'[a-f0-9]{40}|[a-f0-9]{64}', commit):
                 continue
             names = self.git('ls-tree', '-r', '--name-only', '-z', commit).decode().split('\0')
-            names = {name for name in names if name and name != '.research-trace.json'
-                     and name.split('/')[0] not in {'.claude', '.entire'}}
+            names = {
+                name
+                for name in names
+                if name and name != '.research-trace.json' and name.split('/')[0] not in {'.claude', '.entire'}
+            }
             if names != set(files):
                 continue
             # Git exports the upstream tree. Never persist the raw archive,
@@ -157,7 +169,10 @@ class EntireRepository:
             raw = self.git('archive', '--format=zip', commit)
             output = io.BytesIO()
             matched = True
-            with zipfile.ZipFile(io.BytesIO(raw)) as original, zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as clean:
+            with (
+                zipfile.ZipFile(io.BytesIO(raw)) as original,
+                zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as clean,
+            ):
                 selected = [item for item in original.infolist() if item.filename in files]
                 if sum(item.file_size for item in selected) > max_code_bytes:
                     raise EvidenceError('Entire code exceeds configured size limit')
@@ -167,8 +182,11 @@ class EntireRepository:
                     content = original.read(item)
                     expected = files[item.filename]
                     mode = item.external_attr >> 16
-                    if (hashlib.sha256(content).hexdigest() != expected['sha256'] or stat.S_ISLNK(mode)
-                            or bool(mode & 0o111) != (expected['mode'] == '100755')):
+                    if (
+                        hashlib.sha256(content).hexdigest() != expected['sha256']
+                        or stat.S_ISLNK(mode)
+                        or bool(mode & 0o111) != (expected['mode'] == '100755')
+                    ):
                         matched = False
                         break
                     clean.writestr(item, content)
@@ -203,11 +221,13 @@ class EntireRepository:
         for index, session in enumerate(sessions):
             if not isinstance(session, dict) or not session.get("session_id") or session.get("index") != index:
                 raise EvidenceError("Unsupported Entire session metadata")
-            raw_text = self._run([self.executable, "checkpoint", "explain", checkpoint_id,
-                                  "--transcript", "--session-index", str(index)]).decode("utf-8")
+            raw_text = self._run(
+                [self.executable, "checkpoint", "explain", checkpoint_id, "--transcript", "--session-index", str(index)]
+            ).decode("utf-8")
             transcripts.append({"session_id": session["session_id"], "content": visible_transcript(raw_text)})
         archive = self.git("archive", "--format=zip", commit_hash)
         if len(archive) > max_code_bytes:
             raise EvidenceError("Code archive exceeds configured size limit")
-        return CheckpointEvidence(commit_hash, checkpoint_id, local_refs[0],
-                                  visible_content(metadata), tuple(transcripts), archive)
+        return CheckpointEvidence(
+            commit_hash, checkpoint_id, local_refs[0], visible_content(metadata), tuple(transcripts), archive
+        )

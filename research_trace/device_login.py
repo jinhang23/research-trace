@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import socket
@@ -91,14 +92,37 @@ def load_device_credential(path: str | os.PathLike[str] | None, url: str) -> dic
     target = Path(path).expanduser().resolve() if path else default_credential_file()
     key = normalize_server_url(url)
     value = _read_store(target).get("credentials", {}).get(key)
-    if not isinstance(value, dict) or not str(value.get("credential") or "").startswith("rtd_"):
+    if not isinstance(value, dict):
+        return None
+    credential = str(value.get("credential") or "")
+    if not credential:
+        return None
+    if not credential.startswith("rtd_") and value.get("kind") != "token":
         return None
     return dict(value)
 
 
-def save_device_credential(
-    path: str | os.PathLike[str] | None, url: str, response: dict[str, Any]
-) -> Path:
+def save_token_credential(path: str | os.PathLike[str] | None, url: str, token: str, device_name: str) -> Path:
+    """Store a deployment's shared access key next to device credentials.
+
+    Every client (deliverer, Recorder, MCP, trace-project) already reads this file, so one
+    `trace-login --token` per machine replaces exporting TRACE_TOKEN in every shell and
+    filling the plugin's `token` setting — the two places people forgot before.
+    """
+    target = Path(path).expanduser().resolve() if path else default_credential_file()
+    store = _read_store(target)
+    store["credentials"][normalize_server_url(url)] = {
+        "credential": token,
+        "kind": "token",
+        "device": {"name": device_name},
+        "user": {"login": "access-key"},
+        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    _atomic_write(target, store)
+    return target
+
+
+def save_device_credential(path: str | os.PathLike[str] | None, url: str, response: dict[str, Any]) -> Path:
     target = Path(path).expanduser().resolve() if path else default_credential_file()
     key = normalize_server_url(url)
     credential = str(response.get("credential") or "")
@@ -131,18 +155,14 @@ def _pending_file(path: str | os.PathLike[str] | None) -> Path:
     return target.with_name(target.name + ".pending")
 
 
-def save_pending_login(
-    path: str | os.PathLike[str] | None, url: str, value: dict[str, Any]
-) -> None:
+def save_pending_login(path: str | os.PathLike[str] | None, url: str, value: dict[str, Any]) -> None:
     target = _pending_file(path)
     store = _read_store(target)
     store["credentials"][normalize_server_url(url)] = dict(value)
     _atomic_write(target, store)
 
 
-def load_pending_login(
-    path: str | os.PathLike[str] | None, url: str
-) -> dict[str, Any] | None:
+def load_pending_login(path: str | os.PathLike[str] | None, url: str) -> dict[str, Any] | None:
     value = _read_store(_pending_file(path))["credentials"].get(normalize_server_url(url))
     return dict(value) if isinstance(value, dict) else None
 
@@ -154,19 +174,46 @@ def clear_pending_login(path: str | os.PathLike[str] | None, url: str) -> None:
     _atomic_write(target, store)
 
 
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """A redirect on the API path is always a deployment mistake, never something to follow.
+
+    urllib would turn a redirected POST into a GET (RFC-compliant for 301/302/303), so a
+    plain-http URL behind an https-redirecting proxy makes every upload land as a GET and
+    fail with 405 — with no hint about why.  Name the real cause instead.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.URLError(
+            f"server redirected {req.get_method()} {req.full_url} to {newurl} (HTTP {code}); "
+            "point --url at the final https address, a redirecting URL would turn uploads into GETs"
+        )
+
+
+# One opener for every client in this package: environment proxies (HTTPS_PROXY / NO_PROXY),
+# the default verified TLS context (SSL_CERT_FILE for a private CA), and no redirects.
+_OPENER = urllib.request.build_opener(_RefuseRedirects())
+
+
+def open_url(request: urllib.request.Request, timeout: float):
+    return _OPENER.open(request, timeout=timeout)
+
+
 def request_json(
-    url: str, method: str, path: str, value: dict[str, Any] | None = None,
-    *, credential: str | None = None, timeout: float = 30,
+    url: str,
+    method: str,
+    path: str,
+    value: dict[str, Any] | None = None,
+    *,
+    credential: str | None = None,
+    timeout: float = 30,
 ) -> tuple[int, dict[str, Any]]:
     data = None if value is None else json.dumps(value).encode("utf-8")
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
     if credential:
         headers["Authorization"] = f"Bearer {credential}"
-    request = urllib.request.Request(
-        normalize_server_url(url) + path, data=data, headers=headers, method=method
-    )
+    request = urllib.request.Request(normalize_server_url(url) + path, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with open_url(request, timeout=timeout) as response:
             return response.status, json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")
@@ -182,9 +229,7 @@ def request_json(
 def start_login(url: str, device_name: str) -> dict[str, Any]:
     status, value = request_json(url, "POST", "/api/device/start", {"device_name": device_name})
     if status == 429:
-        raise DeviceLoginError(
-            "Research Trace is rate limiting device logins from this machine; wait and retry"
-        )
+        raise DeviceLoginError("Research Trace is rate limiting device logins from this machine; wait and retry")
     if status != 200:
         raise DeviceLoginError(str(value.get("error") or value.get("detail") or value))
     if not value.get("verification_uri") or not value.get("user_code"):
@@ -201,9 +246,7 @@ def renew_login(url: str, credential: str) -> dict[str, Any]:
 
 
 def poll_login(url: str, device_code: str) -> dict[str, Any]:
-    status, value = request_json(
-        url, "POST", "/api/device/token", {"device_code": device_code}
-    )
+    status, value = request_json(url, "POST", "/api/device/token", {"device_code": device_code})
     if status in {200, 202}:
         return value
     raise DeviceLoginError(str(value.get("error") or value.get("detail") or value.get("status") or value))
@@ -216,11 +259,34 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--credential-file", default=os.environ.get("TRACE_CREDENTIAL_FILE"))
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--logout", action="store_true")
-    parser.add_argument("--renew", action="store_true",
-                        help="roll this machine's credential over before it expires")
+    parser.add_argument("--renew", action="store_true", help="roll this machine's credential over before it expires")
+    parser.add_argument(
+        "--token",
+        nargs="?",
+        const="",
+        metavar="KEY",
+        help="store the deployment's shared access key for this URL (no value: prompt without echo)",
+    )
     args = parser.parse_args(argv)
     try:
         url = normalize_server_url(args.url)
+        if args.token is not None:
+            key = args.token or getpass.getpass("Research Trace access key: ")
+            if not key.strip():
+                raise DeviceLoginError("no access key given")
+            status, health = request_json(url, "GET", "/api/health", credential=key.strip())
+            if status == 401 or (status == 200 and health.get("authentication_required")):
+                raise DeviceLoginError("the server rejected this access key")
+            if status != 200:
+                raise DeviceLoginError(f"unexpected response {status} from {url}: {health}")
+            if not health.get("write_protected"):
+                print("WARNING: this server does not require a token at all; storing the key anyway.", file=sys.stderr)
+            target = save_token_credential(args.credential_file, url, key.strip(), args.device_name)
+            print(
+                f"Access key for {url} saved to {target}; trace-deliver, trace-recorder, trace-project and the MCP process will use it."
+            )
+            _warn_if_shadowed_by_explicit_token()
+            return 0
         if args.renew:
             current = load_device_credential(args.credential_file, url)
             if not current:
@@ -233,9 +299,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.logout:
             current = load_device_credential(args.credential_file, url)
-            if current:
+            if current and current.get("kind") != "token":
                 status, value = request_json(
-                    url, "DELETE", "/api/device/self",
+                    url,
+                    "DELETE",
+                    "/api/device/self",
                     credential=current["credential"],
                 )
                 if status not in {200, 401}:
@@ -250,8 +318,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Open: {started['verification_uri']}", flush=True)
         print(f"Type this code there: {started['user_code']}", flush=True)
         print(
-            "Only approve if you started this on your own machine. "
-            "Never enter a code somebody sent you.",
+            "Only approve if you started this on your own machine. Never enter a code somebody sent you.",
             flush=True,
         )
         if not args.no_browser:

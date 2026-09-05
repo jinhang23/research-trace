@@ -1,6 +1,7 @@
 """SQLAlchemy-managed SQLite connections and Alembic schema upgrades."""
-from pathlib import Path
+
 import sqlite3
+from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
@@ -9,8 +10,9 @@ from sqlalchemy.engine import URL
 
 
 def open_database(path: Path):
-    engine = create_engine(URL.create('sqlite', database=str(path)),
-                           connect_args={'check_same_thread': False, 'isolation_level': None})
+    engine = create_engine(
+        URL.create('sqlite', database=str(path)), connect_args={'check_same_thread': False, 'isolation_level': None}
+    )
 
     @event.listens_for(engine, 'connect')
     def configure(connection, _record):

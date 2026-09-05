@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import math
 import os
@@ -14,9 +13,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .storage import ValidationError
-
-
-from .visible import stable_json, fingerprint, visible_content
+from .visible import fingerprint, visible_content
 
 
 def load_config(path: str | os.PathLike[str] | None) -> dict[str, Any]:
@@ -57,7 +54,9 @@ def load_config(path: str | os.PathLike[str] | None) -> dict[str, Any]:
         if memory.get("token_env") and not isinstance(memory["token_env"], str):
             raise ValidationError("Basic Memory token_env must be an environment variable name")
     mlflow = config.get("mlflow")
-    if mlflow and (not isinstance(mlflow, dict) or not isinstance(mlflow.get("tracking_uri"), str) or not mlflow["tracking_uri"]):
+    if mlflow and (
+        not isinstance(mlflow, dict) or not isinstance(mlflow.get("tracking_uri"), str) or not mlflow["tracking_uri"]
+    ):
         raise ValidationError("MLflow tracking_uri is required")
     interval = config.get("sync_interval_seconds", 60)
     if not isinstance(interval, (int, float)) or not math.isfinite(interval) or interval < 5:
@@ -117,13 +116,17 @@ class BasicMemory:
                 headers["Authorization"] = "Bearer " + token
             transport = streamablehttp_client(self.config["url"], headers=headers, timeout=self.timeout)
         else:
-            transport = stdio_client(StdioServerParameters(
-                command=self.config["command"], args=self.config.get("args", ["mcp"]),
-                env={**os.environ, **self.config.get("env", {})},
-            ))
+            transport = stdio_client(
+                StdioServerParameters(
+                    command=self.config["command"],
+                    args=self.config.get("args", ["mcp"]),
+                    env={**os.environ, **self.config.get("env", {})},
+                )
+            )
         async with transport as channels:
-            async with ClientSession(channels[0], channels[1],
-                                     read_timeout_seconds=timedelta(seconds=self.timeout)) as client:
+            async with ClientSession(
+                channels[0], channels[1], read_timeout_seconds=timedelta(seconds=self.timeout)
+            ) as client:
                 await client.initialize()
                 yield client
 
@@ -173,11 +176,18 @@ class BasicMemory:
 
     async def search(self, project: str, query: str, limit: int = 50) -> Any:
         async with self.session() as client:
-            return await self.call(client, "search_notes", {
-                "project": project, "query": query, "search_type": "hybrid",
-                "page_size": min(limit, 100), "output_format": "json",
-                "note_types": ["research_trace"],
-            })
+            return await self.call(
+                client,
+                "search_notes",
+                {
+                    "project": project,
+                    "query": query,
+                    "search_type": "hybrid",
+                    "page_size": min(limit, 100),
+                    "output_format": "json",
+                    "note_types": ["research_trace"],
+                },
+            )
 
 
 class MLflowEvidence:
@@ -210,7 +220,11 @@ class MLflowEvidence:
             raise ValidationError("MLflow experiment is not bound to this Research Trace project")
         clean = visible_content(payload)
         return {
-            "provider": "mlflow", "source_id": self.source_id, "kind": kind,
-            "external_id": external_id, "experiment_id": experiment_id,
-            "payload": clean, "sha256": fingerprint(clean),
+            "provider": "mlflow",
+            "source_id": self.source_id,
+            "kind": kind,
+            "external_id": external_id,
+            "experiment_id": experiment_id,
+            "payload": clean,
+            "sha256": fingerprint(clean),
         }

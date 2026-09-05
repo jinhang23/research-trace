@@ -1,1 +1,1 @@
--e .[server]
+-e .[server,dev]
