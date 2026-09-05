@@ -11,6 +11,29 @@
 - **hook 不上传。** hook 只把事件写进本机 `pending/`，把它送到中央、并且只在中央返回
   2xx 之后搬进 `sent/`，是 `trace-deliver` 这个独立进程的事（第 5 节）。
 
+## 0. 先选安全档位（三档，按谁能连到这个端口来选）
+
+| 档位 | 谁能连到端口 | 怎么配 | 读 / 写 | 网页登录 | 每台机器 |
+|---|---|---|---|---|---|
+| **单机** | 只有你自己（`--host 127.0.0.1`） | `trace-server --data-dir …` | 读开放 / 写开放或 `--token` | 不用登录 | 不用登录 |
+| **内网（推荐）** | 同一网段的机器 | `trace-server --init`，然后 `--env-file` 启动 | 一个访问密钥同时守读和写 | 输入密钥 + 你的名字 | `trace-login --token` 一次 |
+| **团队 / 公网** | 任何人 | 第 2 节 GitHub OAuth + HTTPS | GitHub 白名单 | GitHub 登录 | `trace-login` 设备码 |
+
+内网档三条命令就够：
+
+```bash
+# 服务器：生成访问密钥，写进 <data-dir>/server.env（0600），读写都锁上
+trace-server --init --data-dir /srv/research-trace/data --host 0.0.0.0 --port 8765
+trace-server --env-file /srv/research-trace/data/server.env --host 0.0.0.0 --port 8765
+
+# 每台工作站 / HPC 登录节点：把密钥存进本机凭证文件，投递器、Recorder、MCP、trace-project 都会自动读
+trace-login --url http://<服务器>:8765 --token        # 不带值会提示输入、不回显
+```
+
+网页打开 `http://<服务器>:8765/` 会要密钥和你的名字，之后确认、纠正、编辑都署这个名（`human`）。
+`server.env` 里还有两个可选项：`TRACE_ALLOWED_NETWORKS=10.0.0.0/8,…` 只放行这些网段；
+反向代理后面开 `TRACE_TRUST_PROXY_HEADERS=true`。`--host` 不是回环而又没锁读时启动会打印醒目警告。
+
 ## 1. 启动中央服务
 
 需要 Python 3.10+。服务端安装 FastAPI 依赖：
@@ -23,9 +46,9 @@ trace-server --data-dir /srv/research-trace/data \
 
 服务不再包含定时备份任务或自动 Git push；无需配置备份即可启动。
 
-不配置 OAuth 时，浏览器打开 `http://127.0.0.1:8765/`；读取兼容旧的公开模式，写操作使用
-Bearer token。团队部署应按下一节配置 GitHub OAuth 和 HTTPS。启用后，Project、原始历史、
-搜索和附件都必须经过网页登录或机器 Bearer token，不再公开读取。
+这是第 0 节的"单机档"：浏览器直接打开 `http://127.0.0.1:8765/`，读取公开，写操作用 Bearer token。
+服务要对网络监听时按第 0 节选内网档（`--init`）或团队档（第 2 节 OAuth + HTTPS）；两者都让
+Project、原始历史、搜索和附件必须先登录。
 
 HiperGator 上先按集群要求加载 conda，再使用该环境的绝对 Python 路径：
 
@@ -222,6 +245,9 @@ trace-project status --url https://trace.example.org
 删掉之后。`trace-login` 现在会在登录成功时就检查环境变量并警告，`trace-project status`
 则会直接说出哪一份在生效。
 
+内网档不会踩到这个坑：`trace-login --url … --token` 把访问密钥存进同一个凭证文件，之后什么都
+不用 export、插件里的 `token` 留空即可。
+
 ### 三个前提
 
 - **URL 三处必须一致。** 凭证在文件里是**按服务 URL 索引**的，`trace-login`、插件配置和
@@ -250,6 +276,28 @@ trace-recorder --watch --data-dir /path/to/claude-plugin-data --url https://trac
 trace-recorder --data-dir /path/to/claude-plugin-data --url https://trace.example.org
 ```
 
+#### 在 HPC 登录节点上无头登录（没有浏览器、没有 Keychain）
+
+Recorder 用的是 Claude Code CLI 自己的订阅登录。工作站上 `claude` 登录一次即可；SSH 进 UF
+这类没有浏览器的机器时，用长期 OAuth token：
+
+```bash
+# 在有浏览器的机器上跑一次，按提示登录；它把一个一年期 token 打印到终端，**不会保存**
+claude setup-token
+
+# 在 HPC 上把它交给 watcher 所在的 shell / systemd EnvironmentFile（只对你可读）
+export CLAUDE_CODE_OAUTH_TOKEN=<粘贴的 token>
+trace-recorder --watch --data-dir /path/to/claude-plugin-data --url https://trace.example.org
+```
+
+几条已核实的边界：这个 token 走的是**订阅额度**，不是 API 计费，所以不在 Recorder 的拒绝列表里；
+Recorder 调用前会清掉外层 Claude Code 会话注入的 `CLAUDE_CODE_*` 变量，但会**保留**这一个；
+`ANTHROPIC_API_KEY`、`ANTHROPIC_BASE_URL`、Bedrock/Vertex/Foundry 变量只要有一个在环境里，
+Recorder 就拒绝启动（它无法证明账单落在哪）。Keychain 不可用时 CLI 会退回
+`~/.claude/.credentials.json`（0600）。启动前可以用 `claude auth status --json` 自查——旧版
+CLI 没有这个子命令，Recorder 会按 `unverified` 放行，由第一次模型调用判定登录；但 UF 上装的
+是哪个版本仍需要你确认一次（`claude --version`）。
+
 命令在现有 marker 中合并 Recorder 配置，形状如下（不要手工复制示例中的 workspace key）：
 
 ```json
@@ -267,9 +315,9 @@ trace-recorder --data-dir /path/to/claude-plugin-data --url https://trace.exampl
 ```
 
 之后每轮 Stop 只把材料写进持久批次；hook 不启动 Recorder，主 agent 也不会收到阻塞、
-Agent 或 SendMessage 指令。独立 watcher 读取新增材料、简短项目背景和少量相关旧记录。每个项目
-复用自己的独立 Claude 会话，12 批后轮换；这可以利用独立会话的缓存，但不继承主 agent
-上下文或缓存。
+Agent 或 SendMessage 指令。独立 watcher 读取新增材料、简短项目背景和少量相关旧记录，每次都是
+无状态的新调用（固定的 system prompt/schema 前缀可以命中缓存）；不继承主 agent 上下文或缓存，
+也不续接自己的旧会话。
 
 模型进程使用 `--setting-sources ""`、`--tools ""` 和空 MCP 配置。程序拒绝 API key、
 Bedrock、Vertex、Foundry 和额外用量事件；订阅额度不足时批次留在本机，等待额度恢复。
@@ -285,24 +333,35 @@ trace-project recorder-disable .
 状态含义见 [Recorder 协议](../hooks/RECORDER_PROTOCOL.md)。
 ## 4. 安装 Claude Code 插件
 
-```text
-/plugin marketplace add jinhang23/research-trace
-/plugin install research-trace@research-trace
+插件 = 本仓库的一份拷贝（`hooks/hooks.json`、`skills/`、`scripts/trace_hook.py`、`trace_mcp.py`），
+由 `claude plugin install` 放进 `${CLAUDE_PLUGIN_ROOT}`；插件数据（outbox、Recorder 工作目录）在
+`${CLAUDE_PLUGIN_DATA}`。hook 与 MCP 进程用插件配置里的 `python` 解释器直接运行这些文件，
+所以先装第 3b 节的客户端包、记下那个解释器的绝对路径，再装插件：
+
+```bash
+claude plugin marketplace add jinhang23/research-trace
+claude plugin install research-trace@research-trace \
+  --config python=/abs/path/to/python --config url=https://trace.example.org
 ```
 
-在插件配置中填写：
+（在 Claude Code 里也可以用 `/plugin marketplace add …`、`/plugin install …`，然后在 `/plugin` 的配置界面填。）
+
+插件配置项：
 
 - `url`：中央服务地址；
 - `token`：旧部署兼容项；使用 GitHub 设备登录后留空；
-- `python`：Python 3.10+ 解释器的绝对路径；
+- `python`：**装了 research-trace 包的** Python 3.10+ 解释器的绝对路径。指错时 MCP 只会显示
+  `CONNECTION_CLOSED`；用它跑一次 `--selfcheck` 就能看出来：
+
+  ```bash
+  /abs/path/to/python "${CLAUDE_PLUGIN_ROOT}/trace_mcp.py" --selfcheck --url https://trace.example.org
+  ```
+
 - `capture`：全局暂停开关，默认 `on`；改成 `off` 会让所有项目都停止采集，暂停期间不补采。
   它**不是**采集的开关来源：采集本身要先绑定项目，见下一小节。
 
-可先在仓库内验证 MCP 进程：
-
-```bash
-python trace_mcp.py --selfcheck
-```
+升级：`claude plugin update research-trace`，它只在版本号变化时重新拷贝。
+格式与目录的完整清单见[格式清单](FORMATS.md)。
 
 ### 4.1 绑定要记录的项目（不绑定就什么都不录）
 
@@ -421,6 +480,34 @@ key 指到已有项目。
 - 命中多个项目时进入待确认状态（HTTP 200，`pending_confirmation`），**即使调用方要求创建也
   不创建**；`trace-project bind` 会把候选连同「是谁在什么时候加的这条规则」一起打印出来。
 
+## 4b. 服务端在远端时：网络路径检查清单
+
+工作站和 HPC 登录节点都通过 HTTPS 连同一台中央；下面每条都由 `scripts/net_battery.py`
+在真 TLS 服务上验证过（自签证书、非回环地址、真 CLI）。
+
+- **`--url` 只写最终的 `https://` 地址。** 三个客户端（投递器、MCP、Recorder）共用一个
+  **拒绝重定向**的 HTTP 客户端：一个会被反向代理 301 到 https 的 `http://` URL，会把上传
+  的 POST 变成 GET，以前只能看到莫名其妙的 405；现在直接报出"server redirected … point --url
+  at the final https address"，文件留在 `pending/`。
+- **证书校验是开着的。** 自签或内网 CA 的服务端，客户端机器上设 `SSL_CERT_FILE=/path/ca.pem`
+  （Python 的 urllib 认这个变量）；不要关校验。校验失败时投递器的 `last_error` 会写明
+  `CERTIFICATE_VERIFY_FAILED`，`trace_mcp.py --selfcheck` 也会。
+- **代理。** 客户端遵守 `HTTPS_PROXY` / `HTTP_PROXY`；中央在内网时给它加进 `NO_PROXY`。
+  HPC 计算节点通常没有出网：投递器和 Recorder 放在登录节点或有出网的节点上跑，hook 本身不联网。
+- **密钥怎么到每台机器。** `trace-login --url … --token` 把密钥存进本机凭证文件，投递器、Recorder、
+  MCP、`trace-project` 都从那里读，不用再在每个 shell 里 `export TRACE_TOKEN`，插件配置里的 `token`
+  也可以留空（它只喂 MCP）。显式 `TRACE_TOKEN` / `--token` 仍然优先，且会盖住凭证文件——
+  `trace-project status` 会说出哪一份在生效。
+- **反向代理的两个数字。** 投递器一个 POST 最多 6 MiB / 400 个文件，附件（含代码取证 zip）
+  上限 100 MiB、base64 后约 133 MB：Nginx 要 `client_max_body_size 150m;`，并把
+  `proxy_read_timeout` 放到 300 s 以上。大文件上传的客户端超时会按体积自动放大
+  （100 MiB 约 7 分钟），`trace-deliver --timeout` 是下限。
+- **暴露面。** `--host 0.0.0.0` 且读没锁时启动会打印醒目警告：那时**所有读端点对能连到端口的人
+  公开**（原始 transcript、附件）。第 0 节的内网档（`--init` → `TRACE_PROTECT_READS=true`）或 OAuth
+  都能锁上；再不然 `--host 127.0.0.1` 只经 SSH 隧道访问。
+- **验证顺序**：客户端机器上 `python trace_mcp.py --selfcheck --url https://…` → `trace-deliver`
+  跑一次看 `delivered_events` → 网页 `/api/health`。
+
 ## 5. 投递：`trace-deliver`
 
 投递是一个独立进程，它是唯一有权把文件从 `pending/` 搬到 `sent/` 的角色，而且只在中央返回
@@ -436,7 +523,7 @@ session。所以「那次崩掉的会话」的残留有确定的重放路径，�
 
 三种部署方式，按机器选一种：
 
-- **什么都不配**：hook 会在 SessionStart 和 SessionEnd 各分离启动一次投递器（fire-and-forget，
+- **什么都不配**：hook 会在 SessionStart、Stop 和 SessionEnd 分离启动投递器（fire-and-forget，
   不等待、不看返回码，同一 session 60 秒内不重复拉起）。对日常工作站够用。
 - **常驻**：`trace-deliver --watch --interval 300`，适合长期开机、希望积压更快清空的机器。
 - **外部调度**：cron / systemd `--user` timer / SLURM 定时任务里跑 `trace-deliver`，

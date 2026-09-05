@@ -1,3 +1,40 @@
+# 2.0.0a29 — 让独立 Recorder 在真实 CLI 上跑通；安全三档；包与格式标准化
+
+## Recorder 管线（真实 CLI 上的修复）
+
+- **相关旧记录此前从未进入模型。** worker 读 `/api/search` 的 `items`，服务端返回的键是 `hits`（测试里的 mock 写错了同一个键，所以一直是绿的）。改为读 `hits` 且只取 `scope=node` 的命中；comment / overview 的 id 不再可能被当成 parent。
+- 召回不再用整句 prompt 做 `%query%` 子串匹配（永远搜不到旧 Node）：改为从 prompt 与最后回答里抽标识符（ESM-2、warmup、esm2_gnn、10Å）和重复出现的中文二元词，每个词各查一次再合并，已在 `recent_nodes` 里的不重复送。
+- 搜索永远匹配不上 `10Å`：服务端用 Python `str.lower()` 折叠查询（`Å→å`），列那边是 SQLite 的 `lower()`（只折 ASCII）。改成两边只折 ASCII；网页搜索同样受益。
+- 去掉 `--exclude-dynamic-system-prompt-sections`：官方帮助写明传 `--system-prompt` 时该参数被忽略，而 2.1.30 之前的 CLI 不认识它，每次调用直接 rc=1。
+- `claude auth status` 预检对没有这个子命令的旧版 CLI 放行并记为 `unverified`，登录由模型调用本身判定；有回答时仍严格要求 claude.ai/OAuth 且 `apiProvider` 为 first-party。
+- 模型调用改为无状态（`--no-session-persistence`），删除 12 轮 `--session-id`/`--resume` 轮换：每轮都带完整 packet，续接只会把旧 packet 重复送一遍（12 轮足以顶穿 200k 上下文）；固定前缀已实测命中缓存。
+- 空输出/格式错误/超时类失败最多 4 次，之后批次转 `attempts_exhausted` 等 `--retry-blocked`；以前指数退避封的是间隔不是次数，一个永远解析不了的批次会无限烧额度。
+- `ANTHROPIC_BASE_URL` 进入拒绝列表；调用前清理嵌套 Claude Code 会话变量（`CLAUDECODE`、`CLAUDE_CODE_*` 等），保留 `CLAUDE_CODE_OAUTH_TOKEN`。
+- 新增 `artifact_refs`：Recorder 可为 Node 登记 W&B run 页面等外部产物 URI，URI 必须在本批证据中原样出现，Node 写入后经 `/api/attach` 以 `capture_key` 幂等登记，从此曲线链接是数据流的键而不只是正文里的一串字。
+- 模型把 **Node 上的人工纠正 id** 放进章摘要的 `resolve_comment_ids` 时不再整批 format 失败（服务端的 409 闸门按目标算，列上外目标的 id 改变不了任何事），只丢掉该 id；编造的 id 仍是硬错误。schema 字段和 system prompt 补上了 `resolve_comment_ids` 的用法。
+- `status` 只是模型自述，写什么由 `records` / `curations` 两个数组决定（模型对"只更新 Overview、零记录"答了 `status=skip`，旧的矛盾检查把一次正确的编辑判成 format 失败并重试）。labels 要求用原文语言并复用已有标签；章归属规则：名字/摘要明显匹配就归入，Inbox 只给真正拿不准的。
+- 摘要不再每轮都改：curation 必须给出 `reason`（`first_summary` / `result_changed` / `plan_changed` / `direction_closed` / `correction_absorbed` / `milestone` / `progress_only`），`progress_only` 和「已有摘要的章再来一次 first_summary」在写入前丢弃，sidecar 记 `dropped_curations`。摘要是研究线当前的答案，不是步骤日志。
+- `capture=off` 与 `trace-project disable` 暂停期间推进 transcript 游标，重新开启后不再补采暂停期间的内容——此前文档承诺如此而实现恰好相反。暂停期间才新开的会话仍从头采，文档写明。
+
+## 安全与网络
+
+- **安全配置三档，内网档一把钥匙。** 以前只有"读全开 + token 挡写"和 GitHub OAuth 两档。新增访问密钥模式：`TRACE_PROTECT_READS=true`（`--protect-reads`；`--host` 非回环且有 token 时默认开）让同一个密钥守读写，网页弹出"访问密钥 + 你的名字"登录（`POST /api/auth/token-login`，用密钥签名的无状态 cookie，纠正/确认署名为 `human`），`trace-server --init` 生成密钥和 0600 的 `server.env`，`--env-file` 启动；客户端 `trace-login --url … --token` 把密钥存进本机凭证文件，投递器、Recorder、MCP、trace-project 一起读——不必再在每个 shell `export TRACE_TOKEN`、也不必填插件的 `token`。可选 `TRACE_ALLOWED_NETWORKS` 按网段放行（可信代理后读 `X-Forwarded-For`）。未认证的 `/api/health` 只回最小信息。`/api/auth/config` 带 `mode: open|token|oauth`。
+- **网络路径（服务端在远端）。** 投递器、MCP、Recorder 三个 HTTP 客户端共用一个拒绝重定向的 opener：`http://` 被 301 到 https 时以前 POST 变 GET、只见 405，现在直接报出重定向与正确做法，文件留在 pending。投递器 401 提示点名 `TRACE_TOKEN/--token`。代码取证 zip 的上传超时按体积放大（100 MiB 约 7 分钟，`--timeout` 是下限）。`trace-server --public-url` 之前是死参数，现已接入；对网络监听而读没锁时启动打印醒目警告。
+- 插件的 `python` 默认是裸 `python3`，它多半不是 `pip install research-trace` 进去的解释器：以前 MCP 服务在 stdio 握手里留一条 `ModuleNotFoundError: mcp` traceback，Claude Code 只显示 `CONNECTION_CLOSED`，而 `trace_mcp.py --selfcheck` 根本不 import SDK 所以照样"通过"。现在两条路径都先检查 SDK 可导入，不行就打印一行可操作的提示并退出 2。
+
+## 包、格式与代码风格
+
+- 版本只剩一个来源（`research_trace/__init__.py`，pyproject 用 dynamic version 读它，server/mcp 引用 `PLUGIN_VERSION`），两份插件清单的 semver 写法由测试守着；pyproject 补齐 license/authors/classifiers/urls，extras 收成 `server` / `integrations` / `dev`，根目录三个入口 shim 不再打进 wheel；统一用 ruff（行宽 120）排版与检查，全仓库按它格式化。
+- 新增 [docs/FORMATS.md](docs/FORMATS.md)：磁盘/网络上每一种格式标识、写入方、读取方、位置与兼容规则，安装后的目录布局，数值版本与迁移，环境变量；`tests/test_formats_are_documented.py` 守着代码里的每个 `research-trace.*.vN` 都在表里。
+- README / QUICKSTART 的安装说明改写成"中央服务 / Claude Code 插件 / 客户端包"三层，并给出 `claude plugin install --config python=… --config url=…` 的一步到位写法；`skills/research-trace/SKILL.md` 删除已不存在的 Stop block decision / fork 派发说明；`docs/RECORDER_DESIGN.md`、`docs/TODO.md` 标明 alpha.26 的派发上限已随派发机制删除；`docs/DESIGN.md` 不再把 GitHub 当灾备。
+
+## 验证工具（见 scripts/README.md）
+
+- `tests/test_server.py` 的 vendored JS 路径不再写死某台 Windows 机器的绝对路径（此前 9 个 Node 断言在任何其它机器上都 MODULE_NOT_FOUND）；接受 Node 20+ 的 `ℹ fail 0` 摘要；新增真调 CLI `--help` 的参数契约测试、hook 无网络 import 守卫。
+- `scripts/simulate_research.py`：三天真实研究情境（真 hook、真投递、真中央、真 `claude --print`，合成研究内容），20 项评分；与 pytest、运维 battery 连跑 8 轮（64 次 sonnet 调用）管线零失败，第 4–8 轮连续全绿，记录数 / parent / 摘要次数跨轮稳定。
+- `scripts/ops_battery.py`：运维角度 41 项（真 CLI、真 hook 进程、真中央；Recorder 失败路径经 `scripts/fake_claude.py` 走真子进程，不花额度；`REAL_WATCH=1` 加一次真 watcher 进程）。
+- `scripts/net_battery.py`：服务端在远端的网络路径 15 项，在真 TLS（自签证书、非回环地址）上验证证书校验、`SSL_CERT_FILE` 私有 CA、错 token、重定向、代理、13 MB 分批、Recorder 与 selfcheck 走 TLS、暴露警告。
+
 # 2.0.0a28 — Hook 与独立 Recorder 生命周期彻底分离
 
 - 修正方案 3 的触发边界：Hook 只保存事件、transcript 增量和语义 batch，不启动、唤醒或管理模型进程。

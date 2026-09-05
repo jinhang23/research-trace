@@ -17,6 +17,14 @@
   数据目录里的 JSON。
 - 文档中标注【未实现】的条目是待办，不是错误描述：它们仍然是验收目标。
 
+实现注（`2.0.0a29`）：
+
+- Recorder 是另行启动的 `trace-recorder --watch` 进程，每批一次**无状态**的 `claude --print`
+  （§6.3）；hook 只封 batch。记录可附带 `artifact_refs`，URI 必须在本批证据里原样出现。
+- 访问分三档：单机（读公开）、内网（`TRACE_PROTECT_READS`，一把访问密钥守读写，网页密钥登录算
+  `human`）、团队（GitHub OAuth）。机器侧 `trace-login --token` 把密钥存进凭证文件，所有客户端共用。
+- `capture=off` / `trace-project disable` 暂停期间推进 transcript 游标，不补采（§13）。
+
 ## 1. 产品目标
 
 Research Trace 是团队共用的研究与项目记忆。它服务于使用 Claude Code、Codex CLI 和
@@ -35,7 +43,8 @@ Codex Desktop 完成的真实工作：想法讨论、论文阅读、数据理解
 - 第一优先宿主是 Claude Code，随后适配 Codex CLI 和 Codex Desktop。
 - 一台中央服务，多台工作站和 HPC 节点通过 HTTPS/MCP 写入。
 - 多人团队使用；成员默认可看到团队内全部项目。
-- 网页最终使用 GitHub OAuth；机器使用独立、可撤销的 token。
+- 网页最终使用 GitHub OAuth；机器使用独立、可撤销的 token。内网小团队可以用一把共享访问密钥
+  同时守读写（网页输入密钥登录），不必申请 OAuth App。
 - 权限保留只读、成员、管理员三档。
 - 中央服务是唯一长期真相源。SQLite 只由单个服务实例访问，附件放服务数据卷。
 
@@ -178,7 +187,8 @@ Hook 的任何失败都 fail-open：退出码恒为 0，不输出会阻断主任
 - 按大小/条数分批 POST 到中央 `/api/ingest`；**只有 2xx 才**把文件搬进 `sent/`
   （transcript chunk 进 `transcripts/sent/`），其余情况原样留在 `pending/`；
 - 触发方式：手动 `trace-deliver`、常驻 `trace-deliver --watch`、外部定时任务，
-  以及 hook 在 SessionStart / SessionEnd 分离启动的一次性投递（fire-and-forget，绝不等待）。
+  以及 hook 在 SessionStart / Stop / SessionEnd 分离启动的一次性投递（fire-and-forget，绝不等待，
+  同一 session 60 秒内不重复拉起；挂上 Stop 是因为 HPC 上的长会话经常从不正常结束）。
 
 投递结果不得由模型自述决定。Recorder **不参与原始投递**，不得为 hook batch 调用 `trace_ingest`，
 系统也不存在任何由模型输出文本承载的投递回执——那样等于让「模型说存上了」变成「存上了」，
@@ -190,15 +200,25 @@ Hook 的任何失败都 fail-open：退出码恒为 0，不输出会阻断主任
   不向主 agent 返回 fork、Agent 或 SendMessage 指令。
 - Recorder 由独立命令或进程管理器启动。`trace-recorder --watch` 在空队列时继续等待，发现新 batch
   后消费；worker 停止期间的 batch 留在 outbox，重启后继续。
-- Recorder 使用独立 Claude Code CLI 会话，每次输入为新增材料、简短项目背景、人工纠正、少量近期及
-  相关旧记录。每个项目单独复用有界会话，然后轮换；不继承主会话上下文或缓存。
+- Recorder 使用独立、**无状态**的 Claude Code CLI 调用（`--no-session-persistence`），每次输入为
+  新增材料、简短项目背景、人工纠正、少量近期及相关旧记录（`/api/search` 的 `hits` 里 `scope=node`
+  的命中）。不继承主会话上下文或缓存，也不续接自己的旧会话：每轮都带完整 packet，续接只会重复
+  发送旧 packet；固定的 system prompt/schema 前缀本身就是缓存命中的条件。
 - 模型没有工具、MCP、项目设置或文件访问。它只输出结构化计划；程序校验来源、Chapter、parent、run
   后通过现有 API 幂等写入。
-- 调用只允许 Claude 订阅/OAuth 登录及白名单模型，拒绝 API key、Bedrock、Vertex、Foundry 和 fallback。
+- Recorder 可以为 Node 登记外部产物引用（`artifact_refs`：名称、带 scheme 的绝对 URI、方向）。
+  URI 必须在本批新证据里**原样出现**，否则按编造拒绝；程序在 Node 写入后通过 `/api/attach`
+  以 `capture_key` 幂等登记。这是 W&B run 页面等曲线链接进入 Node 和数据流的路径（§8）。
+- 调用只允许 Claude 订阅/OAuth 登录及白名单模型，拒绝 API key、Bedrock、Vertex、Foundry、自定义
+  `ANTHROPIC_BASE_URL` 和 fallback。`claude auth status` 有回答时必须是 first-party 的订阅登录；
+  旧版 CLI 没有这个子命令时预检按 `unverified` 放行，由模型调用本身判定登录。
   账户 Extra usage 必须由操作者关闭并一次确认；额度不足保留 batch 到恢复时间，overage 信号永久暂停
   自动重试，直到操作者修复后显式解除。
+- 每次空输出/格式错误/超时类重试都是一次真实模型调用，次数有上限（4 次）；超过后批次转
+  `attempts_exhausted`，材料保留，等操作者 `--retry-blocked`。预检类失败（认证、配置、付费凭证）
+  不消耗额度，按固定间隔重试。
 - 计划在首条写入前持久化，部分写入后按 `semantic:<batch>:<index>` 恢复；成功零记录、格式错误、
-  额度暂停、认证错误、中央故障和未绑定项目必须是不同状态。
+  额度暂停、认证错误、尝试耗尽、中央故障和未绑定项目必须是不同状态。
 - Hook、Recorder、CLI 或网络故障不得阻断主任务；batch 留在 outbox 重放。
 - 语义整理的取材范围不受投递影响：投递器把文件从 `pending/` 搬进 `sent/` 不得让任何一段历史
   永远进不了语义 batch。
@@ -427,6 +447,11 @@ outbox/
 2. **项目排除**：`trace-project disable` 写 `"capture": false`，保留绑定但停止采集；
 3. **全局暂停**：插件配置 `capture=off`，暂停期间不补采。
 
+第 2、3 条走同一条暂停路径：hook 不写事件、不读 transcript 正文，只把**已有会话**的 transcript
+游标推到当前位置，因此重新开启后不会把暂停期间写进 transcript 的内容补采上传。边界：暂停期间才
+开始的会话没有 outbox 目录，hook 不会为它建目录，重新开启后它从头采——处理令牌时用当时已经
+开着的会话，或者处理完再开新会话。
+
 已实现的 purge 路径：`trace-backup purge`（真删除中央库内容并写只含 id/计数/操作者/理由的审计
 记录）与 `trace-backup rewrite-history`（重建备份分支，§13 允许的唯一 force-push 场景）。
 purge 只保证中央库、下一次导出和被重写后的备份分支里不再有原文；远端托管方的旧对象要等它自己
@@ -460,8 +485,12 @@ CLI（`trace-backup purge` / `rewrite-history`）与管理员 REST（`POST /api/
   也不导致整份 transcript 被丢弃。
 - 【已实现】主 agent 和所有子 agent 的可见历史可永久检索（限已绑定项目）。
 - 【已实现】Recorder 可以对无价值 batch 选择不建 Node。
-- 【已实现】Stop 不再唤起主 agent 派发 fork；独立 `trace-recorder` 使用订阅登录、无工具 CLI、
-  有界项目会话和持久计划，额度/overage/格式/写入失败均保留 batch。
+- 【已实现】Stop 不再唤起主 agent 派发 fork；独立 `trace-recorder` 使用订阅登录、无工具、无状态
+  CLI 调用和持久计划，额度/overage/格式/写入失败均保留 batch，格式类失败有尝试上限。
+- 【已实现】`capture=off` 与 `trace-project disable` 暂停期间推进 transcript 游标，重新开启后
+  不补采暂停期间的内容（§13）。
+- 【已实现】访问三档：`TRACE_PROTECT_READS` 让同一把密钥守读写、网页密钥登录、`TRACE_ALLOWED_NETWORKS`
+  网段放行、`trace-server --init` 生成 0600 的 env 文件、`trace-login --token` 一次登录全客户端共用。
 - 【已实现】想法、论文、数据理解、实验、关键实现和失败都能用同一 Node 表达。
 - 【已实现】Recorder 不能创建 Chapter、不能自我确认，也不能用旧幂等重试覆盖人类移动或修改过的
   Node：写入身份来自凭证而非请求体，只有浏览器会话算 `human`，机器凭证发 confirmation/correction

@@ -1,40 +1,34 @@
 # 待办与交付边界
 
-alpha.28 已接入方案 3 的独立 Recorder，并按用户纠正改成 hook 只保存、独立 watcher 消费。
-单元/集成测试不等于真实 UF 部署、订阅计费或
-科学记录质量验收；这些仍列在 P1。
+状态（2.0.0a29）：方案 3 的独立 Recorder 已接入，hook 只保存、独立 watcher 消费；在本机把
+真 hook → 投递 → Recorder → 网页整条链路跑通，安全分三档，包与格式已标准化。做过什么、
+修过什么在 [CHANGELOG](../CHANGELOG.md)。这里只放还没做的。
 
-## P0：独立 Recorder（已接入）
+## 还没验证的（P1）
 
-- [x] 后台处理现有持久化 outbox，只读取新增材料、简短项目背景及相关旧记录。
-- [x] 适配固定版本 Claude-Mem 的提示词构造、输出分类与限流状态设计；保留许可证、
-  NOTICE、版本和修改说明。具体接缝见 [源码复用方案](RECORDER_REUSE_PLAN.md)。
-- [x] 使用官方 Claude Code CLI、订阅认证预检和白名单模型，拒绝 API/云后端/fallback；
-  额度不足保留材料并等待，不反复唤起主 agent。真实账户计费路径验证仍在 P1。
-- [x] 接入独立处理状态、幂等写入、部分失败恢复及额度恢复；区分成功零记录、格式错误、
-  额度暂停和未处理，保留原始证据及人工修订。
-- [x] 移除当前 Stop 阻塞、Agent/SendMessage 派发路径，以及依赖主
-  会话 fork 的默认指导和配置；迁移期间不并行运行两套整理器导致重复记录。
-- [x] Hook 不启动或管理模型；`trace-recorder --watch` 是单独启动、空队列仍等待的消费者。
-- [x] 保留现有 Web，并显示待整理、暂停和失败状态；研究节点继续关联可靠来源。
+- [ ] **UF 真实环境。** 在 HiperGator 新建一个测试项目，按顺序确认：`claude --version`（2.1.30 与
+  2.1.261 行为不同，代码已兼容但没在旧版真跑）；`claude setup-token` → `CLAUDE_CODE_OAUTH_TOKEN`
+  无头登录；`REAL_WATCH=1 python scripts/ops_battery.py`（一次验掉版本、登录、watcher）；再用真项目
+  跑 `trace-recorder --watch`。
+- [ ] **UF ↔ 服务器链路。** 防火墙、代理策略、证书是谁签的——按 [QUICKSTART 4b](QUICKSTART.md) 走一遍，
+  `python trace_mcp.py --selfcheck` → `trace-deliver` 一次 → `/api/health`。
+- [ ] **记录质量。** 纯讨论、未探索方向、失败结果、一组实验、用户纠正、并行模型版本，用真实项目
+  读正文判断。`scripts/simulate_research.py` 的合成情境已稳定（8 轮全绿），但它检查的是管线行为。
+- [ ] **真实额度。** 每轮约 5–9k 新输入 + 2.5k 缓存前缀 + 1–4k 输出，一天 30 个回合约 20–40 万 token
+  订阅用量；用真实账户的 `usage_totals` 与限额事件核对。
+- [ ] **中断与恢复。** 进程中断、网络断开、额度耗尽后材料完整、无重复节点、无人工记录覆盖——
+  运维 battery 用假 claude 覆盖了失败路径，真实额度耗尽事件的形状仍需一次实测。
+- [ ] 按实际科研目录核对代码 / 共享代码、数据引用与 W&B 曲线链接；Entire 路径未测（Git-only 已验证）。
+- [ ] Windows 中央存储的超长路径支持（附件临时文件可能超过传统路径上限）。
 
-## P1：真实环境与质量验证
+## 明确不做
 
-- [ ] 在 UF 的新建测试项目确认 Claude Code 版本、订阅登录、文件访问及后台进程行为。
-- [ ] 验证纯讨论、未探索方向、失败结果、一组实验、用户纠正和并行模型版本的记录质量。
-- [ ] 验证进程中断、网络断开、额度耗尽与恢复后材料完整、无重复节点、无人工记录覆盖。
-- [ ] 分别测量新增输入、缓存读写、输出及额度事件，报告真实摘要质量和额度表现。
-- [ ] 按实际科研目录核对代码/共享代码、数据引用与 W&B 曲线链接；不提交或管理实验任务。
-- [ ] 完善 Windows 中央存储的超长路径支持：较长数据目录可能使附件临时文件超过传统
-  路径上限；当前本地回归使用短临时目录，不能据此宣称所有长路径场景已支持。
+- Codex CLI / Desktop 宿主适配。
+- 团队配置映射与紧急 purge 的网页管理界面（REST 与配置文件路径已有）。
+- GitHub 定时备份（手动导出/校验/恢复保留）。
 
-## 已有实现
+## 验证工具
 
-- [x] 原始采集、离线保存、独立投递、现有 Web 与人工纠正边界。
-- [x] Entire/Git 代码与会话证据，以及官方 MCP SDK、SQLAlchemy/Alembic、Authlib、markdown-it、Dagre 接入。
-- [x] 删除 GitHub 每日备份、Submitit 调度及实验执行管理。
-- [x] alpha.26 的 Recorder 内部事件过滤、重复派发限制和自动派发上限。
-- [x] 方案 3 需求和源码复用范围已记录，见 [需求](USER_REQUIREMENTS_INTERVIEW.md) 与
-  [实际接入状态](SOURCE_REUSE.md)。
-
-Claude-Mem worker 尚未成为运行依赖。原始证据库继续保留；不会用上游内存缓冲替代长期存储。
+三套都在 `scripts/`，说明见 [scripts/README.md](../scripts/README.md)：`simulate_research.py`
+（研究情境，8 次 sonnet）、`ops_battery.py`（运维 41 项，不花额度）、`net_battery.py`（网络 15 项，真 TLS）。
+Claude-Mem worker 不是运行依赖；原始证据库继续保留，不会用上游内存缓冲替代长期存储。
