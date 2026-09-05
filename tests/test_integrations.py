@@ -44,8 +44,10 @@ class Memory:
         if self.fail:
             raise OSError("private credential")
         # Deliberately untrusted results: include another project and forged body.
-        return {"results": [{"permalink": key[1], "body": "FORGED", "project": "wrong"}
-                            for key in self.notes] + [{"permalink": "unmanaged", "body": "FORGED"}]}
+        return {
+            "results": [{"permalink": key[1], "body": "FORGED", "project": "wrong"} for key in self.notes]
+            + [{"permalink": "unmanaged", "body": "FORGED"}]
+        }
 
 
 class Evidence:
@@ -53,9 +55,15 @@ class Evidence:
         self.metric = 0.7
 
     def fetch(self, kind, external_id, allowed):
-        return {"provider": "mlflow", "source_id": "test", "kind": kind,
-                "external_id": external_id, "experiment_id": allowed[0],
-                "payload": {"metric": self.metric}, "sha256": fingerprint(self.metric)}
+        return {
+            "provider": "mlflow",
+            "source_id": "test",
+            "kind": kind,
+            "external_id": external_id,
+            "experiment_id": allowed[0],
+            "payload": {"metric": self.metric},
+            "sha256": fingerprint(self.metric),
+        }
 
 
 @pytest.fixture
@@ -65,8 +73,12 @@ def setup(tmp_path):
     node = store.record_node(project["id"], idempotency_key="node", title="Original", body="overfitting")
     other = store.create_project("Other private project")
     other_node = store.record_node(other["id"], idempotency_key="other", title="Private", body="secret")
-    config = {"projects": {project["id"]: {"memory_project": "research", "mlflow_experiment_ids": ["1"]},
-                           other["id"]: {"memory_project": "other"}}}
+    config = {
+        "projects": {
+            project["id"]: {"memory_project": "research", "mlflow_experiment_ids": ["1"]},
+            other["id"]: {"memory_project": "other"},
+        }
+    }
     memory, evidence = Memory(), Evidence()
     manager = Integrations(store, config=config, memory=memory, mlflow=evidence)
     yield store, project, node, other_node, manager, memory, evidence
@@ -81,7 +93,9 @@ def test_index_is_incremental_and_search_resolves_current_human_content(setup):
         writes = memory.writes
         await manager.sync()
         assert memory.writes == writes
-        memory.on_search = lambda: store.update_node(node["id"], {"body": "Human revision"}, expect_version=1, actor_type="human")
+        memory.on_search = lambda: store.update_node(
+            node["id"], {"body": "Human revision"}, expect_version=1, actor_type="human"
+        )
         result = await manager.search("overfitting", project_id=project["id"], scope="semantic")
         hit = next(h for h in result["hits"] if h["id"] == node["id"])
         assert hit["body"] == "Human revision" and hit["index_stale"]
@@ -90,6 +104,7 @@ def test_index_is_incremental_and_search_resolves_current_human_content(setup):
         memory.on_search = None
         await manager.sync()
         assert memory.writes == writes + 1
+
     asyncio.run(check())
 
 
@@ -104,6 +119,7 @@ def test_purged_node_is_not_returned_even_during_remote_search(setup):
         memory.on_search = None
         await manager.sync()
         assert not any(node["id"].replace("_", "-") in key[1] for key in memory.notes)
+
     asyncio.run(check())
 
 
@@ -121,6 +137,7 @@ def test_failed_index_keeps_retry_state_and_search_falls_back(setup):
         memory.fail = False
         await manager.sync()
         assert manager.state and manager.health()["basic_memory"]["state"] == "ready"
+
     asyncio.run(check())
 
 
@@ -140,6 +157,7 @@ def test_failed_managed_delete_is_retried_and_unbound_content_excluded(setup):
         memory.delete_error = False
         await manager.sync()
         assert not any(v["project_id"] == project["id"] for v in manager.state.values())
+
     asyncio.run(check())
 
 
@@ -160,14 +178,17 @@ def test_import_is_idempotent_and_preserves_human_revision(setup):
         assert len(current["attachments"]) == 2
         assert current["body"] == revised["body"] and current["version"] == revised["version"]
         assert current["review_state"] == "confirmed"
+
     asyncio.run(check())
 
 
 def test_mlflow_experiment_binding_is_enforced_before_storage(tmp_path):
     class Run:
         info = type("Info", (), {"experiment_id": "other"})()
+
         def to_dictionary(self):
             return {"secret": "other project"}
+
     adapter = MLflowEvidence({"tracking_uri": "http://localhost:5000"})
     adapter.client = lambda: type("Client", (), {"get_run": lambda self, rid: Run()})()
     with pytest.raises(ValidationError, match="not bound"):
@@ -175,9 +196,18 @@ def test_mlflow_experiment_binding_is_enforced_before_storage(tmp_path):
 
 
 def test_nested_hidden_content_is_removed_without_deleting_visible_prose():
-    raw = {"span": json.dumps({"output": [{"type": "thinking", "text": "HIDDEN"},
-                                          {"type": "text", "text": "visible reasoning summary"}],
-                               "reasoning_content": "HIDDEN"}), "reasoning_details": "HIDDEN"}
+    raw = {
+        "span": json.dumps(
+            {
+                "output": [
+                    {"type": "thinking", "text": "HIDDEN"},
+                    {"type": "text", "text": "visible reasoning summary"},
+                ],
+                "reasoning_content": "HIDDEN",
+            }
+        ),
+        "reasoning_details": "HIDDEN",
+    }
     clean = json.dumps(visible_content(raw))
     assert "HIDDEN" not in clean and "visible reasoning summary" in clean
 
@@ -190,22 +220,36 @@ def test_http_integration_auth_existing_tool_and_machine_rights(tmp_path):
         headers = {"Authorization": "Bearer secret"}
         p = client.post("/api/projects", json={"name": "Test"}, headers=headers).json()
         manager.bindings[p["id"]] = {"mlflow_experiment_ids": ["1"]}
-        n = client.post("/api/record", json={"project_id": p["id"], "idempotency_key": "k", "title": "Note"}, headers=headers).json()
-        payload = {"project_id": p["id"], "target_type": "node", "target_id": n["id"],
-                   "integration": "mlflow", "external_kind": "run", "external_id": "r"}
+        n = client.post(
+            "/api/record", json={"project_id": p["id"], "idempotency_key": "k", "title": "Note"}, headers=headers
+        ).json()
+        payload = {
+            "project_id": p["id"],
+            "target_type": "node",
+            "target_id": n["id"],
+            "integration": "mlflow",
+            "external_kind": "run",
+            "external_id": "r",
+        }
         assert client.post("/api/attach", json=payload).status_code == 401
         assert client.post("/api/integrations/sync").status_code == 401
         response = client.post("/api/attach", headers=headers, json=payload)
         assert response.status_code == 200, response.text
         assert response.json()["attachment"]["metadata"]["provider"] == "mlflow"
-        denied = client.patch(f"/api/nodes/{n['id']}", headers=headers,
-                              json={"expect_version": 1, "patch": {"review_state": "confirmed"}})
+        denied = client.patch(
+            f"/api/nodes/{n['id']}", headers=headers, json={"expect_version": 1, "patch": {"review_state": "confirmed"}}
+        )
         assert denied.status_code == 403
 
 
-@pytest.mark.parametrize("patch", [{"sync_interval_seconds": float("inf")},
-                                    {"basic_memory": {"command": "bm", "args": [1]}},
-                                    {"basic_memory": {"command": "bm", "env": {"X": 1}}}])
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"sync_interval_seconds": float("inf")},
+        {"basic_memory": {"command": "bm", "args": [1]}},
+        {"basic_memory": {"command": "bm", "env": {"X": 1}}},
+    ],
+)
 def test_invalid_configuration_fails_at_startup(tmp_path, patch):
     path = tmp_path / "integrations.json"
     path.write_text(json.dumps({"schema": "research-trace.integrations.v1", **patch}), encoding="utf-8")

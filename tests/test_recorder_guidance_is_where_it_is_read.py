@@ -7,6 +7,7 @@ for** an actual continuation」——写成了限制而不是要求，还夹在�
 
 所以这条钉的是位置，不是措辞：说明必须在 schema 里，且必须说出后果。
 """
+
 from __future__ import annotations
 
 from research_trace.mcp import TOOLS
@@ -47,8 +48,9 @@ def test_the_body_field_carries_a_framework_and_not_just_a_type():
 
 def test_the_protocol_document_still_carries_the_same_rule():
     """两处说的必须是同一件事。文档和 schema 各写一半，读者只会拿到一半。"""
-    protocol = (__import__("pathlib").Path(__file__).resolve().parents[1]
-                / "hooks" / "RECORDER_PROTOCOL.md").read_text(encoding="utf-8")
+    protocol = (__import__("pathlib").Path(__file__).resolve().parents[1] / "hooks" / "RECORDER_PROTOCOL.md").read_text(
+        encoding="utf-8"
+    )
     assert "## What a Node looks like" in protocol
     assert "structure_gaps" in protocol, "文档得说清那个回执是什么"
     assert "Missing links are allowed".lower() in protocol.lower()

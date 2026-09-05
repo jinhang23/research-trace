@@ -6,16 +6,24 @@ import zipfile
 import pytest
 
 from research_trace.entire_evidence import (
-    EntireRepository, EvidenceError, extract_code_archive, visible_transcript,
+    EntireRepository,
+    EvidenceError,
+    extract_code_archive,
+    visible_transcript,
 )
 
 
 def test_transcript_keeps_visible_context_but_not_hidden_blocks():
-    row = {"type": "assistant", "message": {"content": [
-        {"type": "text", "text": "This idea has not been tried."},
-        {"type": "thinking", "thinking": "SYNTHETIC_PRIVATE_SENTINEL"},
-        {"type": "tool_use", "input": {"reasoning_content": "SYNTHETIC_PRIVATE_SENTINEL", "path": "train.py"}},
-    ]}}
+    row = {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {"type": "text", "text": "This idea has not been tried."},
+                {"type": "thinking", "thinking": "SYNTHETIC_PRIVATE_SENTINEL"},
+                {"type": "tool_use", "input": {"reasoning_content": "SYNTHETIC_PRIVATE_SENTINEL", "path": "train.py"}},
+            ]
+        },
+    }
     output = visible_transcript(json.dumps(row))
     assert "SYNTHETIC_PRIVATE_SENTINEL" not in output
     assert "This idea has not been tried." in output
