@@ -7,6 +7,7 @@ UTF-8，否则 Windows 的默认 code page 会在协议层就把中文改掉。
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import json
 import os
@@ -18,11 +19,13 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from . import PLUGIN_VERSION
 from .device_login import (
     clear_pending_login,
     default_credential_file,
     load_device_credential,
     load_pending_login,
+    open_url,
     poll_login,
     request_json,
     save_device_credential,
@@ -30,22 +33,7 @@ from .device_login import (
     start_login,
 )
 
-
-PROTOCOL_VERSION = "2025-03-26"
-# initialize 必须做版本协商。客户端报的版本我们支持就原样回；不支持就回自己偏好的那个，
-# 由客户端决定是否继续握手。无条件回一个固定字符串会让老客户端误以为握手成功，
-# 然后在第一次 tools/call 上以看不懂的方式失败。
-SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
-
-# JSON-RPC 2.0 错误码。客户端按码分流：解析失败报成 -32603 会被当成服务端内部崩溃，
-# 而不是"这一行坏了、重发即可"。
-PARSE_ERROR = -32700
-INVALID_REQUEST = -32600
-METHOD_NOT_FOUND = -32601
-INVALID_PARAMS = -32602
-INTERNAL_ERROR = -32603
-
-SERVER_INFO = {"name": "research-trace", "version": "2.0.0-alpha.20"}
+SERVER_INFO = {"name": "research-trace", "version": PLUGIN_VERSION}
 INSTRUCTIONS = (
     "Research Trace has a raw-history layer and a selective semantic layer. "
     "Capture is opt-in per project: a directory without a .research-trace.json marker records "
@@ -54,8 +42,8 @@ INSTRUCTIONS = (
     "and hand the user `trace-project bind`; never write that marker on your own initiative. "
     "Raw batches are delivered by the independent trace-deliver process; do not call trace_ingest "
     "for hook manifests — durability never depends on a model remembering to call a tool. "
-    "Use trace_record only for work worth understanding "
-    "or reusing later; a batch may legitimately create no node. Experiments, ideas, papers, data "
+    "Use trace_record for new understanding worth reusing later, not the observer's activities; "
+    "compare existing memory before writing, and let a batch create no node. Experiments, ideas, papers, data "
     "understanding, failures and implementations all use the same Node. Chapters are human-defined "
     "parallel research tracks such as main and ablation experiments, not content types or pipeline stages. "
     "Recorder-created Nodes must use an existing chapter_id or omit it for Inbox, and always remain "
@@ -77,7 +65,12 @@ TOOLS: list[dict[str, Any]] = [
                 "workspace_keys": {"type": "array", "items": {"type": "string"}},
                 "create_if_missing": {"type": "boolean", "default": False},
                 "project_name": {"type": "string"},
-                "recent_limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                "recent_limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "description": "Start small (e.g. 6); search for relevant older records when needed. This recent list is not the complete history.",
+                },
                 "include_dataflow": {
                     "type": "boolean",
                     "default": False,
@@ -119,9 +112,12 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "trace_record",
-        "description": ("Create or retry one valuable unreviewed Node in an existing human-defined Chapter; "
-                        "omit chapter_id for Inbox. Set parent_id when this continues earlier work - "
-                        "the structure view is built from that field alone."),
+        "description": (
+            "Create or retry one valuable unreviewed Node in an existing human-defined Chapter; "
+            "omit chapter_id for Inbox. Set parent_id when this continues earlier work - "
+            "the structure view is built from that field alone. Group related experiments in one Node; "
+            "untried ideas are valid records. Omit unknown links instead of guessing."
+        ),
         "inputSchema": {
             "type": "object",
             "required": ["project_id", "idempotency_key", "title"],
@@ -131,53 +127,44 @@ TOOLS: list[dict[str, Any]] = [
                 "title": {
                     "type": "string",
                     "description": (
-                        "One line that states the outcome, not the activity. "
-                        "'Pocket cut at 8 A, 6,767 -> 4,554 pairs' is a title; 'Ran step 5' is not. "
-                        "It is what a reader scans in the structure view, so put the number in it."
+                        "Name the specific finding, decision or open question, not the act of inspecting or recording it. Include numbers only when useful; "
+                        "untried ideas need no fabricated outcome."
                     ),
                 },
                 "body": {
                     "type": "string",
                     "description": (
-                        "Answer three questions, in this order, before any detail:\n"
-                        "1. CLAIM - one to three sentences a reader can act on without reading further. "
-                        "The single thing this record asserts.\n"
-                        "2. BASIS - what it rests on: the command, the numbers, the file, the citation. "
-                        "Mark anything not directly observed as inference or hypothesis in those words; "
-                        "an inference written in the voice of an observation is the one error nobody "
-                        "downstream can detect.\n"
-                        "3. CONSEQUENCE - what is now settled, what is still open, and which earlier "
-                        "record this overturns (name it).\n"
-                        "Then any amount of detail: method, parameters, input/output tables, pitfalls.\n"
-                        "Use headings in the record's own language; do not translate the record itself. "
-                        "The three answers are what makes a Node readable a year later - the detail "
-                        "below them is what makes it reproducible, and it is optional in a way they are not."
+                        "Explain the new finding or idea, its basis and why it matters, and what remains open in concise coherent prose. "
+                        "Distinguish observation, inference, hypothesis and user decision. One Node can summarize "
+                        "several related experiments; put reproduction detail in linked run/evidence records. "
+                        "Name variants and known evaluation conditions so facts stand alone. Failed runs do not by themselves refute a hypothesis. "
+                        "For an untried idea preserve its rationale and proposed check without inventing an outcome. "
+                        "Distinguish agreed next steps from parked possibilities; reference earlier records when correcting a conclusion. "
+                        "Preserve the original language and human corrections."
                     ),
                 },
                 "chapter_id": {"type": "string"},
                 "parent_id": {
                     "type": "string",
                     "description": (
-                        "The id of the Node this one continues - normally the record whose result this "
-                        "work started from. Take it from trace_context's recent_nodes.\n"
-                        "The structure view is built from this field and nothing else: order in time, "
-                        "similar titles and shared files infer nothing. Omit it and the record is drawn "
-                        "as an unconnected root forever, and no later pass repairs it.\n"
-                        "A root is a real and useful thing to record - a new line of work, an "
-                        "independent finding - but it is a claim that nothing preceded this, so make it "
-                        "on purpose rather than by leaving the field out. Same Chapter only."
+                        "Known same-Chapter predecessor, if supported by the evidence. "
+                        "Omit for an independent idea or when the relation is unknown; omission does "
+                        "not assert that nothing preceded it. Do not infer links from time or similar names."
                     ),
                 },
                 "labels": {"type": "array", "items": {"type": "string"}},
+                "run_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Existing IDs from trace_context.recent_runs. Associate multiple runs with this research narrative; code, job status and W&B links remain available.",
+                },
                 "occurred_at": {"type": "string"},
                 "source_event_ids": {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": (
-                        "The manifest event ids this Node was written from. This is the only edge from a "
-                        "semantic record back to the raw history behind it: without it the Node's "
-                        "raw-history button degrades to 'the project's most recent events', and the "
-                        "promise that any record can be checked against its source stops being true."
+                        "Event IDs that directly support this record. Missing links remain explicit "
+                        "and may be added later. Unrelated recent events must never stand in for sources."
                     ),
                 },
                 "code_evidence": {
@@ -256,6 +243,16 @@ TOOLS: list[dict[str, Any]] = [
                 "size": {"type": "integer"},
                 "sha256": {"type": "string"},
                 "metadata": {"type": "object"},
+                "integration": {
+                    "type": "string",
+                    "enum": ["mlflow"],
+                    "description": "Fetch a configured MLflow run/trace as verified source evidence on this Node; no need to copy metrics by hand.",
+                },
+                "external_kind": {"type": "string", "enum": ["run", "trace"]},
+                "external_id": {
+                    "type": "string",
+                    "description": "Exact MLflow run or trace id; its experiment must be bound to this project.",
+                },
             },
         },
     },
@@ -265,7 +262,7 @@ TOOLS: list[dict[str, Any]] = [
     # 钉死在六个。
     {
         "name": "trace_search",
-        "description": "Search semantic records and/or permanent raw history across projects. Use scope=semantic when looking for conclusions or existing records; scope=all also dredges up raw events.",
+        "description": "Search semantic records and/or permanent raw history across projects. To check existing findings, pass project_id, scope=semantic and a small limit first; expand only for a specific question. Raw results are evidence, not automatically research conclusions.",
         "inputSchema": {
             "type": "object",
             "required": ["query"],
@@ -295,12 +292,12 @@ TOOLS: list[dict[str, Any]] = [
 
 
 class Remote:
-    def __init__(
-        self, url: str, token: str = "", credential_file: str | os.PathLike[str] | None = None
-    ):
+    def __init__(self, url: str, token: str = "", credential_file: str | os.PathLike[str] | None = None):
         self.url = url.rstrip("/")
         self.explicit_token = token
-        self.credential_file = Path(credential_file).expanduser().resolve() if credential_file else default_credential_file()
+        self.credential_file = (
+            Path(credential_file).expanduser().resolve() if credential_file else default_credential_file()
+        )
 
     def auth_token(self) -> str:
         if self.explicit_token:
@@ -312,12 +309,11 @@ class Remote:
         if action == "start":
             current = load_device_credential(self.credential_file, self.url)
             if current:
-                status, health = request_json(
-                    self.url, "GET", "/api/health", credential=current["credential"]
-                )
+                status, health = request_json(self.url, "GET", "/api/health", credential=current["credential"])
                 if status == 200 and not health.get("authentication_required"):
                     return {
-                        "status": "connected", "user": current.get("user"),
+                        "status": "connected",
+                        "user": current.get("user"),
                         "device": current.get("device"),
                     }
             value = start_login(self.url, device_name or socket.gethostname())
@@ -342,12 +338,11 @@ class Remote:
         if not pending:
             current = load_device_credential(self.credential_file, self.url)
             if current:
-                status, health = request_json(
-                    self.url, "GET", "/api/health", credential=current["credential"]
-                )
+                status, health = request_json(self.url, "GET", "/api/health", credential=current["credential"])
                 if status == 200 and not health.get("authentication_required"):
                     return {
-                        "status": "connected", "user": current.get("user"),
+                        "status": "connected",
+                        "user": current.get("user"),
                         "device": current.get("device"),
                         "expires_at": current.get("expires_at"),
                     }
@@ -359,12 +354,15 @@ class Remote:
             clear_pending_login(self.credential_file, self.url)
             expires_at = value.get("expires_at") or (value.get("device") or {}).get("expires_at")
             return {
-                "status": "connected", "user": value.get("user"), "device": value.get("device"),
+                "status": "connected",
+                "user": value.get("user"),
+                "device": value.get("device"),
                 "expires_at": expires_at,
                 "next": (
-                    "This credential expires; renew it on the command line with "
-                    "`trace-login --renew` before then."
-                ) if expires_at else None,
+                    "This credential expires; renew it on the command line with `trace-login --renew` before then."
+                )
+                if expires_at
+                else None,
             }
         return {
             "status": "pending",
@@ -381,7 +379,7 @@ class Remote:
             headers["Authorization"] = f"Bearer {token}"
         request = urllib.request.Request(self.url + path, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
+            with open_url(request, timeout=60) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode("utf-8", errors="replace")
@@ -459,8 +457,7 @@ def _manifest_payload(path_value: str, project_id: str | None = None) -> dict[st
             }
     if not events and not chunks and missing:
         raise RuntimeError(
-            f"manifest {path} references {len(missing)} file(s) that no longer exist: "
-            + ", ".join(missing[:5])
+            f"manifest {path} references {len(missing)} file(s) that no longer exist: " + ", ".join(missing[:5])
         )
     return {
         "batch_id": manifest.get("batch_id"),
@@ -469,9 +466,10 @@ def _manifest_payload(path_value: str, project_id: str | None = None) -> dict[st
             "id": session_id,
             "source": "claude-code",
             "cwd": manifest.get("project_dir"),
-            "metadata": {"manifest": str(path), "missing_files": missing} if missing
-            else {"manifest": str(path)},
-        } if session_id else None,
+            "metadata": {"manifest": str(path), "missing_files": missing} if missing else {"manifest": str(path)},
+        }
+        if session_id
+        else None,
         "agents": list(agents.values()),
         "events": events,
         "transcript_chunks": chunks,
@@ -523,9 +521,7 @@ def call_tool(remote: Remote, name: str, args: dict[str, Any]) -> Any:
                 )
         if bind_path and isinstance(result, dict) and result.get("matched") is not False:
             result = dict(result)
-            result["bound"] = _bind_marker(
-                bind_path, result, [str(k) for k in (value.get("workspace_keys") or [])]
-            )
+            result["bound"] = _bind_marker(bind_path, result, [str(k) for k in (value.get("workspace_keys") or [])])
         return result
     if name == "trace_ingest":
         value = _manifest_payload(args["manifest_path"], args.get("project_id")) if args.get("manifest_path") else args
@@ -547,27 +543,22 @@ def call_tool(remote: Remote, name: str, args: dict[str, Any]) -> Any:
             value.setdefault("size", len(raw))
         return remote.request("POST", "/api/attach", value)
     if name == "trace_search":
-        query = urllib.parse.urlencode({
-            key: value for key, value in {
-                "q": args.get("query"),
-                "project_id": args.get("project_id"),
-                "scope": args.get("scope", "all"),
-                "limit": args.get("limit", 50),
-            }.items() if value is not None
-        })
+        query = urllib.parse.urlencode(
+            {
+                key: value
+                for key, value in {
+                    "q": args.get("query"),
+                    "project_id": args.get("project_id"),
+                    "scope": args.get("scope", "all"),
+                    "limit": args.get("limit", 50),
+                }.items()
+                if value is not None
+            }
+        )
         return remote.request("GET", "/api/search?" + query)
     if name == "trace_login":
         return remote.device_login(args.get("action") or "start", args.get("device_name"))
     raise RuntimeError(f"unknown tool: {name}")
-
-
-def _response(request_id: Any, result: Any = None, error: dict[str, Any] | None = None) -> dict[str, Any]:
-    value = {"jsonrpc": "2.0", "id": request_id}
-    if error is not None:
-        value["error"] = error
-    else:
-        value["result"] = result
-    return value
 
 
 def force_utf8_stdio() -> None:
@@ -589,115 +580,60 @@ def force_utf8_stdio() -> None:
             pass
 
 
-def _is_request_id(value: Any) -> bool:
-    # JSON-RPC 允许 string/number；MCP 在其上收紧，禁止 null。bool 是 int 的子类，单独挡掉。
-    return isinstance(value, str) or (isinstance(value, int) and not isinstance(value, bool))
+def sdk_server(remote: Remote):
+    import mcp.types as types
+    from mcp.server.lowlevel import Server
 
+    server = Server(SERVER_INFO['name'], version=SERVER_INFO['version'], instructions=INSTRUCTIONS)
 
-def handle(remote: Remote, message: Any) -> dict[str, Any] | None:
-    """处理一条消息，返回要发回去的响应；通知返回 None。"""
-    if not isinstance(message, dict):
-        return _response(None, error={"code": INVALID_REQUEST, "message": "request must be a JSON object"})
-    has_id = "id" in message
-    request_id = message.get("id")
-    if has_id and not _is_request_id(request_id):
-        # id 为 null 的"请求"官方客户端解析不了；只有错误响应可以带 id: null。
-        return _response(None, error={"code": INVALID_REQUEST, "message": "request id must be a string or integer"})
-    if not has_id:
-        # JSON-RPC §4.1：通知不回复。更重要的是不执行——一条没有 id 的 tools/call
-        # 曾经会照常写入中央库，调用方却拿不到任何回执。
-        return None
-    method = message.get("method")
-    if not isinstance(method, str) or not method:
-        return _response(request_id, error={"code": INVALID_REQUEST, "message": "method must be a non-empty string"})
-    params = message.get("params")
-    if params is None:
-        params = {}
-    if not isinstance(params, dict):
-        return _response(request_id, error={"code": INVALID_PARAMS, "message": "params must be an object"})
+    @server.list_tools()
+    async def list_tools():
+        return [types.Tool(**tool) for tool in TOOLS]
 
-    if method == "initialize":
-        requested = params.get("protocolVersion")
-        version = requested if requested in SUPPORTED_PROTOCOL_VERSIONS else PROTOCOL_VERSION
-        return _response(request_id, result={
-            "protocolVersion": version,
-            "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": SERVER_INFO,
-            "instructions": INSTRUCTIONS,
-        })
-    if method == "ping":
-        # 客户端用 ping 判断进程还活着；缺了它这个连接会被当成挂死然后重启。
-        return _response(request_id, result={})
-    if method == "tools/list":
-        return _response(request_id, result={"tools": TOOLS})
-    if method == "tools/call":
-        name = params.get("name")
-        args = params.get("arguments")
-        if args is None:
-            args = {}
-        if not isinstance(name, str) or not name:
-            return _response(request_id, error={"code": INVALID_PARAMS, "message": "tools/call requires a tool name"})
-        if not isinstance(args, dict):
-            return _response(request_id, error={"code": INVALID_PARAMS, "message": "tools/call arguments must be an object"})
+    @server.call_tool()
+    async def invoke(name: str, arguments: dict):
         try:
-            value = call_tool(remote, name, args)
+            value = await asyncio.to_thread(call_tool, remote, name, arguments)
+            return types.CallToolResult(
+                content=[types.TextContent(type='text', text=json.dumps(value, ensure_ascii=False))]
+            )
         except Exception as exc:
-            # 工具内部的失败一律 isError。回成 JSON-RPC error 会被客户端当成传输故障
-            # 抛给上层，模型既看不到原因也没法自己纠正。
-            return _response(request_id, result={
-                "content": [{"type": "text", "text": f"{type(exc).__name__}: {exc}"}],
-                "isError": True,
-            })
-        return _response(request_id, result={
-            "content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False, indent=2)}],
-            "isError": False,
-        })
-    return _response(request_id, error={"code": METHOD_NOT_FOUND, "message": f"method not found: {method}"})
-
-
-def serve(remote: Remote, stream_in: Any = None, stream_out: Any = None) -> int:
-    if stream_in is None and stream_out is None:
-        force_utf8_stdio()
-    source = stream_in if stream_in is not None else sys.stdin
-    sink = stream_out if stream_out is not None else sys.stdout
-
-    def emit(value: Any) -> None:
-        # ensure_ascii=True：输出行全是 ASCII，任何控制台/管道编码都改不了它的内容。
-        sink.write(json.dumps(value, ensure_ascii=True) + "\n")
-        sink.flush()
-
-    def dispatch(message: Any) -> dict[str, Any] | None:
-        try:
-            return handle(remote, message)
-        except Exception as exc:  # handle 自己不该抛，抛了也不能让连接断掉
-            request_id = message.get("id") if isinstance(message, dict) else None
-            return _response(
-                request_id if _is_request_id(request_id) else None,
-                error={"code": INTERNAL_ERROR, "message": f"{type(exc).__name__}: {exc}"},
+            return types.CallToolResult(
+                isError=True, content=[types.TextContent(type='text', text=f'{type(exc).__name__}: {exc}')]
             )
 
-    for line in source:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            message = json.loads(line)
-        except (ValueError, RecursionError):
-            # RecursionError 不是 ValueError 的子类：嵌套上万层的数组会逃出去掀翻整个循环。
-            emit(_response(None, error={"code": PARSE_ERROR, "message": "invalid JSON"}))
-            continue
-        if isinstance(message, list):
-            if not message:
-                emit(_response(None, error={"code": INVALID_REQUEST, "message": "batch must not be empty"}))
-                continue
-            responses = [value for value in (dispatch(item) for item in message) if value is not None]
-            if responses:  # 整批都是通知时不回任何东西
-                emit(responses)
-            continue
-        response = dispatch(message)
-        if response is not None:
-            emit(response)
-    return 0
+    return server
+
+
+async def serve(remote: Remote):
+    from mcp.server.stdio import stdio_server
+
+    server = sdk_server(remote)
+    async with stdio_server() as (incoming, outgoing):
+        await server.run(incoming, outgoing, server.create_initialization_options())
+
+
+def sdk_missing_hint() -> str | None:
+    """One actionable line when this interpreter cannot serve MCP at all.
+
+    The plugin's `python` setting defaults to a bare `python3`, which on most
+    machines is not the interpreter `pip install research-trace` went into.
+    Claude Code then only shows "CONNECTION_CLOSED"; without this the
+    traceback dies inside the stdio handshake and `--selfcheck` used to pass
+    anyway because it never imported the SDK.
+    """
+    import importlib
+
+    try:
+        importlib.import_module("mcp.server.stdio")
+    except ImportError as exc:
+        return (
+            f"research-trace MCP: the 'mcp' SDK is not importable in {sys.executable} ({exc}). "
+            "Either install the package into this interpreter (python -m pip install "
+            "'research-trace[server]') or point the plugin's `python` setting at the interpreter "
+            "that has it: python -c \"import sys; print(sys.executable)\""
+        )
+    return None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -708,6 +644,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--selfcheck", action="store_true")
     args = parser.parse_args(argv)
     force_utf8_stdio()
+    hint = sdk_missing_hint()
+    if hint:
+        print(hint, file=sys.stderr)
+        return 2
     remote = Remote(args.url, args.token, args.credential_file)
     if args.selfcheck:
         try:
@@ -716,11 +656,13 @@ def main(argv: list[str] | None = None) -> int:
             if (health.get("write_protected") or health.get("authentication_required")) and not remote.auth_token():
                 print("device login or legacy write token is required", file=sys.stderr)
                 return 1
+            print(f"mcp SDK importable in {sys.executable}; central reachable", file=sys.stderr)
             return 0
         except Exception as exc:
             print(str(exc), file=sys.stderr)
             return 1
-    return serve(remote)
+    asyncio.run(serve(remote))
+    return 0
 
 
 if __name__ == "__main__":

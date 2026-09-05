@@ -8,7 +8,7 @@
    （REQUIREMENTS §13 的项目排除、§7 的「不能静默创建重复项目」）。
 2. **hook 不投递。** 它只把事件原子地写进 `pending/` 就返回，绝不碰网络、绝不等任何人。
    把 pending 送到中央并只在 2xx 后搬进 `sent/` 是独立进程 `trace-deliver` 的事。
-   于是正确性不再依赖模型是否记得调用工具、fork 是否成功、或缓存是否命中（§6）。
+   于是正确性不再依赖模型是否记得调用工具、后台进程是否启动、或缓存是否命中（§6）。
 3. **隐藏推理不落盘。** transcript 增量按行解析，`thinking` / `redacted_thinking` 块在
    进 outbox 之前就被丢掉（§6「隐藏 chain-of-thought 不采集」）。
 
@@ -26,30 +26,44 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
-
+from typing import Any
 
 SCHEMA = "research-trace.event.v1"
-RECORDER_MARKER = "[research-trace-recorder]"
-BATCH_MARKER = "[research-trace-batch:"
-RECORDER_READ_TOOLS = {"Read", "Grep", "Glob"}
 RECORDER_TRACE_TOOLS = {
-    "trace_context", "trace_ingest", "trace_record", "trace_curate", "trace_attach", "trace_search",
+    "trace_context",
+    "trace_ingest",
+    "trace_record",
+    "trace_curate",
+    "trace_attach",
+    "trace_search",
 }
 
 MARKER_NAME = ".research-trace.json"
 
 #: 这些 hook 事件本身不携带任何研究材料，它们只说「一轮结束了」「会话开始了」。
-#: 一个 batch 如果**只**由它们组成，这一批就没有东西可记——而派一次 Recorder 是一次完整
-#: fork（实测首轮读入约 60 万 token）。此前的判据是 `events or chunks`：任何新东西都开批，
-#: 于是一个只含 Stop 的 batch 也照付全价，Recorder 正确地记下 0 条，下一轮再来一次。
-#: 恒为 0 产出的那种批次不该存在，而不是该被 Recorder 判断掉——判断本身就是那 60 万。
-LIFECYCLE_EVENTS = frozenset({
-    "Stop", "StopFailure", "SessionStart", "SessionEnd", "PreCompact", "PostCompact",
-})
+#: Lifecycle notifications and recorder diagnostics never independently justify model work.
+#: Their raw evidence remains available; transcript growth alone is not a dispatch trigger.
+LIFECYCLE_EVENTS = frozenset(
+    {
+        "Stop",
+        "StopFailure",
+        "SessionStart",
+        "SessionEnd",
+        "PreCompact",
+        "PostCompact",
+    }
+)
+RECORDING_DIAGNOSTICS = frozenset(
+    {
+        "TranscriptCaptureError",
+        "CodeCaptureError",
+        "RecorderDispatchPaused",
+    }
+)
 
 # outbox 里装着完整对话和带令牌的命令原文。在多用户 HPC 节点上默认 0755/0644 等于
 # 同机任何人可读；凭证文件早就是 0600，这里照抄同一个标准。Windows 上 chmod 基本无效，
@@ -159,8 +173,12 @@ def _read_json(path: Path, default: Any) -> Any:
 # --------------------------------------------------------------------------------------
 
 
-def _inline_binding(cwd: str | None) -> dict[str, Any] | None:
-    """`research_trace` 不可导入时的退化实现：只认 marker 在不在、capture 开不开。"""
+def _inline_binding(cwd: str | None, *, include_disabled: bool = False) -> dict[str, Any] | None:
+    """`research_trace` 不可导入时的退化实现：只认 marker 在不在、capture 开不开。
+
+    `include_disabled=True` 时 `"capture": false` 的 marker 也返回（带 `capture_disabled`），
+    给暂停路径用：它需要知道这个项目的 outbox 在哪，才能把游标推过暂停期。
+    """
     try:
         current = Path(cwd or os.getcwd()).expanduser().resolve()
     except OSError:
@@ -172,7 +190,8 @@ def _inline_binding(cwd: str | None) -> dict[str, Any] | None:
                 value = _read_json(candidate, {})
                 if not isinstance(value, dict):
                     value = {}
-                if value.get("capture") is False:
+                disabled = value.get("capture") is False
+                if disabled and not include_disabled:
                     return None
                 keys = [
                     str(item).strip()
@@ -186,6 +205,7 @@ def _inline_binding(cwd: str | None) -> dict[str, Any] | None:
                     "workspace_key": keys[0] if keys else None,
                     "project_id": str(value.get("project_id") or "").strip() or None,
                     "project_name": str(value.get("project_name") or "").strip() or None,
+                    "capture_disabled": disabled,
                 }
         except OSError:
             return None
@@ -195,29 +215,43 @@ def _inline_binding(cwd: str | None) -> dict[str, Any] | None:
     return None
 
 
-def binding_for(payload: dict[str, Any]) -> dict[str, Any] | None:
+def binding_for(payload: dict[str, Any], *, include_disabled: bool = False) -> dict[str, Any] | None:
     cwd = payload.get("cwd")
     cwd = str(cwd) if isinstance(cwd, str) and cwd.strip() else None
+    binding = None
     if _package_binding is not None:
         try:
-            return _package_binding(cwd)
+            binding = _package_binding(cwd)
         except Exception:
-            pass
-    return _inline_binding(cwd)
+            binding = None
+    else:
+        binding = _inline_binding(cwd)
+    if binding is not None or not include_disabled:
+        return binding
+    # 包实现对 capture:false 返回 None（和「没绑定」同义）。暂停路径需要区分这两种。
+    disabled = _inline_binding(cwd, include_disabled=True)
+    return disabled if disabled is not None and disabled.get("capture_disabled") else None
+
+
+def _session_root_path(data_dir: Path, payload: dict[str, Any], binding: dict[str, Any]) -> Path:
+    # 目录用 workspace key 做 hash：同一个项目在不同路径/worktree 下打开时共用一个 outbox
+    # 分支（§7：绝对 cwd 不是项目身份）。没有 key 的 marker 退回 cwd。
+    identity = binding.get("workspace_key") or os.path.normcase(str(payload.get("cwd") or os.getcwd()))
+    workspace = hashlib.sha256(str(identity).encode("utf-8")).hexdigest()[:16]
+    session = _safe(payload.get("session_id"), "unknown-session")
+    return data_dir / "outbox" / workspace / session
 
 
 def _session_root(data_dir: Path, payload: dict[str, Any], binding: dict[str, Any]) -> Path:
-    # 目录用 workspace key 做 hash：同一个项目在不同路径/worktree 下打开时共用一个 outbox
-    # 分支（§7：绝对 cwd 不是项目身份）。没有 key 的 marker 退回 cwd。
-    identity = binding.get("workspace_key") or os.path.normcase(
-        str(payload.get("cwd") or os.getcwd())
-    )
-    workspace = hashlib.sha256(str(identity).encode("utf-8")).hexdigest()[:16]
-    session = _safe(payload.get("session_id"), "unknown-session")
-    root = data_dir / "outbox" / workspace / session
+    root = _session_root_path(data_dir, payload, binding)
     for name in (
-        "pending", "sent", "batches", "batches/done",
-        "transcripts/pending", "transcripts/sent", "transcripts/meta",
+        "pending",
+        "sent",
+        "batches",
+        "batches/done",
+        "transcripts/pending",
+        "transcripts/sent",
+        "transcripts/meta",
     ):
         _mkdir(root / name)
     _chmod(root, DIR_MODE)
@@ -372,7 +406,7 @@ def _drop_thinking(value: Any, depth: int = 0) -> tuple[Any, bool]:
 NOISE_TYPES = ("file-history-snapshot", "queue-operation", "bridge-session", "custom-title", "mode")
 #: 用完整的 `"type":"..."` 形态匹配，而不是裸类型名——"mode" 这种词在正文里太常见。
 #: 写法带空格时会匹配不上，那时这一行被保留：失败方向故意选「多存点噪声」而不是「误删内容」。
-NOISE_MARKERS = tuple(f'"type":"{name}"'.encode("utf-8") for name in NOISE_TYPES)
+NOISE_MARKERS = tuple(f'"type":"{name}"'.encode() for name in NOISE_TYPES)
 
 
 #: Claude Code 给工具输出留了第二份结构化拷贝 `toolUseResult`。读图片时它里面的
@@ -409,27 +443,7 @@ def _strip_duplicate_base64(value: dict[str, Any]) -> bool:
 
 
 def _is_ui_noise(line: bytes) -> bool:
-    for marker in NOISE_MARKERS:
-        if marker in line:
-            return True
-    return False
-
-
-def _remember_recorder_id(state: dict[str, Any], agent_id: str | None) -> None:
-    """记住这个会话里所有当过 Recorder 的 agent id。
-
-    只留「当前那一个」是不够的：每批重新 fork 之后 id 会换，而上一个 Recorder 的
-    transcript 尾巴可能在它退休之后才被采集到。漏掉一行就够重新点着那个反馈环。
-    """
-    agent_id = str(agent_id or "")
-    if not agent_id:
-        return
-    known = state.setdefault("recorder_ids", [])
-    if not isinstance(known, list):
-        known = []
-    if agent_id not in known:
-        known.append(agent_id)
-    state["recorder_ids"] = known[-20:]
+    return any(marker in line for marker in NOISE_MARKERS)
 
 
 def _scrub_line(line: bytes, recorder_ids: frozenset[str] = frozenset()) -> bytes | None:
@@ -451,17 +465,16 @@ def _scrub_line(line: bytes, recorder_ids: frozenset[str] = frozenset()) -> byte
             # 重新序列化之后仍要走下面的 thinking 检查，所以不在这里 return。
             line = (json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
     # Recorder 自己的回合不是研究材料，而且它们跟事件层走的是两条路：事件被
-    # _is_trace_orchestration 挡住了，transcript 却是照单全收的。而 fork 的回合就写在
-    # 同一个 transcript 文件里，于是「recorder 跑完 → transcript 变长 → 新 chunk →
-    # `events or chunks` 成立 → 新 batch → 再派一个 fork」自己转起来，每转一圈烧掉
-    # 一次完整 fork，产出恒为 0。这里断掉的就是那个环。
+    # alpha.26 以前的 fork Recorder 与主会话共享 transcript。升级中的旧 session 可能仍在
+    # 写这些行，所以保留 recorder_ids 的精确过滤作为迁移兼容；alpha.27 的独立进程使用
+    # 无 hook 的独立 cwd，不会再进入这份 transcript。
     for agent_id in recorder_ids:
         if agent_id.encode("utf-8") not in line:
-            continue                      # 快路径：id 的字节都不在这行里，不必解析
+            continue  # 快路径：id 的字节都不在这行里，不必解析
         try:
             value = json.loads(line.decode("utf-8"))
         except (UnicodeDecodeError, ValueError):
-            break                         # 解析不了就交给下面的 thinking 逻辑处理
+            break  # 解析不了就交给下面的 thinking 逻辑处理
         if isinstance(value, dict) and str(value.get("agentId") or "") == agent_id:
             return None
         break
@@ -470,15 +483,19 @@ def _scrub_line(line: bytes, recorder_ids: frozenset[str] = frozenset()) -> byte
     try:
         value = json.loads(line.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
-        return json.dumps(
-            {
-                "type": "research-trace.redacted",
-                "reason": "unparsable transcript line containing hidden-reasoning markers",
-                "bytes": len(line),
-                "sha256": hashlib.sha256(line).hexdigest(),
-            },
-            ensure_ascii=False, separators=(",", ":"),
-        ).encode("utf-8") + b"\n"
+        return (
+            json.dumps(
+                {
+                    "type": "research-trace.redacted",
+                    "reason": "unparsable transcript line containing hidden-reasoning markers",
+                    "bytes": len(line),
+                    "sha256": hashlib.sha256(line).hexdigest(),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
+        )
     scrubbed, changed = _drop_thinking(value)
     if scrubbed is None:
         return None
@@ -506,6 +523,100 @@ def _read_scrubbed(
         if scrubbed:
             parts.append(scrubbed)
     return consumed, b"".join(parts)
+
+
+@contextmanager
+def _entire_capture_stream(root, repository, session_id):
+    staged = []
+    try:
+        with repository.session_stream(session_id) as stream:
+            yield stream, staged
+        # Publish only after upstream succeeds. A failed partial export cannot
+        # leave overlapping chunks for the independent delivery worker to ingest.
+        for temporary, metadata in staged:
+            destination = root / metadata['path']
+            _mkdir(destination.parent)
+            os.replace(_long(temporary), _long(destination))
+            _atomic_json(root / 'transcripts' / 'meta' / (destination.name + '.json'), metadata)
+    finally:
+        for temporary, _ in staged:
+            _long(temporary).unlink(missing_ok=True)
+
+
+def _capture_entire_transcript(root, payload, state, binding, config, chunk_size=512 * 1024):
+    """Consume the upstream session export; Trace only filters and queues deltas.
+
+    Do not fall back to reading a guessed main-session path on provider failure.
+    Existing physical offsets give upgraded/resumed sessions a fresh boundary.
+    Subagent transcripts remain a compatibility path until Entire exports them
+    as individually addressable sessions.
+    """
+    package_root = str(Path(__file__).resolve().parents[1])
+    if package_root not in sys.path:
+        sys.path.insert(0, package_root)
+    from research_trace.entire_evidence import EntireRepository, EvidenceError
+
+    sid = str(payload.get('session_id') or '')
+    key = hashlib.sha256(('entire:' + sid).encode()).hexdigest()[:20]
+    source = str(payload.get('transcript_path') or '')
+    legacy_key = hashlib.sha256(os.path.normcase(str(Path(source).expanduser())).encode()).hexdigest()[:20]
+    start = int(state.get('entire_offsets', {}).get(key, state.get('transcript_offsets', {}).get(legacy_key, 0)))
+    recorder_ids = frozenset(str(x) for x in state.get('recorder_ids', []))
+    captured = []
+    repository = EntireRepository(binding['project_dir'], config['entire_executable'])
+    with _entire_capture_stream(root, repository, sid) as (stream, staged):
+        skipped = 0
+        last = b''
+        while skipped < start:
+            raw = stream.read(min(65536, start - skipped))
+            if not raw:
+                raise EvidenceError('Entire export is shorter than its saved cursor; old history was not reimported')
+            skipped += len(raw)
+            last = raw[-1:]
+        offset = start
+        # The fresh boundary may cut a partially written row. Skip that row,
+        # rather than importing its old prefix or treating its suffix as JSON.
+        if last and last != b'\n':
+            offset += len(stream.readline())
+        eof = False
+        while not eof:
+            begin = offset
+            parts = []
+            while offset - begin < chunk_size:
+                line = stream.readline(16 * 1024 * 1024 + 1)
+                if not line:
+                    eof = True
+                    break
+                if not line.endswith(b'\n') or len(line) > 16 * 1024 * 1024:
+                    raise EvidenceError('Entire export contains an incomplete or oversized JSONL row')
+                if not isinstance(json.loads(line), dict):
+                    raise EvidenceError('Entire export row must be an object')
+                offset += len(line)
+                scrubbed = _scrub_line(line, recorder_ids)
+                if scrubbed:
+                    parts.append(scrubbed)
+            if parts:
+                raw = b''.join(parts)
+                sha = hashlib.sha256(raw).hexdigest()
+                filename = f'{key}_{begin:016d}_{offset:016d}_{sha[:16]}.jsonl'
+                metadata = {
+                    'path': f'transcripts/pending/{filename}',
+                    'chunk_id': f'claude-transcript-{sha}',
+                    'session_id': sid,
+                    'agent_id': None,
+                    'source_path': 'entire:session:' + sid,
+                    'provider': 'entire',
+                    'start_offset': begin,
+                    'end_offset': offset,
+                    'sha256': sha,
+                }
+                temporary = root / 'transcripts' / 'staging' / (uuid.uuid4().hex + '.tmp')
+                _atomic_bytes(temporary, raw)
+                staged.append((temporary, metadata))
+                captured.append(metadata)
+    # Advance only after the upstream process has completed successfully.
+    state.setdefault('entire_offsets', {})[key] = offset
+    return captured
 
 
 def _capture_transcripts(
@@ -550,8 +661,7 @@ def _capture_transcripts(
                 stream.seek(start)
                 offset = start
                 while offset < size:
-                    consumed, raw = _read_scrubbed(
-                        stream, size - offset, chunk_size, recorder_ids)
+                    consumed, raw = _read_scrubbed(stream, size - offset, chunk_size, recorder_ids)
                     if consumed == 0:
                         break
                     end = offset + consumed
@@ -591,28 +701,6 @@ def _capture_transcripts(
 # --------------------------------------------------------------------------------------
 # Recorder 编排（语义层）
 # --------------------------------------------------------------------------------------
-
-
-def _extract_agent_id(value: Any) -> str | None:
-    if isinstance(value, dict):
-        for key in ("agent_id", "agentId"):
-            found = value.get(key)
-            if isinstance(found, str) and found.strip():
-                return found.strip()
-        for child in value.values():
-            found = _extract_agent_id(child)
-            if found:
-                return found
-    elif isinstance(value, list):
-        for child in value:
-            found = _extract_agent_id(child)
-            if found:
-                return found
-    elif isinstance(value, str):
-        match = re.search(r"\bagent[-_ ]?id\b[^A-Za-z0-9_-]*([A-Za-z0-9_-]{6,})", value, re.I)
-        if match:
-            return match.group(1)
-    return None
 
 
 def _open_manifests(root: Path) -> list[tuple[Path, dict[str, Any]]]:
@@ -678,6 +766,7 @@ def _ensure_batch(
             "project_dir": payload.get("cwd"),
             "project_id": binding.get("project_id"),
             "workspace_keys": binding.get("workspace_keys") or [],
+            "recorder": dict(binding.get("recorder") or {}),
             "event_count": len(events),
             "events": [rel for _, rel in events],
             "transcript_chunk_count": len(chunks),
@@ -698,237 +787,34 @@ def _has_material(root: Path, events: list[tuple[str, str]]) -> bool:
     """这一批里有没有「真的发生过什么」。
 
     判据是**事件**而不是 transcript 长度：用户说了话（UserPromptSubmit）、调了工具
-    （Pre/PostToolUse）、子 agent 跑完（SubagentStart/Stop）——这些都写事件；而 Recorder
-    自己那一段被 `_is_trace_orchestration` 挡在事件层之外，一个事件都不写。所以
-    「只剩生命周期事件」和「这段时间里只有 Recorder 在动」是同一件事。
-
-    transcript 不能当判据：Recorder 的回合就写在同一个 transcript 文件里，chunk 照样变长
-    （scrub 只按 agentId 精确匹配丢行，漏一行就够开一批），于是 `events or chunks` 会把
-    Recorder 自己的活动当成新素材，再派一次 fork。
+    （Pre/PostToolUse）、研究子 agent 跑完（SubagentStart/Stop）——这些都写事件。
+    已识别的 Recorder 活动在事件层被过滤；生命周期和采集诊断不单独触发整理。
+    transcript 不能单独当判据：文本增长可能只有生命周期/UI 噪声。独立 Recorder 不在项目
+    hook 或主 transcript 中运行，因此不会把自己的整理活动重新喂回批次。
 
     跳过时**不推进游标**：这些事件会留到下一批真有内容时一起带上，什么都不会丢。
     原始投递跟这里无关——它由投递器按中央 2xx 决定，本来就不经过 batch。
     """
-    for name, rel in events:
+    for _name, rel in events:
         record = _read_json(root / rel, {})
         if not isinstance(record, dict):
-            return True     # 读不出来就当它有内容：宁可多派一次，也不要静默漏记
-        if str(record.get("hook_event") or "") not in LIFECYCLE_EVENTS:
+            return True  # 读不出来就当它有内容：宁可多派一次，也不要静默漏记
+        if str(record.get("hook_event") or "") not in LIFECYCLE_EVENTS | RECORDING_DIAGNOSTICS:
             return True
     return False
 
 
-def _close_batch(root: Path, batch_id: str) -> None:
-    """Recorder 处理完一个 manifest 就归档它。
-
-    注意这只影响语义层：原始文件的去向由投递器按中央 2xx 决定，跟这里无关。
-    """
-    manifest_path = root / "batches" / f"{_safe(batch_id, '')}.json"
-    if not batch_id or not manifest_path.is_file():
-        return
-    manifest = _read_json(manifest_path, {})
-    if isinstance(manifest, dict):
-        manifest["recorder_finished_at"] = _now()
-        _atomic_json(root / "batches" / "done" / manifest_path.name, manifest)
-    try:
-        manifest_path.unlink()
-    except OSError:
-        pass
-
-
-def _fork_window(configured: str = "") -> int:
-    """每处理多少个批次重新 fork 一次 Recorder。
-
-    fork 的意义是继承主 agent **此刻**的完整上下文。但实测下来，很多批次的全部内容
-    就是「某个子 agent 结束了」——为这种批次付一次完整 fork 不划算：实测一次 fork
-    首轮读入约 60 万 token（命中率 99.7–99.9%，所以是便宜的那种 token，但底数不是零）。
-
-    1 = 每批都重新 fork（最新鲜）。调大 = 窗口内复用同一个 Recorder，它的上下文逐渐
-    变旧，但省下那些读取。0 / 空 / 非数字 = 整个会话只 fork 一次（最省，最旧）。
-    """
-    #: 这个值来自项目 marker（`.research-trace.json` 的 `recorder_fork_window`），不是插件
-    #: 配置项。插件配置项走 hooks.json 的 `${user_config.…}` 展开，而**未设置的选项会让整个
-    #: hook 执行失败**——老安装升级上来时它们的 settings 里根本没有这个键，于是采集全停。
-    #: marker 是 hook 本来就要读的东西，缺这个键就用默认值，不会有任何东西展开失败。
-    raw = str(configured or os.environ.get("TRACE_RECORDER_FORK_WINDOW") or "").strip()
-    if not raw and str(os.environ.get("TRACE_RECORDER_REUSE") or "").strip().lower() in {
-        "1", "true", "yes", "on"
-    }:
-        return 0                      # 老开关继续认，等价于「整个会话只 fork 一次」
-    if not raw:
-        return 1
-    try:
-        value = int(raw)
-    except ValueError:
-        return 1
-    return max(0, value)
-
-
-def _remember_recorder(state: dict[str, Any], agent_id: str | None) -> None:
-    """记下当前 Recorder 的 agent id，但**退休过的不许复活**。
-
-    同一次派发会产生多个事件（PreToolUse / SubagentStart / SubagentStop /
-    PostToolUse），而它们的先后顺序由 harness 决定。SubagentStop 之后如果还收到
-    那次派发的 PostToolUse，照原样写回去就会把「已经结束、下一批重新 fork」
-    悄悄改回「复用这个已经停掉的 agent」——下一批于是被 SendMessage 发给一个死掉的
-    Recorder。只在某一种事件顺序下才正确的实现是脆的。
-    """
-    agent_id = str(agent_id or "")
-    if not agent_id or agent_id == str(state.get("retired_recorder_id") or ""):
-        return
-    state["recorder_agent_id"] = agent_id
-
-
-def _is_trace_orchestration(
-    root: Path, payload: dict[str, Any], state: dict[str, Any]
-) -> bool:
-    event = str(payload.get("hook_event_name") or "")
-    tool = str(payload.get("tool_name") or "")
-    tool_blob = _json_text(payload.get("tool_input"))
-
-    if event == "SessionStart" and payload.get("source") == "clear":
-        state.pop("recorder_agent_id", None)
-        state.pop("pending_recorder_spawn", None)
-
-    if event == "PreToolUse" and tool == "Agent" and RECORDER_MARKER in tool_blob:
-        state["pending_recorder_spawn"] = _now()
-        state.pop("retired_recorder_id", None)   # 新的一次派发，退休名单清零
-        return True
-
-    if event == "SubagentStart" and state.get("pending_recorder_spawn"):
-        agent_id = payload.get("agent_id")
-        if agent_id:
-            _remember_recorder(state, agent_id)
-            _remember_recorder_id(state, agent_id)
-            state.pop("pending_recorder_spawn", None)
-            return True
-
-    if event == "PostToolUse" and tool == "Agent" and RECORDER_MARKER in tool_blob:
-        _remember_recorder(state, _extract_agent_id(payload.get("tool_response")))
-        _remember_recorder_id(state, _extract_agent_id(payload.get("tool_response")))
-        state.pop("pending_recorder_spawn", None)
-        return True
-
-    if tool == "SendMessage" and BATCH_MARKER in tool_blob:
-        if event == "PostToolUseFailure":
-            state.pop("recorder_agent_id", None)
-        return True
-
-    # Research Trace 自己的 MCP 调用永远不是研究材料——记录系统在运转，不等于研究在推进。
-    # 这一条**不看 agent_id**，因为 agent_id 靠不住：实测某些 Claude Code 版本只在
-    # SubagentStop 上给 agent_id，PreToolUse / PostToolUse 上一个都没有（现场 195 条
-    # 工具事件全是空）。于是 Recorder 自己调 trace_attach 时 is_recorder 判不出来，
-    # 那次调用被当成主 agent 的普通事件写进事件层 —— 而事件就是「素材」，素材就开新批，
-    # 新批再派一个 Recorder。环就是这么闭合的，且因为它是 PreToolUse 而非生命周期事件，
-    # `_has_material` 也拦不住。
-    # 代价是主 agent 手动调 trace_* 时也不落事件：可以接受——那同样是记录系统在运转。
-    if tool.rsplit("__", 1)[-1] in RECORDER_TRACE_TOOLS:
-        return True
-
-    recorder_id = str(state.get("recorder_agent_id") or "")
-    is_recorder = bool(recorder_id) and str(payload.get("agent_id") or "") == recorder_id
-    if event == "SubagentStop" and is_recorder:
-        # Recorder 身份只来自它被派发时记下的 agent id，绝不来自收尾消息里的自称文本：
-        # 旧实现认任何带 batch_id 的 TRACE_RECEIPT，普通子 agent 因此会被误认成 Recorder
-        # 并被此后所有 Edit/Write/Bash 拒绝，主任务当场被插件挡死。
-        _close_batch(root, str(state.pop("dispatched_batch", "") or ""))
-        window = _fork_window(str(state.get("fork_window") or ""))
-        state["forked_batches"] = int(state.get("forked_batches") or 0) + 1
-        if window and state["forked_batches"] >= window:
-            state["forked_batches"] = 0
-            state["retired_recorder_id"] = recorder_id
-            # 下一批重新 fork。复用等于「保留了 fork 这个昂贵机制，却只享受了第一批的收益」：
-            # 后续批次通过 SendMessage 送过去的只有一个 manifest 路径，Recorder 手里是
-            # fork 那一刻的陈旧快照加它自己的记录历史，唯独没有这一批真正发生了什么。
-            # 而重 fork 的前缀与主 agent 完全一致，本来就该命中提示缓存 —— 边际成本是
-            # 缓存读取，不是全量重算。
-            state.pop("recorder_agent_id", None)
-        return True
-    if is_recorder:
-        return True
-    if event == "Stop" and payload.get("stop_hook_active"):
-        return True
-    return False
-
-
-def _recorder_running(payload: dict[str, Any], recorder_id: str | None) -> bool:
-    if not recorder_id:
-        return False
-    for task in payload.get("background_tasks") or []:
-        if isinstance(task, dict) and str(task.get("id") or "") == recorder_id:
-            return str(task.get("status") or "").lower() in {"running", "pending"}
-    return False
-
-
-def _recorder_tool_guard(
-    payload: dict[str, Any], state: dict[str, Any]
-) -> dict[str, Any] | None:
-    """Deny mutation and unrelated tools inside the full-context Recorder fork.
-
-    A fork intentionally inherits the main agent's tools for context/cache parity. The hook is
-    therefore the enforcement boundary: the Recorder may inspect existing material and write only
-    through the Research Trace MCP tools.
-    """
-    if payload.get("hook_event_name") != "PreToolUse":
-        return None
-    recorder_id = str(state.get("recorder_agent_id") or "")
-    if not recorder_id or str(payload.get("agent_id") or "") != recorder_id:
-        return None
-    tool = str(payload.get("tool_name") or "")
-    tool_basename = tool.rsplit("__", 1)[-1]
-    if tool in RECORDER_READ_TOOLS or tool_basename in RECORDER_TRACE_TOOLS:
-        return None
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": (
-                "Research Trace Recorder is read-only outside the trace MCP; "
-                f"tool {tool or '<unknown>'} is not allowed"
-            ),
-        }
-    }
-
-
-def _nudge(
-    manifest_path: Path,
-    manifest: dict[str, Any],
-    recorder_id: str | None,
-    protocol_path: Path,
-) -> dict[str, Any]:
-    batch_id = manifest["batch_id"]
-    batch_message = (
-        f"{BATCH_MARKER}{batch_id}] Read the batch manifest at {manifest_path}. "
-        f"Follow the recorder protocol at {protocol_path}. Process this batch without asking "
-        "the user, then finish with one short line and no raw logs."
-    )
-    if recorder_id:
-        action = (
-            f"Use SendMessage once with to={recorder_id!r} and this message:\n{batch_message}"
-        )
-    else:
-        action = (
-            "Spawn one background Agent with subagent_type='fork'. Its task prompt must begin "
-            f"with {RECORDER_MARKER!r} and then contain:\n{batch_message}\n"
-            "A fork is required because it receives the main agent's complete current context."
-        )
-    guidance = (
-        "Research Trace has durably queued a recorder batch. Raw history is already safe on disk "
-        "and is uploaded by the independent trace-deliver process, so nothing here affects "
-        "durability. Do not summarize or interpret the batch in the main context. " + action
-        + " After dispatching it once, stop without adding a user-facing trace message and do not "
-        "wait for the background recorder. If fork or SendMessage is unavailable, do not retry "
-        "this turn; the batch remains safely queued."
-    )
-    # Stop hooks do not support hookSpecificOutput.additionalContext.  The documented
-    # continuation mechanism is a top-level block decision whose reason becomes the
-    # agent's next instruction.  stop_hook_active prevents a second continuation.
-    return {"decision": "block", "reason": guidance}
-
-
-# --------------------------------------------------------------------------------------
 # ① 投递器：分离启动，绝不等待
 # --------------------------------------------------------------------------------------
+
+
+def _is_internal_trace_event(payload: dict[str, Any]) -> bool:
+    """Research Trace's own calls are plumbing, never new research evidence."""
+    event = str(payload.get("hook_event_name") or "")
+    tool = str(payload.get("tool_name") or "")
+    if tool.rsplit("__", 1)[-1] in RECORDER_TRACE_TOOLS:
+        return True
+    return event == "Stop" and bool(payload.get("stop_hook_active"))
 
 
 def _spawn_deliver(data_dir: Path, url: str, state: dict[str, Any]) -> bool:
@@ -951,8 +837,11 @@ def _spawn_deliver(data_dir: Path, url: str, state: dict[str, Any]) -> bool:
     env = dict(os.environ)
     env["PYTHONPATH"] = str(_PLUGIN_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     options: dict[str, Any] = {
-        "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
-        "cwd": str(_PLUGIN_ROOT), "env": env,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "cwd": str(_PLUGIN_ROOT),
+        "env": env,
     }
     if os.name == "nt":
         options["creationflags"] = 0x00000008 | 0x08000000  # DETACHED_PROCESS | CREATE_NO_WINDOW
@@ -966,14 +855,63 @@ def _spawn_deliver(data_dir: Path, url: str, state: dict[str, Any]) -> bool:
         return False
 
 
+def _skip_paused_transcript(data_dir: Path, payload: dict[str, Any], binding: dict[str, Any]) -> None:
+    """暂停期间不补采：把 transcript 游标推到当前文件末尾，内容一个字节都不读。
+
+    只在这个 session 的 outbox 目录**已经存在**时才动手（不为暂停中的项目建任何目录）。
+    代价是在暂停期间才开始的会话没有游标，重新开启后会从头采——这条边界写在
+    REQUIREMENTS §13 里，不在这里悄悄扩大采集范围。
+    """
+    root = _session_root_path(data_dir, payload, binding)
+    if not root.is_dir():
+        return
+    state_path = root / "state.json"
+    with _state_lock(root) as acquired:
+        if not acquired:
+            return
+        state = _read_json(state_path, {})
+        if not isinstance(state, dict):
+            state = {}
+        cursors = state.setdefault("transcript_offsets", {})
+        if not isinstance(cursors, dict):
+            cursors = {}
+            state["transcript_offsets"] = cursors
+        moved = False
+        for field in ("transcript_path", "agent_transcript_path"):
+            source_text = payload.get(field)
+            if not isinstance(source_text, str) or not source_text.strip():
+                continue
+            source = Path(source_text).expanduser()
+            key = hashlib.sha256(os.path.normcase(str(source)).encode("utf-8")).hexdigest()[:20]
+            try:
+                size = source.stat().st_size
+            except OSError:
+                continue
+            if size > int(cursors.get(key, 0) or 0):
+                cursors[key] = size
+                moved = True
+        if moved:
+            state["paused_through"] = _now()
+            _atomic_json(state_path, state)
+
+
 def handle(
-    payload: dict[str, Any], data_dir: Path, protocol_path: Path, url: str = "",
-    fork_window: str = "",
+    payload: dict[str, Any],
+    data_dir: Path,
+    protocol_path: Path,
+    url: str = "",
+    *,
+    paused: bool = False,
 ) -> dict[str, Any] | None:
     """Handle one hook input. Exposed separately for deterministic tests."""
-    binding = binding_for(payload)
+    binding = binding_for(payload, include_disabled=True)
     if binding is None:
         # 未绑定的项目：不建目录、不写文件、不看 transcript。采集是 opt-in 的。
+        return None
+    if paused or binding.get("capture_disabled"):
+        # 全局 capture=off 或 marker capture:false：不写事件、不读 transcript，
+        # 只把已有会话的游标推过暂停期，重新开启后不补采暂停期间的内容。
+        _skip_paused_transcript(data_dir, payload, binding)
         return None
     root = _session_root(data_dir, payload, binding)
     state_path = root / "state.json"
@@ -986,13 +924,61 @@ def handle(
         state = _read_json(state_path, {})
         if not isinstance(state, dict):
             state = {}
-        # 窗口跟着项目走：marker 里没有这个键就是默认值。
-        window = fork_window or str(binding.get("recorder_fork_window") or "")
-        if window:
-            state["fork_window"] = window
-        _capture_transcripts(root, payload, state)
-        internal = _is_trace_orchestration(root, payload, state)
+        capture_config = _read_json(Path(binding['marker_path']), {}).get('code_capture') or {}
+        if capture_config.get('enabled') and not state.get('code_capture_started'):
+            # Enabling on a resumed conversation establishes a forward-only
+            # boundary. The current hook payload is still recorded below.
+            transcript = payload.get('transcript_path')
+            if transcript:
+                source = Path(transcript).expanduser()
+                if source.is_file():
+                    key = hashlib.sha256(os.path.normcase(str(source)).encode('utf-8')).hexdigest()[:20]
+                    state.setdefault('transcript_offsets', {}).setdefault(key, source.stat().st_size)
+            state['code_capture_started'] = _now()
+        if capture_config.get('entire_executable'):
+            try:
+                _capture_entire_transcript(root, payload, state, binding, capture_config)
+            except Exception as exc:
+                _write_event(
+                    root,
+                    {
+                        **payload,
+                        'hook_event_name': 'TranscriptCaptureError',
+                        'transcript_capture_error': str(exc)[:1000],
+                        'provider': 'entire',
+                    },
+                    binding,
+                )
+            _capture_transcripts(root, {**payload, 'transcript_path': None}, state)
+        else:
+            _capture_transcripts(root, payload, state)
+        internal = _is_internal_trace_event(payload)
         if not internal:
+            if (
+                payload.get("hook_event_name") in {"Stop", "SessionEnd"}
+                and not payload.get("stop_hook_active")
+                and (_read_json(Path(binding['marker_path']), {}).get('code_capture') or {}).get('enabled')
+            ):
+                try:
+                    # The hook remains offline. Git/Entire evidence is queued;
+                    # the existing delivery worker uploads the retained bytes.
+                    package_root = str(Path(__file__).resolve().parents[1])
+                    if package_root not in sys.path:
+                        sys.path.insert(0, package_root)
+                    from research_trace.workspace import capture_phase
+
+                    snapshot = capture_phase(binding, payload.get("session_id"))
+                    if snapshot and snapshot['commit_hash'] != state.get('last_code_commit'):
+                        _write_event(
+                            root, {**payload, 'hook_event_name': 'CodeCheckpoint', 'code_snapshot': snapshot}, binding
+                        )
+                        state['last_code_commit'] = snapshot['commit_hash']
+                except Exception as exc:
+                    _write_event(
+                        root,
+                        {**payload, 'hook_event_name': 'CodeCaptureError', 'code_capture_error': str(exc)[:1000]},
+                        binding,
+                    )
             _write_event(root, payload, binding)
 
         # Stop 也要拉一次：一轮对话刚结束，batch 正好写完。只挂在 SessionStart/SessionEnd
@@ -1001,13 +987,35 @@ def handle(
         if payload.get("hook_event_name") in {"SessionStart", "SessionEnd", "Stop"}:
             _spawn_deliver(data_dir, url, state)
 
-        result = _recorder_tool_guard(payload, state)
-        if result is None and payload.get("hook_event_name") == "Stop" and not payload.get("stop_hook_active"):
-            selected = _ensure_batch(root, payload, state, binding)
-            recorder_id = state.get("recorder_agent_id")
-            if selected and not _recorder_running(payload, recorder_id):
-                state["dispatched_batch"] = selected[1]["batch_id"]
-                result = _nudge(selected[0], selected[1], recorder_id, protocol_path)
+        result = None
+        if (
+            result is None
+            and payload.get('hook_event_name') == 'SessionStart'
+            and (_read_json(Path(binding['marker_path']), {}).get('code_capture') or {}).get('enabled')
+        ):
+            result = {
+                'hookSpecificOutput': {
+                    'hookEventName': 'SessionStart',
+                    'additionalContext': 'Research Trace passively records this project. Continue using your normal training and sbatch commands. '
+                    'The research agent is responsible for keeping submitted experiment directories and their referenced '
+                    'shared code unchanged. Research Trace does not submit jobs, create execution directories, rewrite paths '
+                    'or enforce that rule. It preserves observed commands, outputs, conversations and code evidence. '
+                    'When recording a meaningful experiment group, use source_event_ids for observed commands/results and '
+                    'code checkpoints; use run_ids only for run records that actually exist. '
+                    'Keep W&B as a curve link in the research record; never upload code to W&B. '
+                    'Untried ideas and unknown predecessor relationships are valid; keep summaries short and mark uncertainty.',
+                }
+            }
+        if (
+            not internal
+            and payload.get("hook_event_name") in {"Stop", "SessionEnd"}
+            and not payload.get("stop_hook_active")
+        ):
+            # Recorder execution has a separate lifecycle. The hook only seals
+            # durable input; a separately started `trace-recorder --watch`
+            # process discovers it. This boundary keeps model startup, quota
+            # waits and failures completely outside the observed agent session.
+            _ensure_batch(root, payload, state, binding)
         state["updated_at"] = _now()
         _atomic_json(state_path, state)
         return result
@@ -1016,18 +1024,23 @@ def handle(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--data-dir", required=True)
-    parser.add_argument("--protocol", required=True)
+    parser.add_argument("--protocol", default=str(_PLUGIN_ROOT / "hooks" / "RECORDER_PROTOCOL.md"))
     parser.add_argument("--capture-enabled", default="on")
     parser.add_argument("--url", default=os.environ.get("TRACE_URL", ""))
     args = parser.parse_args(argv)
-    if str(args.capture_enabled).strip().lower() in {"0", "false", "off", "no"}:
-        return 0
+    paused = str(args.capture_enabled).strip().lower() in {"0", "false", "off", "no"}
     try:
         raw = sys.stdin.read()
         payload = json.loads(raw)
         if not isinstance(payload, dict):
             return 0
-        output = handle(payload, Path(args.data_dir), Path(args.protocol), str(args.url or ""))
+        output = handle(
+            payload,
+            Path(args.data_dir),
+            Path(args.protocol),
+            str(args.url or ""),
+            paused=paused,
+        )
         if output:
             print(json.dumps(output, ensure_ascii=False, separators=(",", ":")))
     except Exception as exc:  # fail-open by design; stderr is debug-only on exit 0

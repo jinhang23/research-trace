@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import secrets
@@ -24,6 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import httpx
+from authlib.integrations.httpx_client import OAuth2Client
 
 SESSION_COOKIE = "trace_session"
 OAUTH_NONCE_COOKIE = "trace_oauth_nonce"
@@ -48,9 +51,7 @@ def pkce_challenge(verifier: str) -> str:
 
 
 def csrf_token(session_secret: str, raw_session: str) -> str:
-    return _b64url(hmac.new(
-        session_secret.encode("utf-8"), raw_session.encode("utf-8"), hashlib.sha256
-    ).digest())
+    return _b64url(hmac.new(session_secret.encode("utf-8"), raw_session.encode("utf-8"), hashlib.sha256).digest())
 
 
 def normalize_base_path(value: str | None) -> str:
@@ -84,7 +85,9 @@ def safe_return_to(value: str | None, base_path: str = "") -> str:
     home = base + "/" if base else "/"
     value = str(value or home).strip()
     if (
-        not value.startswith("/") or value.startswith("//") or "\\" in value
+        not value.startswith("/")
+        or value.startswith("//")
+        or "\\" in value
         or any(ord(character) < 32 or ord(character) == 127 for character in value)
     ):
         return home
@@ -266,15 +269,17 @@ class GitHubOAuthConfig:
         session_days: int = 30,
         device_credential_days: int = 90,
         insecure_cookies: bool = False,
-    ) -> "GitHubOAuthConfig | None":
-        pieces = [str(client_id or "").strip(), str(client_secret or "").strip(),
-                  str(public_url or "").strip(), str(session_secret or "").strip()]
+    ) -> GitHubOAuthConfig | None:
+        pieces = [
+            str(client_id or "").strip(),
+            str(client_secret or "").strip(),
+            str(public_url or "").strip(),
+            str(session_secret or "").strip(),
+        ]
         if not any(pieces):
             return None
         if not all(pieces):
-            raise ValueError(
-                "GitHub OAuth requires client id, client secret, public URL, and session secret"
-            )
+            raise ValueError("GitHub OAuth requires client id, client secret, public URL, and session secret")
         client_id_value, client_secret_value, public_url_value, session_secret_value = pieces
         public_url_value = public_url_value.rstrip("/")
         parsed = urllib.parse.urlparse(public_url_value)
@@ -284,10 +289,7 @@ class GitHubOAuthConfig:
         # 少了前缀 GitHub 会把人回调到域名根上（那里通常是别的应用）。
         base = normalize_base_path(base_path)
         if normalize_base_path(parsed.path) != base:
-            raise ValueError(
-                "GitHub OAuth public URL path must match the service base path"
-                f" ({base or '/'})"
-            )
+            raise ValueError(f"GitHub OAuth public URL path must match the service base path ({base or '/'})")
         is_loopback = (parsed.hostname or "").lower() in {"127.0.0.1", "localhost", "::1"}
         if parsed.scheme != "https" and not (insecure_cookies and is_loopback):
             raise ValueError("GitHub OAuth requires HTTPS (HTTP is allowed only for loopback development)")
@@ -297,9 +299,7 @@ class GitHubOAuthConfig:
         user_set = parse_principals(allowed_users)
         org_value = str(allowed_org or "").strip() or None
         if not (admin_set or user_set or org_value or allow_all):
-            raise ValueError(
-                "GitHub OAuth needs at least one admin, allowed user, allowed organization, or allow-all"
-            )
+            raise ValueError("GitHub OAuth needs at least one admin, allowed user, allowed organization, or allow-all")
         if not 1 <= int(session_days) <= 365:
             raise ValueError("GitHub OAuth session days must be between 1 and 365")
         if not 1 <= int(device_credential_days) <= 3650:
@@ -415,42 +415,43 @@ class GitHubOAuthClient:
         self.timeout = timeout
 
     def authorize_url(self, *, state: str, challenge: str) -> str:
-        query = urllib.parse.urlencode({
-            "client_id": self.config.client_id,
-            "redirect_uri": self.config.callback_url,
-            "scope": self.config.scopes,
-            "state": state,
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-        })
-        return f"{self.AUTHORIZE_URL}?{query}"
+        with self._client() as client:
+            url, _ = client.create_authorization_url(
+                self.AUTHORIZE_URL, state=state, code_challenge=challenge, code_challenge_method='S256'
+            )
+            return url
+
+    def _client(self, token=None):
+        return OAuth2Client(
+            client_id=self.config.client_id,
+            client_secret=self.config.client_secret,
+            redirect_uri=self.config.callback_url,
+            scope=self.config.scopes,
+            token_endpoint_auth_method='client_secret_post',
+            token=token,
+            timeout=self.timeout,
+            headers={'Accept': 'application/json', 'User-Agent': 'research-trace'},
+        )
 
     def _json_request(
         self, url: str, *, data: dict[str, str] | None = None, token: str | None = None
     ) -> dict[str, Any]:
-        encoded = urllib.parse.urlencode(data).encode("utf-8") if data is not None else None
-        headers = {
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "research-trace",
-            "X-GitHub-Api-Version": "2022-11-28",
-        }
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        request = urllib.request.Request(url, data=encoded, headers=headers, method="POST" if data else "GET")
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError) as exc:
+            with self._client({'access_token': token, 'token_type': 'Bearer'} if token else None) as client:
+                response = client.get(url, headers={'X-GitHub-Api-Version': '2022-11-28'})
+                response.raise_for_status()
+                return response.json()
+        except (httpx.HTTPError, TimeoutError, ValueError) as exc:
             raise OAuthError(f"GitHub OAuth request failed ({type(exc).__name__})") from exc
 
     def exchange_code(self, *, code: str, verifier: str) -> str:
-        value = self._json_request(self.TOKEN_URL, data={
-            "client_id": self.config.client_id,
-            "client_secret": self.config.client_secret,
-            "code": code,
-            "redirect_uri": self.config.callback_url,
-            "code_verifier": verifier,
-        })
+        try:
+            with self._client() as client:
+                value = client.fetch_token(
+                    self.TOKEN_URL, code=code, code_verifier=verifier, grant_type='authorization_code'
+                )
+        except Exception as exc:
+            raise OAuthError(f'GitHub OAuth token exchange failed ({type(exc).__name__})') from exc
         token = str(value.get("access_token") or "")
         if not token:
             raise OAuthError("GitHub did not return an access token")
@@ -465,9 +466,69 @@ class GitHubOAuthClient:
     def active_org_member(self, access_token: str, organization: str) -> bool:
         quoted = urllib.parse.quote(organization, safe="")
         try:
-            value = self._json_request(
-                f"{self.API_URL}/user/memberships/orgs/{quoted}", token=access_token
-            )
+            value = self._json_request(f"{self.API_URL}/user/memberships/orgs/{quoted}", token=access_token)
         except OAuthError:
             return False
         return value.get("state") == "active"
+
+
+# --------------------------------------------------------------------------------------
+# Shared access-key sessions: the intranet mode between "open" and GitHub OAuth
+# --------------------------------------------------------------------------------------
+
+TOKEN_SESSION_PREFIX = "tk1."
+
+
+def token_session_cookie(name: str, secret: str, days: int = 30) -> str:
+    """A stateless, signed browser session for deployments that use one shared access key.
+
+    The key itself never goes into the cookie; the cookie carries the display name and an
+    expiry, signed with the key.  Rotating the key invalidates every session at once.
+    """
+    expires = int(time.time()) + int(days) * 86400
+    message = f"{_b64url(name.encode('utf-8'))}.{expires}"
+    signature = hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+    return TOKEN_SESSION_PREFIX + message + "." + signature
+
+
+def token_session_user(raw: str | None, secret: str) -> dict[str, Any] | None:
+    if not raw or not secret or not raw.startswith(TOKEN_SESSION_PREFIX):
+        return None
+    try:
+        name_b64, expires, signature = raw[len(TOKEN_SESSION_PREFIX) :].split(".")
+    except ValueError:
+        return None
+    message = f"{name_b64}.{expires}"
+    expected = hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not secrets.compare_digest(signature, expected):
+        return None
+    if not expires.isdigit() or int(expires) <= time.time():
+        return None
+    padded = name_b64 + "=" * (-len(name_b64) % 4)
+    try:
+        name = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    name = name.strip()[:40] or "operator"
+    return {"id": f"token:{name}", "login": name, "display_name": name, "role": "admin", "kind": "token"}
+
+
+def parse_networks(value: str | None) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    """`TRACE_ALLOWED_NETWORKS=10.0.0.0/8,192.168.1.0/24` → network objects; empty means no allowlist."""
+    networks = []
+    for item in str(value or "").replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        networks.append(ipaddress.ip_network(item, strict=False))
+    return networks
+
+
+def client_in_networks(host: str, networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network]) -> bool:
+    if not networks:
+        return True
+    try:
+        address = ipaddress.ip_address(host.strip())
+    except ValueError:
+        return False
+    return any(address in network for network in networks)

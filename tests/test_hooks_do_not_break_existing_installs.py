@@ -12,6 +12,7 @@
 所以新增的可配项要走**项目 marker**（hook 本来就要读它，缺键就用默认值），
 或者环境变量 —— 不要走 hooks.json。
 """
+
 import json
 import re
 from pathlib import Path

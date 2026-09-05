@@ -56,11 +56,14 @@ snippet/diff、参数说明，以及指标、图片和产物引用。Git 继续�
 历史、附件、评论、确认状态和结构编辑按需展开。半透明、阴影和颜色只用于建立层级，不作为
 装饰堆叠。
 
-## 6. 中央服务是真相源，GitHub 是灾备
+## 6. 中央服务是唯一真相源，备份是手动导出
 
 多台电脑、HPC 和团队成员都连接同一个中央 Research Trace 服务。服务端 SQLite 与对象目录是
-在线真相源；私有 GitHub 仓库保存确定性导出，用于审计和恢复。
+在线真相源。GitHub 定时备份已经移除——把完整原始 transcript 推到一个 git remote 是外向的事，
+必须有人明确要求；保留的是 `trace-backup export / verify / restore` 这条手动路径，导出树按
+年份和容量分卷，读取端永不退役旧格式。
 
-备份不会提交运行中的 SQLite/WAL、GitHub access token、网页 session、设备凭证原文或其它
-secret，也不会 force-push。
+导出不包含运行中的 SQLite/WAL、GitHub access token、网页 session、设备凭证原文或其它 secret。
+唯一允许 force-push 的场景是紧急 purge 之后的 `trace-backup rewrite-history`：那时旧历史里的
+内容正是要被抹掉的东西。
 

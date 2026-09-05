@@ -7,6 +7,7 @@ for** an actual continuation」——写成了限制而不是要求，还夹在�
 
 所以这条钉的是位置，不是措辞：说明必须在 schema 里，且必须说出后果。
 """
+
 from __future__ import annotations
 
 from research_trace.mcp import TOOLS
@@ -30,27 +31,28 @@ def test_the_fields_that_build_the_views_are_documented_in_the_schema():
 def test_the_parent_field_says_what_omitting_it_costs():
     text = _field("trace_record", "parent_id")["description"]
     # 后果，不是「请填写此字段」
-    assert "structure view" in text
-    assert "recent_nodes" in text, "得告诉它去哪儿拿候选 id，否则填不了"
+    assert "evidence" in text
+    assert "unknown" in text
     # 根节点仍然合法：把它写成「必须填」会换来一堆胡乱认的父亲
-    assert "root" in text
+    assert "Omit" in text
 
 
 def test_the_body_field_carries_a_framework_and_not_just_a_type():
     text = _field("trace_record", "body")["description"]
-    for question in ("CLAIM", "BASIS", "CONSEQUENCE"):
+    for question in ("finding", "basis", "open"):
         assert question in text, f"正文框架缺了 {question}"
     # 认识论状态是这套框架里唯一无法被下游发现的错误，必须点名
     assert "inference" in text and "observation" in text
-    assert "own language" in text, "不能诱导模型把记录翻译成英文"
+    assert "original language" in text, "不能诱导模型把记录翻译成英文"
 
 
 def test_the_protocol_document_still_carries_the_same_rule():
     """两处说的必须是同一件事。文档和 schema 各写一半，读者只会拿到一半。"""
-    protocol = (__import__("pathlib").Path(__file__).resolve().parents[1]
-                / "hooks" / "RECORDER_PROTOCOL.md").read_text(encoding="utf-8")
+    protocol = (__import__("pathlib").Path(__file__).resolve().parents[1] / "hooks" / "RECORDER_PROTOCOL.md").read_text(
+        encoding="utf-8"
+    )
     assert "## What a Node looks like" in protocol
     assert "structure_gaps" in protocol, "文档得说清那个回执是什么"
-    assert "built from\n   this field and nothing else" in protocol
+    assert "Missing links are allowed".lower() in protocol.lower()
     # 旧措辞会把「要求」读成「限制」，必须已经撤掉
-    assert "Set `parent_id` only for" not in protocol
+    assert "Never invent a parent" in protocol

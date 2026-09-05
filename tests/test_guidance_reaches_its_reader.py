@@ -8,6 +8,7 @@
 
 写给主 agent 的规则放进第三个文件，等于从没生效过。
 """
+
 import re
 from pathlib import Path
 

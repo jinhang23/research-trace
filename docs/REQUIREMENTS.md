@@ -12,10 +12,18 @@
 - **采集是按项目 opt-in 的**：只有放了 `.research-trace.json` marker 的目录会被记录（§6、§7、§13）。
 - **原始投递由独立进程 `trace-deliver` 负责**，不经过 Recorder、不经过 hook 的网络调用（§6、§12）。
 - 备份导出按年份/容量分卷（格式版本 3；版本 2 的旧树仍可 verify/restore）并带容量阈值告警（§13），
-  告警显示在健康视图的备份卡片上；数据流派生视图（§8）在网页项目视图里作为第三种呈现方式出现；
+  告警随手动导出返回；数据流派生视图（§8）在网页项目视图里作为第三种呈现方式出现；
   团队配置映射（§7.1）已实现，但它的**网页管理界面**仍【未实现】，目前靠 REST 或直接编辑
   数据目录里的 JSON。
 - 文档中标注【未实现】的条目是待办，不是错误描述：它们仍然是验收目标。
+
+实现注（`2.0.0a29`）：
+
+- Recorder 是另行启动的 `trace-recorder --watch` 进程，每批一次**无状态**的 `claude --print`
+  （§6.3）；hook 只封 batch。记录可附带 `artifact_refs`，URI 必须在本批证据里原样出现。
+- 访问分三档：单机（读公开）、内网（`TRACE_PROTECT_READS`，一把访问密钥守读写，网页密钥登录算
+  `human`）、团队（GitHub OAuth）。机器侧 `trace-login --token` 把密钥存进凭证文件，所有客户端共用。
+- `capture=off` / `trace-project disable` 暂停期间推进 transcript 游标，不补采（§13）。
 
 ## 1. 产品目标
 
@@ -35,7 +43,8 @@ Codex Desktop 完成的真实工作：想法讨论、论文阅读、数据理解
 - 第一优先宿主是 Claude Code，随后适配 Codex CLI 和 Codex Desktop。
 - 一台中央服务，多台工作站和 HPC 节点通过 HTTPS/MCP 写入。
 - 多人团队使用；成员默认可看到团队内全部项目。
-- 网页最终使用 GitHub OAuth；机器使用独立、可撤销的 token。
+- 网页最终使用 GitHub OAuth；机器使用独立、可撤销的 token。内网小团队可以用一把共享访问密钥
+  同时守读写（网页输入密钥登录），不必申请 OAuth App。
 - 权限保留只读、成员、管理员三档。
 - 中央服务是唯一长期真相源。SQLite 只由单个服务实例访问，附件放服务数据卷。
 
@@ -166,7 +175,7 @@ Hook 的任何失败都 fail-open：退出码恒为 0，不输出会阻断主任
 
 **隐藏 chain-of-thought 不采集。** transcript 增量按行解析，`thinking` 与 `redacted_thinking`
 块（含 `signature`）在**写进 outbox 之前**就被丢弃，因此隐藏推理不进本机 outbox、不上传中央、
-也不进每日备份。单行解析失败不得让 hook 崩溃、也不得因此丢掉整个文件：无法解析又含该字样的行
+也不进入手动导出。单行解析失败不得让 hook 崩溃、也不得因此丢掉整个文件：无法解析又含该字样的行
 替换成只含长度与哈希的占位记录，留下缺口证据而不留原文。只保存宿主实际暴露的可见内容。
 
 ### 6.2 投递权威：独立投递器，不是 Recorder，也不是模型
@@ -178,25 +187,43 @@ Hook 的任何失败都 fail-open：退出码恒为 0，不输出会阻断主任
 - 按大小/条数分批 POST 到中央 `/api/ingest`；**只有 2xx 才**把文件搬进 `sent/`
   （transcript chunk 进 `transcripts/sent/`），其余情况原样留在 `pending/`；
 - 触发方式：手动 `trace-deliver`、常驻 `trace-deliver --watch`、外部定时任务，
-  以及 hook 在 SessionStart / SessionEnd 分离启动的一次性投递（fire-and-forget，绝不等待）。
+  以及 hook 在 SessionStart / Stop / SessionEnd 分离启动的一次性投递（fire-and-forget，绝不等待，
+  同一 session 60 秒内不重复拉起；挂上 Stop 是因为 HPC 上的长会话经常从不正常结束）。
 
 投递结果不得由模型自述决定。Recorder **不参与原始投递**，不得为 hook batch 调用 `trace_ingest`，
 系统也不存在任何由模型输出文本承载的投递回执——那样等于让「模型说存上了」变成「存上了」，
 并且任何子 agent 的收尾文本都可能被误认成 Recorder 身份。
 
-### 6.3 Recorder fork
+### 6.3 独立 Recorder
 
-- Claude Code 推荐 `2.1.232+`。
-- 每个主会话首次派发时创建一个 fork Recorder；它继承主会话当时的实际上下文和 prompt cache。
-- 后续恢复同一 recorder agent id，只发送增量 batch。
-- Recorder 身份只来自派发时记录的 agent id，不得从任何消息文本中推断。
-- Recorder 不跨主会话常驻；中央服务保存长期状态。
-- fork 虽继承主会话工具，但 Hook 按 recorder agent id 强制只允许只读检查和 Research Trace MCP，
-  禁止 Bash、Edit、Write、Agent、外部搜索及无关 MCP。
-- Hook、fork、MCP 或网络故障不得阻断主任务；batch 留在 outbox 由投递器重放。
+- Hook 只原子写事件并生成 batch；它不得启动、唤醒或管理 Recorder 模型进程。Stop 始终放行，
+  不向主 agent 返回 fork、Agent 或 SendMessage 指令。
+- Recorder 由独立命令或进程管理器启动。`trace-recorder --watch` 在空队列时继续等待，发现新 batch
+  后消费；worker 停止期间的 batch 留在 outbox，重启后继续。
+- Recorder 使用独立、**无状态**的 Claude Code CLI 调用（`--no-session-persistence`），每次输入为
+  新增材料、简短项目背景、人工纠正、少量近期及相关旧记录（`/api/search` 的 `hits` 里 `scope=node`
+  的命中）。不继承主会话上下文或缓存，也不续接自己的旧会话：每轮都带完整 packet，续接只会重复
+  发送旧 packet；固定的 system prompt/schema 前缀本身就是缓存命中的条件。
+- 模型没有工具、MCP、项目设置或文件访问。它只输出结构化计划；程序校验来源、Chapter、parent、run
+  后通过现有 API 幂等写入。
+- Recorder 可以为 Node 登记外部产物引用（`artifact_refs`：名称、带 scheme 的绝对 URI、方向）。
+  URI 必须在本批新证据里**原样出现**，否则按编造拒绝；程序在 Node 写入后通过 `/api/attach`
+  以 `capture_key` 幂等登记。这是 W&B run 页面等曲线链接进入 Node 和数据流的路径（§8）。
+- 调用只允许 Claude 订阅/OAuth 登录及白名单模型，拒绝 API key、Bedrock、Vertex、Foundry、自定义
+  `ANTHROPIC_BASE_URL` 和 fallback。`claude auth status` 有回答时必须是 first-party 的订阅登录；
+  旧版 CLI 没有这个子命令时预检按 `unverified` 放行，由模型调用本身判定登录。
+  账户 Extra usage 必须由操作者关闭并一次确认；额度不足保留 batch 到恢复时间，overage 信号永久暂停
+  自动重试，直到操作者修复后显式解除。
+- 每次空输出/格式错误/超时类重试都是一次真实模型调用，次数有上限（4 次）；超过后批次转
+  `attempts_exhausted`，材料保留，等操作者 `--retry-blocked`。预检类失败（认证、配置、付费凭证）
+  不消耗额度，按固定间隔重试。
+- 计划在首条写入前持久化，部分写入后按 `semantic:<batch>:<index>` 恢复；成功零记录、格式错误、
+  额度暂停、认证错误、尝试耗尽、中央故障和未绑定项目必须是不同状态。
+- Hook、Recorder、CLI 或网络故障不得阻断主任务；batch 留在 outbox 重放。
 - 语义整理的取材范围不受投递影响：投递器把文件从 `pending/` 搬进 `sent/` 不得让任何一段历史
   永远进不了语义 batch。
-- 正确性不能依赖 prompt cache、模型是否记得调用工具或一次派发是否成功。
+- 正确性不能依赖 prompt cache、模型是否记得调用工具或一次调用是否成功；缓存只用于降低独立会话
+  的重复前缀成本，并记录真实 cache read/create 与输入输出 token 供验收。
 
 ## 7. 项目识别
 
@@ -339,14 +366,11 @@ Comments 的人工操作走网页 REST；不为每个网页动作增加 MCP 工�
 - Node 内联评论和修订历史。
 - 原始 session/agent timeline 默认折叠，可从语义记录跳转。
 - 跨项目全文搜索。
-- outbox、Recorder 和 GitHub backup 健康状态。三格都有数据源：投递器每轮结束时
+- outbox、Recorder 和框架集成健康状态。状态都有数据源：投递器每轮结束时
   `POST /api/telemetry/outbox` 上报本机的 pending/sent 计数、最老一条 pending 的时间、
   最近一次错误和 Recorder 未处理的 batch 数；`GET /api/health` 把最近一次结果放在
   `outbox.machines[]` 与 `recorder` 里。没有任何机器上报过时界面显示「未上报」，不画假绿灯。
   同一份统计也写在本机 `outbox/delivery-status.json`，`trace-deliver --status` 不联网就能读。
-  备份卡片额外显示 `unpushed_commits`，「本地 commit 成功但远端落后几周」因此看得见；
-  同一张卡片显示 `backup.capacity`（导出体积、仓库体积、分卷数、最大文件与逐条告警，
-  `critical` 把整张卡片提到 danger）与 `backup.missing_objects` 的条数（§13）。
 - 数据流只在存在明确 artifact 关系时显示：项目视图的结构面板有第三个切换「数据流」，
   **只有真的连出边时才出现**，并且上一个项目选过它、下一个项目没有关系时自动退回结构图。
   边只来自 `GET /api/projects/{project_id}/dataflow`（agent 侧是 `trace_context` 的
@@ -404,66 +428,17 @@ outbox/
   结果，有 pending 时退出码为 1。插件数据目录默认保留。
 - outbox 里是完整对话和可能含令牌的命令原文，因此目录 `0700`、文件 `0600`（Windows 上 best-effort）。
 
-## 13. 中央存储与 GitHub 备份
+## 13. 中央存储与手动恢复
 
-- 中央服务永久保存原始历史和语义记录；默认无 30/90 天 TTL。
-- SQLite WAL 只由单个服务实例访问；小附件按 SHA-256 内容寻址保存。
-- 每日向专用 private GitHub repository 导出确定性的 JSON/JSONL、压缩 transcript chunks、
-  小附件、manifest 和校验和；不提交运行中的 SQLite/WAL。
-- 大产物只备份引用元数据。
-- 常规备份只追加/正常 push，不 force-push；必须支持 verify 和从空数据库 restore。
-  上一轮 push 失败但 commit 已成功时，下一轮即使没有新数据也要补 push。
-- Git 接近容量阈值时告警，并支持按年份/容量分卷。
-
-导出树是**先按年、年内再按容量**的分卷结构（备份格式版本 3）：
-
-```text
-research-trace-backup/
-├── index.json                     每卷的 manifest 校验和、字节数、最大文件与行数
-├── .gitattributes
-└── volumes/<年 | base>/
-    ├── manifest.json              format=research-trace-backup-volume
-    ├── tables/<table>.NNNN.jsonl  年内按字节切的分片
-    ├── transcripts/<chunk_id>.zlib
-    └── objects/<sha 前缀路径>
-```
-
-按年是主轴，因为一行的 `created_at` 永不改变：去年的卷一旦写定就再也不被重写，Git 不必
-每天重新打包全部历史，某一年太大时可以整卷搬走。纯按容量切做不到这点——中间插一行会推移
-其后所有分片边界，等于每天重写整棵树。年内再按字节切分片，是因为托管方的限制有两个量级：
-单文件 50 MiB 警告 / 100 MiB 拒绝 push，仓库 1 GiB 建议 / 5 GiB 附近受限；按年只压得住
-仓库增速，压不住「某年 events 表本身 300 MB」的单文件超限。分片预算默认 32 MiB
-（`TRACE_BACKUP_PART_BYTES` / `--part-bytes`）。没有 `created_at` 的行（`schema_meta`）
-进 `volumes/base`。
-
-- verify 有三种粒度：整体（校验根文件、每卷 manifest 的 sha、逐卷内容，并核对 `volumes/`
-  下的目录集合与索引完全一致、各表行数逐卷求和等于索引总数）、`--volume <年>` 只验一卷、
-  或直接把 `--source` 指到卷目录。
-- restore 与卷的顺序无关：先把所有卷的所有表读进来合并，再按固定顺序一次性写库。否则
-  2027 年的 Node 指向 2026 年的 Chapter 会撞外键。
-- **旧格式（版本 2 的全量单树）仍然可以 verify 和 restore**：写入端只写当前版本，读取端
-  永不退役。备份的全部意义是「几年后还能读回来」，一次不兼容的升级就把之前所有备份变成废纸。
-  对旧树原地重新导出会把它升级成分卷并删掉根 `manifest.json`。
-- 容量告警只报不拦——容量到顶时最不该做的事就是停止备份。`export_backup` 与
-  `sync_git_backup` 的返回值都带 `capacity = {level: ok|warn|critical, warnings[], limits,
-  export_bytes, largest_file, largest_file_bytes, volumes}`，sync 额外带 `repository_bytes`
-  （`git count-objects -v`，含历史）。看三样东西：单文件、仓库总量、以及没有仓库尺寸时用
-  导出树总量兜底。四个阈值都可用 `TRACE_BACKUP_{FILE,REPO}_{WARN,CRITICAL}_BYTES` 覆盖，
-  因为自建 Gitea / GHE 的数字不一样。`repository_bytes` 故意不写进 `index.json`，否则每次
-  push 后仓库尺寸变化都会让索引变，每轮产生一个「内容没变」的 commit。
-  统计口径包含每个卷的 `manifest.json`：它不在自己的 `files` 表里（没法给自己算校验和），
-  但它是树里真实存在的一个文件，而且每个文件一条记录——一个有几十万附件对象的卷，manifest
-  本身就能越过单文件硬拒线。只有 `index.json` 不计，因为它内含 `export_bytes`，自我引用。
-- 服务把 `capacity` 与 `missing_objects` 写进 `/api/health` 的 `backup`，level 为
-  warn/critical 时另打一行 stderr（无人值守部署没人开网页）；网页备份卡片渲染同一份数据，
-  `critical` 把整张卡片提到 danger（§10）。
-- 附件对象在导出时已不存在不再中止整次导出：缺口登记进卷 manifest 与索引的
-  `missing_objects` 并继续；restore 同样跳过并报出来。否则从那天起所有新增历史都进不了备份。
-- push 之后重新数一遍积压：`unpushed_commits` 是 push 之后的数字（补推成功后为 0），
-  push 之前的那个数字叫 `retried_commits`。否则刚补推成功的那一轮会和真的落后长得一样。
-- `git add` 之后用 `git ls-files --cached` 与 `backup_file_paths()` 对账，备份仓的
-  `.gitignore` 吞掉文件时抛错而不是报成功——verify 只看工作树，这是唯一能回答
-  「推上去的那份是不是完整的」的一步。
+- 中央服务永久保存原始历史、语义记录、修订和代码/日志附件；不设自动 TTL。
+- SQLite 连接由 SQLAlchemy 管理，Alembic 负责事务内迁移。业务查询仍保留显式 SQL。
+- GitHub 每日备份及其后台调度、参数、健康面板已移除；不启用 restic 等替代服务。
+- 保留 `trace-backup export/verify/restore` 的手动本地路径，以及旧版手动 Git 同步兼容命令。
+- 备份格式版本为 3，按年份/容量分卷；版本 2 的全量旧树仍可 verify/restore。
+- 导出保留 transcript、代码及日志附件；大型数据/模型输出仅引用。校验结果报告缺失对象。
+- 不提交运行中的 SQLite/WAL、会话密钥或原始设备凭证。
+- 在新代码路径中，Entire 管理提交的会话 checkpoint，Git 对象保存未提交代码；并行运行的源目录
+  独立。W&B 只连接曲线。来源不完整时显示缺口，不虚构依赖图。
 
 默认永久保存不等于无法清除敏感内容：管理员必须有紧急 purge 能力。紧急 purge 可以重写备份、
 轮换仓库或加密密钥，并留下不含原文的审计记录。系统不自动脱敏，但提供三层「不采集」控制：
@@ -471,6 +446,11 @@ research-trace-backup/
 1. **默认不采集**：没有 marker 的项目从一开始就不被记录（§6.0）；
 2. **项目排除**：`trace-project disable` 写 `"capture": false`，保留绑定但停止采集；
 3. **全局暂停**：插件配置 `capture=off`，暂停期间不补采。
+
+第 2、3 条走同一条暂停路径：hook 不写事件、不读 transcript 正文，只把**已有会话**的 transcript
+游标推到当前位置，因此重新开启后不会把暂停期间写进 transcript 的内容补采上传。边界：暂停期间才
+开始的会话没有 outbox 目录，hook 不会为它建目录，重新开启后它从头采——处理令牌时用当时已经
+开着的会话，或者处理完再开新会话。
 
 已实现的 purge 路径：`trace-backup purge`（真删除中央库内容并写只含 id/计数/操作者/理由的审计
 记录）与 `trace-backup rewrite-history`（重建备份分支，§13 允许的唯一 force-push 场景）。
@@ -505,6 +485,12 @@ CLI（`trace-backup purge` / `rewrite-history`）与管理员 REST（`POST /api/
   也不导致整份 transcript 被丢弃。
 - 【已实现】主 agent 和所有子 agent 的可见历史可永久检索（限已绑定项目）。
 - 【已实现】Recorder 可以对无价值 batch 选择不建 Node。
+- 【已实现】Stop 不再唤起主 agent 派发 fork；独立 `trace-recorder` 使用订阅登录、无工具、无状态
+  CLI 调用和持久计划，额度/overage/格式/写入失败均保留 batch，格式类失败有尝试上限。
+- 【已实现】`capture=off` 与 `trace-project disable` 暂停期间推进 transcript 游标，重新开启后
+  不补采暂停期间的内容（§13）。
+- 【已实现】访问三档：`TRACE_PROTECT_READS` 让同一把密钥守读写、网页密钥登录、`TRACE_ALLOWED_NETWORKS`
+  网段放行、`trace-server --init` 生成 0600 的 env 文件、`trace-login --token` 一次登录全客户端共用。
 - 【已实现】想法、论文、数据理解、实验、关键实现和失败都能用同一 Node 表达。
 - 【已实现】Recorder 不能创建 Chapter、不能自我确认，也不能用旧幂等重试覆盖人类移动或修改过的
   Node：写入身份来自凭证而非请求体，只有浏览器会话算 `human`，机器凭证发 confirmation/correction
@@ -514,7 +500,7 @@ CLI（`trace-backup purge` / `rewrite-history`）与管理员 REST（`POST /api/
 - 【已实现】人工 correction 会进入后续 Recorder 上下文且不会被自动摘要覆盖。
 - 【已实现】多人并发编辑不会静默丢内容（版本号 + revisions）。
 - 【已实现】关键代码记录包含可独立理解的 snippet/diff，而不是依赖可能消失的 branch。
-- 【已实现】GitHub 备份可以从空数据库恢复并通过 manifest/hash 校验；备份格式版本为 3，
+- 【已实现】手动导出可以从空数据库恢复并通过 manifest/hash 校验；备份格式版本为 3，
   且版本 2 的旧全量树仍然可以 `verify` 和 `restore`（读取端永不退役）。
 - 【已实现】搜索不被原始事件淹没：存储层给语义层保底名额并算出截断信息，`/api/search`
   返回 `SearchResult.as_dict()`（旧的 `hits` 键仍在，另带 `totals` / `returned` / `omitted` /
@@ -522,7 +508,7 @@ CLI（`trace-backup purge` / `rewrite-history`）与管理员 REST（`POST /api/
 - 【已实现】管理员可以紧急 purge 并留下不含原文的审计记录（CLI 与 `POST /api/admin/purge`）。
 - 【已实现】`sent/` 的 30 天保留、磁盘阈值告警、`trace-deliver --status` 的未同步计数（§12）。
 - 【已实现】网页显示 outbox 与 Recorder 健康状态：投递器 `POST /api/telemetry/outbox`
-  上报，`/api/health` 返回 `outbox` 与 `recorder`（§10、§11）。
+  上报，`/api/health` 返回待处理量、状态、最近处理、暂停时间和错误（§10、§11）。
 - 【已实现】人工 correction 不会被机器悄悄了结：Recorder 在 `resolve_comment_ids` 里回填的
   id 只记为 acknowledgement（解开 curate 闸门，不再被同一条永久挡住），`resolved_at` 只有
   真人能写，纠正在界面与后续 `trace_context` 里保持未处理直到有人关掉它。
@@ -530,8 +516,7 @@ CLI（`trace-backup purge` / `rewrite-history`）与管理员 REST（`POST /api/
   长路径，否则 260 字符的 MAX_PATH 会让每一次落盘失败而退出码仍是 0。
 - 【已实现】按年份/容量分卷（§13）：导出树是 `volumes/<年>/…` + 顶层 `index.json`，
   每卷自足、可单独 `verify --volume <年>`，restore 与卷顺序无关；去年的卷写定后不再被重写。
-- 【已实现】备份容量告警：单文件 / 仓库总量 / 导出树三个口径，阈值可用环境变量覆盖，
-  告警只报不拦，结果进 `/api/health`、服务日志与网页备份卡片。
+- 【已实现】手动导出返回容量/缺失对象信息；服务不再运行定时备份。
 - 【已实现】数据流（§8）：`Store.dataflow()` 按明确登记的 sha256 / uri / machine+path 键
   join，`reference` 不参与，不从自然语言猜生产者与消费者；没有 artifact 关系的项目是空图
   而不是错误，缺键的登记如实记在 `unkeyed` 里并在界面上说出来。入口是
@@ -544,6 +529,13 @@ CLI（`trace-backup purge` / `rewrite-history`）与管理员 REST（`POST /api/
   规则的增删有 `created_by`（取自凭证）与 history 审计。【未实现】网页上的映射管理界面
   与待确认状态界面（§10）。
 - 【未实现】Codex CLI / Codex Desktop 的自动采集适配（§2）。
+
+## 实验执行边界（用户最新确认）
+
+实验提交后保持原目录和所引用公共代码不变，由研究 Agent 负责。记录系统只负责被动采集、
+版本证据与可读研究记忆，不承担 Slurm 提交/轮询、训练执行/重跑、运行目录复制、路径重写或文件锁定。
+无需专门提交接口就能留下普通 sbatch 命令及其输出；保存代码证据不等于系统接管实验目录。
+alpha.24 撤回 Submitit 和 trace-run 执行组件，旧记录与附件仍保留可读。
 
 ## 16. 命名与历史包袱
 

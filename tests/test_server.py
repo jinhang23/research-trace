@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json as _json
 import shutil
 import subprocess
-import time
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -10,6 +11,14 @@ from fastapi.testclient import TestClient
 
 from research_trace.server import TeamProjectMap, create_app
 from research_trace.webapp import INDEX_HTML
+
+# vendored 前端库按仓库位置解析；写死某一台机器的绝对路径会让别的机器上 9 个
+# Node 断言全部 MODULE_NOT_FOUND，看起来像 Node 版本问题，其实是路径。
+_STATIC = Path(__file__).resolve().parent.parent / "research_trace" / "static"
+VENDOR_JS = (
+    f"globalThis.markdownit = require({_json.dumps(str(_STATIC / 'markdown-it.min.js'))});\n"
+    f"globalThis.dagre = require({_json.dumps(str(_STATIC / 'dagre.min.js'))});\n"
+)
 
 
 def test_http_flow_and_write_auth(tmp_path):
@@ -42,7 +51,8 @@ def test_http_flow_and_write_auth(tmp_path):
         ).json()
         assert node["chapter_id"] == chapter["id"]
         invalid = client.patch(
-            f"/api/nodes/{node['id']}", headers=headers,
+            f"/api/nodes/{node['id']}",
+            headers=headers,
             json={"patch": {"body": "missing version"}},
         )
         assert invalid.status_code == 400
@@ -63,9 +73,11 @@ def test_http_flow_and_write_auth(tmp_path):
         detail = client.get(f"/api/projects/{project['id']}").json()
         assert detail["nodes"][0]["review_state"] == "unreviewed"
         client.post(
-            "/api/ingest", headers=headers,
+            "/api/ingest",
+            headers=headers,
             json={
-                "batch_id": "http-batch", "project_id": project["id"],
+                "batch_id": "http-batch",
+                "project_id": project["id"],
                 "session": {"id": "http-session", "source": "claude-code"},
                 "agents": [],
                 "events": [{"event_id": "http-event", "event_type": "Stop", "payload": {"ok": True}}],
@@ -86,11 +98,15 @@ def test_machine_token_cannot_confirm_or_correct_and_cannot_claim_a_human_identi
         headers = {"Authorization": "Bearer secret", "X-Trace-Actor": "tester"}
         project = client.post("/api/projects", headers=headers, json={"name": "RNA"}).json()
         node = client.post(
-            "/api/record", headers=headers,
+            "/api/record",
+            headers=headers,
             json={
-                "project_id": project["id"], "idempotency_key": "k1", "title": "t",
+                "project_id": project["id"],
+                "idempotency_key": "k1",
+                "title": "t",
                 # 请求体自称是人、自称已确认，都必须被忽略。
-                "created_by": "human", "review_state": "confirmed",
+                "created_by": "human",
+                "review_state": "confirmed",
             },
         ).json()
         assert node["created_by"] == "recorder"
@@ -98,19 +114,24 @@ def test_machine_token_cannot_confirm_or_correct_and_cannot_claim_a_human_identi
 
         for kind in ("confirmation", "correction"):
             denied = client.post(
-                "/api/comments", headers=headers,
+                "/api/comments",
+                headers=headers,
                 json={
-                    "project_id": project["id"], "target_type": "node", "target_id": node["id"],
-                    "kind": kind, "body": "self service", "author_type": "human",
+                    "project_id": project["id"],
+                    "target_type": "node",
+                    "target_id": node["id"],
+                    "kind": kind,
+                    "body": "self service",
+                    "author_type": "human",
                     "author_id": "alice",
                 },
             )
             assert denied.status_code == 403, kind
 
         denied_patch = client.patch(
-            f"/api/nodes/{node['id']}", headers=headers,
-            json={"expect_version": node["version"], "actor_type": "human",
-                  "patch": {"review_state": "confirmed"}},
+            f"/api/nodes/{node['id']}",
+            headers=headers,
+            json={"expect_version": node["version"], "actor_type": "human", "patch": {"review_state": "confirmed"}},
         )
         assert denied_patch.status_code == 403
         detail = client.get(f"/api/projects/{project['id']}").json()
@@ -120,7 +141,7 @@ def test_machine_token_cannot_confirm_or_correct_and_cannot_claim_a_human_identi
 def test_anonymous_read_is_announced_loudly_when_oauth_is_not_configured(tmp_path, capsys):
     app = create_app(tmp_path, token="secret")
     warning = capsys.readouterr().err
-    assert "GitHub OAuth is NOT configured" in warning
+    assert "reads are ANONYMOUS" in warning
     assert "open to" in warning
     with TestClient(app) as client:
         assert client.get("/api/health").json()["anonymous_read"] is True
@@ -156,11 +177,11 @@ def test_web_ui_keeps_structure_and_record_detail_together(tmp_path):
     assert 'data-work-view="list"' in page
     assert 'id="fieldChapter"' in page
     assert 'id="fieldReview"' in page
-    assert '新的起点（无 parent）' in page
+    assert '独立探索或前序关系待核实' in page
     assert "function layoutGraphNodes" in page
     assert 'data-select-node="' in page
     assert "连线仅表示明确的 parent 关系" in page
-    assert "node.parent_id && byId.has(node.parent_id)" in page
+    assert "dagre.layout(graph)" in page
 
 
 def test_graph_layout_is_deterministic_and_respects_parent_depth(tmp_path):
@@ -194,11 +215,13 @@ if (first.positions.c.left - first.positions.b.left < first.cardWidth) throw Err
 // 每一层各自紧排：b 有孩子、c 没有，两者仍在同一层且只隔一个间距。
 if (first.positions.b.top !== first.positions.c.top) throw Error('siblings must share a row');
 // 孤儿是另一棵树，必须整个躲开第一棵，而不是压在它上面。
-const firstTreeRight = Math.max(first.positions.a.left, first.positions.c.left) + first.cardWidth;
-if (first.positions.orphan.left < firstTreeRight) throw Error('a second tree must clear the first');
+const boxes=Object.values(first.positions);
+for(let i=0;i<boxes.length;i++) for(let j=i+1;j<boxes.length;j++) {
+  if(Math.abs(boxes[i].left-boxes[j].left)<first.cardWidth && Math.abs(boxes[i].top-boxes[j].top)<first.cardHeight) throw Error('nodes must not overlap');
+}
 """
     result = subprocess.run(
-        [node, "-"], input=functions + check, text=True, capture_output=True, check=False
+        [node, "-"], input=VENDOR_JS + functions + check, text=True, capture_output=True, check=False
     )
     assert result.returncode == 0, result.stderr
 
@@ -226,7 +249,7 @@ def test_web_fmt_escapes_hostile_timestamps():
     if not node:
         pytest.skip("node is not installed")
     start = INDEX_HTML.index("const esc = value =>")
-    source = INDEX_HTML[start:INDEX_HTML.index("function file64", start)]
+    source = INDEX_HTML[start : INDEX_HTML.index("function file64", start)]
     check = r"""
 const attack = '<img src=x onerror="fetch(\'/api/search\')">';
 if (fmt(attack).includes('<')) throw Error('hostile timestamp reached innerHTML unescaped');
@@ -236,7 +259,7 @@ if (fmt('') !== '') throw Error('empty stays empty');
 if (fmt(null) !== '') throw Error('null stays empty');
 """
     result = subprocess.run(
-        [node, "-"], input=source + check, text=True, encoding="utf-8", capture_output=True, check=False
+        [node, "-"], input=VENDOR_JS + source + check, text=True, encoding="utf-8", capture_output=True, check=False
     )
     assert result.returncode == 0, result.stderr
 
@@ -247,15 +270,16 @@ def test_web_shows_outbox_recorder_and_backup_health():
     assert "$('#healthBtn').onclick" in INDEX_HTML
     assert "async function showHealth()" in INDEX_HTML
     assert "await api('/api/health')" in INDEX_HTML
-    for name in ("outboxHealthHtml", "recorderHealthHtml", "backupHealthHtml"):
+    for name in ("outboxHealthHtml", "recorderHealthHtml", "integrationHealthHtml"):
         assert f"function {name}(" in INDEX_HTML
     # 投递器还没上报时必须说"未上报"，不能画一个绿灯
     assert "还没有投递器上报 outbox 状态。" in INDEX_HTML
     assert "value.outbox" in INDEX_HTML
 
+
 def _js_slice(start_marker: str, end_marker: str) -> str:
     start = INDEX_HTML.index(start_marker)
-    return INDEX_HTML[start:INDEX_HTML.index(end_marker, start)]
+    return INDEX_HTML[start : INDEX_HTML.index(end_marker, start)]
 
 
 def _run_js(source: str, check: str) -> None:
@@ -264,8 +288,12 @@ def _run_js(source: str, check: str) -> None:
     if not node:
         pytest.skip("node is not installed")
     result = subprocess.run(
-        [node, "-"], input=source + check, text=True, encoding="utf-8",
-        capture_output=True, check=False,
+        [node, "-"],
+        input=VENDOR_JS + source + check,
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        check=False,
     )
     assert result.returncode == 0, result.stderr
 
@@ -274,8 +302,16 @@ def _dataflow_js(*extra: str) -> str:
     """esc / fmt 那一段 + 数据流的渲染路径。S 由每个用例自己摆好。"""
     source = "var S = {project: {chapters: []}, dataflow: null, workView: 'graph', selectedNodeId: null};\n"
     source += _js_slice("const esc = value =>", "function file64")
-    for name in ("nodeOrder", "dataflowAvailable", "effectiveWorkView",
-                 "dataflowKeyLabel", "layoutDataflowNodes", "dataflowSectionHtml", *extra):
+    for name in (
+        "nodeOrder",
+        "dataflowAvailable",
+        "effectiveWorkView",
+        "dataflowKeyLabel",
+        "dagreLayout",
+        "layoutDataflowNodes",
+        "dataflowSectionHtml",
+        *extra,
+    ):
         source += _js_function(INDEX_HTML, name)
     return source
 
@@ -285,7 +321,9 @@ def test_web_dataflow_block_is_absent_until_edges_exist():
     所以「登记了产物但没给可比对的键」也一样不画图。"""
     # 视图按钮本身必须挂在同一个判据上，否则会出现一个点进去是空白的按钮
     assert "${dataflowAvailable() ? `<button type=\"button\" data-work-view=\"dataflow\"" in INDEX_HTML
-    _run_js(_dataflow_js(), r"""
+    _run_js(
+        _dataflow_js(),
+        r"""
 if (dataflowAvailable()) throw Error('no payload must not count as a data flow');
 if (dataflowSectionHtml() !== '') throw Error('an always-empty panel is pure noise');
 S.workView = 'dataflow';
@@ -307,7 +345,8 @@ S.dataflow = {
 if (!dataflowAvailable()) throw Error('one registered relation is enough to show the view');
 if (effectiveWorkView() !== 'dataflow') throw Error('the stored view must come back once edges exist');
 if (dataflowSectionHtml() === '') throw Error('edges exist but nothing was drawn');
-""")
+""",
+    )
 
 
 def test_web_says_when_artifacts_were_left_at_the_default_reference_direction():
@@ -322,7 +361,9 @@ def test_web_says_when_artifacts_were_left_at_the_default_reference_direction():
     assert "flowStats.unkeyed" in hint and "flowStats.unlabeled_direction" in hint
     assert "!dataflowAvailable()" in hint  # 有边时一个字都不该出现
 
-    _run_js(_dataflow_js(), r"""
+    _run_js(
+        _dataflow_js(),
+        r"""
 S.project = {chapters: [{id: 'c1', name: '主实验'}]};
 S.dataflow = {
   nodes: [
@@ -338,14 +379,17 @@ if (!/\b4\b/.test(withGap)) throw Error('the panel must say how many');
 
 S.dataflow.stats.unlabeled_direction = 0;
 if (/reference/.test(dataflowSectionHtml())) throw Error('nothing to report must print nothing');
-""")
+""",
+    )
 
 
 def test_web_dataflow_edge_says_what_it_joined_on_and_crosses_chapters():
     """§8 的全部立场是「只画登记过的、不猜」，所以每条边都要能说出凭哪个键连的。
     边可以跨 Chapter（消融吃主实验的产物），但 Chapter 之间仍然互不相连——
     这个视图因此不画任何 Chapter 容器，Chapter 只是节点卡片上的一行标签。"""
-    _run_js(_dataflow_js(), r"""
+    _run_js(
+        _dataflow_js(),
+        r"""
 S.project = {chapters: [{id: 'c1', name: '主实验'}, {id: 'c2', name: '消融实验'}]};
 S.dataflow = {
   nodes: [
@@ -369,13 +413,16 @@ if (!html.includes('主实验') || !html.includes('消融实验')) throw Error('
 if (html.includes('chapter-map-title')) throw Error('the data flow must not draw chapters as containers');
 if (!html.includes('model.ckpt')) throw Error('the artifact name is part of the evidence');
 if ((html.match(/class="flow-edge /g) || []).length !== 2) throw Error('one edge per registered relation');
-""")
+""",
+    )
 
 
 def test_web_dataflow_layout_survives_a_cycle_and_ignores_dangling_edges():
     """存储层只做一次键 join、不按时间过滤方向，所以 A→B→A 是可能出现的。
     布局里的深度计算必须自带环保护，否则一条环就能让页面转不出来。"""
-    _run_js(_dataflow_js(), r"""
+    _run_js(
+        _dataflow_js(),
+        r"""
 const nodes = [
   {id: 'a', title: 'A', chapter_id: 'c1', occurred_at: '2026-01-01'},
   {id: 'b', title: 'B', chapter_id: 'c1', occurred_at: '2026-01-02'},
@@ -403,13 +450,16 @@ if (!(chain.positions.a.depth < chain.positions.b.depth)) throw Error('a produce
 if (!(chain.positions.b.depth < chain.positions.c.depth)) throw Error('depth must follow the chain');
 const only = layoutDataflowNodes([nodes[0]], []);
 if (only.positions.a.depth !== 0) throw Error('an isolated node is a root');
-""")
+""",
+    )
 
 
 def test_web_dataflow_long_edges_do_not_run_through_the_cards_between_them():
     """跨层的边如果按「直上直下」画，在同一列上就是一条从中间那些节点身上碾过去的
     竖线；两条边的中点还会重合，标签叠成一团。图读不懂就等于没画。"""
-    _run_js(_dataflow_js(), r"""
+    _run_js(
+        _dataflow_js(),
+        r"""
 S.project = {chapters: [{id: 'c1', name: '主实验'}]};
 const at = day => `2026-01-0${day}T00:00:00Z`;
 S.dataflow = {
@@ -434,13 +484,16 @@ if (!(canvas > lane)) throw Error('the canvas must be wide enough to show the de
 
 const labels = [...html.matchAll(/<text class="flow-edge-label" x="([^"]+)" y="([^"]+)"/g)].map(m => m[1] + ',' + m[2]);
 if (new Set(labels).size !== labels.length) throw Error('two edge labels landed on the same point');
-""")
+""",
+    )
 
 
 def test_web_dataflow_escapes_hostile_artifact_metadata():
     """artifact 的 name / uri / 机器路径是任何持凭证的机器能写的自由文本，
     整块图都是拼出来直插 innerHTML 的。fmt 那次存储型 XSS 不许在这里重犯。"""
-    _run_js(_dataflow_js(), r"""
+    _run_js(
+        _dataflow_js(),
+        r"""
 const attack = '<img src=x onerror="fetch(\'/api/search\')">';
 S.project = {chapters: [{id: 'c1', name: attack}]};
 S.dataflow = {
@@ -455,44 +508,8 @@ const html = dataflowSectionHtml();
 if (html.includes('<img')) throw Error('hostile artifact metadata reached innerHTML unescaped');
 if (!html.includes('&lt;img')) throw Error('the raw value must still be readable, escaped');
 if (dataflowKeyLabel(attack).includes('<')) throw Error('an unknown key_kind is returned verbatim');
-""")
-
-
-def test_web_backup_capacity_alarm_and_missing_objects_are_visible():
-    """§13「Git 接近容量阈值时告警」的落点。sync_git_backup 每轮都算 capacity，
-    界面不渲染的话那次计算等于没做。"""
-    source = "var S = {};\n"
-    source += _js_slice("const esc = value =>", "function file64")
-    source += _js_slice("const HEALTH_STATE_PILL", "function healthCardHtml")
-    for name in ("healthCardHtml", "bytesLabel", "backupCapacityLines", "backupHealthHtml"):
-        source += _js_function(INDEX_HTML, name)
-    _run_js(source, r"""
-const ok = backupHealthHtml({backup: {enabled: true, last_success_at: '2026-08-18T00:00:00Z',
-  unpushed_commits: 0, capacity: {level: 'ok', export_bytes: 1024, volumes: 2, warnings: []},
-  missing_objects: []}});
-if (!ok.includes('正常')) throw Error('a healthy backup must not be painted as a problem');
-if (!ok.includes('2 个分卷')) throw Error('volume count is the shape of the new backup tree');
-
-const bad = backupHealthHtml({backup: {enabled: true, last_success_at: '2026-08-18T00:00:00Z',
-  unpushed_commits: 0,
-  capacity: {level: 'critical', export_bytes: 1073741824, repository_bytes: 5368709120, volumes: 4,
-    largest_file: 'volumes/2026/tables/events.0001.jsonl', largest_file_bytes: 99614720,
-    limits: {}, warnings: ['largest backup file <img src=x> is 99614720 bytes']},
-  missing_objects: ['ab/cd/ef']}});
-if (!bad.includes('严重')) throw Error('a critical capacity level must escalate the card');
-if (!bad.includes('95.0 MiB')) throw Error('the largest file size must be readable');
-if (!bad.includes('5.0 GiB')) throw Error('repository size must be shown');
-if (!bad.includes('4 个分卷')) throw Error('volume count missing');
-if (!bad.includes('99614720 bytes')) throw Error('the warning text itself must be shown');
-if (bad.includes('<img')) throw Error('a backup warning reached innerHTML unescaped');
-if (!bad.includes('附件对象在导出时已不存在')) throw Error('missing attachment objects must be surfaced');
-
-const warn = backupHealthHtml({backup: {enabled: true, last_success_at: '2026-08-18T00:00:00Z',
-  unpushed_commits: 0, capacity: {level: 'warn', export_bytes: 0, volumes: 1, warnings: ['close']},
-  missing_objects: []}});
-if (!warn.includes('需要注意')) throw Error('a warn level must not read as healthy');
-if (bytesLabel('nonsense') !== '—') throw Error('an unparsable size must not be echoed back');
-""")
+""",
+    )
 
 
 def test_dataflow_endpoint_feeds_the_web_view(tmp_path):
@@ -504,22 +521,36 @@ def test_dataflow_endpoint_feeds_the_web_view(tmp_path):
     with TestClient(app) as client:
         project = client.post("/api/projects", headers=headers, json={"name": "flow"}).json()
         chapters = [
-            client.post(f"/api/projects/{project['id']}/chapters", headers=headers,
-                        json={"name": name}).json()
+            client.post(f"/api/projects/{project['id']}/chapters", headers=headers, json={"name": name}).json()
             for name in ("主实验", "消融实验")
         ]
         nodes = [
-            client.post("/api/record", headers=headers, json={
-                "project_id": project["id"], "chapter_id": chapter["id"],
-                "idempotency_key": f"flow-{index}", "title": title, "body": "b",
-            }).json()
+            client.post(
+                "/api/record",
+                headers=headers,
+                json={
+                    "project_id": project["id"],
+                    "chapter_id": chapter["id"],
+                    "idempotency_key": f"flow-{index}",
+                    "title": title,
+                    "body": "b",
+                },
+            ).json()
             for index, (chapter, title) in enumerate(zip(chapters, ("训练", "消融")))
         ]
         for node, direction in zip(nodes, ("output", "input")):
-            attached = client.post("/api/attach", headers=headers, json={
-                "project_id": project["id"], "target_type": "node", "target_id": node["id"],
-                "name": "model.ckpt", "direction": direction, "sha256": digest,
-            })
+            attached = client.post(
+                "/api/attach",
+                headers=headers,
+                json={
+                    "project_id": project["id"],
+                    "target_type": "node",
+                    "target_id": node["id"],
+                    "name": "model.ckpt",
+                    "direction": direction,
+                    "sha256": digest,
+                },
+            )
             assert attached.status_code == 200, attached.text
         flow = client.get(f"/api/projects/{project['id']}/dataflow").json()
 
@@ -567,16 +598,27 @@ def test_search_no_longer_drops_the_truncation_report(tmp_path):
     headers = {"Authorization": "Bearer t"}
     with TestClient(app) as client:
         project = client.post("/api/projects", headers=headers, json={"name": "P"}).json()
-        client.post("/api/record", headers=headers, json={
-            "project_id": project["id"], "idempotency_key": "k", "title": "alpha", "body": "alpha",
-        }).raise_for_status()
+        client.post(
+            "/api/record",
+            headers=headers,
+            json={
+                "project_id": project["id"],
+                "idempotency_key": "k",
+                "title": "alpha",
+                "body": "alpha",
+            },
+        ).raise_for_status()
         for index in range(60):
-            client.post("/api/ingest", headers=headers, json={
-                "batch_id": f"b{index}", "project_id": project["id"],
-                "session": {"id": "s", "source": "claude-code"},
-                "events": [{"event_id": f"e{index}", "event_type": "Stop",
-                            "payload": {"x": "alpha"}}],
-            }).raise_for_status()
+            client.post(
+                "/api/ingest",
+                headers=headers,
+                json={
+                    "batch_id": f"b{index}",
+                    "project_id": project["id"],
+                    "session": {"id": "s", "source": "claude-code"},
+                    "events": [{"event_id": f"e{index}", "event_type": "Stop", "payload": {"x": "alpha"}}],
+                },
+            ).raise_for_status()
         value = client.get("/api/search", params={"q": "alpha", "limit": 10}).json()
     assert value["hits"], "旧结构必须还在，网页和 MCP 都在读 hits"
     assert value["truncated"] is True
@@ -591,41 +633,70 @@ def test_the_deliverer_can_report_outbox_health_and_health_shows_it(tmp_path):
     headers = {"Authorization": "Bearer t"}
     with TestClient(app) as client:
         assert "outbox" not in client.get("/api/health", headers=headers).json()
-        assert client.post("/api/telemetry/outbox", json={
-            "machine": "hpg-node-7", "pending": 3, "sent": 41,
-            "oldest_pending_at": "2026-08-19T00:00:00Z", "last_error": None,
-        }).status_code == 401, "遥测也要写权限，否则谁都能往健康页上写字"
-        client.post("/api/telemetry/outbox", headers=headers, json={
-            "machine": "hpg-node-7", "pending": 3, "sent": 41,
-            "oldest_pending_at": "2026-08-19T00:00:00Z",
-        }).raise_for_status()
+        assert (
+            client.post(
+                "/api/telemetry/outbox",
+                json={
+                    "machine": "hpg-node-7",
+                    "pending": 3,
+                    "sent": 41,
+                    "oldest_pending_at": "2026-08-19T00:00:00Z",
+                    "last_error": None,
+                },
+            ).status_code
+            == 401
+        ), "遥测也要写权限，否则谁都能往健康页上写字"
+        client.post(
+            "/api/telemetry/outbox",
+            headers=headers,
+            json={
+                "machine": "hpg-node-7",
+                "pending": 3,
+                "sent": 41,
+                "oldest_pending_at": "2026-08-19T00:00:00Z",
+                "recorder_pending_batches": 2,
+                "recorder_status": "quota",
+                "recorder_last_processed_at": "2026-09-04T10:00:00Z",
+                "recorder_last_error": "subscription quota exhausted",
+                "recorder_pause_until": 2_000_000_000,
+            },
+        ).raise_for_status()
         health = client.get("/api/health", headers=headers).json()
     machine = health["outbox"]["machines"][0]
     assert machine["machine"] == "hpg-node-7"
     assert machine["pending"] == 3 and machine["sent"] == 41
+    assert health["recorder"] == {
+        "pending_batches": 2,
+        "status": "quota",
+        "last_processed_at": "2026-09-04T10:00:00Z",
+        "last_error": "subscription quota exhausted",
+        "pause_until": 2_000_000_000,
+    }
 
 
 def test_a_raw_batch_records_which_credential_delivered_it(tmp_path):
     """投递已经和产生事件的 session 解耦，所以「哪台机器推的」只能来自凭证。"""
     app = create_app(tmp_path, token="t")
     with TestClient(app) as client:
-        client.post("/api/ingest", json={
-            "batch_id": "b1", "session": {"id": "s", "source": "claude-code"},
-            "events": [{"event_id": "e1", "event_type": "Stop", "payload": {}}],
-        }, headers={"Authorization": "Bearer t", "X-Trace-Actor": "alice@hpg-node-7"}).raise_for_status()
-        row = app.state.store._db.execute(
-            "SELECT delivered_by FROM ingest_batches WHERE batch_id='b1'"
-        ).fetchone()
+        client.post(
+            "/api/ingest",
+            json={
+                "batch_id": "b1",
+                "session": {"id": "s", "source": "claude-code"},
+                "events": [{"event_id": "e1", "event_type": "Stop", "payload": {}}],
+            },
+            headers={"Authorization": "Bearer t", "X-Trace-Actor": "alice@hpg-node-7"},
+        ).raise_for_status()
+        row = app.state.store._db.execute("SELECT delivered_by FROM ingest_batches WHERE batch_id='b1'").fetchone()
     assert row["delivered_by"] == "alice@hpg-node-7"
 
 
-def test_web_surfaces_truncation_expiry_and_an_unpushed_backup():
+def test_web_surfaces_truncation_and_expiry():
     """三件以前只存在于 JSON 里、界面上完全看不出来的事。"""
     assert "function searchTruncationHtml(" in INDEX_HTML
     assert "value.truncated" in INDEX_HTML
     assert "未显示" in INDEX_HTML
-    assert "backup.unpushed_commits" in INDEX_HTML
-    assert "远端落后" in INDEX_HTML
+    assert "GitHub 每日备份" not in INDEX_HTML
     assert "function deviceExpiringSoon(" in INDEX_HTML
     assert "trace-login --renew" in INDEX_HTML
     assert "value.anonymous_read" in INDEX_HTML
@@ -674,16 +745,19 @@ class _FakeGitHub:
 
 def _admin_client(tmp_path):
     app = create_app(
-        tmp_path, token="t", github_client_id="cid", github_client_secret="sec",
-        public_url="https://trace.example", session_secret="s" * 48,
-        github_admins="alice", oauth_client=_FakeGitHub(),
+        tmp_path,
+        token="t",
+        github_client_id="cid",
+        github_client_secret="sec",
+        public_url="https://trace.example",
+        session_secret="s" * 48,
+        github_admins="alice",
+        oauth_client=_FakeGitHub(),
     )
     client = TestClient(app, base_url="https://trace.example")
     start = client.get("/auth/github/login", follow_redirects=False)
     state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
-    client.get(
-        "/auth/github/callback", params={"code": "c", "state": state}, follow_redirects=False
-    )
+    client.get("/auth/github/callback", params={"code": "c", "state": state}, follow_redirects=False)
     return app, client, {"X-CSRF-Token": client.get("/api/auth/me").json()["csrf_token"]}
 
 
@@ -693,16 +767,27 @@ def test_a_team_mapping_rule_lands_a_fresh_clone_on_the_same_central_project(tmp
     app = create_app(tmp_path, token="t")
     headers = {"Authorization": "Bearer t"}
     with TestClient(app) as client:
-        project = client.post("/api/projects", headers=headers, json={
-            "name": "RNA", "workspace_keys": ["rt-ws-original"],
-        }).json()
+        project = client.post(
+            "/api/projects",
+            headers=headers,
+            json={
+                "name": "RNA",
+                "workspace_keys": ["rt-ws-original"],
+            },
+        ).json()
         app.state.team_map.add(
-            pattern="https://github.com/lab/rna*", project_id=project["id"],
-            note="lab monorepo", actor="alice",
+            pattern="https://github.com/lab/rna*",
+            project_id=project["id"],
+            note="lab monorepo",
+            actor="alice",
         )
-        value = client.post("/api/context", headers=headers, json={
-            "workspace_keys": ["rt-ws-fresh-clone", "https://github.com/lab/rna"],
-        }).json()
+        value = client.post(
+            "/api/context",
+            headers=headers,
+            json={
+                "workspace_keys": ["rt-ws-fresh-clone", "https://github.com/lab/rna"],
+            },
+        ).json()
 
     assert value["matched"] is True
     assert value["project"]["id"] == project["id"]
@@ -710,7 +795,9 @@ def test_a_team_mapping_rule_lands_a_fresh_clone_on_the_same_central_project(tmp
     assert value["matched_rules"][0]["created_by"] == "alice"
     # 命中后把 key 登记上去，下一次直接走第一/第二种发现方式，不必再过映射
     assert {k["workspace_key"] for k in value["project"]["workspace_keys"]} == {
-        "rt-ws-original", "rt-ws-fresh-clone", "https://github.com/lab/rna",
+        "rt-ws-original",
+        "rt-ws-fresh-clone",
+        "https://github.com/lab/rna",
     }
 
 
@@ -721,14 +808,17 @@ def test_an_ambiguous_team_mapping_refuses_to_create_even_when_asked_to(tmp_path
     with TestClient(app) as client:
         alpha = client.post("/api/projects", headers=headers, json={"name": "Alpha"}).json()
         beta = client.post("/api/projects", headers=headers, json={"name": "Beta"}).json()
-        app.state.team_map.add(pattern="https://github.com/lab/*", project_id=alpha["id"],
-                               note="", actor="alice")
-        app.state.team_map.add(pattern="https://github.com/*/shared", project_id=beta["id"],
-                               note="", actor="bob")
-        value = client.post("/api/context", headers=headers, json={
-            "workspace_keys": ["https://github.com/lab/shared"],
-            "create_if_missing": True, "project_name": "Would be a duplicate",
-        }).json()
+        app.state.team_map.add(pattern="https://github.com/lab/*", project_id=alpha["id"], note="", actor="alice")
+        app.state.team_map.add(pattern="https://github.com/*/shared", project_id=beta["id"], note="", actor="bob")
+        value = client.post(
+            "/api/context",
+            headers=headers,
+            json={
+                "workspace_keys": ["https://github.com/lab/shared"],
+                "create_if_missing": True,
+                "project_name": "Would be a duplicate",
+            },
+        ).json()
         names = {p["name"] for p in client.get("/api/projects", headers=headers).json()["projects"]}
 
     assert value["matched"] is False
@@ -744,16 +834,26 @@ def test_team_mapping_rules_are_admin_only_and_record_who_added_them_and_when(tm
     app, client, headers = _admin_client(tmp_path)
     with client:
         project = client.post("/api/projects", headers=headers, json={"name": "RNA"}).json()
-        anonymous = client.post("/api/team/mapping", json={
-            "pattern": "https://github.com/lab/rna*", "project_id": project["id"],
-            "created_by": "mallory",
-        })
+        anonymous = client.post(
+            "/api/team/mapping",
+            json={
+                "pattern": "https://github.com/lab/rna*",
+                "project_id": project["id"],
+                "created_by": "mallory",
+            },
+        )
         assert anonymous.status_code == 403, "没有 CSRF 的写入必须被挡住"
 
-        rule = client.post("/api/team/mapping", headers=headers, json={
-            "pattern": "https://github.com/lab/rna*", "project_id": project["id"],
-            "note": "lab monorepo", "created_by": "mallory",
-        }).json()
+        rule = client.post(
+            "/api/team/mapping",
+            headers=headers,
+            json={
+                "pattern": "https://github.com/lab/rna*",
+                "project_id": project["id"],
+                "note": "lab monorepo",
+                "created_by": "mallory",
+            },
+        ).json()
         assert rule["created_by"] == "alice" and rule["created_at"]
 
         listing = client.get("/api/team/mapping").json()
@@ -777,41 +877,15 @@ def test_a_wildcard_only_rule_is_refused(tmp_path):
     with client:
         project = client.post("/api/projects", headers=headers, json={"name": "RNA"}).json()
         for pattern in ("*", "**", "/srv/*"):
-            denied = client.post("/api/team/mapping", headers=headers, json={
-                "pattern": pattern, "project_id": project["id"],
-            })
+            denied = client.post(
+                "/api/team/mapping",
+                headers=headers,
+                json={
+                    "pattern": pattern,
+                    "project_id": project["id"],
+                },
+            )
             assert denied.status_code == 400, pattern
-
-
-def test_the_backup_capacity_alert_reaches_health_and_the_service_log(tmp_path, monkeypatch, capsys):
-    """§13：「Git 接近容量阈值时告警。」备份那一层每轮都算了这个数，服务端不把它
-    带进 /api/health 的话，那次计算谁也看不见——健康卡片依旧一片正常，直到某天
-    push 被拒。"""
-    from research_trace import server as S
-
-    repo = tmp_path / "repo"
-    (repo / ".git").mkdir(parents=True)
-    capacity = {"level": "critical", "warnings": ["export is 5 GiB, above the repository limit"],
-                "export_bytes": 5 * 1024 ** 3}
-
-    def fake_sync(store, backup_repo, **_kwargs):
-        return {"changed": True, "pushed": True, "unpushed_commits": 0,
-                "capacity": capacity, "missing_objects": ["sha256:deadbeef"]}
-
-    monkeypatch.setattr(S, "sync_git_backup", fake_sync)
-    app = create_app(tmp_path / "data", token="t", backup_repo=repo, backup_interval_hours=24)
-    with TestClient(app) as client:
-        # 备份循环是后台任务，第一轮要经过一次线程跳转；轮询而不是赌它已经跑完。
-        for _ in range(100):
-            backup = client.get("/api/health", headers={"Authorization": "Bearer t"}).json()["backup"]
-            if backup.get("capacity"):
-                break
-            time.sleep(0.02)
-
-    assert backup["capacity"]["level"] == "critical"
-    assert backup["capacity"]["warnings"] == capacity["warnings"]
-    assert backup["missing_objects"] == ["sha256:deadbeef"]
-    assert "backup capacity critical" in capsys.readouterr().err, "无人值守的部署也要看得见"
 
 
 def test_the_dataflow_view_is_reachable_over_http_and_stays_opt_in(tmp_path):
@@ -820,17 +894,31 @@ def test_the_dataflow_view_is_reachable_over_http_and_stays_opt_in(tmp_path):
     app = create_app(tmp_path, token="t")
     headers = {"Authorization": "Bearer t"}
     with TestClient(app) as client:
-        project = client.post("/api/projects", headers=headers, json={
-            "name": "RNA", "workspace_keys": ["rt-ws-flow"],
-        }).json()
-        quiet = client.post("/api/context", headers=headers, json={
-            "workspace_keys": ["rt-ws-flow"],
-        }).json()
+        project = client.post(
+            "/api/projects",
+            headers=headers,
+            json={
+                "name": "RNA",
+                "workspace_keys": ["rt-ws-flow"],
+            },
+        ).json()
+        quiet = client.post(
+            "/api/context",
+            headers=headers,
+            json={
+                "workspace_keys": ["rt-ws-flow"],
+            },
+        ).json()
         assert "dataflow" not in quiet["project"], "热路径默认不算这张图"
 
-        asked = client.post("/api/context", headers=headers, json={
-            "workspace_keys": ["rt-ws-flow"], "include_dataflow": True,
-        }).json()
+        asked = client.post(
+            "/api/context",
+            headers=headers,
+            json={
+                "workspace_keys": ["rt-ws-flow"],
+                "include_dataflow": True,
+            },
+        ).json()
         assert asked["project"]["dataflow"]["edges"] == []
 
         # 网页不必为了一张图重拉整个 context
@@ -844,18 +932,28 @@ def test_an_absolute_cwd_is_refused_as_a_project_identity(tmp_path):
     app = create_app(tmp_path, token="t")
     headers = {"Authorization": "Bearer t"}
     with TestClient(app) as client:
-        denied = client.post("/api/context", headers=headers, json={
-            "workspace_keys": ["/home/alice/rna"],
-            "create_if_missing": True, "project_name": "RNA",
-        })
+        denied = client.post(
+            "/api/context",
+            headers=headers,
+            json={
+                "workspace_keys": ["/home/alice/rna"],
+                "create_if_missing": True,
+                "project_name": "RNA",
+            },
+        )
         assert denied.status_code == 400
         assert client.get("/api/projects", headers=headers).json()["projects"] == []
 
         # 混着来时只丢掉路径那一个并回报，剩下的身份仍然成立
-        value = client.post("/api/context", headers=headers, json={
-            "workspace_keys": [WINDOWS_CWD_KEY, "rt-ws-shared"],
-            "create_if_missing": True, "project_name": "RNA",
-        }).json()
+        value = client.post(
+            "/api/context",
+            headers=headers,
+            json={
+                "workspace_keys": [WINDOWS_CWD_KEY, "rt-ws-shared"],
+                "create_if_missing": True,
+                "project_name": "RNA",
+            },
+        ).json()
         assert value["matched"] is True
         assert value["rejected_workspace_keys"][0]["workspace_key"] == WINDOWS_CWD_KEY
         assert [k["workspace_key"] for k in value["project"]["workspace_keys"]] == ["rt-ws-shared"]
@@ -871,7 +969,9 @@ def test_web_graph_cards_carry_their_own_size():
 
     所以这条从两个方向钉死：卡片自带尺寸，且那个尺寸来自布局函数本人。
     """
-    _run_js(_dataflow_js(), r"""
+    _run_js(
+        _dataflow_js(),
+        r"""
 S.project = {chapters: [{id: 'c1', name: '主实验'}]};
 S.dataflow = {
   nodes: [
@@ -889,7 +989,8 @@ const cards = html.split('class="graph-node').length - 1;
 if (cards !== 2) throw Error('expected one card per node, got ' + cards);
 if ((html.match(new RegExp(size.source, 'g')) || []).length !== cards)
   throw Error('every data flow card must carry the size its layout computed');
-""")
+""",
+    )
 
     # 结构图同样：布局算出来的那个尺寸必须原样出现在卡片上。
     _run_js(
@@ -908,4 +1009,5 @@ const html = graphSectionHtml({id: 'c1', name: '主实验'}, nodes);
 const size = 'width:' + layout.cardWidth + 'px;height:' + layout.cardHeight + 'px';
 if ((html.split(size).length - 1) !== 2)
   throw Error('every structure card must carry the size its layout computed');
-""")
+""",
+    )

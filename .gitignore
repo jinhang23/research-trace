@@ -19,8 +19,18 @@ claude_logs/
 __pycache__/
 *.pyc
 .pytest_cache/
+pytest-cache-files-*/
 .venv/
+.venv-basic-memory/
+.test-tmp/
+.integration-demo/
+integrations.local.json
 
 # 打包产物
 *.egg-info/
 build/
+
+# 真实研究情境模拟的输出（scripts/simulate_research.py）
+scripts/simulate_research.log
+scripts/simulate_research.json
+scripts/ops_battery.log

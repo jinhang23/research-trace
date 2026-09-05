@@ -4,6 +4,7 @@
 一段按字符硬截断的 JSONL，连一个完整的 JSON 行都不保证有。解析放在服务端做，
 因为客户端拿到的就是那段截断后的 blob，怎么都解析不出来。
 """
+
 import pytest
 
 pytest.importorskip("fastapi")
@@ -82,7 +83,7 @@ def test_traces_own_dispatch_turns_are_hidden():
 
 def test_real_work_next_to_plumbing_still_shows():
     """只挡调度那几条，同一段里真正的工作内容不能跟着消失。"""
-    mixed = PLUMBING + [LINES[0]]
+    mixed = [*PLUMBING, LINES[0]]
     result = turns("\n".join(mixed))
     assert len(result) == 1
     assert "8 Å" in result[0]["text"]
@@ -91,6 +92,7 @@ def test_real_work_next_to_plumbing_still_shows():
 def test_only_our_own_markers_are_matched():
     """只匹配本系统自己产生的字符串，不去猜别人的措辞。"""
     from research_trace.storage import Store
+
     assert Store._is_plumbing("[research-trace-batch 123]") is True
     assert Store._is_plumbing("我们讨论一下 recorder 的协议") is False
     assert Store._is_plumbing("batch size 设成 32") is False

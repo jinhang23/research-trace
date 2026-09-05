@@ -1,0 +1,17 @@
+{
+  "schema": "research-trace.integrations.v1",
+  "sync_interval_seconds": 60,
+  "basic_memory": {
+    "command": "/opt/basic-memory/bin/basic-memory",
+    "args": ["mcp"],
+    "env": {"BASIC_MEMORY_CONFIG_DIR": "/srv/basic-memory-config"},
+    "timeout_seconds": 30
+  },
+  "mlflow": {"tracking_uri": "http://127.0.0.1:5000"},
+  "projects": {
+    "REPLACE_WITH_TRACE_PROJECT_ID": {
+      "memory_project": "research-index",
+      "mlflow_experiment_ids": ["REPLACE_WITH_EXPERIMENT_ID"]
+    }
+  }
+}

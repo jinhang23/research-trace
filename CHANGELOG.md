@@ -1,8 +1,118 @@
+# 2.0.0a29 — 让独立 Recorder 在真实 CLI 上跑通；安全三档；包与格式标准化
+
+## Recorder 管线（真实 CLI 上的修复）
+
+- **相关旧记录此前从未进入模型。** worker 读 `/api/search` 的 `items`，服务端返回的键是 `hits`（测试里的 mock 写错了同一个键，所以一直是绿的）。改为读 `hits` 且只取 `scope=node` 的命中；comment / overview 的 id 不再可能被当成 parent。
+- 召回不再用整句 prompt 做 `%query%` 子串匹配（永远搜不到旧 Node）：改为从 prompt 与最后回答里抽标识符（ESM-2、warmup、esm2_gnn、10Å）和重复出现的中文二元词，每个词各查一次再合并，已在 `recent_nodes` 里的不重复送。
+- 搜索永远匹配不上 `10Å`：服务端用 Python `str.lower()` 折叠查询（`Å→å`），列那边是 SQLite 的 `lower()`（只折 ASCII）。改成两边只折 ASCII；网页搜索同样受益。
+- 去掉 `--exclude-dynamic-system-prompt-sections`：官方帮助写明传 `--system-prompt` 时该参数被忽略，而 2.1.30 之前的 CLI 不认识它，每次调用直接 rc=1。
+- `claude auth status` 预检对没有这个子命令的旧版 CLI 放行并记为 `unverified`，登录由模型调用本身判定；有回答时仍严格要求 claude.ai/OAuth 且 `apiProvider` 为 first-party。
+- 模型调用改为无状态（`--no-session-persistence`），删除 12 轮 `--session-id`/`--resume` 轮换：每轮都带完整 packet，续接只会把旧 packet 重复送一遍（12 轮足以顶穿 200k 上下文）；固定前缀已实测命中缓存。
+- 空输出/格式错误/超时类失败最多 4 次，之后批次转 `attempts_exhausted` 等 `--retry-blocked`；以前指数退避封的是间隔不是次数，一个永远解析不了的批次会无限烧额度。
+- `ANTHROPIC_BASE_URL` 进入拒绝列表；调用前清理嵌套 Claude Code 会话变量（`CLAUDECODE`、`CLAUDE_CODE_*` 等），保留 `CLAUDE_CODE_OAUTH_TOKEN`。
+- 新增 `artifact_refs`：Recorder 可为 Node 登记 W&B run 页面等外部产物 URI，URI 必须在本批证据中原样出现，Node 写入后经 `/api/attach` 以 `capture_key` 幂等登记，从此曲线链接是数据流的键而不只是正文里的一串字。
+- 模型把 **Node 上的人工纠正 id** 放进章摘要的 `resolve_comment_ids` 时不再整批 format 失败（服务端的 409 闸门按目标算，列上外目标的 id 改变不了任何事），只丢掉该 id；编造的 id 仍是硬错误。schema 字段和 system prompt 补上了 `resolve_comment_ids` 的用法。
+- `status` 只是模型自述，写什么由 `records` / `curations` 两个数组决定（模型对"只更新 Overview、零记录"答了 `status=skip`，旧的矛盾检查把一次正确的编辑判成 format 失败并重试）。labels 要求用原文语言并复用已有标签；章归属规则：名字/摘要明显匹配就归入，Inbox 只给真正拿不准的。
+- 摘要不再每轮都改：curation 必须给出 `reason`（`first_summary` / `result_changed` / `plan_changed` / `direction_closed` / `correction_absorbed` / `milestone` / `progress_only`），`progress_only` 和「已有摘要的章再来一次 first_summary」在写入前丢弃，sidecar 记 `dropped_curations`。摘要是研究线当前的答案，不是步骤日志。
+- `capture=off` 与 `trace-project disable` 暂停期间推进 transcript 游标，重新开启后不再补采暂停期间的内容——此前文档承诺如此而实现恰好相反。暂停期间才新开的会话仍从头采，文档写明。
+
+## 安全与网络
+
+- **安全配置三档，内网档一把钥匙。** 以前只有"读全开 + token 挡写"和 GitHub OAuth 两档。新增访问密钥模式：`TRACE_PROTECT_READS=true`（`--protect-reads`；`--host` 非回环且有 token 时默认开）让同一个密钥守读写，网页弹出"访问密钥 + 你的名字"登录（`POST /api/auth/token-login`，用密钥签名的无状态 cookie，纠正/确认署名为 `human`），`trace-server --init` 生成密钥和 0600 的 `server.env`，`--env-file` 启动；客户端 `trace-login --url … --token` 把密钥存进本机凭证文件，投递器、Recorder、MCP、trace-project 一起读——不必再在每个 shell `export TRACE_TOKEN`、也不必填插件的 `token`。可选 `TRACE_ALLOWED_NETWORKS` 按网段放行（可信代理后读 `X-Forwarded-For`）。未认证的 `/api/health` 只回最小信息。`/api/auth/config` 带 `mode: open|token|oauth`。
+- **网络路径（服务端在远端）。** 投递器、MCP、Recorder 三个 HTTP 客户端共用一个拒绝重定向的 opener：`http://` 被 301 到 https 时以前 POST 变 GET、只见 405，现在直接报出重定向与正确做法，文件留在 pending。投递器 401 提示点名 `TRACE_TOKEN/--token`。代码取证 zip 的上传超时按体积放大（100 MiB 约 7 分钟，`--timeout` 是下限）。`trace-server --public-url` 之前是死参数，现已接入；对网络监听而读没锁时启动打印醒目警告。
+- 插件的 `python` 默认是裸 `python3`，它多半不是 `pip install research-trace` 进去的解释器：以前 MCP 服务在 stdio 握手里留一条 `ModuleNotFoundError: mcp` traceback，Claude Code 只显示 `CONNECTION_CLOSED`，而 `trace_mcp.py --selfcheck` 根本不 import SDK 所以照样"通过"。现在两条路径都先检查 SDK 可导入，不行就打印一行可操作的提示并退出 2。
+
+## 包、格式与代码风格
+
+- 版本只剩一个来源（`research_trace/__init__.py`，pyproject 用 dynamic version 读它，server/mcp 引用 `PLUGIN_VERSION`），两份插件清单的 semver 写法由测试守着；pyproject 补齐 license/authors/classifiers/urls，extras 收成 `server` / `integrations` / `dev`，根目录三个入口 shim 不再打进 wheel；统一用 ruff（行宽 120）排版与检查，全仓库按它格式化。
+- 新增 [docs/FORMATS.md](docs/FORMATS.md)：磁盘/网络上每一种格式标识、写入方、读取方、位置与兼容规则，安装后的目录布局，数值版本与迁移，环境变量；`tests/test_formats_are_documented.py` 守着代码里的每个 `research-trace.*.vN` 都在表里。
+- README / QUICKSTART 的安装说明改写成"中央服务 / Claude Code 插件 / 客户端包"三层，并给出 `claude plugin install --config python=… --config url=…` 的一步到位写法；`skills/research-trace/SKILL.md` 删除已不存在的 Stop block decision / fork 派发说明；`docs/RECORDER_DESIGN.md`、`docs/TODO.md` 标明 alpha.26 的派发上限已随派发机制删除；`docs/DESIGN.md` 不再把 GitHub 当灾备。
+
+## 验证工具（见 scripts/README.md）
+
+- `tests/test_server.py` 的 vendored JS 路径不再写死某台 Windows 机器的绝对路径（此前 9 个 Node 断言在任何其它机器上都 MODULE_NOT_FOUND）；接受 Node 20+ 的 `ℹ fail 0` 摘要；新增真调 CLI `--help` 的参数契约测试、hook 无网络 import 守卫。
+- `scripts/simulate_research.py`：三天真实研究情境（真 hook、真投递、真中央、真 `claude --print`，合成研究内容），20 项评分；与 pytest、运维 battery 连跑 8 轮（64 次 sonnet 调用）管线零失败，第 4–8 轮连续全绿，记录数 / parent / 摘要次数跨轮稳定。
+- `scripts/ops_battery.py`：运维角度 41 项（真 CLI、真 hook 进程、真中央；Recorder 失败路径经 `scripts/fake_claude.py` 走真子进程，不花额度；`REAL_WATCH=1` 加一次真 watcher 进程）。
+- `scripts/net_battery.py`：服务端在远端的网络路径 15 项，在真 TLS（自签证书、非回环地址）上验证证书校验、`SSL_CERT_FILE` 私有 CA、错 token、重定向、代理、13 MB 分批、Recorder 与 selfcheck 走 TLS、暴露警告。
+
+# 2.0.0a28 — Hook 与独立 Recorder 生命周期彻底分离
+
+- 修正方案 3 的触发边界：Hook 只保存事件、transcript 增量和语义 batch，不启动、唤醒或管理模型进程。
+- `trace-recorder --watch` 改为单独启动的长期消费者；空队列时继续等待，之后自动消费新增 batch。停止期间积压留在 outbox。
+- `trace-project recorder-enable` 只写项目开关并明确提示单独启动 watcher，不隐式产生模型调用。
+- README、快速开始、需求和协议明确区分持久采集与独立 AI 整理，不再把 Hook 的 fire-and-forget 与方案 3 混为一谈。
+
+# 2.0.0a27 — 独立订阅 Recorder（方案 3）
+
+- Stop 只原子落盘、生成语义 batch 并分离启动 `trace-recorder`；删除主 agent 的 fork、Agent/SendMessage、阻塞和复用窗口运行路径。
+- 独立 Claude Code CLI 仅接收新增证据、精简项目背景、人工纠正、近期及相关旧记录；无工具、无 MCP、无项目设置，每项目复用 12 批后轮换的独立会话。
+- 适配固定 Claude-Mem 源码的观察者提示结构、输出分类、额度事件和 hardened observer 边界；保留 Apache-2.0 LICENSE、NOTICE、固定提交与修改说明。CLI 启动方式参考 Entire 的隔离调用路径。
+- 使用官方 `--json-schema` 输出；程序严格校验来源、Chapter、parent、run 和摘要版本，先保存计划，再用 `semantic:<batch>:<index>` 幂等写 Node。Overview/Chapter curation 用乐观版本，并能识别“中央已写、响应丢失”的重试。
+- 调用前拒绝 API key、Bedrock、Vertex、Foundry 和非订阅认证；不配置 fallback。启用需确认账户 Extra usage 已关闭。quota 按 reset 时间等待，overage 自动重试永久停止，材料不删除。
+- 本机及中央健康状态新增 Recorder 状态、暂停时间、最近处理、错误和真实 input/output/cache token 计数；现有 Web 增加状态显示。
+- 新增独立 CLI、部分失败恢复、成功零记录、格式校验、quota/overage、会话轮换和无感 Stop 测试。测试未调用真实模型；UF 订阅、长会话和科学记录质量仍列为 P1。
+
+# 2.0.0a26 — 限制 Recorder 异步反馈循环
+
+- 修复缺少 agent_id 的 Recorder 读取批次/协议时被当成新研究材料的问题；已退休 Recorder 的迟到事件也按内部活动过滤。
+- 同一次主用户请求内，每个批次最多派发一次，总共最多派发三次。后台完成、普通 Stop、会话生命周期和 Recorder 提示不会重置预算。
+- 达到上限后不再唤起主 agent；未处理批次保持排队，原始采集和投递继续，新用户输入后恢复自动派发。
+- 采集错误和暂停诊断保留在原始记录中，但不单独触发模型整理。修正 Stop 输出兼容性的旧注释。
+- 使用模拟 hook 序列验证重复 Stop、身份缺失、迟到事件和暂停后恢复；未在 UF 的真实 Claude Code 会话中验证。
+
+# 2.0.0a25 — 借鉴 Claude-Mem 的研究记忆提示词
+
+- 对照固定版本的 Claude-Mem 提示词，重写 Recorder：独立可理解的事实、连贯的研究解释、与已有记忆比较、阶段摘要和按需读取。
+- 保留未探索方向、失败与负结果、一组实验一个研究节点，以及来源 ID、人工纠正和被动取证边界。
+- 不要求每轮生成摘要，不照搬软件类型枚举或所有文件清单；缩短与整理无关的协议说明。
+- MCP 字段说明同步上述规则；复用 Recorder 时明确要求读取新增事件和对话，避免只凭旧上下文总结。
+- 这是现有 Recorder 的提示词与派发指导改进；没有安装 Claude-Mem worker、替换存储或实现新的缓存机制。
+- 来源映射和语义验收样例见 [Recorder 借鉴说明](docs/RECORDER_DESIGN.md)。
+
+# 2.0.0a24 — 记录系统回归被动取证
+
+- 按用户明确的职责边界，删除 Submitit 依赖与调度器，以及准备/执行/提交/轮询/重跑和运行目录复制代码。
+- 移除 trace-run 执行入口，trace-code 只启用、保存和查看代码证据。
+- Agent 使用原有 sbatch 并负责保持实验原目录和公共代码不变；hook 不再要求使用专门运行封装。
+- 普通工具命令、输出、对话、Entire/Git 阶段证据继续通过原 outbox 保存，研究节点以来源 ID 关联。
+- 保留旧 run、W&B 链接、日志、代码附件与节点的读取/投递兼容性。
+- 以下 alpha.22/23 的执行管理说明仅为版本历史，已被本次边界调整撤回。
+
+# 2.0.0a23 — 上游接管会话、阶段快照和 Slurm
+
+- 直接使用 Submitit 的 SlurmExecutor / SlurmJob，删除自制提交脚本、sbatch 作业号解析和 sacct 文本解析。
+- Entire 的 live session export 接管已配置项目的主会话来源；可记录没有代码改动的讨论和未探索方向。
+- 复用 Entire 未提交/已提交 checkpoint，逐文件校验代码，固定 ref 并保存不含会话元数据的代码 ZIP。
+- 训练启动前优先使用匹配的上游版本；当前代码更新后才进行必要的 Git 执行冻结，并明确记录原因。
+- Entire 阶段捕获有短暂并发等待和明确缺口；失败的会话导出不推进游标、不发布半次导出的内容。
+- 加入真实 Entire CLI 与 Submitit 序列化/执行验收；Slurm 命令边界模拟，尚未提交 UF 作业。
+- 保持原有 Web、人工修订、W&B 曲线外链与新记录起点；GitHub 每日备份继续移除。
+
+# 2.0.0a22 — 组件替换与实际运行记录
+
+- 官方 MCP SDK、markdown-it、Dagre、SQLAlchemy/Alembic、Authlib 接管相应通用实现。
+- 新增 trace-run：Entire/Git 捕获、共享代码冻结、独立本地/Slurm 运行、状态投递、W&B 外链、归档复跑。
+- 节点可关联一组实验，展开代码与运行证据；原始来源按 ID 精确查询。
+- 保留原有 Web 和人工修订规则，允许未实施想法和未知关系。
+- GitHub 每日备份完全移出服务；旧自动备份环境设置不再生效。本地手动导出/恢复保留。
+- 具体配置、验证范围和 UF 尚待验证部分见 [运行集成指南](docs/RUNTIME_INTEGRATION.md)。
+
+以下为旧版本历史，不代表当前定时备份行为。
+
 # 变更记录
 
 版本号同时出现在六个地方（`pyproject.toml`、`research_trace/__init__.py`、
 `research_trace/server.py`、`research_trace/mcp.py`、两个 `.claude-plugin/*.json`），
 有测试守它们一致。**改动插件包里的东西之后必须 bump**，否则已安装的机器拿不到。
+
+## 2.0.0-alpha.21
+
+- 增加 Entire CLI 的只读证据适配器与隔离验证脚本：真实 Git/checkpoint 关联、公共代码版本固定、恢复后重跑，以及记录/修订/附件恢复。会话与研究摘要使用合成材料，尚未替换生产采集或接入 UF/SLURM。
+- 可选 MLflow 官方 SDK 集成：将已绑定 experiment 的 run / trace 保存为不可变原始事件和 Node 证据附件；重复导入去重，内容变化保存新快照，过滤结构化隐藏推理字段。
+- 可选 Basic Memory 官方 MCP 集成：增量同步 Overview / Chapter / Node、评论和证据引用，用 hybrid 检索召回；结果重新解析为中央当前版本，排除已 purge 内容。知识服务故障时回退本地关键词检索。
+- 复用 Basic Memory MCP 连接，让写入后的后台向量任务有机会完成；两个框架均默认关闭，项目绑定由管理员配置，现有 hooks / 投递器不增加依赖或联网步骤。
+- “附件 / 产物”增加 MLflow 导入；状态面板增加索引同步状态与重试入口，搜索支持 Chapter 定位、索引滞后和故障回退提示。
+- 同步 Recorder 文档与现有 fresh 默认行为；提供集成需求映射、部署说明、真实框架模拟数据验证脚本及隔离/去重/人工修订保护测试。
 
 ## 2.0.0-alpha.20
 
@@ -186,7 +296,7 @@
 - **Recorder 重新 fork 的间隔可配**（插件配置 `recorder_fork_window`，默认 1 = 每批）。
   依据是真实数据：一次 fork 首轮读入约 60 万 token（缓存命中率 99.7–99.9%），而很多批次
   的全部内容就是「某个子 agent 结束了」—— 一份样本里 137 个事件中 `SubagentStop` 占 56 个。
-  为这种批次付一次完整 fork 不划算。`0` 等价于旧的 `TRACE_RECORDER_REUSE=1`。
+  为这种批次付一次完整 fork 不划算。`0` 等价于当时的旧复用环境开关。
 
 ## 2.0.0-alpha.8
 
@@ -207,7 +317,7 @@
 - **Recorder 每一批都重新 fork**，拿当下的完整上下文。此前只有第一批享受到 fork 的
   好处：后续批次通过 `SendMessage` 只收到一个 manifest 路径，手里是 fork 那一刻的
   陈旧快照。重 fork 的前缀与主 agent 一致，本来就该命中提示缓存。
-  `TRACE_RECORDER_REUSE=1` 可退回旧行为。
+  当时也可用旧复用环境开关退回旧行为。
 - 退休过的 Recorder agent id 不会被后到的 `PostToolUse` 复活 —— 否则下一批会被发给
   一个已经停掉的 Recorder。
 

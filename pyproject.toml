@@ -4,22 +4,39 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "research-trace"
-version = "2.0.0a20"
+# 版本只写在一个地方：research_trace/__init__.py 的 __version__（PEP 440，例如 2.0.0a29）。
+# 插件清单 .claude-plugin/plugin.json 与 marketplace.json 用 semver 写法（2.0.0-alpha.29），
+# 由 tests/test_version_is_consistent.py 守着两种写法指向同一个版本。
+dynamic = ["version"]
 description = "团队研究与项目记忆：完整 agent 历史与精选语义记录"
 readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Jinhang Wei" }]
 requires-python = ">=3.10"
+keywords = ["research", "provenance", "agent-memory", "lab-notebook", "claude-code"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering",
+]
 
-# MCP 那一侧零运行时依赖。MCP 是一份开放协议规范，`mcp` 那个 pip 包只是它的官方
-# Python SDK；stdio 侧就是换行分隔的 JSON-RPC 2.0，直接说协议即可，不必依赖 SDK。
-# 于是也不会再被 SDK 的破坏性改版牵连（mcp 2.0 删掉了 1.x 的整套装饰器 API）。
-# 中央服务另需 fastapi/uvicorn，见下面的 optional-dependencies。
-dependencies = []
+# 客户端最小依赖：hook 只用标准库；MCP 进程和独立 Recorder 需要这两个。
+# 协议传输属于上游 SDK，这里只钉主版本。
+dependencies = ["mcp>=1.29,<2", "filelock>=3.16,<4"]
 
 [project.urls]
 Homepage = "https://github.com/jinhang23/research-trace"
+Repository = "https://github.com/jinhang23/research-trace"
+Changelog = "https://github.com/jinhang23/research-trace/blob/main/CHANGELOG.md"
 
-# 装完之后这几个就是真正的命令（Windows 上是 Scripts/*.exe），于是 MCP 配置写成
-# `command: trace-mcp`，和别的 MCP server 形状一致，不用写死某个 .py 的绝对路径。
+# 装完之后这几个就是真正的命令（Windows 上是 Scripts/*.exe）。
+# Claude Code 插件里的 hook 与 MCP 进程**不**依赖 PATH：它们用插件配置的 `python`
+# 解释器直接运行 ${CLAUDE_PLUGIN_ROOT}/scripts/trace_hook.py 和 trace_mcp.py，
+# 所以 `trace-mcp` 只是给手工 `claude mcp add` 的人用的。
 [project.scripts]
 trace-mcp = "research_trace.mcp:main"
 trace-server = "research_trace.server:main"
@@ -28,17 +45,63 @@ trace-login = "research_trace.device_login:main"
 # 投递权威是这个独立进程，不是 hook、也不是 Recorder：它扫 outbox 全部 session，
 # 只有中央返回 2xx 才把文件搬进 sent/。trace-project 是采集的 opt-in 绑定入口。
 trace-deliver = "research_trace.deliver:main"
+trace-recorder = "research_trace.recorder:main"
 trace-project = "research_trace.deliver:project_main"
+trace-code = "research_trace.workspace:main"
 
 [project.optional-dependencies]
-server = ["fastapi>=0.110", "uvicorn>=0.27"]
-dev = ["pytest"]
+# 中央服务这一台机器才需要。
+server = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "sqlalchemy>=2,<3",
+    "alembic>=1.13,<2",
+    "authlib>=1.6,<2",
+    "httpx>=0.28,<1",
+]
+# 可选的 MLflow 证据导入与 Basic Memory 检索索引。
+integrations = ["mlflow-skinny>=3.14,<4"]
+# 开发与验证：pytest、ruff，以及 TestClient 需要的 httpx。
+dev = ["pytest>=8", "ruff>=0.6", "httpx>=0.28,<1"]
 
 [tool.setuptools]
 packages = ["research_trace"]
-# 根目录那三个 .py 只是薄薄的入口转发（给不想用 console script 的人直接
-# `python trace_server.py` 用），本体全在 research_trace 包里。
-py-modules = ["trace_mcp", "trace_server", "trace_login"]
+# 根目录的 trace_mcp.py / trace_server.py / trace_login.py 是给插件目录和
+# `python trace_server.py` 用的薄入口，不打进 wheel：wheel 里的命令是上面的 console scripts。
+
+[tool.setuptools.dynamic]
+version = { attr = "research_trace.__version__" }
+
+[tool.setuptools.package-data]
+research_trace = ["static/*", "migrations/*.py", "migrations/versions/*.py", "third_party/claude_mem/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# 代码格式与静态检查统一用 ruff：`ruff format` 排版，`ruff check` 查错。
+# 行宽 120：仓库里大量说明性长注释和 SQL，88 会把它们切得难读。
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["research_trace/static", "research_trace/third_party"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = [
+    "B008",   # FastAPI 的 Depends(...) 就是写在默认参数里的
+    "B023",   # 闭包在同一次循环迭代里定义并调用，不存在延迟绑定问题
+    "RUF001", "RUF002", "RUF003",  # 中文标点不是"易混淆字符"
+    "RUF012", # 可变类属性作为常量表
+    "SIM117", # 嵌套 with 在这里更清楚
+    "SIM105", # 显式的 try/except/pass 比 contextlib.suppress 更容易看出吞了什么
+    "B017",   # 测试里有意断言"任何异常"
+    "B905",   # zip(strict=) 是 3.10 才有的写法，这里的配对长度由调用方保证
+    "RUF059", # 测试 fixture 解包出的占位变量
+    "UP007", "UP045",  # 保留 Optional/Union 写法的兼容
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["research_trace"]
+
+[tool.ruff.format]
+quote-style = "preserve"

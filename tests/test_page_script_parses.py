@@ -7,6 +7,7 @@
 
 所以这里不切片，整段丢给 node --check。
 """
+
 from __future__ import annotations
 
 import shutil
@@ -26,7 +27,7 @@ def test_the_whole_inline_script_parses(tmp_path):
         page = client.get("/").text
 
     assert page.count("<script>") == 1, "页面不止一段脚本了，这条测试得跟着扩到每一段"
-    script = page[page.index("<script>") + len("<script>"): page.rindex("</script>")]
+    script = page[page.index("<script>") + len("<script>") : page.rindex("</script>")]
     source = tmp_path / "page.js"
     source.write_text(script, encoding="utf-8")
 

@@ -3,6 +3,7 @@
 这里守两件事：① 根部署的行为一个字节都不能变；② 挂在前缀下时，前缀之外必须
 真的进不去 —— 「站点只存在于某个不可猜路径之下」这种部署，靠的就是这一条。
 """
+
 import pytest
 
 pytest.importorskip("fastapi")
@@ -14,11 +15,18 @@ from research_trace.server import create_app
 from research_trace.webapp import INDEX_HTML, render_index
 
 
-@pytest.mark.parametrize("raw,expected", [
-    (None, ""), ("", ""), ("/", ""),
-    ("/trace", "/trace"), ("trace", "/trace"), ("/trace/", "/trace"),
-    ("/t/abc/def/", "/t/abc/def"),
-])
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        (None, ""),
+        ("", ""),
+        ("/", ""),
+        ("/trace", "/trace"),
+        ("trace", "/trace"),
+        ("/trace/", "/trace"),
+        ("/t/abc/def/", "/t/abc/def"),
+    ],
+)
 def test_normalize_base_path(raw, expected):
     assert normalize_base_path(raw) == expected
 
@@ -77,16 +85,19 @@ def test_writes_still_need_the_token_under_a_prefix(tmp_path):
     app = create_app(tmp_path, token="secret", base_path="/t/abc")
     with TestClient(app) as client:
         assert client.post("/t/abc/api/projects", json={"name": "x"}).status_code == 401
-        created = client.post("/t/abc/api/projects", json={"name": "x"},
-                              headers={"Authorization": "Bearer secret"})
+        created = client.post("/t/abc/api/projects", json={"name": "x"}, headers={"Authorization": "Bearer secret"})
         assert created.status_code == 200
 
 
 def _oauth_kwargs(base_path, public_url):
     return dict(
-        client_id="cid", client_secret="secret",
-        public_url=public_url, session_secret="s" * 32,
-        admins="someone", base_path=base_path, insecure_cookies=True,
+        client_id="cid",
+        client_secret="secret",
+        public_url=public_url,
+        session_secret="s" * 32,
+        admins="someone",
+        base_path=base_path,
+        insecure_cookies=True,
     )
 
 
@@ -105,10 +116,14 @@ def test_oauth_public_url_must_carry_the_same_prefix():
 def test_session_cookies_are_scoped_to_the_prefix(tmp_path):
     """cookie 写死 path=/ 时，会被发给同一域名上的每一个应用。"""
     app = create_app(
-        tmp_path, base_path="/t/abc",
-        github_client_id="cid", github_client_secret="secret",
-        public_url="http://127.0.0.1:8765/t/abc", session_secret="s" * 32,
-        github_admins="someone", insecure_cookies=True,
+        tmp_path,
+        base_path="/t/abc",
+        github_client_id="cid",
+        github_client_secret="secret",
+        public_url="http://127.0.0.1:8765/t/abc",
+        session_secret="s" * 32,
+        github_admins="someone",
+        insecure_cookies=True,
     )
     with TestClient(app) as client:
         response = client.get("/t/abc/auth/github/login", follow_redirects=False)
@@ -121,10 +136,14 @@ def test_session_cookies_are_scoped_to_the_prefix(tmp_path):
 
 def test_device_page_redirects_into_the_prefix_when_signed_out(tmp_path):
     app = create_app(
-        tmp_path, base_path="/t/abc",
-        github_client_id="cid", github_client_secret="secret",
-        public_url="http://127.0.0.1:8765/t/abc", session_secret="s" * 32,
-        github_admins="someone", insecure_cookies=True,
+        tmp_path,
+        base_path="/t/abc",
+        github_client_id="cid",
+        github_client_secret="secret",
+        public_url="http://127.0.0.1:8765/t/abc",
+        session_secret="s" * 32,
+        github_admins="someone",
+        insecure_cookies=True,
     )
     with TestClient(app) as client:
         response = client.get("/t/abc/device", follow_redirects=False)

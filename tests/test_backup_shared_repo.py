@@ -5,14 +5,14 @@
 所以第一次被推到前面之后 push 就永远是 non-fast-forward —— 而且是每轮都失败，
 因为没有任何环节会去拉。
 """
+
 import shutil
 import subprocess
 
 import pytest
 
 from research_trace.backup import sync_git_backup
-from research_trace.storage import Store, ValidationError
-
+from research_trace.storage import ValidationError
 from tests.test_backup import _git, _init_repo, _repo_with_remote, populated_store
 
 GIT = shutil.which("git")
@@ -23,8 +23,7 @@ def other_writer_pushes(tmp_path, bare, filename="README.md", body="code\n"):
     """模拟另一台机器往同一个分支推代码。"""
     work = tmp_path / f"other-{filename}"
     subprocess.run([GIT, "clone", "-q", str(bare), str(work)], check=True)
-    for key, value in (("user.email", "o@example.com"), ("user.name", "other"),
-                       ("commit.gpgsign", "false")):
+    for key, value in (("user.email", "o@example.com"), ("user.name", "other"), ("commit.gpgsign", "false")):
         _git(work, "config", key, value)
     (work / filename).write_text(body, encoding="utf-8")
     _git(work, "add", "-A")
@@ -78,7 +77,7 @@ def test_an_unreachable_remote_does_not_lose_the_local_commit(tmp_path):
     _git(repo, "remote", "add", "origin", str(tmp_path / "nope.git"))
 
     with pytest.raises(Exception):
-        sync_git_backup(store, repo)          # push 会失败
+        sync_git_backup(store, repo)  # push 会失败
     assert _git(repo, "log", "--oneline").stdout.strip(), "本地 commit 必须还在"
 
 
@@ -91,8 +90,7 @@ def test_a_real_conflict_aborts_instead_of_mangling_someone_elses_work(tmp_path)
 
     work = tmp_path / "other"
     subprocess.run([GIT, "clone", "-q", str(bare), str(work)], check=True)
-    for key, value in (("user.email", "o@example.com"), ("user.name", "other"),
-                       ("commit.gpgsign", "false")):
+    for key, value in (("user.email", "o@example.com"), ("user.name", "other"), ("commit.gpgsign", "false")):
         _git(work, "config", key, value)
     # 必须挑一个我们下一轮**一定会重写**的文件，否则 rebase 干净应用，造不出冲突。
     victim = sorted((work / "research-trace-backup").rglob("nodes.*.jsonl"))[0]

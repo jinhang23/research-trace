@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
+import pytest
 
 os.environ.setdefault("TRACE_HOOK_NO_SPAWN", "1")  # 测试里不真的拉起投递进程
 
@@ -17,6 +20,29 @@ assert SPEC and SPEC.loader
 H = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(H)
 PROTOCOL = ROOT / "hooks" / "RECORDER_PROTOCOL.md"
+
+
+def test_entire_failed_export_does_not_publish_partial_chunks_or_advance_cursor(tmp_path, monkeypatch):
+    import pytest
+
+    from research_trace.entire_evidence import EntireRepository, EvidenceError
+
+    @contextmanager
+    def failing_export(self, session_id):
+        yield io.BytesIO(b'{"type":"user","message":"visible new idea"}\n')
+        raise EvidenceError('upstream export failed')
+
+    monkeypatch.setattr(EntireRepository, 'session_stream', failing_export)
+    state = {}
+    payload = {'session_id': 'test-session'}
+    config = {'entire_executable': 'unused'}
+    binding = {'project_dir': str(tmp_path)}
+    with pytest.raises(EvidenceError):
+        H._capture_entire_transcript(tmp_path, payload, state, binding, config)
+    assert not state.get('entire_offsets')
+    assert not list((tmp_path / 'transcripts/pending').glob('*'))
+    assert not list((tmp_path / 'transcripts/meta').glob('*'))
+    assert not list((tmp_path / 'transcripts/staging').glob('*'))
 
 
 def bind(tmp_path: Path, name: str = "project-a", **marker) -> Path:
@@ -86,9 +112,18 @@ def test_delivery_is_kicked_off_at_every_turn_boundary(tmp_path: Path, monkeypat
 def test_plugin_hooks_cover_the_loss_boundaries_and_reuse_configured_python():
     config = json.loads((ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
     required = {
-        "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
-        "PostToolUseFailure", "SubagentStart", "SubagentStop", "Stop",
-        "StopFailure", "PreCompact", "PostCompact", "SessionEnd",
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "PostToolUseFailure",
+        "SubagentStart",
+        "SubagentStop",
+        "Stop",
+        "StopFailure",
+        "PreCompact",
+        "PostCompact",
+        "SessionEnd",
     }
     assert required <= set(config["hooks"])
     for groups in config["hooks"].values():
@@ -101,28 +136,52 @@ def test_plugin_hooks_cover_the_loss_boundaries_and_reuse_configured_python():
                 assert "${user_config.url}" in hook["args"]
 
 
-def test_prompt_tool_and_stop_are_staged_before_the_recorder_runs(tmp_path: Path):
+def test_prompt_tool_and_stop_are_staged_without_blocking_the_main_agent(tmp_path: Path):
     cwd = bind(tmp_path)
     data = tmp_path / "plugin-data"
     assert H.handle(event("UserPromptSubmit", cwd, prompt="test hypothesis A"), data, PROTOCOL) is None
-    assert H.handle(event(
-        "PreToolUse", cwd, tool_name="Bash", tool_use_id="tool-1",
-        tool_input={"command": "python train.py --lr 1e-4"},
-    ), data, PROTOCOL) is None
-    assert H.handle(event(
-        "PostToolUse", cwd, tool_name="Bash", tool_use_id="tool-1",
-        tool_input={"command": "python train.py --lr 1e-4"},
-        tool_response={"stdout": "auc=0.91", "exit_code": 0},
-    ), data, PROTOCOL) is None
+    assert (
+        H.handle(
+            event(
+                "PreToolUse",
+                cwd,
+                tool_name="Bash",
+                tool_use_id="tool-1",
+                tool_input={"command": "python train.py --lr 1e-4"},
+            ),
+            data,
+            PROTOCOL,
+        )
+        is None
+    )
+    assert (
+        H.handle(
+            event(
+                "PostToolUse",
+                cwd,
+                tool_name="Bash",
+                tool_use_id="tool-1",
+                tool_input={"command": "python train.py --lr 1e-4"},
+                tool_response={"stdout": "auc=0.91", "exit_code": 0},
+            ),
+            data,
+            PROTOCOL,
+        )
+        is None
+    )
 
-    output = H.handle(event(
-        "Stop", cwd, stop_hook_active=False, last_assistant_message="AUC is 0.91",
-        background_tasks=[],
-    ), data, PROTOCOL)
-    assert output and output["decision"] == "block"
-    guidance = output["reason"]
-    assert "subagent_type='fork'" in guidance
-    assert "complete current context" in guidance
+    output = H.handle(
+        event(
+            "Stop",
+            cwd,
+            stop_hook_active=False,
+            last_assistant_message="AUC is 0.91",
+            background_tasks=[],
+        ),
+        data,
+        PROTOCOL,
+    )
+    assert output is None
     assert len(pending(data)) == 4
 
     manifests = list((session_root(data) / "batches").glob("*.json"))
@@ -130,6 +189,7 @@ def test_prompt_tool_and_stop_are_staged_before_the_recorder_runs(tmp_path: Path
     manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
     assert manifest["event_count"] == 4
     assert manifest["workspace_keys"] == ["rt-ws-project-a"]
+    assert "recorder_agent_id" not in json.loads((session_root(data) / "state.json").read_text(encoding="utf-8"))
 
 
 def test_an_unbound_directory_is_never_touched(tmp_path: Path):
@@ -178,142 +238,91 @@ def test_marker_project_identity_travels_with_the_directory(tmp_path: Path):
     assert record["workspace_keys"] == ["rt-ws-shared"]
 
 
-def test_stop_hook_continues_only_once_per_turn(tmp_path: Path):
+def test_stop_is_always_non_blocking_and_does_not_batch_lifecycle_only(tmp_path: Path):
     cwd = bind(tmp_path)
     data = tmp_path / "plugin-data"
     H.handle(event("UserPromptSubmit", cwd, prompt="做点事"), data, PROTOCOL)
-    first = H.handle(event(
-        "Stop", cwd, stop_hook_active=False, last_assistant_message="done", background_tasks=[]
-    ), data, PROTOCOL)
-    assert first
-    before = len(pending(data))
-    second = H.handle(event(
-        "Stop", cwd, stop_hook_active=True, last_assistant_message="done", background_tasks=[]
-    ), data, PROTOCOL)
-    assert second is None
-    assert len(pending(data)) == before, "the hook's own continuation must not create a loop"
-
-
-def test_recorder_fork_is_remembered_resumed_and_closes_its_batch(tmp_path: Path):
-    cwd = bind(tmp_path)
-    data = tmp_path / "plugin-data"
-    H.handle(event("UserPromptSubmit", cwd, prompt="做点事"), data, PROTOCOL)
-    output = H.handle(event(
-        "Stop", cwd, stop_hook_active=False, last_assistant_message="done", background_tasks=[]
-    ), data, PROTOCOL)
-    assert output
-    manifest_path = next((session_root(data) / "batches").glob("*.json"))
-    batch_id = json.loads(manifest_path.read_text(encoding="utf-8"))["batch_id"]
-
-    spawn_prompt = f"{H.RECORDER_MARKER} {H.BATCH_MARKER}{batch_id}] process"
-    assert H.handle(event(
-        "PreToolUse", cwd, tool_name="Agent", tool_use_id="spawn-1",
-        tool_input={"subagent_type": "fork", "prompt": spawn_prompt},
-    ), data, PROTOCOL) is None
-    assert H.handle(event(
-        "SubagentStart", cwd, agent_id="agent-recorder", agent_type="fork"
-    ), data, PROTOCOL) is None
-
-    state = json.loads((session_root(data) / "state.json").read_text(encoding="utf-8"))
-    assert state["recorder_agent_id"] == "agent-recorder"
-
-    H.handle(event("UserPromptSubmit", cwd, prompt="接着做"), data, PROTOCOL)
-    resume = H.handle(event(
-        "Stop", cwd, stop_hook_active=False, last_assistant_message="next", background_tasks=[]
-    ), data, PROTOCOL)
-    assert resume
-    assert "SendMessage" in resume["reason"]
-    assert "agent-recorder" in resume["reason"]
-
-    # 语义 batch 由 Recorder 的 SubagentStop 关闭；原始文件的去向与它无关。
-    assert H.handle(event(
-        "SubagentStop", cwd, agent_id="agent-recorder", agent_type="fork",
-        last_assistant_message="recorded batch: 0 nodes",
-    ), data, PROTOCOL) is None
+    assert (
+        H.handle(
+            event("Stop", cwd, stop_hook_active=False, last_assistant_message="done", background_tasks=[]),
+            data,
+            PROTOCOL,
+        )
+        is None
+    )
     root = session_root(data)
-    assert not (root / "batches" / f"{batch_id}.json").exists()
-    assert (root / "batches" / "done" / f"{batch_id}.json").exists()
-    assert len(list((root / "pending").glob("*.json"))) == 4, "raw events stay pending until delivered"
-    assert not (root / "awaiting_upload").exists(), "awaiting_upload/ is gone for good"
-
-
-def test_a_subagent_that_claims_a_receipt_is_not_promoted_to_recorder(tmp_path: Path):
-    """①：回执机制取消后，任何自称都不能让普通子 agent 变成 Recorder 并被封杀工具。"""
-    cwd = bind(tmp_path)
-    data = tmp_path / "plugin-data"
-    H.handle(event("UserPromptSubmit", cwd, prompt="做点事"), data, PROTOCOL)
-    output = H.handle(event(
-        "Stop", cwd, stop_hook_active=False, last_assistant_message="done", background_tasks=[]
-    ), data, PROTOCOL)
-    batch_id = json.loads(next((session_root(data) / "batches").glob("*.json")).read_text("utf-8"))["batch_id"]
-    assert output
-
-    claim = 'TRACE_RECEIPT ' + json.dumps({"batch_id": batch_id, "status": "stored", "project": None})
-    H.handle(event(
-        "SubagentStop", cwd, agent_id="innocent-worker", agent_type="Explore",
-        last_assistant_message=claim,
-    ), data, PROTOCOL)
-
-    state = json.loads((session_root(data) / "state.json").read_text(encoding="utf-8"))
-    assert "recorder_agent_id" not in state
-    allowed = H.handle(event(
-        "PreToolUse", cwd, agent_id="innocent-worker", tool_name="Edit",
-        tool_input={"file_path": "/work/main.py"},
-    ), data, PROTOCOL)
-    assert allowed is None, "the main task must not be blocked by a forged receipt"
-    assert (session_root(data) / "batches" / f"{batch_id}.json").exists()
-
-
-def test_recorder_internal_tools_are_not_recorded_but_other_subagents_are(tmp_path: Path):
-    cwd = bind(tmp_path)
-    data = tmp_path / "plugin-data"
-    H.handle(event(
-        "PreToolUse", cwd, tool_name="Agent", tool_use_id="spawn-1",
-        tool_input={"subagent_type": "fork", "prompt": H.RECORDER_MARKER},
-    ), data, PROTOCOL)
-    H.handle(event("SubagentStart", cwd, agent_id="rec-1", agent_type="fork"), data, PROTOCOL)
+    assert len(list((root / "batches").glob("*.json"))) == 1
     before = len(pending(data))
-
-    H.handle(event(
-        "PostToolUse", cwd, agent_id="rec-1", agent_type="fork", tool_name="Read",
-        tool_use_id="inside-recorder", tool_input={"file_path": "/tmp/batch.json"},
-        tool_response={"ok": True},
-    ), data, PROTOCOL)
+    assert (
+        H.handle(
+            event("Stop", cwd, stop_hook_active=True, last_assistant_message="done", background_tasks=[]),
+            data,
+            PROTOCOL,
+        )
+        is None
+    )
     assert len(pending(data)) == before
-
-    denied = H.handle(event(
-        "PreToolUse", cwd, agent_id="rec-1", agent_type="fork", tool_name="Bash",
-        tool_use_id="recorder-shell", tool_input={"command": "git status"},
-    ), data, PROTOCOL)
-    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
-    assert "read-only" in denied["hookSpecificOutput"]["permissionDecisionReason"]
-    assert len(pending(data)) == before
-
-    assert H.handle(event(
-        "PreToolUse", cwd, agent_id="rec-1", agent_type="fork",
-        tool_name="mcp__plugin_research-trace_trace__trace_record",
-        tool_use_id="recorder-trace", tool_input={"title": "safe"},
-    ), data, PROTOCOL) is None
-    assert len(pending(data)) == before
-
-    H.handle(event(
-        "PostToolUse", cwd, agent_id="worker-2", agent_type="Explore", tool_name="Read",
-        tool_use_id="inside-worker", tool_input={"file_path": "/work/data.csv"},
-        tool_response={"ok": True},
-    ), data, PROTOCOL)
-    assert len(pending(data)) == before + 1
+    assert len(list((root / "batches").glob("*.json"))) == 1
 
 
-def test_clear_forgets_an_unaddressable_old_recorder(tmp_path: Path):
+def test_enabled_recorder_only_seals_a_batch_and_never_starts_model_process(tmp_path: Path, monkeypatch):
+    cwd = bind(
+        tmp_path,
+        recorder={
+            "enabled": True,
+            "mode": "independent",
+            "model": "sonnet",
+            "extra_usage_disabled": True,
+        },
+    )
+    data = tmp_path / "plugin-data"
+    calls = []
+    monkeypatch.setattr(H.subprocess, "Popen", lambda command, **options: calls.append((command, options)))
+    monkeypatch.setattr(H, "_spawn_deliver", lambda *a, **k: False)
+    H.handle(event("UserPromptSubmit", cwd, prompt="做点事"), data, PROTOCOL)
+    assert H.handle(event("Stop", cwd), data, PROTOCOL, "http://trace") is None
+    assert calls == []
+    assert list((session_root(data) / "batches").glob("*.json"))
+
+
+def test_recorder_without_extra_usage_confirmation_only_queues(tmp_path: Path, monkeypatch):
+    cwd = bind(tmp_path, recorder={"enabled": True, "model": "sonnet"})
+    data = tmp_path / "plugin-data"
+    calls = []
+    monkeypatch.setattr(H.subprocess, "Popen", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(H, "_spawn_deliver", lambda *a, **k: False)
+    H.handle(event("UserPromptSubmit", cwd, prompt="hypothesis"), data, PROTOCOL)
+    assert H.handle(event("Stop", cwd), data, PROTOCOL) is None
+    assert calls == []
+    assert list((session_root(data) / "batches").glob("*.json")), "material stays queued"
+
+
+def test_trace_mcp_calls_do_not_become_research_material(tmp_path: Path):
     cwd = bind(tmp_path)
     data = tmp_path / "plugin-data"
-    H.handle(event(
-        "PreToolUse", cwd, tool_name="Agent", tool_input={"prompt": H.RECORDER_MARKER}
-    ), data, PROTOCOL)
-    H.handle(event("SubagentStart", cwd, agent_id="old-recorder", agent_type="fork"), data, PROTOCOL)
-    H.handle(event("SessionStart", cwd, source="clear"), data, PROTOCOL)
-    state = json.loads((session_root(data) / "state.json").read_text(encoding="utf-8"))
-    assert "recorder_agent_id" not in state
+    for name in ("PreToolUse", "PostToolUse"):
+        H.handle(
+            event(
+                name,
+                cwd,
+                tool_name="mcp__plugin_research-trace_trace__trace_record",
+                tool_input={"title": "plumbing"},
+            ),
+            data,
+            PROTOCOL,
+        )
+    assert not list((data / "outbox").glob("*/*/pending/*.json"))
+
+
+@pytest.mark.parametrize("diagnostic", ["TranscriptCaptureError", "CodeCaptureError"])
+def test_capture_diagnostics_alone_do_not_start_a_recorder(tmp_path, diagnostic):
+    cwd, data = bind(tmp_path), tmp_path / "plugin-data"
+    H.handle(event(diagnostic, cwd, error="capture temporarily unavailable"), data, PROTOCOL)
+    for _ in range(4):
+        assert H.handle(event("Stop", cwd, stop_hook_active=False), data, PROTOCOL) is None
+    records = [json.loads(p.read_text(encoding="utf-8")) for p in pending(data)]
+    assert records[0]["hook_event"] == diagnostic
+    assert not list((session_root(data) / "batches").glob("*.json"))
 
 
 def test_session_start_launches_the_deliverer_without_waiting(tmp_path: Path, monkeypatch):
@@ -360,30 +369,29 @@ def test_transcript_content_is_copied_incrementally_into_the_batch(tmp_path: Pat
     )
     output = H.handle(
         event(
-            "Stop", cwd, transcript_path=str(transcript), stop_hook_active=False,
-            last_assistant_message="second", background_tasks=[],
+            "Stop",
+            cwd,
+            transcript_path=str(transcript),
+            stop_hook_active=False,
+            last_assistant_message="second",
+            background_tasks=[],
         ),
         tmp_path / "plugin-data",
         PROTOCOL,
     )
-    assert output and output["decision"] == "block"
+    assert output is None
     root = session_root(tmp_path / "plugin-data")
     manifest_path = next((root / "batches").glob("*.json"))
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["transcript_chunk_count"] == 2
-    text = "".join(
-        (root / item["path"]).read_text(encoding="utf-8")
-        for item in manifest["transcript_chunks"]
-    )
+    text = "".join(H._long(root / item["path"]).read_text(encoding="utf-8") for item in manifest["transcript_chunks"])
     assert '"message":"first"' in text
     assert '"message":"second"' in text
 
 
 def test_transcript_chunks_never_split_a_utf8_jsonl_record(tmp_path: Path):
     transcript = tmp_path / "unicode.jsonl"
-    transcript.write_text(
-        '{"message":"批次效应"}\n{"message":"修正方案"}\n', encoding="utf-8"
-    )
+    transcript.write_text('{"message":"批次效应"}\n{"message":"修正方案"}\n', encoding="utf-8")
     outbox = tmp_path / "outbox"
     (outbox / "transcripts" / "pending").mkdir(parents=True)
     (outbox / "transcripts" / "meta").mkdir(parents=True)
@@ -395,9 +403,10 @@ def test_transcript_chunks_never_split_a_utf8_jsonl_record(tmp_path: Path):
         chunk_size=10,
     )
     assert len(chunks) == 2
-    assert [
-        (outbox / item["path"]).read_text(encoding="utf-8") for item in chunks
-    ] == ['{"message":"批次效应"}\n', '{"message":"修正方案"}\n']
+    assert [(outbox / item["path"]).read_text(encoding="utf-8") for item in chunks] == [
+        '{"message":"批次效应"}\n',
+        '{"message":"修正方案"}\n',
+    ]
 
 
 def test_hidden_reasoning_never_reaches_the_outbox(tmp_path: Path):
@@ -405,22 +414,34 @@ def test_hidden_reasoning_never_reaches_the_outbox(tmp_path: Path):
     transcript = tmp_path / "thinking.jsonl"
     lines = [
         json.dumps({"type": "user", "message": {"content": "run it"}}),
-        json.dumps({"type": "assistant", "message": {"content": [
-            {"type": "thinking", "thinking": "HIDDEN COT SECRET", "signature": "sig-abc"},
-            {"type": "text", "text": "visible answer"},
-        ]}}),
-        json.dumps({"type": "assistant", "message": {"content": [
-            {"type": "redacted_thinking", "data": "OPAQUE"},
-        ]}}),
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "thinking", "thinking": "HIDDEN COT SECRET", "signature": "sig-abc"},
+                        {"type": "text", "text": "visible answer"},
+                    ]
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "redacted_thinking", "data": "OPAQUE"},
+                    ]
+                },
+            }
+        ),
         json.dumps({"type": "thinking", "thinking": "WHOLE LINE SECRET"}),
         json.dumps({"type": "user", "message": "I am thinking about batch effects"}),
         '{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"TRUNCATED',
     ]
     transcript.write_text("\n".join(lines) + "\n", encoding="utf-8")
     outbox = tmp_path / "outbox"
-    chunks = H._capture_transcripts(
-        outbox, event("Stop", tmp_path, transcript_path=str(transcript)), {}
-    )
+    chunks = H._capture_transcripts(outbox, event("Stop", tmp_path, transcript_path=str(transcript)), {})
     text = "".join((outbox / item["path"]).read_text(encoding="utf-8") for item in chunks)
     for secret in ("HIDDEN COT SECRET", "WHOLE LINE SECRET", "sig-abc", "OPAQUE", "TRUNCATED"):
         assert secret not in text
@@ -439,9 +460,7 @@ def test_untouched_lines_are_copied_verbatim_and_cursor_tracks_source_bytes(tmp_
     transcript.write_bytes(body.encode("utf-8"))  # 不能让 Windows 换行翻译改变字节数
     outbox = tmp_path / "outbox"
     state: dict = {}
-    chunks = H._capture_transcripts(
-        outbox, event("Stop", tmp_path, transcript_path=str(transcript)), state
-    )
+    chunks = H._capture_transcripts(outbox, event("Stop", tmp_path, transcript_path=str(transcript)), state)
     assert (outbox / chunks[0]["path"]).read_text(encoding="utf-8") == body
     # cursor 按源文件字节推进，与剥离后的落盘长度无关
     assert list(state["transcript_offsets"].values()) == [len(body.encode("utf-8"))]
@@ -449,9 +468,7 @@ def test_untouched_lines_are_copied_verbatim_and_cursor_tracks_source_bytes(tmp_
     # 追加中的半行留到下一次，绝不切开一条 JSON 记录
     with transcript.open("ab") as stream:
         stream.write(b'{"type":"assistant","message":"half')
-    more = H._capture_transcripts(
-        outbox, event("Stop", tmp_path, transcript_path=str(transcript)), state
-    )
+    more = H._capture_transcripts(outbox, event("Stop", tmp_path, transcript_path=str(transcript)), state)
     assert more == []
     assert list(state["transcript_offsets"].values()) == [len(body.encode("utf-8"))]
 
@@ -472,15 +489,11 @@ def test_transcript_io_failure_is_reported_and_leaves_no_tmp_garbage(tmp_path: P
 
     monkeypatch.setattr(Path, "write_bytes", failing)
     state: dict = {}
-    assert H._capture_transcripts(
-        outbox, event("Stop", tmp_path, transcript_path=str(transcript)), state
-    ) == []
+    assert H._capture_transcripts(outbox, event("Stop", tmp_path, transcript_path=str(transcript)), state) == []
     monkeypatch.undo()
     assert "transcript capture failed" in capsys.readouterr().err
     assert list((outbox / "transcripts" / "pending").glob(".*.tmp")) == []
-    assert state["transcript_offsets"] == {} or all(
-        value == 0 for value in state["transcript_offsets"].values()
-    )
+    assert state["transcript_offsets"] == {} or all(value == 0 for value in state["transcript_offsets"].values())
 
 
 def test_outbox_files_and_directories_are_private(tmp_path: Path, monkeypatch):
@@ -503,7 +516,7 @@ def test_outbox_files_and_directories_are_private(tmp_path: Path, monkeypatch):
     assert modes[str(root / "pending")] == 0o700
     assert modes[str(data / "outbox")] == 0o700
     event_file = pending(data)[0]
-    assert modes[str(event_file)] == 0o600
+    assert modes[str(H._long(event_file))] == 0o600
     assert modes[str(root / "state.json")] == 0o600
 
 
@@ -530,6 +543,86 @@ def test_a_dead_state_lock_does_not_tax_every_later_event(tmp_path: Path):
     assert len(pending(data)) == 3
 
 
+def _grow(transcript: Path, line: str) -> None:
+    with transcript.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"type": "user", "message": line}) + "\n")
+
+
+def _chunks(data: Path) -> str:
+    root = session_root(data)
+    return "".join(
+        path.read_text(encoding="utf-8")
+        for directory in ("pending", "sent")
+        for path in sorted((root / "transcripts" / directory).glob("*.jsonl"))
+    )
+
+
+def test_a_global_pause_does_not_backfill_what_was_written_while_paused(tmp_path: Path, monkeypatch):
+    """plugin.json 的承诺：capture=off「暂停期间不会补采，适合临时处理令牌」。
+
+    以前 off 只是让 hook 提前 return，transcript 游标一动不动，重新开启后暂停期间写进
+    transcript 的内容会被完整补采上传——而这个开关的文档用途正是最不该发生这件事的场景。
+    """
+    cwd = bind(tmp_path)
+    data = tmp_path / "plugin-data"
+    transcript = tmp_path / "session-123.jsonl"
+    _grow(transcript, "before")
+    monkeypatch.setattr(H, "_spawn_deliver", lambda *a, **k: False)
+
+    H.handle(event("UserPromptSubmit", cwd, prompt="x", transcript_path=str(transcript)), data, PROTOCOL)
+    _grow(transcript, "DURING-PAUSE-SECRET")
+    assert (
+        H.handle(
+            event("PreToolUse", cwd, tool_name="Bash", transcript_path=str(transcript)),
+            data,
+            PROTOCOL,
+            paused=True,
+        )
+        is None
+    )
+    _grow(transcript, "after")
+    H.handle(event("UserPromptSubmit", cwd, prompt="y", transcript_path=str(transcript)), data, PROTOCOL)
+
+    chunks = _chunks(data)
+    assert "before" in chunks and "after" in chunks
+    assert "DURING-PAUSE-SECRET" not in chunks
+    hook_events = [json.loads(p.read_text(encoding="utf-8"))["hook_event"] for p in pending(data)]
+    assert hook_events == ["UserPromptSubmit", "UserPromptSubmit"], "no event is written while paused"
+    state = json.loads((session_root(data) / "state.json").read_text(encoding="utf-8"))
+    assert state["paused_through"]
+
+
+def test_a_disabled_marker_pauses_the_same_way_without_creating_anything(tmp_path: Path, monkeypatch):
+    """`trace-project disable` 写的 capture:false 和全局开关走同一条暂停路径。"""
+    cwd = bind(tmp_path)
+    data = tmp_path / "plugin-data"
+    transcript = tmp_path / "session-123.jsonl"
+    _grow(transcript, "before")
+    monkeypatch.setattr(H, "_spawn_deliver", lambda *a, **k: False)
+    H.handle(event("UserPromptSubmit", cwd, prompt="x", transcript_path=str(transcript)), data, PROTOCOL)
+
+    marker = cwd / H.MARKER_NAME
+    value = json.loads(marker.read_text(encoding="utf-8"))
+    marker.write_text(json.dumps({**value, "capture": False}), encoding="utf-8")
+    _grow(transcript, "DURING-DISABLE-SECRET")
+    assert H.handle(event("UserPromptSubmit", cwd, prompt="z", transcript_path=str(transcript)), data, PROTOCOL) is None
+    marker.write_text(json.dumps({**value, "capture": True}), encoding="utf-8")
+    _grow(transcript, "after")
+    H.handle(event("UserPromptSubmit", cwd, prompt="y", transcript_path=str(transcript)), data, PROTOCOL)
+
+    chunks = _chunks(data)
+    assert "before" in chunks and "after" in chunks and "DURING-DISABLE-SECRET" not in chunks
+    assert len(pending(data)) == 2
+
+    # 暂停中的 hook 从不为任何项目建目录：没绑定的目录、没见过的 session 都一样
+    elsewhere = tmp_path / "nowhere"
+    elsewhere.mkdir()
+    assert H.handle(event("Stop", elsewhere, session_id="never-seen"), data, PROTOCOL, paused=True) is None
+    assert not list((data / "outbox").glob("*/never-seen"))
+    assert H.handle(event("Stop", cwd, session_id="never-seen"), data, PROTOCOL, paused=True) is None
+    assert not list((data / "outbox").glob("*/never-seen"))
+
+
 def test_bad_stdin_never_blocks_the_main_task(tmp_path: Path, monkeypatch, capsys):
     class FakeStdin:
         def __init__(self, value: str):
@@ -546,7 +639,7 @@ def test_bad_stdin_never_blocks_the_main_task(tmp_path: Path, monkeypatch, capsy
     capsys.readouterr()
     assert not data.exists()
     monkeypatch.setattr(H.sys, "stdin", FakeStdin("{}"))
-    assert H.main(argv + ["--capture-enabled", "off"]) == 0
+    assert H.main([*argv, "--capture-enabled", "off"]) == 0
 
 
 def test_a_long_windows_outbox_path_does_not_silently_swallow_events(tmp_path: Path):
@@ -594,6 +687,7 @@ def test_the_deliverer_can_see_what_the_hook_wrote_at_the_same_depth(tmp_path: P
         return 200, {"ok": True}
 
     import pytest as _pytest
+
     monkey = _pytest.MonkeyPatch()
     monkey.setattr(D, "_post_json", accept)
     try:

@@ -17,9 +17,7 @@ DOCS = {
     "docs/QUICKSTART.md": (ROOT / "docs" / "QUICKSTART.md").read_text(encoding="utf-8"),
     "docs/REQUIREMENTS.md": (ROOT / "docs" / "REQUIREMENTS.md").read_text(encoding="utf-8"),
     "hooks/RECORDER_PROTOCOL.md": (ROOT / "hooks" / "RECORDER_PROTOCOL.md").read_text(encoding="utf-8"),
-    "skills/research-trace/SKILL.md": (
-        ROOT / "skills" / "research-trace" / "SKILL.md"
-    ).read_text(encoding="utf-8"),
+    "skills/research-trace/SKILL.md": (ROOT / "skills" / "research-trace" / "SKILL.md").read_text(encoding="utf-8"),
     # 新文档一样要被漂移守卫覆盖：命令、环境变量、REST 路径都会对着代码核。
     "docs/DESIGN.md": (ROOT / "docs" / "DESIGN.md").read_text(encoding="utf-8"),
     "CHANGELOG.md": (ROOT / "CHANGELOG.md").read_text(encoding="utf-8"),
@@ -39,20 +37,28 @@ def test_no_document_still_describes_the_deleted_receipt_or_archive_directory():
                 if dead not in line:
                     continue
                 assert any(
-                    marker in line for marker in
-                    ("没有", "取消", "作废", "遗留", "旧", "gone", "earlier version", "An earlier")
+                    marker in line
+                    for marker in ("没有", "取消", "作废", "遗留", "旧", "gone", "earlier version", "An earlier")
                 ), f"{name}: {dead} still described as current behaviour: {line.strip()}"
 
 
 def test_every_command_the_docs_mention_is_a_real_console_script():
-    scripts = set(
-        re.findall(r"^([\w-]+)\s*=", (ROOT / "pyproject.toml").read_text(encoding="utf-8"), re.M)
-    )
+    scripts = set(re.findall(r"^([\w-]+)\s*=", (ROOT / "pyproject.toml").read_text(encoding="utf-8"), re.M))
     for name, text in DOCS.items():
+        if name == 'CHANGELOG.md':
+            # Historical releases may describe commands intentionally retired
+            # later. Check the current release's instructions, not old history.
+            releases = list(re.finditer(r'^# \d+\.\d+\.', text, re.M))
+            if len(releases) > 1:
+                text = text[: releases[1].start()]
         # 前面不能是词字符或连字符：否则 `[research-trace-recorder]` 这种自有标记里会被
         # 切出一个并不存在的命令 `trace-recorder`，把一条正确的文档判成错的。
-        for command in set(re.findall(r"(?<![\w-])trace-[a-z]+\b", text)):
-            assert command in scripts, f"{name} mentions {command}, which pyproject does not install"
+        for line in text.splitlines():
+            for command in set(re.findall(r"(?<![\w-])trace-[a-z]+\b", line)):
+                retired_notice = command == 'trace-run' and any(word in line for word in ('移除', '撤回', '退役'))
+                assert command in scripts or retired_notice, (
+                    f"{name} mentions {command}, which pyproject does not install"
+                )
 
 
 def test_every_environment_variable_the_docs_mention_exists_in_the_code():
@@ -70,10 +76,7 @@ def test_the_backup_format_version_in_the_docs_matches_the_code():
     字符串都合法存在，只是数字过时了，而这条正好是「几年前的备份还读不读得回来」。"""
     from research_trace.backup import FORMAT_VERSION, SUPPORTED_FORMAT_VERSIONS
 
-    stated = {
-        name: set(re.findall(r"备份格式版本(?:现在)?(?:为|是)\s*\**(\d+)", text))
-        for name, text in DOCS.items()
-    }
+    stated = {name: set(re.findall(r"备份格式版本(?:现在)?(?:为|是)\s*\**(\d+)", text)) for name, text in DOCS.items()}
     assert any(stated.values()), "no document states the backup format version any more"
     for name, versions in stated.items():
         for version in versions:
@@ -106,7 +109,8 @@ def test_every_rest_path_the_docs_mention_exists_in_the_server():
     """文档里写出来的端点必须真的挂在 server 上。团队映射和数据流这两组是这一轮新加的，
     文档先写好、路由忘了挂，读者只会拿到 404 而不知道是谁的错。"""
     routes = re.sub(
-        r"\{[a-z_]+\}", "{x}",
+        r"\{[a-z_]+\}",
+        "{x}",
         (ROOT / "research_trace" / "server.py").read_text(encoding="utf-8"),
     )
     documented: dict[str, str] = {}
@@ -152,7 +156,9 @@ def test_every_trace_tool_the_skill_mentions_is_a_real_mcp_tool():
     `trace_new_step` / `trace_update_step` 这些已经不存在的工具，比没有 skill 更糟。
     """
     skill = DOCS["skills/research-trace/SKILL.md"]
-    real = set(re.findall(r'"name":\s*"(trace_[a-z_]+)"', (ROOT / "research_trace" / "mcp.py").read_text(encoding="utf-8")))
+    real = set(
+        re.findall(r'"name":\s*"(trace_[a-z_]+)"', (ROOT / "research_trace" / "mcp.py").read_text(encoding="utf-8"))
+    )
     assert len(real) == 7, f"工具表变了，这条测试要跟着改：{sorted(real)}"
     mentioned = set(re.findall(r"\btrace_[a-z0-9_]+", skill))
     assert not (mentioned - real), f"SKILL.md 提到了不存在的工具：{sorted(mentioned - real)}"

@@ -1,4 +1,4 @@
-"""Dependency-free Research Trace web client embedded by the service."""
+"""Research Trace reader with vendored markdown-it and Dagre components."""
 
 #: 页面里所有指回本服务的地址都从这个占位符派生。挂在域名根时它渲染成空串，
 #: 于是 BASE + '/api/x' 还是 '/api/x' —— 根部署的行为一个字节都没变。
@@ -1003,6 +1003,9 @@ details[open] > summary .chevron { transform: rotate(180deg); }
   tab-size: 2;
 }
 .code-annotation { padding: 10px 12px; color: var(--ink-soft); font-size: 12px; }
+.code-evidence { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); min-width: 0; }
+.code-evidence pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.6; }
+.code-evidence summary { cursor: pointer; }
 .artifact {
   display: flex;
   align-items: flex-start;
@@ -1183,6 +1186,10 @@ details[open] > summary .chevron { transform: rotate(180deg); }
   text-align: center;
 }
 .empty-inner { max-width: 560px; }
+.form-stack { display: grid; gap: 8px; max-width: 360px; margin: 16px auto 0; text-align: left; }
+.form-stack label { font-size: 13px; color: var(--muted, #666); }
+.form-stack input { padding: 8px 10px; font: inherit; }
+.form-stack .btn { margin-top: 4px; justify-self: start; }
 .empty h2 { margin: 0; color: var(--ink); font-size: 25px; letter-spacing: -.03em; }
 .empty p { margin: 10px 0 0; }
 .empty .btn { margin-top: 20px; }
@@ -2491,7 +2498,7 @@ main.workspace-mode {
       <div id="searchResults" class="search-results" role="region" aria-label="搜索结果" hidden></div>
     </div>
     <div class="top-actions">
-      <button class="account-btn" id="healthBtn" type="button" aria-haspopup="dialog" aria-label="采集、Recorder 与备份状态">
+      <button class="account-btn" id="healthBtn" type="button" aria-haspopup="dialog" aria-label="采集、Recorder 与集成状态">
         <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l2-5 3 10 2.5-5H21"></path></svg>
         <span>状态</span>
       </button>
@@ -2541,6 +2548,8 @@ main.workspace-mode {
 </dialog>
 <div class="toast-region" id="toastRegion" aria-live="polite" aria-atomic="true"></div>
 
+<script src="__TRACE_BASE__/assets/markdown-it.min.js"></script>
+<script src="__TRACE_BASE__/assets/dagre.min.js"></script>
 <script>
 /* 本地偏好只有一个 key 前缀。曾经这里还兜底读一次带旧后缀的 key，免得升级把
    开发者存的写入 token 弄丢；§16 已经拍板「现在没有任何已发凭证」，兼容读因此
@@ -2562,6 +2571,7 @@ const S = {
   token: stored('token'),
   actor: stored('actor') || 'human',
   authEnabled: false,
+  authMode: 'open',
   user: null,
   csrf: ''
 };
@@ -2597,195 +2607,57 @@ const icon = name => ICONS[name] || '';
 const BASE = '__TRACE_BASE__';
 
 /* === markdown renderer (begin) === */
-/* md.js — 极简 markdown 渲染器（零依赖，不走 CDN，file:// 下可用）。
- *
- * 覆盖科研笔记实际会用到的语法：标题、围栏代码、行内代码、列表（任意层嵌套、
- * 有序/无序/任务、项内可放代码块和引用）、引用、表格（含列对齐 + 数值列自动
- * 右对齐；`\|` 按 CommonMark 当字面竖线）、分隔线、粗体斜体删除线（* 和 _ 两套）、
- * 链接与图片（含 <尖括号> 目标和括号成对的裸路径）、裸链接自动识别、
- * 数学公式原样保留、[[007]] 内部跳转。
- *
- * 有意不做：引用式链接 [a][ref]、脚注、setext 标题、四空格缩进代码块。
- * 这些在实验记录里几乎不出现，做进来只会让下面这堆正则更难被人看懂。
- *
- * 安全：先整体转义 HTML，之后才插入自己生成的标签。正文里写不进裸 HTML。
- * 正文是人和 agent 通过 API 写进来的不可信输入，所以链接目标还要过 safeHref。
- */
-(function (global) {
-  "use strict";
-
-  var ESC = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
-  function esc(s) { return String(s).replace(/[&<>"']/g, function (c) { return ESC[c]; }); }
-
-  /* ------------------------------------------------------------ 链接目标消毒 */
-
-  var NAMED_ENT = {
-    amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", colon: ":",
-    tab: "\t", newline: "\n", sol: "/", nbsp: " ", semi: ";"
-  };
-  function fromCp(n) { return (n >= 0 && n <= 0x10ffff) ? String.fromCodePoint(n) : ""; }
-
-  /* 只用来生成「拿去比对黑名单」的探针，不用来生成真正输出的 href。
-     浏览器会在属性值上解码实体，所以 &#106;avascript: / java&Tab;script: 这类写法
-     到了浏览器手里就是 javascript:；黑名单必须看解码之后的样子。
-     反复解码几轮是为了挡 &amp;#106; 这种套娃——宁可误判成 # 也不要漏。 */
-  function decodeEntities(s) {
-    for (var round = 0; round < 3; round++) {
-      var next = s
-        .replace(/&#x([0-9a-f]+);?/gi, function (_, hex) { return fromCp(parseInt(hex, 16)); })
-        .replace(/&#(\d+);?/g, function (_, dec) { return fromCp(parseInt(dec, 10)); })
-        .replace(/&([a-z][a-z0-9]*);?/gi, function (m, name) {
-          var k = name.toLowerCase();
-          return Object.prototype.hasOwnProperty.call(NAMED_ENT, k) ? NAMED_ENT[k] : m;
-        });
-      if (next === s) break;
-      s = next;
-    }
-    return s;
-  }
-
-  var BAD_SCHEME = /^(?:javascript|data|vbscript|livescript|mocha):/i;
-
-  /* WHATWG URL 解析在认协议之前，会先剥掉首尾的 C0 控制字符与空格、
-     并删掉中间所有的 tab/换行。所以 "\x01javascript:alert(1)" 在浏览器眼里
-     就是一个 javascript: URL —— 只用 trim() 加一个 \s 前缀的正则判断，会整条漏过去。
-     这里的做法是：先按同一套规则把控制字符清干净，再判断，并且**返回清干净的那份**
-     （返回原串等于把控制字符留给浏览器自己去剥，等于没修）。 */
-  function safeHref(h, resolve) {
-    var s = String(h == null ? "" : h).replace(/[\u0000-\u001f\u007f]/g, "").trim();
-    var probe = decodeEntities(s).replace(/[\u0000-\u0020\u007f]/g, "");
-    if (BAD_SCHEME.test(probe)) return "#";
-    if (/^([a-z][a-z0-9+.-]*:|\/\/|\/|#)/i.test(s)) return s;   // 绝对 / 协议 / 锚点：原样
-    return resolve ? resolve(s) : s;                             // 相对路径：交给调用方重写
-  }
-
-  function imgTag(alt, src, resolve, cls, title) {
-    return '<img class="' + (cls || "") + '" alt="' + alt + '" src="' + safeHref(src, resolve) + '"'
-      + (title ? ' title="' + title + '"' : "") + ' loading="lazy">';
-  }
-
-  /* 目标地址两种写法：CommonMark 的 <...> 尖括号形式（里面允许空格），
-     以及圆括号成对的裸路径。`loss curve (run 42).png` 这种附件名在实验记录里太常见，
-     只认「不含空格和括号」的老写法会让这类图/附件在网页上根本不出现。
-     标题（图注）里的引号在整体转义之后已经是 &quot; / &#39;，
-     正则必须按转义后的样子写——按 `"` 写会导致整个图片语法匹配不上。
-     标题允许跨行：FORMAT.md §5 自己给的示例就是把长图注折成两行写的。 */
-  var DEST = "(?:&lt;([^\\n]*?)&gt;|((?:[^()\\s]|\\((?:[^()\\s]|\\([^()\\s]*\\))*\\))+))";
-  var TITLE = "(?:\\s+(?:&quot;([\\s\\S]*?)&quot;|&#39;([\\s\\S]*?)&#39;))?";
-  var IMG_SRC = "!\\[([^\\]]*)\\]\\(\\s*" + DEST + TITLE + "\\s*\\)";
-  var LINK_SRC = "\\[([^\\]]+)\\]\\(\\s*" + DEST + TITLE + "\\s*\\)";
-  var RE_IMG = new RegExp(IMG_SRC, "g");
-  var RE_LINK = new RegExp(LINK_SRC, "g");
-  var RE_LONE_IMG = new RegExp("^" + IMG_SRC + "$");
-  // 捕获组：1=alt/文字 2=<尖括号>目标 3=裸目标 4="标题" 5='标题'
-  function destOf(m) { return m[2] !== undefined ? m[2] : (m[3] || ""); }
-  function titleOf(m) { return m[4] !== undefined ? m[4] : (m[5] !== undefined ? m[5] : ""); }
-
-  /* ---------------------------------------------------------------- 行内 */
-
-  var SENT = "\u0000";   // render() 已把正文里的控制字符清掉，所以它一定不会和正文撞
-
-  // CommonMark 的反斜杠转义只对 ASCII 标点生效。这条限制很重要：
-  // 实验记录里全是 C:\Users\... 这类 Windows 路径，若无差别地吃掉反斜杠，
-  // 路径会当场变形；按标准只在标点前生效，路径原样保留。
-  var ESCAPABLE = "!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~";
-
-  function inline(text, resolve, brk) {
-    var holes = [];
-    function hole(html) { holes.push(html); return SENT + (holes.length - 1) + SENT; }
-
-    // 行内代码。先抠出来，后面的强调/链接规则就碰不到它了。
-    text = text.replace(/`([^`]+)`/g, function (_, c) { return hole("<code>" + c + "</code>"); });
-
-    // 数学公式。不引 KaTeX（零依赖是硬约束），但**必须原样留住**：
-    // 公式一旦被 * _ \ 那几条规则啃过，人和 LLM 都再也读不回原式。
-    // 所以整段抠成不可变文本、连 $ 一起保留，将来接排版器时纯属加成。
-    text = text.replace(/\$\$([^\n]+?)\$\$/g, function (m) { return hole('<span class="math">' + m + "</span>"); });
-    // 单个 $ 的判定按 pandoc 那套：$ 后不能是空白、$ 前不能是空白、收尾的 $ 后面不能跟数字。
-    // 这条「后面不能跟数字」正是用来放过「花了 $5 又花了 $3」这种货币写法的。
-    text = text.replace(/(^|[^\\$])\$(?!\s)((?:[^$\n])*?[^\s\\])\$(?!\d)/g,
-      function (_, pre, body) { return pre + hole('<span class="math">$' + body + "$</span>"); });
-
-    // 反斜杠转义：\| \* \_ \[ … 一律变回字面字符，且不再参与后面的语法。
-    text = text.replace(new RegExp("\\\\([" + ESCAPABLE + "])", "g"), function (_, c) { return hole(c); });
-
-    // 裸链接。必须在 [text](url) 之前处理，且前导字符里排除 ( 和 [，
-    // 否则 [标题](http://x) 里的 url 会被再包一层。
-    // 括号按成对计入：维基百科那种 .../Foo_(bar) 链接不这样做会被截成坏链接。
-    text = text.replace(/(^|[\s、，。；：])(https?:\/\/(?:[^\s<>"'()（）、，。；：]|\((?:[^\s()]|\([^\s()]*\))*\))+)/g,
-      function (_, pre, url) { return pre + "[" + url + "](" + url + ")"; });
-
-    text = text.replace(RE_IMG, function () {
-      var m = arguments;
-      return hole(imgTag(m[1], destOf(m), resolve, "inline-img zoomable", titleOf(m)));
-    });
-    // 链接：开合标签各自入洞，中间的文字留在外面继续吃强调规则。
-    // （旧实现是整条 <a …> 生成完再跑强调替换，于是 [x](https://a/**b**/c) 的
-    //  href 里会被塞进 <strong>，链接指向一个不存在的地址。）
-    text = text.replace(RE_LINK, function () {
-      var m = arguments;
-      var href = safeHref(destOf(m), resolve);
-      var ext = /^[a-z][a-z0-9+.-]*:/i.test(href) ? ' target="_blank" rel="noopener noreferrer"' : "";
-      var title = titleOf(m);
-      return hole('<a href="' + href + '"' + ext + (title ? ' title="' + title + '"' : "") + ">")
-        + m[1] + hole("</a>");
-    });
-    // <https://…> 自动链接。放在上面两条之后，免得抢走 ![](<a b.png>) 里的尖括号目标。
-    text = text.replace(/&lt;(https?:\/\/[^\s&]+)&gt;/g, function (_, url) {
-      var href = safeHref(url, resolve);
-      return hole('<a href="' + href + '" target="_blank" rel="noopener noreferrer">' + url + "</a>");
-    });
-    // [[007]] —— 森林结构下表达"另见某条支"的软链接；反向链接由后端算出
-    text = text.replace(/\[\[\s*(\d+[a-z]*)\s*\]\]/g, function (_, id) {
-      return hole('<a class="wikilink" href="#' + id + '" data-goto="' + id + '">' + id + "</a>");
-    });
-
-    text = text.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-    text = text.replace(/(^|[^\w_])__([^_]+?)__(?![\w])/g, "$1<strong>$2</strong>");
-    text = text.replace(/(^|[^*\w])\*([^*\n]+)\*(?![*\w])/g, "$1<em>$2</em>");
-    // 下划线强调的前后都要求不是词内字符，否则 some_var_name 会被劈成斜体
-    text = text.replace(/(^|[^\w_])_([^_\n]+?)_(?![\w])/g, "$1<em>$2</em>");
-    text = text.replace(/~~([^~]+)~~/g, "<del>$1</del>");
-
-    if (brk) text = text.replace(/\n/g, "<br>");
-
-    // 洞里可能还嵌着洞（比如 ![`a`](x) 的 alt），所以要循环填到没有为止。
-    var guard = 8;
-    while (text.indexOf(SENT) >= 0 && guard-- > 0) {
-      text = text.replace(new RegExp(SENT + "(\\d+)" + SENT, "g"), function (_, i) {
-        var v = holes[+i];
-        return v === undefined ? "" : v;
-      });
+// markdown-it owns Markdown parsing; these rules preserve research-note affordances.
+(function(global) {
+  const parser = global.markdownit({html:false, linkify:true, breaks:true});
+  const esc = parser.utils.escapeHtml;
+  function safeHref(value, resolve) {
+    let text = String(value == null ? '' : value).replace(/[\u0000-\u001f\u007f]/g, '').trim();
+    let probe = text;
+    for (let i=0; i<4; i++) probe = parser.utils.unescapeAll(probe);
+    try { probe=decodeURIComponent(probe); } catch (_) {}
+    probe = probe.replace(/[\u0000-\u0020\u007f]/g, '');
+    if (/^(javascript|vbscript|data|livescript|mocha):/i.test(probe)) return '#';
+    if (!/^([a-z][a-z0-9+.-]*:|\/\/|\/|#)/i.test(text) && resolve) {
+      return safeHref(resolve(text));
     }
     return text;
   }
-
-  /* ---------------------------------------------------------------- 表格 */
-
-  /* 按 CommonMark 切分表格行：`\|` 是**字面竖线**，不是分隔符。
-     从 Excel / Google Sheets 粘表格时会自动产出这种转义（含管道命令、`低|中|高`
-     这类取值都会），认不出来就会把一格劈成两格、把最右边的列整个挤掉。 */
-  function cells(line) {
-    var s = line.replace(/^\s*\|/, "");
-    var out = [], cur = "";
-    for (var i = 0; i < s.length; i++) {
-      var ch = s.charAt(i);
-      if (ch === "\\" && s.charAt(i + 1) === "|") { cur += "\\|"; i++; continue; }
-      if (ch === "|") { out.push(cur); cur = ""; continue; }
-      cur += ch;
+  // Invalid destinations still render as inert links instead of active schemes.
+  parser.validateLink = () => true;
+  parser.renderer.rules.link_open = (tokens, idx, options, env, self) => {
+    tokens[idx].attrSet('href', safeHref(tokens[idx].attrGet('href'), env.resolve));
+    tokens[idx].attrSet('rel', 'noopener noreferrer');
+    if(tokens[idx].attrGet('href')!=='#') tokens[idx].attrSet('target','_blank');
+    return self.renderToken(tokens, idx, options);
+  };
+  const image = parser.renderer.rules.image;
+  parser.renderer.rules.image = (tokens, idx, options, env, self) => {
+    const token=tokens[idx];
+    token.attrSet('src', safeHref(token.attrGet('src'), env.resolve));
+    token.attrSet('loading', 'lazy'); token.attrSet('class', token.meta?.figure ? 'zoomable' : 'zoomable inline-img');
+    return image(tokens, idx, options, env, self) + (token.meta && token.meta.caption
+      ? '<figcaption>'+parser.renderInline(token.meta.caption, env)+'</figcaption>' : '');
+  };
+  parser.renderer.rules.s_open=()=>'<del>';
+  parser.renderer.rules.s_close=()=>'</del>';
+  parser.renderer.rules.fence=(tokens,idx)=>{
+    const token=tokens[idx], language=token.info.trim().split(/\s+/)[0];
+    return '<pre class="code"'+(language?' data-lang="'+esc(language)+'"':'')+'><code>'+esc(token.content.replace(/\n$/,''))+'</code></pre>\n';
+  };
+  parser.renderer.rules.table_open=()=>'<div class="tablewrap"><table>\n';
+  parser.renderer.rules.table_close=()=>'</table></div>\n';
+  parser.inline.ruler.before('link', 'research_reference', (state, silent) => {
+    const match=/^\[\[([\w-]+)\]\]/.exec(state.src.slice(state.pos));
+    if (!match) return false;
+    if (!silent) {
+      const open=state.push('link_open','a',1); open.attrSet('href','#');
+      open.attrSet('data-goto',match[1]); open.attrSet('class','wikilink');
+      const text=state.push('text','',0); text.content=match[1];
+      state.push('link_close','a',-1);
     }
-    out.push(cur);
-    // 行尾那根收口的竖线会切出一个空格子，去掉它；以 `\|` 结尾时切不出空格子，不受影响
-    if (out.length > 1 && /^\s*$/.test(out[out.length - 1])) out.pop();
-    return out.map(function (c) { return c.trim(); });
-  }
-
-  /* 数值单元格：剥掉强调/空白之后是一个数，可带正负号、千分位、百分号、科学计数，
-     并且允许「主值 ± 误差」这种写法。
-     FORMAT.md §4 明写「有方差就写进去（0.943 ± 0.004）」，
-     所以带 ± 的格子必须仍然算数值列——否则照着格式标准写，反而丢掉标准承诺的
-     右对齐和底纹条，标准和实现就打架了。
-     带单位的（40 s）故意**不**算数值：FORMAT.md 说这是对的，单位列当文字列读更清楚。 */
+    state.pos+=match[0].length; return true;
+  });
   var NUM = "[+\\-\u2212\u00b1\u2213]?(?:\\d[\\d,]*(?:\\.\\d+)?|\\.\\d+)(?:[eE][+\\-\u2212]?\\d+)?%?";
   var PM = "(?:\u00b1|\u2213|\\+\\/-|\\+-)";                       // ± ∓ +/- +-
   var NUMERIC = new RegExp("^" + NUM + "(?:" + PM + NUM + ")?$");
@@ -2811,231 +2683,63 @@ const BASE = '__TRACE_BASE__';
     return parseFloat(v);
   }
 
-  /* 表格列：显式的 :--- / ---: / :---: 优先；没写就把"整列都是数字"的列右对齐。
-     科研表格里的指标列右对齐之后小数点自然成列，好读得多。
-     numeric[] 单独算一份（不受显式对齐影响），供底纹条使用。 */
-  function columnInfo(sepLine, head, rows) {
-    var explicit = cells(sepLine).map(function (c) {
-      var l = /^:/.test(c), r = /:$/.test(c);
-      return l && r ? "center" : r ? "right" : l ? "left" : "";
-    });
-    var align = [], numeric = [];
-    head.forEach(function (_, i) {
-      var seen = 0, ok = true;
-      for (var k = 0; k < rows.length; k++) {
-        var v = isNumeric(rows[k][i]);
-        if (v === false) { ok = false; break; }
-        if (v === true) seen++;
-      }
-      numeric[i] = ok && seen > 0;
-      align[i] = explicit[i] || (numeric[i] ? "right" : "");
-    });
-    return { align: align, numeric: numeric };
-  }
 
-  /* ---------------------------------------------------------------- 块 */
-
-  var BLOCK_START = /^(\s*(#{1,6}\s|&gt;|```|~~~|\||\$\$)|\s*([-*+]|\d+[.)])\s|\s*(-{3,}|\*{3,}|_{3,})\s*$)/;
-  var LI_RE = /^(\s*)([-*+]|\d+[.)])(\s+)(.*)$/;
-
-  function isBlank(s) { return /^\s*$/.test(s); }
-  function indentOf(s) { return s.match(/^\s*/)[0].length; }
-
-  /* 列表块：把每一项的行收集起来、剥掉这一项的缩进，然后**递归**丢回 renderLines。
-     子列表、项内的围栏代码、项内的引用块因此全部自然支持，不必在这里为每种嵌套
-     各写一遍分支。旧实现是手工展开了一层子列表，于是三层缩进被压平、
-     有序子列表退化成 <ul> 丢掉编号、项内的代码块把列表劈成两段还泄漏出缩进。 */
-  function listBlock(lines, i0, opts) {
-    var m0 = lines[i0].match(LI_RE);
-    var base = m0[1].length;
-    var ordered = /\d/.test(m0[2]);
-    var startNo = ordered ? parseInt(m0[2], 10) : 1;
-    var i = i0, items = [], isTask = false;
-
-    while (i < lines.length) {
-      if (isBlank(lines[i])) {
-        // 松散列表：项与项之间的空行只是段间距，不该把一个列表切成两个 <ul>
-        var k = i;
-        while (k < lines.length && isBlank(lines[k])) k++;
-        var nx = k < lines.length ? lines[k].match(LI_RE) : null;
-        if (!nx || nx[1].length > base || /\d/.test(nx[2]) !== ordered) break;
-        i = k;
-      }
-      var m = lines[i].match(LI_RE);
-      if (!m || m[1].length > base || /\d/.test(m[2]) !== ordered) break;
-
-      var pad = m[1].length + m[2].length + m[3].length;   // 这一项的内容起始列
-      var buf = [m[4]];
-      i++;
-      while (i < lines.length) {
-        var ln = lines[i];
-        if (isBlank(ln)) {
-          var j = i;
-          while (j < lines.length && isBlank(lines[j])) j++;
-          if (j >= lines.length || indentOf(lines[j]) < base + 1) break;   // 空行后不再缩进 → 本项结束
-          while (i < j) { buf.push(""); i++; }
-          continue;
+  parser.core.ruler.after('inline','research_presentation', state => {
+    const tokens=state.tokens;
+    let cells=[], column=0, inTable=false;
+    const finishTable=()=>{
+      const columns=new Map();
+      cells.filter(c=>c.tag==='td').forEach(c=>{
+        const values=columns.get(c.column)||[]; values.push(isNumeric(c.content)); columns.set(c.column,values);
+      });
+      cells.forEach(c=>{
+        const values=(columns.get(c.column)||[]).filter(v=>v!==null);
+        if (values.length && values.every(v=>v)) {
+          if (!c.token.attrGet('style')) c.token.attrSet('style','text-align:right');
+          const n=numericValue(c.content);
+          if(c.tag==='td' && Number.isFinite(n)) c.token.attrSet('data-num',String(n));
         }
-        if (indentOf(ln) >= base + 1) { buf.push(ln.slice(Math.min(pad, indentOf(ln)))); i++; continue; }
-        if (LI_RE.test(ln)) break;            // 同级或更浅的新项
-        if (BLOCK_START.test(ln)) break;      // 另起一个块
-        buf.push(ln.trim());                  // 懒续行
-        i++;
-      }
-
-      var t = buf[0].match(/^\[([ xX])\]\s+(.*)$/);
-      var checked = false;
-      if (t) { isTask = true; checked = t[1] !== " "; buf[0] = t[2]; }
-      var html = renderLines(buf, opts).replace(/^<p>([\s\S]*?)<\/p>/, "$1");   // 紧凑列表：首段不套 <p>
-      if (t) {
-        // <label> 只包住这一项自己的首段。项里还挂着子列表时不能一起包进去，
-        // 否则子项的勾选框会落在父项的 label 内，点父项等于点子项。
-        var cut = html.search(/\n(?=<)/);
-        var lead = cut < 0 ? html : html.slice(0, cut);
-        html = '<label class="task"><input type="checkbox" disabled'
-          + (checked ? " checked" : "") + ">" + lead + "</label>" + (cut < 0 ? "" : html.slice(cut));
-      }
-      items.push(html);
-    }
-
-    var tag = ordered ? "ol" : "ul";
-    var attr = (isTask ? ' class="tasks"' : "") + (ordered && startNo !== 1 ? ' start="' + startNo + '"' : "");
-    return {
-      next: i,
-      html: "<" + tag + attr + ">"
-        + items.map(function (h) { return "<li>" + h + "</li>"; }).join("")
-        + "</" + tag + ">"
+        const align=/text-align:(left|center|right)/.exec(c.token.attrGet('style')||'');
+        if(align) {
+          c.token.attrs=c.token.attrs.filter(([name])=>name!=='style');
+          c.token.attrJoin('class','ta-'+align[1]);
+        }
+      }); cells=[];
     };
-  }
-
-  /* 输入必须是**已经转义**的行数组。render() 负责转义，blockquote / 列表项递归时直接复用。 */
-  function renderLines(lines, opts) {
-    var resolve = opts && opts.resolve;
-    var out = [];
-    var i = 0;
-
-    while (i < lines.length) {
-      var line = lines[i];
-      if (isBlank(line)) { i++; continue; }
-
-      // 围栏代码：info string 可以带参数（```python title=x），闭合只认光秃秃的一行围栏。
-      // 内容按围栏自身的缩进对齐剥掉，免得列表项里的代码块带着多余空格显示。
-      var fence = line.match(/^(\s*)(`{3,}|~{3,})\s*(\S*)([^`]*)$/);
-      if (fence) {
-        var indent = fence[1].length, mark = fence[2][0], lang = fence[3], buf = [];
-        var closer = new RegExp("^\\s*\\" + mark + "{3,}\\s*$");
-        i++;
-        while (i < lines.length && !closer.test(lines[i])) {
-          buf.push(lines[i].slice(Math.min(indent, indentOf(lines[i]))));
-          i++;
-        }
-        i++;
-        out.push('<pre class="code"' + (lang ? ' data-lang="' + lang + '"' : "") + "><code>" + buf.join("\n") + "</code></pre>");
-        continue;
+    for(let i=0;i<tokens.length;i++) {
+      const t=tokens[i];
+      if(t.type==='table_open') inTable=true;
+      if(t.type==='table_close') {finishTable(); inTable=false;}
+      if(t.type==='tr_open') column=0;
+      if(inTable && (t.type==='td_open'||t.type==='th_open')) {
+        cells.push({token:t,tag:t.tag,column:column++,content:(tokens[i+1]||{}).content||''});
       }
-
-      // $$ 独占几行的行间公式：原样保留（含定界符），只用 <pre> 把换行留住。
-      // 不解析、不转写——渲染器认不出的公式，至少要保证人和 LLM 读到的还是原式。
-      if (/^\s*\$\$\s*$/.test(line)) {
-        var mbuf = [];
-        i++;
-        while (i < lines.length && !/^\s*\$\$\s*$/.test(lines[i])) mbuf.push(lines[i++]);
-        i++;
-        out.push('<pre class="math math-block">$$\n' + mbuf.join("\n") + "\n$$</pre>");
-        continue;
+      if(t.type!=='inline') continue;
+      const children=t.children||[];
+      if(children.length===1 && children[0].type==='image' && tokens[i-1]?.type==='paragraph_open') {
+        tokens[i-1].tag='figure'; tokens[i+1].tag='figure';
+        children[0].meta={figure:true,caption:children[0].attrGet('title')||children[0].content};
       }
-
-      var h = line.match(/^(#{1,6})\s+(.*)$/);
-      if (h) { var lv = h[1].length; out.push("<h" + lv + ">" + inline(h[2], resolve) + "</h" + lv + ">"); i++; continue; }
-
-      if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) { out.push("<hr>"); i++; continue; }
-
-      if (/^\s*&gt;\s?/.test(line)) {
-        var q = [];
-        while (i < lines.length && /^\s*&gt;\s?/.test(lines[i])) q.push(lines[i++].replace(/^\s*&gt;\s?/, ""));
-        out.push("<blockquote>" + renderLines(q, opts) + "</blockquote>");
-        continue;
-      }
-
-      if (/^\s*\|.*\|\s*$/.test(line) && i + 1 < lines.length && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1])) {
-        var head = cells(line), sep = lines[i + 1];
-        i += 2;
-        var rows = [];
-        while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) rows.push(cells(lines[i++]));
-        var info = columnInfo(sep, head, rows);
-        var at = function (k) { return info.align[k] ? ' class="ta-' + info.align[k] + '"' : ""; };
-        // data-num 是给底纹条用的「主数值」（0.943 ± 0.004 → 0.943）。
-        // 它是从单元格文本现算的派生量，不是新语法：去掉这层属性一个字都不丢。
-        var num = function (k, v) {
-          if (!info.numeric[k]) return "";
-          var n = numericValue(v);
-          return isFinite(n) ? ' data-num="' + n + '"' : "";
-        };
-        out.push(
-          '<div class="tablewrap"><table><thead><tr>' +
-          head.map(function (c, k) { return "<th" + at(k) + ">" + inline(c, resolve) + "</th>"; }).join("") +
-          "</tr></thead><tbody>" +
-          rows.map(function (r) {
-            return "<tr>" + head.map(function (_, k) {
-              var v = r[k] == null ? "" : r[k];
-              return "<td" + at(k) + num(k, v) + ">" + inline(v, resolve) + "</td>";
-            }).join("") + "</tr>";
-          }).join("") +
-          "</tbody></table></div>"
-        );
-        continue;
-      }
-
-      if (LI_RE.test(line)) {
-        var lb = listBlock(lines, i, opts);
-        out.push(lb.html);
-        i = lb.next;
-        continue;
-      }
-
-      // 独占一段的图片渲染成 figure：图注用 "标题" 里的文字，没有就用 alt。
-      // 科研笔记里的图基本都需要一句说明，否则半年后看不出画的是什么。
-      // 整段一起匹配（不是只看一行）是因为 FORMAT.md §5 的示例把长图注折行写了。
-      if (/^\s*!\[/.test(line)) {
-        var j2 = i, chunk = [];
-        while (j2 < lines.length && !isBlank(lines[j2])) chunk.push(lines[j2++]);
-        var lone = chunk.join("\n").trim().match(RE_LONE_IMG);
-        if (lone) {
-          var cap = titleOf(lone) || lone[1];
-          out.push("<figure>" + imgTag(lone[1], destOf(lone), resolve, "zoomable")
-            + (cap ? "<figcaption>" + inline(cap, resolve) + "</figcaption>" : "") + "</figure>");
-          i = j2;
-          continue;
+      if(tokens[i-1]?.type==='paragraph_open' && tokens[i-2]?.type==='list_item_open' && children[0]?.type==='text') {
+        const match=/^\[([ xX])\]\s+/.exec(children[0].content);
+        if(match) {
+          children[0].content=children[0].content.slice(match[0].length);
+          const check=new state.Token('html_inline','',0);
+          check.content='<label class="task"><input type="checkbox" disabled'+(match[1].toLowerCase()==='x'?' checked':'')+'>';
+          children.unshift(check);
+          const close=new state.Token('html_inline','',0); close.content='</label>'; children.push(close);
+          for(let j=i-3;j>=0;j--) {
+            if(tokens[j].nesting===1 && /^(bullet|ordered)_list_open$/.test(tokens[j].type)) {
+              tokens[j].attrSet('class','tasks'); break;
+            }
+          }
         }
       }
-
-      var para = [];
-      while (i < lines.length && !isBlank(lines[i]) && !(para.length && BLOCK_START.test(lines[i]))) {
-        para.push(lines[i++]);
-      }
-      out.push("<p>" + inline(para.join("\n"), resolve, true) + "</p>");
     }
-    return out.join("\n");
-  }
-
-  function render(src, opts) {
-    var s = String(src == null ? "" : src).replace(/\r\n?/g, "\n");
-    // 控制字符一律先剥掉，两个理由：
-    // (1) 行内代码/链接用 \u0000 当占位哨兵，正文里混进真的 \u0000 会串到别的 code span 上；
-    // (2) 浏览器解析 URL 前会剥掉首尾的 C0 控制字符，"\x01javascript:" 在 href 里照样执行。
-    // 它们本来也不是人能读的字符，去掉不损失任何正文信息（note.md 里的原字节不受影响）。
-    s = s.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "");
-    return renderLines(esc(s).split("\n"), opts || {});
-  }
-
-  global.md = {
-    render: render,
-    esc: esc,
-    safeHref: safeHref,
-    isNumeric: isNumeric,
-    numericValue: numericValue
-  };
-})(typeof globalThis !== "undefined" ? globalThis : this);
+  });
+  global.md={render:(src,opts)=>parser.render(String(src||'').replace(/^\uFEFF/,'').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g,''),opts||{}),
+             safeHref,esc,isNumeric,numericValue};
+})(globalThis);
 /* === markdown renderer (end) === */
 
 
@@ -3061,6 +2765,10 @@ async function api(path, options = {}) {
     catch { value = {error: raw}; }
   }
   if (response.status === 401 && S.authEnabled) {
+    if (S.authMode === 'token') {
+      location.reload();
+      throw Error('登录已过期，请重新输入访问密钥');
+    }
     location.href = BASE + '/auth/github/login?return_to=' +
       encodeURIComponent(location.pathname + location.search);
     throw Error('登录已过期，正在重新登录');
@@ -3318,6 +3026,7 @@ function overviewHtml() {
       </div>
       <div class="body ${project.overview ? 'md' : 'empty-copy'}">${project.overview ? md.render(project.overview) : '尚未形成项目 Overview。'}</div>
       ${commentHtml(comments, 'overview', project.id)}
+      ${runsHtml(project.recent_runs || [])}
     </section>
   `;
 }
@@ -3349,6 +3058,43 @@ function chapterPickerHtml() {
   return '<div class="chapter-hint">从左侧选择一个 Chapter，查看章内记录。</div>';
 }
 
+function externalLink(uri,label) {
+  try {
+    const url=new URL(uri);
+    if(!['http:','https:'].includes(url.protocol) || url.username || url.password) return esc(uri);
+    return `<a href="${esc(url.href)}" target="_blank" rel="noopener noreferrer">${esc(label||uri)}</a>`;
+  } catch {return esc(uri);}
+}
+function evidenceDownload(id,label) {
+  return id ? `<a href="${BASE}/api/attachments/${encodeURIComponent(id)}/content">${esc(label)}</a>` : '';
+}
+function codeSnapshotHtml(code) {
+  return `<div class="meta">代码 <code>${esc(code.commit_hash||'待核实')}</code>
+    ${evidenceDownload(code.archive_attachment_id,'下载代码')}
+    ${code.entire ? ` · Entire ${esc(code.entire.checkpoint_id)}${code.entire.matches_snapshot===false ? '（基础提交会话）' : ''}` : ''}
+    ${evidenceDownload(code.entire_attachment_id,'会话来源')}
+    ${!code.archive_attachment_id ? '<span> · 代码文件等待上传</span>' : ''}</div>`;
+}
+function runsHtml(runs, standalone=[]) {
+  if(!runs.length && !standalone.length) return '';
+  const states={PREPARED:'已准备',SUBMITTING:'正在提交',SUBMISSION_UNKNOWN:'提交结果待核实',SUBMISSION_FAILED:'提交失败',
+    QUEUED:'排队中',PENDING:'排队中',RUNNING:'运行中',COMPLETED:'已完成',FAILED:'失败',CANCELLED:'已取消',TIMEOUT:'超时',OUT_OF_MEMORY:'内存不足'};
+  return `<details class="comments"><summary>运行与代码证据 · ${runs.length} 次运行${standalone.length ? ' · '+standalone.length+' 个代码版本' : ''}</summary>
+    ${runs.map(run=>`<section class="code-evidence"><strong>${esc(run.name||run.id)}</strong> · ${esc(states[run.state]||run.state)}
+      ${run.job_id ? ' · SLURM '+esc(run.job_id) : ''}
+      ${run.replay_of ? ' · 复现自 '+esc(run.replay_of.slice(0,12)) : ''}
+      ${run.wandb_url ? ' · '+externalLink(run.wandb_url,'查看 W&B 曲线') : ''}
+      ${codeSnapshotHtml(run.snapshot||{})}
+      <pre>${esc((run.command||[]).join(' '))}</pre>
+      <div class="meta">${run.exit_code!==undefined ? '退出码 '+esc(run.exit_code)+' · ' : ''}
+        ${evidenceDownload(run.stdout_attachment_id,run.stdout_truncated?'标准输出（末尾 1 MiB）':'标准输出')}
+        ${evidenceDownload(run.stderr_attachment_id,run.stderr_truncated?'错误输出（末尾 1 MiB）':'错误输出')}</div>
+      ${run.error ? `<div class="danger">${esc(run.error)}</div>` : ''}
+      <details><summary>配置、环境与数据引用</summary><pre>${esc(JSON.stringify({command:run.command,environment:run.environment,data:run.data,source_directory:run.source_dir,output_directory:run.stdout},null,2))}</pre></details>
+    </section>`).join('')}
+    ${standalone.map(codeSnapshotHtml).join('')}</details>`;
+}
+
 function nodeHtml(node) {
   const comments = node.comments || [];
   const [reviewClass, reviewLabel] = nodeReview(node);
@@ -3367,7 +3113,8 @@ function nodeHtml(node) {
       <div><strong>${esc(directionLabels[artifact.direction] || artifact.direction)}</strong> ·
         ${artifact.object_path ? `<a href="${BASE}/api/attachments/${encodeURIComponent(artifact.id)}/content">${esc(artifact.name)}</a>` : esc(artifact.name)}
         ${artifact.external_path ? ' · ' + esc(artifact.machine || '') + ':' + esc(artifact.external_path) : ''}
-        ${artifact.uri ? ' · ' + esc(artifact.uri) : ''}
+        ${artifact.uri ? ' · ' + externalLink(artifact.uri, '打开来源') : ''}
+        ${artifact.metadata && artifact.metadata.provider === 'mlflow' ? `<div class="meta">MLflow ${esc(artifact.metadata.kind)} · ${esc(artifact.metadata.external_id)} · 已保存证据快照</div>` : ''}
       </div>
     </div>
   `).join('');
@@ -3392,6 +3139,7 @@ function nodeHtml(node) {
           <span class="pill muted ${reviewClass}">${esc(reviewLabel)}</span>
         </div>
         <div class="body md">${md.render(node.body || '')}</div>
+        ${runsHtml(node.runs || [], node.code_snapshots || [])}
         ${codes}
         ${artifacts}
         ${commentHtml(comments, 'node', node.id)}
@@ -3419,22 +3167,14 @@ function parentOptionsHtml(chapterId, selectedId = '', excludeId = '') {
     .filter(node => node.chapter_id === chapterId && node.id !== excludeId)
     .sort(nodeOrder);
   return [
-    `<option value="" ${selectedId ? '' : 'selected'}>新的起点（无 parent）</option>`,
+    `<option value="" ${selectedId ? '' : 'selected'}>独立探索或前序关系待核实</option>`,
     ...candidates.map(node =>
       `<option value="${esc(node.id)}" ${node.id === selectedId ? 'selected' : ''}>${esc(node.title)}</option>`
     )
   ].join('');
 }
 
-/* 结构图的布局 = v1 的 Reingold–Tilford（trace_core.compute_tree 的等价移植），
-   常量也照搬：176×58 的卡片、同层间隔 20、层间 38、树与树之间 56、四周留 24。
-
-   为什么必须是 RT，而不是此前那版「每片叶子占一个新列」：后者的列号全局只增不减，
-   9 片叶子就排成 9 列 ≈ 2300px，塞进 540px 的栏里等于没有图。RT 的 nextX 是**按层**
-   记的，不同深度上的分支共用同一段横向空间，同一批数据只排到两三列。
-   紧凑不是为了省地方，是为了让一屏装得下整棵树 —— 那才是这张图存在的理由。
-
-   parent 指向一条不存在的记录时自成一棵树；时间上的先后、位置上的相邻都不算边。 */
+/* Dagre owns layered graph placement. Only explicitly supported parent/artifact edges are drawn. */
 const TREE_NODE_W = 176;
 /* v1 写的是 58，但 58 装不下「一行元信息 + 两行标题」：6+17+3+35.5+6 = 67.5，
    差的那 10px 会被卡片的 overflow:hidden 从第二行中间切开——半个字比没有字更难读。
@@ -3445,107 +3185,20 @@ const TREE_V_GAP = 38;    // 层与层
 const TREE_SIBLING_GAP = 56;  // 两棵树之间
 const TREE_PAD = 24;
 
-function layoutGraphNodes(inputNodes) {
-  const nodes = [...inputNodes].sort(nodeOrder);
-  const byId = new Map(nodes.map(node => [node.id, node]));
-  const children = new Map(nodes.map(node => [node.id, []]));
-  const roots = [];
-  nodes.forEach(node => {
-    if (node.parent_id && byId.has(node.parent_id)) children.get(node.parent_id).push(node);
-    else roots.push(node);
-  });
-  children.forEach(items => items.sort(nodeOrder));
-  roots.sort(nodeOrder);
-
-  // 深度：前序走一遍，父一定先于子定下来。seen 同时挡住 parent 成环的情况。
-  const depth = new Map();
-  const seen = new Set();
-  const descend = node => {
-    if (seen.has(node.id)) return;
-    seen.add(node.id);
-    const parent = node.parent_id && byId.has(node.parent_id) ? node.parent_id : null;
-    depth.set(node.id, parent && depth.has(parent) ? depth.get(parent) + 1 : 0);
-    (children.get(node.id) || []).forEach(descend);
-  };
-  roots.forEach(descend);
-  nodes.forEach(node => { if (!seen.has(node.id)) { seen.add(node.id); depth.set(node.id, 0); } });
-
-  const x = new Map();
-  const nextX = new Map();
-  const step = TREE_NODE_W + TREE_H_GAP;
-  let treeFloor = TREE_PAD;
-  const floorAt = d => (nextX.has(d) ? nextX.get(d) : treeFloor);
-
-  /* 居中后撞上本层左边已有的节点时，整棵子树一起右移 —— 只挪父节点的话，
-     它就不再居中于自己的孩子了。 */
-  const shiftSubtree = (id, delta) => {
-    const stack = [...(children.get(id) || [])];
-    const moved = new Set();
-    while (stack.length) {
-      const kid = stack.pop();
-      if (moved.has(kid.id) || !x.has(kid.id)) continue;
-      moved.add(kid.id);
-      x.set(kid.id, x.get(kid.id) + delta);
-      const d = depth.get(kid.id);
-      nextX.set(d, Math.max(floorAt(d), x.get(kid.id) + step));
-      stack.push(...(children.get(kid.id) || []));
-    }
-  };
-
-  const place = node => {
-    const d = depth.get(node.id);
-    const floor = floorAt(d);
-    const kids = (children.get(node.id) || []).filter(kid => x.has(kid.id));
-    if (!kids.length) x.set(node.id, floor);
-    else {
-      const desired = (x.get(kids[0].id) + x.get(kids[kids.length - 1].id)) / 2;
-      if (desired >= floor) x.set(node.id, desired);
-      else { x.set(node.id, floor); shiftSubtree(node.id, floor - desired); }
-    }
-    nextX.set(d, x.get(node.id) + step);
-  };
-
-  const placeTree = root => {
-    const stack = [[root, false]];
-    const opened = new Set();
-    while (stack.length) {   // 迭代后序：深链不会撞上递归上限
-      const [node, done] = stack.pop();
-      if (done) { place(node); continue; }
-      if (opened.has(node.id)) continue;
-      opened.add(node.id);
-      stack.push([node, true]);
-      const kids = children.get(node.id) || [];
-      for (let i = kids.length - 1; i >= 0; i--) stack.push([kids[i], false]);
-    }
-    /* 让下一棵树在**所有层**上都躲开这一棵。只把 nextX 里已有的键推高是不够的：
-       那些键只是这棵树到过的层，下一棵树若更深，多出来的层会退回 TREE_PAD，
-       从最左边排起，正好钻到前一棵树的下方。所以抬高公共下限、清空 nextX。 */
-    const reached = [...nextX.values()];
-    if (reached.length) treeFloor = Math.max(...reached) + TREE_SIBLING_GAP - TREE_H_GAP;
-    nextX.clear();
-  };
-  roots.forEach(placeTree);
-  nodes.forEach(node => { if (!x.has(node.id)) placeTree(node); });
-
-  const positions = {};
-  nodes.forEach(node => {
-    const d = depth.get(node.id) || 0;
-    positions[node.id] = {
-      depth: d,
-      left: Math.round((x.has(node.id) ? x.get(node.id) : TREE_PAD) * 100) / 100,
-      top: TREE_PAD + d * (TREE_NODE_H + TREE_V_GAP)
-    };
-  });
-  const spots = Object.values(positions);
-  const maxDepth = Math.max(0, ...spots.map(spot => spot.depth));
-  return {
-    nodes,
-    positions,
-    cardWidth: TREE_NODE_W,
-    cardHeight: TREE_NODE_H,
-    width: Math.max(...spots.map(spot => spot.left), TREE_PAD) + TREE_NODE_W + TREE_PAD,
-    height: TREE_PAD * 2 + (maxDepth + 1) * TREE_NODE_H + maxDepth * TREE_V_GAP
-  };
+function dagreLayout(inputNodes, edges, cardWidth, cardHeight, gapX, gapY, padding) {
+  const nodes=[...inputNodes].sort(nodeOrder);
+  const graph=new dagre.graphlib.Graph().setGraph({rankdir:'TB',nodesep:gapX,ranksep:gapY,marginx:padding,marginy:padding});
+  graph.setDefaultEdgeLabel(()=>({}));
+  nodes.forEach(node=>graph.setNode(node.id,{width:cardWidth,height:cardHeight}));
+  edges.forEach(([from,to])=>{if(from!==to && graph.hasNode(from) && graph.hasNode(to)) graph.setEdge(from,to);});
+  dagre.layout(graph);
+  const ranks=[...new Set(nodes.map(node=>graph.node(node.id).y))].sort((a,b)=>a-b);
+  const positions={};
+  nodes.forEach(node=>{const p=graph.node(node.id); positions[node.id]={left:p.x-cardWidth/2,top:p.y-cardHeight/2,depth:ranks.indexOf(p.y)};});
+  return {nodes,positions,cardWidth,cardHeight,width:Math.max(cardWidth+2*padding,graph.graph().width||0),height:Math.max(cardHeight+2*padding,graph.graph().height||0)};
+}
+function layoutGraphNodes(nodes) {
+  return dagreLayout(nodes,nodes.filter(n=>n.parent_id).map(n=>[n.parent_id,n.id]),TREE_NODE_W,TREE_NODE_H,TREE_H_GAP,TREE_V_GAP,TREE_PAD);
 }
 
 /* 一条记录在图上用哪套线型。有没解决的纠正压过一切：那是「这里还有事没完」，
@@ -3751,61 +3404,8 @@ function dataflowKeyLabel(kind) {
 /* 数据流和结构图共用 .graph-node 的**外观**，但尺寸各算各的：结构图的卡片要密（一屏
    装下整棵树），数据流的卡片只有几个、要看得清产物名字。所以两边都把宽高**内联**写在
    卡片上，由各自的布局函数说了算 —— 让 CSS 定死一个尺寸，另一张图的边就会落在卡片外面。 */
-function layoutDataflowNodes(nodes, edges) {
-  const byId = new Map(nodes.map(node => [node.id, node]));
-  const incoming = new Map(nodes.map(node => [node.id, []]));
-  edges.forEach(edge => {
-    if (!byId.has(edge.from_node_id) || !byId.has(edge.to_node_id)) return;
-    if (edge.from_node_id === edge.to_node_id) return;
-    incoming.get(edge.to_node_id).push(edge.from_node_id);
-  });
-  const depth = new Map();
-  const visiting = new Set();
-  const depthOf = id => {
-    if (depth.has(id)) return depth.get(id);
-    if (visiting.has(id)) return 0;
-    visiting.add(id);
-    let value = 0;
-    (incoming.get(id) || []).forEach(from => {
-      value = Math.max(value, depthOf(from) + 1);
-    });
-    visiting.delete(id);
-    depth.set(id, value);
-    return value;
-  };
-  const ordered = [...nodes].sort(nodeOrder);
-  ordered.forEach(node => depthOf(node.id));
-
-  const cardWidth = 240;
-  const cardHeight = 112;
-  const gapX = 26;
-  const gapY = 62;
-  const padding = 20;
-  const positions = {};
-  const filled = new Map();
-  let maxColumn = 0;
-  let maxDepth = 0;
-  ordered.forEach(node => {
-    const row = depth.get(node.id) || 0;
-    const column = filled.get(row) || 0;
-    filled.set(row, column + 1);
-    positions[node.id] = {
-      depth: row,
-      column,
-      left: padding + column * (cardWidth + gapX),
-      top: padding + row * (cardHeight + gapY)
-    };
-    maxColumn = Math.max(maxColumn, column);
-    maxDepth = Math.max(maxDepth, row);
-  });
-  return {
-    nodes: ordered,
-    positions,
-    cardWidth,
-    cardHeight,
-    width: Math.max(360, padding * 2 + cardWidth + maxColumn * (cardWidth + gapX)),
-    height: Math.max(168, padding * 2 + cardHeight + maxDepth * (cardHeight + gapY))
-  };
+function layoutDataflowNodes(nodes,edges) {
+  return dagreLayout(nodes,edges.map(e=>[e.from_node_id,e.to_node_id]),240,112,26,62,20);
 }
 
 function dataflowSectionHtml() {
@@ -4182,23 +3782,17 @@ async function loadRaw() {
 }
 
 /* 从语义记录跳到它的来源原始历史。Node 上登记的 source_event_ids 就是这条边，
-   没有登记时退回项目最近的原始历史，而不是给一个死按钮。 */
+   没有登记或来源缺失时明确显示缺口，不用最近的事件冒充来源。 */
 async function showNodeRaw(nodeId) {
   const node = S.project.nodes.find(item => item.id === nodeId);
   const label = node ? node.title : nodeId;
   const sources = (node && node.source_event_ids) || [];
   setModal('原始历史 · ' + label, '<div class="meta">加载中…</div>');
   try {
-    const value = await api('/api/projects/' + encodeURIComponent(S.project.id) + '/raw?limit=200');
-    const matched = sources.length
-      ? value.items.filter(item => sources.includes(item.id))
-      : [];
-    const items = matched.length ? matched : value.items;
-    const note = !sources.length
-      ? '这条记录没有登记来源 event，下面是项目最近的原始历史。'
-      : (matched.length
-        ? `这条记录登记了 ${sources.length} 条来源 event，其中 ${matched.length} 条已在中央。`
-        : `这条记录登记的 ${sources.length} 条来源 event 还没有出现在中央，先显示项目最近的原始历史。`);
+    const value = await api('/api/nodes/' + encodeURIComponent(nodeId) + '/sources');
+    const items = value.items;
+    const note = !sources.length ? '这条记录尚未登记来源；前序关系和依据可稍后补充。'
+      : `登记了 ${sources.length} 条来源，已找到 ${items.length} 条${value.missing_event_ids.length ? '；其余来源待核实' : ''}。`;
     setModal('原始历史 · ' + label, `
       <div class="meta">${esc(note)}</div>
       <div class="raw-list">${items.map(rawRowHtml).join('') || '<div class="meta">还没有已上传的原始历史。</div>'}</div>
@@ -4536,11 +4130,24 @@ function bindNodeActions() {
     };
   });
   document.querySelectorAll('[data-attach-node]').forEach(button => {
-    button.onclick = () => {
+    button.onclick = () => withBusy(button, async () => {
       const nodeId = button.dataset.attachNode;
+      const projectId = S.project.id;
+      let mlflowEnabled = false;
+      try {
+        const integrations = await api('/api/integrations');
+        mlflowEnabled = !!((integrations.capabilities || {})[projectId] || {}).mlflow;
+      } catch (_) { /* Ordinary attachments work even if status is unavailable. */ }
       setModal(
         '添加附件或外部产物',
         `
+          <label for="fieldSource">来源</label><select id="fieldSource"><option value="file">文件或外部位置</option>${mlflowEnabled ? '<option value="mlflow">MLflow 实验证据</option>' : ''}</select>
+          <div id="mlflowFields" hidden>
+            <p class="meta">把已绑定实验中的 run 或 trace 保存为证据快照，关联到当前记录。</p>
+            <label for="fieldMlflowKind">证据类型</label><select id="fieldMlflowKind"><option value="run">Run（参数与指标）</option><option value="trace">Trace（会话与工具调用）</option></select>
+            <label for="fieldMlflowId">Run ID / Trace ID</label><input id="fieldMlflowId" autocomplete="off">
+          </div>
+          <div id="fileFields">
           <label for="fieldFile">小文件（可空，服务默认上限 10 MB）</label><input id="fieldFile" type="file">
           <label for="fieldArtifactName">显示名称</label><input id="fieldArtifactName">
           <div class="grid2">
@@ -4549,11 +4156,23 @@ function bindNodeActions() {
           </div>
           <label for="fieldExternal">外部路径（大数据/模型只登记位置）</label><input id="fieldExternal">
           <label for="fieldUri">URI（可选）</label><input id="fieldUri">
+          </div>
         `,
         async () => {
+          if ($('#fieldSource').value === 'mlflow') {
+            const externalId = $('#fieldMlflowId').value.trim();
+            if (!externalId) throw new Error('请填写 Run ID 或 Trace ID');
+            const result = await api('/api/attach', {method: 'POST', body: JSON.stringify({
+              project_id: projectId, target_type: 'node', target_id: nodeId,
+              integration: 'mlflow', external_kind: $('#fieldMlflowKind').value, external_id: externalId
+            })});
+            await refreshProject();
+            notify(result.duplicate ? '这份证据已保存，已关联到当前记录' : '证据快照已保存');
+            return;
+          }
           const file = $('#fieldFile').files[0];
           const value = {
-            project_id: S.project.id,
+            project_id: projectId,
             target_type: 'node',
             target_id: nodeId,
             name: $('#fieldArtifactName').value || (file && file.name) || 'artifact',
@@ -4571,7 +4190,12 @@ function bindNodeActions() {
           await refreshProject();
         }
       );
-    };
+      $('#fieldSource').onchange = () => {
+        const isMlflow = $('#fieldSource').value === 'mlflow';
+        $('#mlflowFields').hidden = !isMlflow;
+        $('#fileFields').hidden = isMlflow;
+      };
+    });
   });
 }
 
@@ -4665,7 +4289,21 @@ function recorderHealthHtml(value) {
     lines.push('Recorder 未处理游标尚未上报；一批 batch 不产生 Node 本身是正常的。');
     return healthCardHtml('Recorder', 'unknown', lines);
   }
-  lines.push(`未处理 batch ${esc(recorder.pending_batches ?? '—')} · 最近处理 ${fmt(recorder.last_processed_at)}`);
+  const recorderStates = {
+    idle: '空闲', quota: '订阅额度暂停', overage: '额外用量已阻止', auth: '等待登录',
+    paid_credentials: '检测到 API/云凭证', config: '配置错误', blocked_config: '等待启用确认',
+    storage_or_network_error: '中央暂不可用', retry_requested: '已请求重试',
+    attempts_exhausted: '模型输出多次无法解析，等待人工重试', cli: 'Claude CLI 无法启动',
+    disabled: '项目已关闭整理', deferred: '等待重试时间', waiting_project: '等待项目绑定',
+    timeout: '模型调用超时，稍后重试', format: '模型输出未通过校验，稍后重试',
+    malformed: '模型输出不是 JSON，稍后重试', empty: '模型无输出，稍后重试', error: '模型调用出错，稍后重试'
+  };
+  lines.push(`状态 ${esc(recorderStates[recorder.status] || recorder.status || '—')} · 未处理 batch ${esc(recorder.pending_batches ?? '—')} · 最近处理 ${fmt(recorder.last_processed_at)}`);
+  if (recorder.pause_until) {
+    const rawPause = Number(recorder.pause_until);
+    const pauseAt = Number.isFinite(rawPause) && rawPause < 1000000000000 ? rawPause * 1000 : recorder.pause_until;
+    lines.push(`预计恢复 ${fmt(pauseAt)}`);
+  }
   if (recorder.last_error) lines.push(`<span class="danger">${esc(recorder.last_error)}</span>`);
   return healthCardHtml('Recorder', recorder.last_error || Number(recorder.pending_batches || 0) > 0 ? 'warn' : 'ok', lines);
 }
@@ -4685,64 +4323,14 @@ function bytesLabel(value) {
   return (index ? scaled.toFixed(1) : String(Math.round(scaled))) + ' ' + units[index];
 }
 
-/* §13 的容量告警。备份撞上 GitHub 的上限是渐进发生的：等到 push 被拒才知道，
-   就已经有一轮备份没写进去了。backup.capacity 是 sync_git_backup 每轮算出来的
-   （backup._capacity → server 的 backup_state → /api/health），这里是它唯一的
-   落点——不渲染的话那次计算等于没做。 */
-function backupCapacityLines(capacity) {
-  if (!capacity) return [];
-  const facts = [
-    `导出 ${bytesLabel(capacity.export_bytes)}`,
-    capacity.repository_bytes === null || capacity.repository_bytes === undefined
-      ? '' : `仓库 ${bytesLabel(capacity.repository_bytes)}`,
-    capacity.volumes ? `${esc(capacity.volumes)} 个分卷` : '',
-    capacity.largest_file ? `最大文件 ${esc(capacity.largest_file)} ${bytesLabel(capacity.largest_file_bytes)}` : ''
-  ].filter(Boolean).join(' · ');
-  const critical = String(capacity.level || '') === 'critical';
-  return [facts, ...(capacity.warnings || []).map(
-    item => critical ? `<span class="danger">${esc(item)}</span>` : esc(item)
-  )];
-}
-
-function backupHealthHtml(value) {
-  const backup = value.backup || {};
-  if (!backup.enabled) {
-    return healthCardHtml('GitHub 每日备份', 'unknown', ['服务没有配置 --backup-repo，没有灾备副本。']);
-  }
-  /* 本地 commit 成功但 push 失败时远端会静静落后好几周，而 last_success_at
-     照样在往前走。unpushed_commits 是唯一能把这件事说出来的字段。 */
-  const behind = Number(backup.unpushed_commits || 0);
-  const capacity = backup.capacity || null;
-  const level = capacity ? String(capacity.level || 'ok') : 'ok';
-  const missing = backup.missing_objects || [];
-  const state = level === 'critical'
-    ? 'critical'
-    : ((backup.error || behind || level === 'warn' || missing.length)
-      ? 'warn'
-      : (backup.last_success_at ? 'ok' : 'unknown'));
-  return healthCardHtml('GitHub 每日备份', state, [
-    backup.running ? '正在导出…' : '',
-    `最近尝试 ${fmt(backup.last_attempt_at) || '—'} · 最近成功 ${fmt(backup.last_success_at) || '—'}`,
-    backup.changed === null || backup.changed === undefined ? '' : `上次导出${backup.changed ? '有变化并已 commit' : '内容未变化'}${backup.pushed ? ' · 已 push' : ''}`,
-    behind ? `<span class="danger">远端落后 ${esc(behind)} 个 commit：上一轮 push 没成功，下一轮会补推。</span>` : '',
-    ...backupCapacityLines(capacity),
-    /* 大产物只备份引用元数据，但小附件的对象文件确实可能在数据卷上丢了。
-       导出不因此中止，可是「备份里没有这些字节」必须有人看得见。 */
-    missing.length
-      ? `<span class="danger">${esc(missing.length)} 个附件对象在导出时已不存在，备份里没有它们的字节。</span>`
-      : '',
-    backup.error ? `<span class="danger">${esc(backup.error)}</span>` : ''
-  ]);
-}
-
 async function showHealth() {
-  setModal('采集与备份状态', '<div class="meta">加载中…</div>');
+  setModal('采集与集成状态', '<div class="meta">加载中…</div>');
   try {
     const value = await api('/api/health');
-    setModal('采集与备份状态', [
+    setModal('采集与集成状态', [
       outboxHealthHtml(value),
       recorderHealthHtml(value),
-      backupHealthHtml(value),
+      integrationHealthHtml(value.integrations),
       healthCardHtml('中央存储', (value.ok && !value.anonymous_read) ? 'ok' : 'warn', [
         `schema v${esc(value.schema_version ?? '—')} · 项目 ${esc((value.counts || {}).projects ?? '—')} 个 · 附件 ${esc((value.counts || {}).attachments ?? '—')} 个`,
         value.write_protected ? '写入需要设备凭证或登录。' : '写入未受保护（仅限本机开发）。',
@@ -4752,9 +4340,29 @@ async function showHealth() {
         value.purge_generation ? `已执行 ${esc(value.purge_generation)} 次紧急 purge · 最近一次 ${fmt((value.last_purge || {}).created_at) || '—'}` : ''
       ])
     ].join(''));
+    const sync = $('#syncKnowledge');
+    if (sync) sync.onclick = () => withBusy(sync, async () => {
+      try {
+        await api('/api/integrations/sync', {method: 'POST', body: '{}'});
+        await showHealth();
+      } catch (error) { notify(error.message); }
+    }, '同步中…');
   } catch (error) {
-    setModal('采集与备份状态', `<div class="danger">${esc(error.message)}</div>`);
+    setModal('采集与集成状态', `<div class="danger">${esc(error.message)}</div>`);
   }
+}
+
+function integrationHealthHtml(value) {
+  if (!value) return '';
+  const memory = value.basic_memory || {}, mlflow = value.mlflow || {};
+  const states = {disabled: '未启用', pending: '等待同步', syncing: '同步中', ready: '可用', configured: '已配置', error: '暂不可用'};
+  return healthCardHtml('知识检索与实验证据', memory.state === 'error' || mlflow.state === 'error' ? 'warn' : 'ok', [
+    `Basic Memory：${esc(states[memory.state] || memory.state)} · 已同步 ${esc(value.indexed_notes || 0)} 份内容`,
+    memory.last_success_at ? `最近同步：${fmt(memory.last_success_at)}。向量生成由知识服务继续处理。` : '',
+    memory.state === 'error' ? '知识同步将自动重试，当前仍可使用本地关键词检索。' : '',
+    `MLflow：${esc(states[mlflow.state] || mlflow.state)}。已绑定项目可在记录的“附件 / 产物”中导入证据。`,
+    memory.enabled && canWrite() ? '<button class="btn" type="button" id="syncKnowledge">立即同步知识</button>' : ''
+  ]);
 }
 
 async function showUsers() {
@@ -4863,13 +4471,15 @@ function showAccount() {
         <div><strong>${esc(name)}</strong><div class="meta">@${esc(S.user.login)} · ${esc(S.user.role)}</div></div>
       </div>
       <div class="toolbar">
-        <button class="btn" type="button" id="manageDevices">${icon('device')}管理已登录设备</button>
-        ${S.user.role === 'admin' ? `<button class="btn" type="button" id="manageUsers">${icon('team')}管理团队用户</button>` : ''}
+        ${S.authMode === 'oauth' ? `<button class="btn" type="button" id="manageDevices">${icon('device')}管理已登录设备</button>` : ''}
+        ${S.authMode === 'oauth' && S.user.role === 'admin' ? `<button class="btn" type="button" id="manageUsers">${icon('team')}管理团队用户</button>` : ''}
+        ${S.authMode === 'token' ? `<p class="meta">访问密钥登录：这台服务用一个共享密钥守读写；改名字重新登录即可。</p>` : ''}
         <button class="btn warn" type="button" id="logoutBtn">${icon('logout')}退出登录</button>
       </div>
     `
   );
-  $('#manageDevices').onclick = () => showDevices().catch(error => notify(error.message));
+  const manageDevices = $('#manageDevices');
+  if (manageDevices) manageDevices.onclick = () => showDevices().catch(error => notify(error.message));
   const manageUsers = $('#manageUsers');
   if (manageUsers) manageUsers.onclick = () => showUsers().catch(error => notify(error.message));
   $('#logoutBtn').onclick = async () => {
@@ -4907,7 +4517,7 @@ function projectName(id) {
 }
 
 const SEARCH_SCOPE_LABEL = {
-  node: '记录', comment: '评论', overview: 'Overview', event: '原始 event', transcript: 'transcript'
+  node: '记录', chapter: '研究线', comment: '评论', overview: 'Overview', event: '原始 event', transcript: 'transcript'
 };
 
 function searchHitHtml(hit) {
@@ -4918,10 +4528,11 @@ function searchHitHtml(hit) {
   const nodeId = hit.scope === 'node' ? hit.id : (hit.target_type === 'node' ? hit.target_id : '');
   return `
     <button class="hit" type="button" data-hit-project="${esc(hit.project_id || '')}"
-      data-hit-node="${esc(nodeId || '')}" data-hit-raw="${isRaw ? '1' : ''}">
+      data-hit-node="${esc(nodeId || '')}" data-hit-chapter="${esc(hit.scope === 'chapter' ? hit.id : (hit.chapter_id || ''))}" data-hit-raw="${isRaw ? '1' : ''}">
       <b>${esc(title)}</b>
       <div>${esc(String(hit.body || hit.overview || '').slice(0, 260))}</div>
       <small><span class="hit-project">${esc(projectName(hit.project_id))}</span> · ${esc(SEARCH_SCOPE_LABEL[hit.scope] || hit.scope)} · ${fmt(when)}</small>
+      ${hit.index_stale ? '<small>索引待更新 · 此处显示最新记录</small>' : ''}
     </button>
   `;
 }
@@ -4941,12 +4552,12 @@ async function openHit(button) {
     S.chapter = S.project.chapters.find(chapter => chapter.id === node.chapter_id) || null;
     S.selectedNodeId = node.id;
   } else {
-    S.chapter = null;
+    S.chapter = S.project.chapters.find(chapter => chapter.id === button.dataset.hitChapter) || null;
     S.selectedNodeId = null;
   }
   renderSide();
   renderMain();
-  if (button.dataset.hitRaw) {
+  if (button.dataset.hitRaw === '1') {
     const raw = $('#rawHistory');
     if (raw) {
       raw.open = true;
@@ -4976,6 +4587,7 @@ $('#search').oninput = event => {
   searchTimer = setTimeout(async () => {
     try {
       const value = await api('/api/search?q=' + encodeURIComponent(query) + '&scope=all&limit=30');
+      if ($('#search').value.trim() !== query) return;
       $('#searchResults').innerHTML = (value.hits.map(searchHitHtml).join('')
         || '<div class="hit"><b>没有结果</b><div>换一个更具体的关键词试试。</div></div>')
         + searchTruncationHtml(value);
@@ -4992,6 +4604,11 @@ $('#search').oninput = event => {
 /* 存储层给语义层留了保底名额并算出了截断信息。不说出来的话，用户看到 30 条
    就以为只有 30 条——而被挤掉的往往正是他要找的那条语义记录。 */
 function searchTruncationHtml(value) {
+  if (value && value.retrieval && value.retrieval.fallback) return '<div class="hit meta">知识检索暂不可用，当前显示本地关键词结果。</div>';
+  if (value && value.retrieval && value.retrieval.backend === 'basic_memory+local') {
+    const more = value.truncated || value.retrieval.candidate_omitted;
+    return `<div class="hit meta">知识检索与关键词结果${more ? ' · 部分结果未显示，请缩小搜索范围' : ''}</div>`;
+  }
   if (!value || !value.truncated) return '';
   const omitted = value.omitted || {};
   const parts = Object.keys(omitted)
@@ -5016,8 +4633,50 @@ document.addEventListener('keydown', event => {
 async function bootstrap() {
   const config = await api('/api/auth/config');
   S.authEnabled = config.enabled;
+  S.authMode = config.mode || (config.enabled ? 'oauth' : 'open');
   if (S.authEnabled) {
     const response = await fetch(BASE + '/api/auth/me', {headers: {Accept: 'application/json'}});
+    if (!response.ok && S.authMode === 'token') {
+      setAccountLabel('输入访问密钥');
+      $('#tokenBtn').onclick = () => $('#accessKey').focus();
+      $('#sidebar').hidden = true;
+      $('.layout').style.gridTemplateColumns = '1fr';
+      $('#main').style.margin = 'auto';
+      $('#main').innerHTML = `
+        <div class="empty">
+          <div class="empty-inner">
+            <span class="section-icon login-icon">${icon('user')}</span>
+            <h2>登录 Research Trace</h2>
+            <p>这台服务用一个共享访问密钥守住读写。输入密钥和你的名字（记录里的纠正、确认会署这个名）。</p>
+            <form id="keyLogin" class="form-stack" autocomplete="off">
+              <label for="accessKey">访问密钥</label>
+              <input id="accessKey" type="password" autocomplete="current-password" required>
+              <label for="accessName">你的名字</label>
+              <input id="accessName" autocomplete="username" value="${esc(stored('actor') || '')}" required>
+              <button class="btn primary" type="submit">登录</button>
+              <p class="meta" id="keyLoginError" role="alert"></p>
+            </form>
+          </div>
+        </div>
+      `;
+      $('#keyLogin').onsubmit = async event => {
+        event.preventDefault();
+        const reply = await fetch(BASE + '/api/auth/token-login', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json', Accept: 'application/json'},
+          body: JSON.stringify({key: $('#accessKey').value, name: $('#accessName').value})
+        });
+        if (!reply.ok) {
+          let detail = reply.statusText;
+          try { detail = (await reply.json()).detail || detail; } catch {}
+          $('#keyLoginError').textContent = reply.status === 401 ? '密钥不对' : detail;
+          return;
+        }
+        localStorage.setItem('trace.actor', $('#accessName').value);
+        location.reload();
+      };
+      return;
+    }
     if (!response.ok) {
       setAccountLabel('GitHub 登录');
       $('#tokenBtn').onclick = () => {

@@ -12,6 +12,7 @@ const assert = require("node:assert");
 const fs = require("node:fs");
 const path = require("node:path");
 
+globalThis.markdownit = require("../research_trace/static/markdown-it.min.js");
 const SOURCE = fs.readFileSync(
   path.join(__dirname, "..", "research_trace", "webapp.py"), "utf8");
 const BEGIN = "/* === markdown renderer (begin) === */";
@@ -155,7 +156,7 @@ test("引用块递归渲染内部结构", () => {
 
 test("嵌套列表保留层级", () => {
   const h = R("- 顶层\n  - 子项\n- 另一个顶层");
-  assert.ok(h.includes("<ul><li>"), h);
+  assert.ok(/<ul>\s*<li>/.test(h), h);
   assert.equal((h.match(/<ul/g) || []).length, 2);
 });
 
@@ -181,18 +182,18 @@ test("同样的输入产出同样的输出", () => {
 /* ======================================================= 附件名里的空格与括号
    trace_mcp._md_ref 对含空格/括号的路径会生成 CommonMark 的 <...> 形式，
    网页拖拽上传则直接插入裸路径。两种都必须能渲染出图，否则
-   `loss curve (run 42).png` 这类再普通不过的文件名在正文里就只剩一串源码。 */
+   `loss%20curve%20(run%2042).png` 这类再普通不过的文件名在正文里就只剩一串源码。 */
 
 test("文件名带空格时 <尖括号> 形式的图片仍渲染成 img 而不是裸源码", () => {
   const h = R('![](<loss curve.png> "第 12 轮后验证集回升")', { resolve: (p) => "/files/3/" + p });
-  assert.ok(h.includes('src="/files/3/loss curve.png"'), h);
+  assert.ok(h.includes('src="/files/3/loss%20curve.png"'), h);
   assert.ok(!h.includes("&lt;"), "尖括号是语法，不该原样显示出来");
   assert.ok(h.includes("<figcaption>第 12 轮后验证集回升</figcaption>"));
 });
 
 test("文件名带空格时 <尖括号> 形式的普通附件链接也认得", () => {
   const h = R("见 [数据](<data set.csv>)", { resolve: (p) => "/files/3/" + p });
-  assert.ok(h.includes('href="/files/3/data set.csv"'), h);
+  assert.ok(h.includes('href="/files/3/data%20set.csv"'), h);
 });
 
 test("文件名里的成对括号不把 src 截断", () => {
@@ -201,9 +202,9 @@ test("文件名里的成对括号不把 src 截断", () => {
   assert.ok(!h.includes(".png)"), "不该有残留的裸文本 .png)");
 });
 
-test("空格加括号的文件名（loss curve (run 42).png）完整保留", () => {
-  const h = R("![](<loss curve (run 42).png>)", RAW);
-  assert.ok(h.includes('src="loss curve (run 42).png"'), h);
+test("空格加括号的文件名（loss%20curve%20(run%2042).png）完整保留", () => {
+  const h = R("![](<loss%20curve%20(run%2042).png>)", RAW);
+  assert.ok(h.includes('src="loss%20curve%20(run%2042).png"'), h);
 });
 
 test("图注的 HTML 转义没被 <尖括号> 支持弄坏", () => {

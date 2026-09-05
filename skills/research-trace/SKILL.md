@@ -9,11 +9,11 @@ Research Trace 有两层：**原始历史层**（hook 自动把宿主暴露的�
 由独立进程 `trace-deliver` 上传）和**语义记录层**（Project / Overview / Chapter / Node）。
 
 这份 skill 只写给**主 agent**。后台 Recorder 有自己的一份协议文件（`hooks/RECORDER_PROTOCOL.md`），
-它由 hook 在 Stop 时派发，你不需要读那份文件，也不需要替它工作。
+它是另一个独立进程（`trace-recorder --watch`）里的另一个 Claude 会话，你不需要读那份文件，
+也不需要替它工作。
 
 主 agent 的介入点有这几个：**开工前读现状**、**按需检索**、**帮用户完成绑定**、
-**Stop 时照 hook 的指令派发一次 Recorder（然后就停）**、
-**在用户明确要求、或某个值只有你拿得到时亲自写一条记录**。
+**在用户明确要求、或某个值只有你拿得到时亲自写一条记录**。Stop 时你**没有**任何事要做。
 
 ## 七个工具，主 agent 的用法
 
@@ -76,28 +76,24 @@ Research Trace 有两层：**原始历史层**（hook 自动把宿主暴露的�
 `limit` 服务端夹到 1..200，不传是 50。带 `project_id` 可以限定在一个项目内，不带就是跨项目。
 返回里有 `totals` / `omitted` / `truncated`，被截断时如实告诉用户还有多少条没显示，别假装搜全了。
 
-## 3. 采集是自动的，Stop 时的那条指令照做即可
+## 3. 采集是自动的，Stop 时你没有任何事要做
 
 原始事件、transcript、投递、batch 归档全部自动，没有你的介入点：
 
 - 没有 `.research-trace.json` marker 的目录，hook 在建任何目录之前就返回，一个字节都不写。
   **装上插件不等于开始记录这台机器上的所有项目。**
 - `thinking` / `redacted_thinking` 在写进 outbox 之前就被剥掉了，不出本机。你不用管这件事。
-- 上传由独立进程 `trace-deliver` 负责，hook 在 SessionStart / SessionEnd fire-and-forget 拉起它。
+- 上传由独立进程 `trace-deliver` 负责，hook 在 SessionStart / Stop / SessionEnd fire-and-forget 拉起它。
   没确认的文件留在 `pending/` 下次重试。**不要去看 outbox 目录，不要手工搬文件，不要汇报上传状态。**
-
-会话结束时（Stop）hook 会用一个 block decision 把派发指令直接发到你的上下文里：派 `fork` 还是
-对已有 Recorder `SendMessage`、任务提示怎么写、为什么必须是 fork、派完就停不要等、
-派不出去时不要本轮重试——那条消息里全都有。**照它的字面做，只做一次。**
-这里只补三件那条消息里没有的：
-
-- hook 会按 agent id 把 Recorder 限死在 Read / Grep / Glob 和六个研究工具
-  （`trace_context` / `trace_ingest` / `trace_record` / `trace_curate` / `trace_attach` / `trace_search`，
-  **不含 `trace_login`**）。**这条限制只对 Recorder 生效，对你完全没有影响**——
-  你的 Edit / Write / Bash 一切照旧。
-- 语义判断是 Recorder 的职责：**不要自己去读那份 batch manifest。**
-- 如果连着几轮都派不出去（这个宿主没有 fork / SendMessage），除了不重试之外，还要告诉用户
-  **语义层现在没人写**，并按 §5 在他要求时自己 `trace_record`。原始历史不受影响，照常入队上传。
+- 语义整理由**另一个进程**做。Stop / SessionEnd 时 hook 只把这一轮的材料封成一个持久 batch 就返回，
+  **不会**给你任何指令，也不会派 fork、Agent 或 SendMessage。消费 batch 的是操作者单独启动的
+  `trace-recorder --watch`：它跑在自己的 Claude 订阅会话里，没有工具、没有 MCP，读不到你的上下文，
+  只看被 hook 采到的事件与可见 transcript。**你不需要等它、催它、替它，也不要去读 batch manifest。**
+- 用户问「语义记录怎么还没出来」时：先按 §6 末尾查绑定和登录；再让他跑
+  `trace-recorder --status --data-dir <插件数据目录>`——它不联网，直接打印待处理 batch 数、
+  最近一次处理时间和最近一次错误。`quota` 是在等额度恢复；`overage` / `attempts_exhausted` /
+  `auth` / `blocked_config` 要人处理完再 `trace-recorder --retry-blocked`。没有人启动 watcher 时
+  batch 会一直排队，原始历史不受影响。
 
 ## 4. 用户说"开始记录这个项目"
 
@@ -129,14 +125,17 @@ Research Trace 有两层：**原始历史层**（hook 自动把宿主暴露的�
 
 ## 5. 你自己写记录
 
-默认情况下语义记录由 Recorder 写。它是 `fork`，你这一整段会话的上下文它都有，所以
-"Recorder 不知道这件事"通常是假的。主 agent 亲自写只有这几种场合：
+默认情况下语义记录由独立 Recorder 写。它读到的是这一轮封存的事件与可见 transcript、精简的项目
+记忆和几条相关旧记录——**不是你的上下文**。所以"Recorder 不知道这件事"有时是真的，
+主 agent 亲自写就是这几种场合：
 
 - **用户明确要求**（"记一下这个""更新 Overview"）——这时必须执行，不要自己判断值不值得记。
-- **这个值必须执行才能拿到，而对话里又没打印出来。** Recorder 只有 Read / Grep / Glob，
-  跑不了 Bash：sha256、文件大小、绝对路径、`git rev-parse` 出来的 commit hash，只有你能提供。
-  这类 `trace_attach` / `code_evidence` 由你写。
-- **这段会话被压缩过**，而你判断关键细节已经不在上下文里了（fork 继承的是压缩后的那一份）。
+- **这个值只在你的上下文里，没有出现在任何事件或可见输出中。** Recorder 只看被 hook 采到的材料：
+  一个你算出来但没打印的 sha256、没在对话里出现过的绝对路径或 `git rev-parse` 结果，它拿不到。
+  这类 `trace_attach` / `code_evidence` 由你写。反过来，只要一个 W&B 链接、产物路径在命令输出或
+  对话里出现过，Recorder 就能引用它（它的 `artifact_refs` 只接受在证据里原样出现过的 URI）。
+- **这段会话被压缩过**，而关键细节只在压缩前的对话里：hook 采的是 transcript 增量，压缩掉的那段
+  多半已经进了之前的 batch，但不确定时自己补一条。
 - **这份产物不是本次会话产生的**：历史结果、在别处跑出来的、用户直接贴进来的。
 
 反过来：**本次会话里正常产出的产物交给 Recorder 登记，不要抢在它前面。** 你先登记一遍、
@@ -242,3 +241,18 @@ Recorder 稍后又登记一遍，数据流图上就是同一个键下两条来�
 - **不要用 `parent_id` 去搭时间链或因果链。** → 见 §5
 - **不要试图设置 `review_state`、`created_by`、`actor_type`**，这些旋钮不存在，
   请求体里写了会被静默忽略（不是 403）。→ 见 §5
+
+
+## 被动记录代码与实验（alpha.24）
+
+在已绑定项目用 `trace-code init` 启用代码取证。研究 Agent 继续使用原有训练脚本和 sbatch，
+负责提交后保持实验原目录及其引用的公共代码不变。记录系统不提交或取消任务、不创建运行目录、
+不改写路径、不锁定文件，也不要求每个模型建立 worktree。不要为了“记录”去操作 Slurm 或重新运行实验。
+
+Hook 自动保存观察到的命令、输出、对话和阶段代码证据。使用 source_event_ids 将这些来源关联到
+一个研究节点；只有 recent_runs 中实际存在的历史/导入运行才填写 run_ids。不要伪造 run ID，
+也不要要求 Agent 为获得记录再走一套任务提交接口。作业提交成功不等于训练完成。
+
+一组实验可以共用一条连贯总结。未实施的想法不需要运行记录，parent 未知可以留空。
+W&B 只在正文或来源中留实际曲线链接；代码不上传 W&B。数据与输出记录观察到的路径、版本或哈希，
+不强制另一套目录管理。代码归档用于回看和下载，复现操作由研究 Agent 执行。GitHub 每日备份已移除。

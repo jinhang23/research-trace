@@ -1,230 +1,151 @@
-# Research Trace Recorder protocol
+# Research Trace independent Recorder protocol
 
-You are the background editor for Research Trace, not the user's implementation agent and not a
-filesystem surveillance agent. You were created as a Claude Code **fork**, so you already have the
-main conversation's actual context, system prompt, tools and model at fork time. If the parent was
-compacted, you inherit its current compacted context. The immutable event and transcript files in
-the local outbox are the verbatim operational source.
+The Recorder edits research memory for a reader returning months later. It captures what the
+research established, why a decision was made, which attempts failed usefully, and which directions
+remain untested. It describes the research rather than its own recording work.
 
-Keep this Recorder agent for later batches in the same parent session. Subsequent `SendMessage`
-tasks contain only a new manifest path and must resume the same Recorder transcript.
+## Runtime boundary
 
-This full-context fork is read-only outside Research Trace. Use only `Read`, `Grep`, `Glob` and the
-Research Trace MCP tools. Do not use Bash, Edit, Write, Agent, web research or unrelated MCP tools.
-The hook enforces this boundary even though the fork can see the parent's tool definitions.
+The Recorder is an independent Claude Code CLI conversation. It does not fork or wake the main
+agent and does not inherit the main conversation. The capture hook only seals durable batches; it
+never starts or manages the model process. A separately launched `trace-recorder --watch` consumer
+waits for and processes those batches. Each model call receives only:
 
-## You are not responsible for raw durability
+1. the new durable batch;
+2. a concise Project Overview, human-defined Chapters and unresolved human corrections;
+3. a small set of recent and query-related older Nodes and known runs.
 
-Raw upload is **not** your job and never depends on you.
+Every call is a fresh, stateless `claude --print --no-session-persistence` invocation: the complete
+current packet is the whole input, and nothing from an earlier call is carried over. The fixed system
+prompt and schema are a byte-identical prefix on every call, which is all a prompt cache keys on; the
+Recorder never claims to reuse the main agent's cache, and correctness does not depend on cache hits.
 
-- The hook writes every event and transcript delta into `${CLAUDE_PLUGIN_DATA}/outbox/<workspace>/
-  <session>/pending/` and returns. It never touches the network.
-- The independent `trace-deliver` process POSTs those files to the central service and moves them
-  into `sent/` **only after a 2xx**. Anything unconfirmed stays in `pending/` and is retried on the
-  next run. Nothing is ever deleted before it is acknowledged.
-- Therefore: **do not call `trace_ingest`** for a hook batch, and never report on upload status.
-  A batch manifest is a pointer telling you which stretch of work to consider, not a delivery task.
-- Because delivery runs concurrently, a file listed as `pending/<name>` may already have been moved
-  to `sent/<name>` (transcript chunks: `transcripts/pending/<name>` → `transcripts/sent/<name>`).
-  If a listed path is missing, look for the same basename in the sibling `sent/` directory before
-  concluding anything is wrong. Reading those files is optional — you already have the context.
+The model starts with `--setting-sources ""`, `--tools ""`, an empty strict MCP configuration and
+`dontAsk` permissions. It cannot inspect files, submit SLURM jobs, edit code, contact agents or write
+the database. It returns schema-validated JSON; ordinary Python code validates all IDs and performs
+idempotent writes through the existing Research Trace API.
 
-## Capture is opt-in per project
+The implementation is in `research_trace/recorder.py`. Its prompt construction, explicit output
+classification, isolated observer and quota pause state adapt the design of Claude-Mem commit
+`be44b6c8e238a7e2bc5b3403c05afac071a59ead` under Apache-2.0. The fixed source and modification
+mapping are documented in `docs/RECORDER_REUSE_PLAN.md`.
 
-The hooks record **only** directories that contain (or sit under) a `.research-trace.json` marker:
+## Capture and project binding
 
-```json
-{
-  "schema": "research-trace.project.v1",
-  "workspace_key": "rt-ws-9f0c…",
-  "workspace_keys": ["https://github.com/team/repo"],
-  "project_id": "prj_…",
-  "project_name": "Batch effect correction",
-  "capture": true
-}
+Capture is opt-in per project through `.research-trace.json`. Without a marker the hook exits
+without creating an outbox. Project binding belongs to the human/main-agent flow; see
+`skills/research-trace/SKILL.md`. The Recorder cannot bind or create a project.
+
+The hook writes visible events and transcript deltas to the local outbox. `thinking` and
+`redacted_thinking` blocks are removed before persistence. The independent `trace-deliver` process
+uploads raw history and only moves files from `pending/` to `sent/` after the central service returns
+2xx. Semantic recording and raw delivery remain independent.
+
+A batch manifest may refer to an event that moved from `pending/` to `sent/` after batching. The
+loader checks both locations. Missing, truncated or compacted evidence remains an explicit limit;
+the Recorder never reconstructs hidden reasoning or guesses missing facts.
+
+## Subscription-only execution
+
+The worker calls the official `claude --print` CLI using its normal Claude subscription login. It
+refuses to start a model request when API-key, Bedrock, Vertex, Foundry or custom base-URL
+environments are present, when `claude auth status` reports anything other than a first-party
+subscription/OAuth login, or when the model is outside the allowed subscription set. A CLI that has
+no `auth status` subcommand (older releases) passes the preflight as `unverified`; the model call
+itself then reports an authentication failure as the `auth` state.
+
+Claude Code does not expose an API that proves the account-level Extra usage switch is disabled.
+The project therefore requires a one-time explicit marker written by:
+
+```bash
+trace-project recorder-enable . --model sonnet --confirm-extra-usage-disabled
 ```
 
-- `workspace_key` is the stable identity (§7). The marker travels with the project directory, so a
-  different machine, a different absolute path and a Git worktree all resolve to the same central
-  project. Absolute `cwd` is metadata only and is never an identity.
-- `project_id` is filled in once the workspace key is mapped centrally; until then raw history
-  uploads unassigned rather than silently creating a duplicate project.
-- `"capture": false` keeps the marker but excludes the project (§13).
-- Without a marker the hook exits before creating a single file or directory.
+Use that command only after disabling Extra usage in the Claude account. A quota event pauses the
+worker until its reset time while leaving the batch in place. An overage event stops processing.
+There is no API-key, provider or fallback-model path. `trace-project recorder-disable` pauses model
+calls without deleting queued evidence. After fixing authentication/configuration or disabling Extra
+usage following an overage signal, run
+`trace-recorder --retry-blocked --data-dir <plugin-data>` once. Overage is never retried automatically.
 
-Binding is a human action, driven from the CLI (`trace-project bind` / `status` / `disable`) or
-walked through by the **main agent**. None of it is yours: you are dispatched with a batch that has
-already been staged, you never see the request that would start a binding, and the tool guard denies
-everything you would need to act on one.
+Every retry of an empty, malformed, format or timeout failure is a real model call. A batch gets at
+most four such attempts; it then rests in `attempts_exhausted` with its material intact until the
+operator runs `--retry-blocked`. Preflight failures (authentication, configuration, paid credentials)
+cost no quota and retry on a fixed interval.
 
-The main agent's side of that flow — resolving a workspace with `trace_context`, the
-`matched: false` and `pending_confirmation: true` responses that are **not** errors, and the rule
-that a marker is never written unasked — lives in `skills/research-trace/SKILL.md` §4, which is the
-document the main agent actually reads. Do not restate it here: two copies of one rule drift, and
-the copy in this file reaches a reader who cannot act on it.
+## Selecting durable meaning
 
-## Process one batch
+A batch can create zero Nodes. Record only material that a future person or agent can reuse:
 
-1. Read the named manifest. You may inspect its event and transcript files when needed, but never
-   edit or delete them.
-2. Resolve the project with `trace_context`, preferring the manifest's `project_id` and
-   `workspace_keys`, which come from the marker. If no project can be identified safely, keep the
-   material in the Inbox rather than guessing.
-3. Decide whether this batch contains durable value. Creating **zero** semantic records is normal.
-   Do not record routine reads, formatting, temporary debugging, low-level tool calls, or facts
-   already obvious from code and Git.
-4. Use the one general Node model for valuable ideas, paper findings, data understanding,
-   experiments, failures, decisions, results and important implementations. A conversation can
-   create zero, one or several Nodes. Preserve epistemic status: observations, user decisions,
-   hypotheses and Recorder inferences must not be rewritten as one another.
-5. Chapters are human-defined parallel research tracks or experiment groups, for example `主实验`
-   and `消融实验`. They are not content types such as data understanding, implementation or
-   evaluation, and they are not time-ordered pipeline stages. Use only an existing `chapter_id`
-   returned by `trace_context`; never invent or create a Chapter. Put the Node in `Inbox` by omitting
-   `chapter_id` whenever placement is uncertain or the material cannot be cleanly split by track.
-   All Recorder-created Nodes remain `unreviewed` until a human confirms their content and placement.
-6. **Set `parent_id` when this record continues earlier work.** The structure view is built from
-   this field and nothing else — order in time, similar titles and shared files infer nothing. Take
-   the id from `trace_context`'s `recent_nodes`. A root is a real and useful thing to record (a new
-   line of work, an independent finding), but it is a *claim that nothing preceded this*, so make it
-   on purpose rather than by leaving the field out: omitting it draws the record unconnected forever
-   and no later pass repairs it. The parent must be in the same Chapter.
-7. Use `trace_record` idempotency keys derived from `batch_id`, such as
-   `semantic:<batch_id>:0`. A retry must reuse the same keys. Never reuse a key in a later batch to
-   revise a Node. If a human has edited, moved, confirmed or corrected the Node, a conflicting retry
-   must preserve the human revision; do not evade the conflict with a new key.
-   **Every Node must carry `source_event_ids`** listing the manifest event ids it came from. That
-   list is the only edge from a semantic record back to the raw history that produced it: without
-   it the web UI's "原始历史" button on that Node degrades to "the project's most recent events",
-   and the claim that any record can be checked against its source stops being true.
-8. For key implementations, record purpose, method, design reason, validation and limitations.
-   Add selected Code Evidence: repo/commit when available, file path, symbol, a short diff or
-   snippet, and a separate annotation. Do not attach every changed file. If parallel agents shared
-   a working tree and authorship cannot be proved, set attribution to `ambiguous`; never infer a
-   final-file author from a shared `git diff`.
-9. Update a Chapter summary or Project Overview with `trace_curate` only when current understanding
-   materially changed. Overview holds active project-level hypotheses, open questions, decisions,
-   lessons and milestones, not a chronological dump. Human corrections returned by
-   `trace_context` have highest priority. Never overwrite one; pass its id in `resolve_comment_ids`
-   only after the revised text actually incorporates it. That id is an **acknowledgement**, not a
-   resolution: the correction stays open for the human and keeps coming back in `trace_context`
-   until a person closes it in the web UI. Pass `source_event_ids` here too.
-   You cannot set `actor_type`, `actor_id`, `created_by` or `review_state` on anything. The server
-   derives all four from the credential and ignores the request body, so a Recorder write is always
-   `recorder` and always `unreviewed`; confirmations and corrections are 403 for you.
-10. Preserve the original language. Research Trace has no bilingual-copy workflow.
+- a finding with its evidence, evaluation conditions and limits;
+- a decision with its reason and alternatives actually considered;
+- a failed attempt with the observed failure, what it rules out, and what remains unknown;
+- an untried idea with its rationale and a possible check, clearly marked untested;
+- an implementation when its purpose, design reason and observed validation matter later.
+
+Skip routine listings, successful installs, repetitive status checks and edits with no durable
+research consequence. An empty search is usually noise, while a controlled negative experiment can
+be useful. A submitted job is not a completed result. Lower training loss alone does not prove
+better downstream affinity prediction, and one failed run does not refute a scientific hypothesis.
+
+Group related events by research question. Several commands or model variants can support one Node.
+Do not produce one Node per tool, file, run or timestamp. Existing memory is context rather than a
+new discovery. If the batch merely repeats a known conclusion, return `status=skip` with no records.
 
 ## What a Node looks like
 
-A Node is read by someone who has forgotten everything, possibly a year later, possibly not you.
-Answer three questions in this order **before any detail**, and the record survives that reader:
+Each Node uses a specific title and concise connected prose in the evidence's original language. It
+must make the claim, basis and consequence understandable without phrases such as “this version” or
+“it worked.” Keep observation, inference, hypothesis, user decision, proposed work and agreed work
+distinguishable. Include known metric, split, baseline, variant and configuration; unknown values
+stay unknown.
 
-1. **Claim** — one to three sentences they can act on without reading further: the single thing this
-   record asserts. `口袋按 8 Å 切,空口袋剪枝后 6,767 → 4,554 对,样本集合在这里首次定型。`
-2. **Basis** — what the claim rests on: the command, the numbers, the file, the citation. Anything
-   you did not directly observe must say so in those words — *inferred*, *hypothesis*, *the user
-   decided*. An inference written in the voice of an observation is the one error nobody downstream
-   can detect, because the record looks exactly the same either way.
-3. **Consequence** — what is now settled, what is still open, and which earlier record this
-   overturns. Name that record: "this supersedes an earlier note" helps nobody.
+Only identifiers present in the packet are accepted:
 
-Then any amount of detail: method, parameters, input/output tables, the pitfalls you hit. Detail is
-what makes a Node reproducible; the three answers are what make it findable and trustworthy, and
-they are not optional the way detail is. Use headings in the record's own language.
+- Every Node needs one or more `source_event_ids` from this batch that directly support it.
+- `chapter_id` must name an existing human-defined Chapter. Omit it for Inbox when placement is
+  uncertain. The Recorder cannot create Chapters.
+- `parent_id` must be a known same-Chapter predecessor. Omit an unknown or independent relation.
+- `run_ids` must already exist in the project and match the discussion. W&B remains a curve link;
+  code is not uploaded to W&B.
+- `artifact_refs` register external artifacts the record produced, consumed or points at: a W&B run
+  page, a checkpoint or dataset URL, a result file with a scheme. Each needs a `name`, an absolute
+  `uri` copied verbatim from NEW EVIDENCE, and optionally `direction` (`output`, `input`; omitted
+  means `reference`). A URI that does not appear in the batch is rejected as a guess. The program
+  registers accepted refs on the written Node through the attachment API with an idempotent
+  `capture_key`, so the link becomes a dataflow key rather than prose.
+- Selected code evidence can name a known repository, commit, file, symbol and short snippet/diff.
+  Shared working trees use `ambiguous` attribution unless contribution is established.
 
-The title carries the same load. It states an outcome, not an activity: `步骤 5 · 8 Å 口袋切割,
-6,767 → 4,554` is a title; `跑了 step5` is not. It is what a reader scans in the structure view,
-so the number belongs in it.
+A Chapter summary or the Overview is the standing answer to that research line's question, not a
+log of steps. Every curation names a `reason`: `first_summary` (the target has none yet),
+`result_changed`, `plan_changed`, `direction_closed`, `correction_absorbed` or `milestone` — what a
+reader of the old summary would now be misled about. Submitting a job, editing code, or adding a
+Node the summary would merely repeat is `progress_only`; the program discards such curations (and
+a `first_summary` for a Chapter that already has one) before any write. Most batches curate nothing.
 
-### The three fields that are not prose
+A curation's `resolve_comment_ids` may list only corrections on that same Overview or Chapter whose
+content the new body absorbs. A correction on a Node is context for records — use the corrected
+figure and say it was corrected — and is never listed on a summary; the program drops such ids
+silently because the server's correction gate is per target, while an id that is not in the packet
+at all is rejected as fabricated.
 
-A Node's prose can be perfect and the project still have no structure. These three carry everything
-the views are built from, and **nothing recovers them afterwards**:
+The program assigns `semantic:<batch_id>:<index>` idempotency keys and persists the validated plan
+before the first write. A crash after a partial write resumes the same plan and skips completed
+indices. Recorder-created Nodes remain unreviewed. Human edits, moves, confirmations and corrections
+have higher authority; the existing server refuses an old machine retry that would overwrite them.
+Missing links are allowed. Never invent a parent to make the structure graph look complete. The
+server's `structure_gaps` response is an informational receipt about omitted links or evidence, not
+a request to fabricate them.
 
-| field | what it feeds | if you omit it |
-|---|---|---|
-| `parent_id` | the structure view | the record is drawn as an unconnected root, forever |
-| `trace_attach` key + `direction` | the data-flow view | no edge, ever — see the next section |
-| `source_event_ids` | that Node's raw-history button | it degrades to "the project's latest events" |
+## Completion and status
 
-This has actually gone wrong. One project accumulated 14 Nodes whose bodies carried full input and
-output tables with absolute paths and sizes — and `parent_id` empty on all 14, zero artifacts
-registered, `source_event_ids` on 3 of them. Every fact was present; none of it was in a field
-anything could use. The structure view was 14 orphans and the data-flow view never appeared.
-**Writing the paths into a markdown table is not registering them.**
+A schema-valid `status=skip` result is a successful zero-record batch. Empty output, malformed JSON,
+unknown IDs, unavailable storage, authentication failure, quota exhaustion, overage and an exhausted
+attempt budget are different states. None may be mislabeled as a successful skip.
 
-`trace_record` tells you when this happens: its response carries `structure_gaps` naming what that
-record left out. It is a receipt, not a validation — the write already succeeded — so read it and
-decide, rather than filling fields to silence it. `trace_context` reports the same for the whole
-project under `structure`, before you write anything.
-
-## What belongs where
-
-- Local hypothesis or attempt: a Node in the relevant Chapter.
-- Project-level active hypothesis or dispute: current Overview, with source Node/event links.
-- Human comments/corrections: already attached inline to Overview/Chapter/Node; use them as
-  constraints, not as a separate content category.
-- Small important script/config with no durable commit: selected snippet and, only when necessary,
-  `trace_attach`.
-- Large dataset/checkpoint/generated output: external path/URI, machine, size and checksum only.
-
-## Registering an artifact: the key is the whole point
-
-When registering an artifact with `trace_attach`, always give a comparable key: a `sha256`, **or** a
-normalized absolute `uri`, **or** `machine` together with an absolute `external_path`. A content
-hash on its own is a complete registration — the store accepts a well-formed 64-hex `sha256` with
-nothing else attached.
-
-This is not a style rule. The data-flow view (`trace_context` with `include_dataflow`, or
-`GET /api/projects/{id}/dataflow`) is derived by **joining registered artifacts on that key and
-nothing else**: an edge exists only where one Node's `direction: "output"` and another Node's
-`direction: "input"` carry the same key. Producers and consumers are never inferred from prose, from
-node titles, or from the order things happened. So the consequence of omitting the key is exact and
-permanent:
-
-- **No key → no edge, ever.** The artifact is still stored and still readable on the Node, but that
-  run is invisible in the data flow. Nobody looking at the graph later can tell that your training
-  Node produced the checkpoint the evaluation Node consumed.
-- **Nothing repairs it afterwards.** There is no background matcher and no fuzzy name matching. The
-  only fix is a human noticing and re-registering the artifact by hand, years later, from memory.
-- The view counts what you left out: an artifact with no key lands in `unkeyed` with a reason. An
-  empty graph therefore reads as either "this project has no artifact relations" (fine) or "records
-  were made with unjoinable artifacts" (your doing).
-
-Four shapes that look like keys and are not — each silently produces nothing:
-
-- a relative path (`out/model.ckpt`) — whose working directory?
-- a bare `~/…` path — whose home directory on which machine?
-- an `external_path` with no `machine` — two machines' `/data/out.csv` are not one artifact;
-- a truncated or prefixed hash (`sha256:abc…`, the first 12 chars) — only 64 hex characters count.
-
-Also set `direction` deliberately. It defaults to `reference`, and **`reference` participates on
-neither side of the join**: it means "I am only pointing at this", not "this Node produced or
-consumed it". Use `output` for what this Node produced and `input` for what it consumed; a
-registration with a perfect key but the default direction still draws no edge. That mistake is
-counted too — it shows up as `stats.unlabeled_direction`, separately from `unkeyed`, so "we
-registered everything correctly except the direction" is visible rather than looking like a project
-with no artifacts at all.
-
-Only register what you actually observed in this batch. An artifact registered as this Node's output
-because it seemed likely is a fabricated edge, and unlike a wrong sentence in a summary, nobody
-reading the graph can see that it was a guess.
-
-## Finishing
-
-Return no reasoning and no raw logs to the parent. End with **one short line** naming the batch and
-what you did, for example:
-
-`recorded batch 1787022476-1fccd8d6b5: 1 node in Inbox`
-
-There is no machine-readable receipt any more. The hook does not parse your reply, and nothing about
-raw-history durability depends on what you say. An earlier version had you emit a `TRACE_RECEIPT`
-JSON line that decided where the raw files were moved; that made correctness depend on a model
-remembering to print a line, and let any subagent that echoed a batch id be mistaken for the
-Recorder. Both are gone.
-
-## Hidden reasoning is never captured
-
-The hook parses each transcript line and drops `thinking` / `redacted_thinking` blocks before
-anything reaches the outbox (§6). Do not attempt to reconstruct, quote or infer hidden reasoning
-from any source, and do not paste transcript content into your own reply.
+Only after every planned Node write succeeds does the worker move the manifest and its processing
+state to `batches/done/`. Local `trace-recorder --status`, `trace-deliver --status` and central health
+telemetry expose pending count, last processed time, pause time and the most recent Recorder error.
+The Web interface continues to read the same Projects, Chapters, Nodes, evidence and correction
+records; no parallel memory database is introduced.

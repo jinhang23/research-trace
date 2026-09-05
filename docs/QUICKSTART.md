@@ -1,9 +1,8 @@
 # Research Trace 快速开始
 
-系统由四部分组成：一台中央服务、每台 Claude Code 机器上的插件（hook + MCP）、
-每台机器上的独立投递器 `trace-deliver`，以及服务端的私有 Git 备份仓库。
-中央服务是在线真相源；插件 outbox 是断网缓冲；投递器负责把 outbox 送上去；
-Git 仓库是可验证的灾备副本。
+系统包括中央服务、Claude 插件（hook + MCP）、独立投递器和代码证据捕获器。
+中央服务保存记录，outbox 缓冲离线材料；`trace-code` 启用代码取证。提交、运行与保持实验目录不变由 Agent 负责。
+具体接入见[运行集成指南](RUNTIME_INTEGRATION.md)。GitHub 每日备份已移除。
 
 两件事先说清楚，它们决定了下面每一步：
 
@@ -11,6 +10,29 @@ Git 仓库是可验证的灾备副本。
   `trace-project bind`（第 4 节）。
 - **hook 不上传。** hook 只把事件写进本机 `pending/`，把它送到中央、并且只在中央返回
   2xx 之后搬进 `sent/`，是 `trace-deliver` 这个独立进程的事（第 5 节）。
+
+## 0. 先选安全档位（三档，按谁能连到这个端口来选）
+
+| 档位 | 谁能连到端口 | 怎么配 | 读 / 写 | 网页登录 | 每台机器 |
+|---|---|---|---|---|---|
+| **单机** | 只有你自己（`--host 127.0.0.1`） | `trace-server --data-dir …` | 读开放 / 写开放或 `--token` | 不用登录 | 不用登录 |
+| **内网（推荐）** | 同一网段的机器 | `trace-server --init`，然后 `--env-file` 启动 | 一个访问密钥同时守读和写 | 输入密钥 + 你的名字 | `trace-login --token` 一次 |
+| **团队 / 公网** | 任何人 | 第 2 节 GitHub OAuth + HTTPS | GitHub 白名单 | GitHub 登录 | `trace-login` 设备码 |
+
+内网档三条命令就够：
+
+```bash
+# 服务器：生成访问密钥，写进 <data-dir>/server.env（0600），读写都锁上
+trace-server --init --data-dir /srv/research-trace/data --host 0.0.0.0 --port 8765
+trace-server --env-file /srv/research-trace/data/server.env --host 0.0.0.0 --port 8765
+
+# 每台工作站 / HPC 登录节点：把密钥存进本机凭证文件，投递器、Recorder、MCP、trace-project 都会自动读
+trace-login --url http://<服务器>:8765 --token        # 不带值会提示输入、不回显
+```
+
+网页打开 `http://<服务器>:8765/` 会要密钥和你的名字，之后确认、纠正、编辑都署这个名（`human`）。
+`server.env` 里还有两个可选项：`TRACE_ALLOWED_NETWORKS=10.0.0.0/8,…` 只放行这些网段；
+反向代理后面开 `TRACE_TRUST_PROXY_HEADERS=true`。`--host` 不是回环而又没锁读时启动会打印醒目警告。
 
 ## 1. 启动中央服务
 
@@ -22,27 +44,11 @@ trace-server --data-dir /srv/research-trace/data \
   --host 127.0.0.1 --port 8765 --token "<long-random-token>"
 ```
 
-**Git 备份默认不开。** 它会把导出往一个 git remote 推，而导出里带**完整原始 transcript**
-—— 这是一件外向的事，不该在没人要求的情况下自己跑起来。
+服务不再包含定时备份任务或自动 Git push；无需配置备份即可启动。
 
-要开就加 `--backup-repo`（或环境变量 `TRACE_BACKUP_REPO`），指向一个 git 工作树：
-
-```bash
-trace-server --data-dir /srv/research-trace/data \
-  --backup-repo /srv/research-trace/private-backup \
-  --host 127.0.0.1 --port 8765 --token "<long-random-token>"
-```
-
-那个仓库的 remote **必须是私有的**，理由同上。只有指定的子目录会被 stage 和 commit，
-所以指向一个你已经在用的仓库，不会把它其它改动卷进来。
-
-不配的话，本机的 `trace.sqlite3` 和 `objects/` 就是**唯一副本**，启动时会提醒一句 ——
-一块盘坏掉就是整个项目历史的终点，而这件事通常要到盘坏了才被发现。
-明确不需要备份时用 `--no-backup`（或 `TRACE_NO_BACKUP=true`）把提醒也关掉。
-
-不配置 OAuth 时，浏览器打开 `http://127.0.0.1:8765/`；读取兼容旧的公开模式，写操作使用
-Bearer token。团队部署应按下一节配置 GitHub OAuth 和 HTTPS。启用后，Project、原始历史、
-搜索和附件都必须经过网页登录或机器 Bearer token，不再公开读取。
+这是第 0 节的"单机档"：浏览器直接打开 `http://127.0.0.1:8765/`，读取公开，写操作用 Bearer token。
+服务要对网络监听时按第 0 节选内网档（`--init`）或团队档（第 2 节 OAuth + HTTPS）；两者都让
+Project、原始历史、搜索和附件必须先登录。
 
 HiperGator 上先按集群要求加载 conda，再使用该环境的绝对 Python 路径：
 
@@ -239,6 +245,9 @@ trace-project status --url https://trace.example.org
 删掉之后。`trace-login` 现在会在登录成功时就检查环境变量并警告，`trace-project status`
 则会直接说出哪一份在生效。
 
+内网档不会踩到这个坑：`trace-login --url … --token` 把访问密钥存进同一个凭证文件，之后什么都
+不用 export、插件里的 `token` 留空即可。
+
 ### 三个前提
 
 - **URL 三处必须一致。** 凭证在文件里是**按服务 URL 索引**的，`trace-login`、插件配置和
@@ -247,57 +256,112 @@ trace-project status --url https://trace.example.org
 - **先有人登录过网页。** 批准页要求一个已登录、且在白名单里的 GitHub 账号。
 - **写入要 member 或 admin。** `reader` 角色的设备凭证读得到、写不了（403）。
 
-### Recorder 多久重新 fork 一次
+### 启用独立 Recorder
 
-Recorder 以 fork 方式继承主 agent **此刻**的完整上下文 —— 这是它知道「刚才发生了什么」的
-唯一途径。代价是每次 fork 首轮读入约 60 万 token（实测缓存命中率 99.7–99.9%，所以是便宜的
-那种 token，但底数不是零）。
+原始采集在 `trace-project bind` 后立即开始。语义 Recorder 另做一次项目级启用：
 
-而实测下来很多批次的全部内容就是「某个子 agent 结束了」（一份真实样本里，137 个采集事件中
-`SubagentStop` 占 56 个），为这种批次付一次完整 fork 不划算。在项目 marker
-（`.research-trace.json`）里加一个键控制这个节奏：
+```bash
+# 先在 Claude 账户中关闭 Extra usage，再运行：
+trace-project recorder-enable . --model sonnet --confirm-extra-usage-disabled
+```
+
+这条命令只写项目配置，**不会调用 Claude，也不会让 hook 启动 Recorder**。在单独的终端、
+tmux、systemd user service 或其它进程管理器中启动消费者：
+
+```bash
+# 常驻：空队列时等待，之后自动消费新增 batch
+trace-recorder --watch --data-dir /path/to/claude-plugin-data --url https://trace.example.org
+
+# 一次性：只处理当前积压，然后退出
+trace-recorder --data-dir /path/to/claude-plugin-data --url https://trace.example.org
+```
+
+#### 在 HPC 登录节点上无头登录（没有浏览器、没有 Keychain）
+
+Recorder 用的是 Claude Code CLI 自己的订阅登录。工作站上 `claude` 登录一次即可；SSH 进 UF
+这类没有浏览器的机器时，用长期 OAuth token：
+
+```bash
+# 在有浏览器的机器上跑一次，按提示登录；它把一个一年期 token 打印到终端，**不会保存**
+claude setup-token
+
+# 在 HPC 上把它交给 watcher 所在的 shell / systemd EnvironmentFile（只对你可读）
+export CLAUDE_CODE_OAUTH_TOKEN=<粘贴的 token>
+trace-recorder --watch --data-dir /path/to/claude-plugin-data --url https://trace.example.org
+```
+
+几条已核实的边界：这个 token 走的是**订阅额度**，不是 API 计费，所以不在 Recorder 的拒绝列表里；
+Recorder 调用前会清掉外层 Claude Code 会话注入的 `CLAUDE_CODE_*` 变量，但会**保留**这一个；
+`ANTHROPIC_API_KEY`、`ANTHROPIC_BASE_URL`、Bedrock/Vertex/Foundry 变量只要有一个在环境里，
+Recorder 就拒绝启动（它无法证明账单落在哪）。Keychain 不可用时 CLI 会退回
+`~/.claude/.credentials.json`（0600）。启动前可以用 `claude auth status --json` 自查——旧版
+CLI 没有这个子命令，Recorder 会按 `unverified` 放行，由第一次模型调用判定登录；但 UF 上装的
+是哪个版本仍需要你确认一次（`claude --version`）。
+
+命令在现有 marker 中合并 Recorder 配置，形状如下（不要手工复制示例中的 workspace key）：
 
 ```json
 {
   "schema": "research-trace.project.v1",
   "workspace_key": "rt-ws-…",
   "capture": true,
-  "recorder_fork_window": "4"
+  "recorder": {
+    "enabled": true,
+    "mode": "independent",
+    "model": "sonnet",
+    "extra_usage_disabled": true
+  }
 }
 ```
 
-| 取值 | 含义 |
-|---|---|
-| 不写（默认） | 每批都重新 fork，最新鲜 |
-| `4` | 每 4 批 fork 一次，窗口内复用；上下文逐渐变旧，省下那些读取 |
-| `0` | 整个会话只 fork 一次，最省也最旧 |
+之后每轮 Stop 只把材料写进持久批次；hook 不启动 Recorder，主 agent 也不会收到阻塞、
+Agent 或 SendMessage 指令。独立 watcher 读取新增材料、简短项目背景和少量相关旧记录，每次都是
+无状态的新调用（固定的 system prompt/schema 前缀可以命中缓存）；不继承主 agent 上下文或缓存，
+也不续接自己的旧会话。
 
-环境变量 `TRACE_RECORDER_FORK_WINDOW` 同样生效；旧的 `TRACE_RECORDER_REUSE=1` 等价于 `0`。
+模型进程使用 `--setting-sources ""`、`--tools ""` 和空 MCP 配置。程序拒绝 API key、
+Bedrock、Vertex、Foundry 和额外用量事件；订阅额度不足时批次留在本机，等待额度恢复。
+Claude CLI 无法读取账户的 Extra usage 开关，所以启用命令要求一次显式确认。要暂停语义模型
+调用而保留队列，运行：
 
-**为什么不是插件配置项**：插件配置项在 `hooks.json` 里走 `${user_config.…}` 展开，
-而**未设置的选项会让整个 hook 执行失败** —— 不是降级，是采集全停。升级上来的机器
-settings 里没有新键，就会集体停摆。marker 是 hook 本来就要读的东西，缺键即默认值。
-
-## 4. 安装 Claude Code 插件
-
-```text
-/plugin marketplace add jinhang23/research-trace
-/plugin install research-trace@research-trace
+```bash
+trace-project recorder-disable .
 ```
 
-在插件配置中填写：
+查看本机状态用 `trace-recorder --status --data-dir <插件数据目录>`。停止 watcher 不会删除积压；
+以后重新启动会继续处理。后台整理的实际规则和
+状态含义见 [Recorder 协议](../hooks/RECORDER_PROTOCOL.md)。
+## 4. 安装 Claude Code 插件
+
+插件 = 本仓库的一份拷贝（`hooks/hooks.json`、`skills/`、`scripts/trace_hook.py`、`trace_mcp.py`），
+由 `claude plugin install` 放进 `${CLAUDE_PLUGIN_ROOT}`；插件数据（outbox、Recorder 工作目录）在
+`${CLAUDE_PLUGIN_DATA}`。hook 与 MCP 进程用插件配置里的 `python` 解释器直接运行这些文件，
+所以先装第 3b 节的客户端包、记下那个解释器的绝对路径，再装插件：
+
+```bash
+claude plugin marketplace add jinhang23/research-trace
+claude plugin install research-trace@research-trace \
+  --config python=/abs/path/to/python --config url=https://trace.example.org
+```
+
+（在 Claude Code 里也可以用 `/plugin marketplace add …`、`/plugin install …`，然后在 `/plugin` 的配置界面填。）
+
+插件配置项：
 
 - `url`：中央服务地址；
 - `token`：旧部署兼容项；使用 GitHub 设备登录后留空；
-- `python`：Python 3.10+ 解释器的绝对路径；
+- `python`：**装了 research-trace 包的** Python 3.10+ 解释器的绝对路径。指错时 MCP 只会显示
+  `CONNECTION_CLOSED`；用它跑一次 `--selfcheck` 就能看出来：
+
+  ```bash
+  /abs/path/to/python "${CLAUDE_PLUGIN_ROOT}/trace_mcp.py" --selfcheck --url https://trace.example.org
+  ```
+
 - `capture`：全局暂停开关，默认 `on`；改成 `off` 会让所有项目都停止采集，暂停期间不补采。
   它**不是**采集的开关来源：采集本身要先绑定项目，见下一小节。
 
-可先在仓库内验证 MCP 进程：
-
-```bash
-python trace_mcp.py --selfcheck
-```
+升级：`claude plugin update research-trace`，它只在版本号变化时重新拷贝。
+格式与目录的完整清单见[格式清单](FORMATS.md)。
 
 ### 4.1 绑定要记录的项目（不绑定就什么都不录）
 
@@ -344,11 +408,10 @@ Hook 把 event 与 transcript 增量写进
 它**不发任何网络请求**，所以中央挂了、DNS 挂了、凭证过期了，都不会让你的主任务变慢或失败。
 
 transcript 增量在落盘之前逐行剥掉 `thinking` / `redacted_thinking` 块：隐藏推理不进 outbox，
-自然也不会上传中央或进入每日备份。
+自然也不会上传中央。
 
-Recorder 是当前 Claude Code 主会话的 fork：首次继承当时上下文，之后按 agent id 恢复并只接收
-增量 batch；它不跨主会话常驻，长期状态在中央服务里。Hook 会根据 recorder agent id 拒绝 Bash、
-Edit、Write、Agent、外部搜索和无关 MCP，只允许只读检查与 Research Trace MCP。
+Recorder 在独立 Claude Code CLI 会话中整理增量 batch，不继承或唤起主会话。模型没有工具、MCP 或项目设置；
+Python 程序验证结构化输出并通过现有中央 API 幂等写入，长期状态仍在中央服务里。
 
 **Recorder 不负责上传原始历史**，也不该为 hook batch 调用 `trace_ingest`：那是 `trace-deliver`
 的事（第 5 节）。Recorder 只按价值判断是否创建语义 Node，一次 batch 创建零个 Node 完全正常。
@@ -417,6 +480,34 @@ key 指到已有项目。
 - 命中多个项目时进入待确认状态（HTTP 200，`pending_confirmation`），**即使调用方要求创建也
   不创建**；`trace-project bind` 会把候选连同「是谁在什么时候加的这条规则」一起打印出来。
 
+## 4b. 服务端在远端时：网络路径检查清单
+
+工作站和 HPC 登录节点都通过 HTTPS 连同一台中央；下面每条都由 `scripts/net_battery.py`
+在真 TLS 服务上验证过（自签证书、非回环地址、真 CLI）。
+
+- **`--url` 只写最终的 `https://` 地址。** 三个客户端（投递器、MCP、Recorder）共用一个
+  **拒绝重定向**的 HTTP 客户端：一个会被反向代理 301 到 https 的 `http://` URL，会把上传
+  的 POST 变成 GET，以前只能看到莫名其妙的 405；现在直接报出"server redirected … point --url
+  at the final https address"，文件留在 `pending/`。
+- **证书校验是开着的。** 自签或内网 CA 的服务端，客户端机器上设 `SSL_CERT_FILE=/path/ca.pem`
+  （Python 的 urllib 认这个变量）；不要关校验。校验失败时投递器的 `last_error` 会写明
+  `CERTIFICATE_VERIFY_FAILED`，`trace_mcp.py --selfcheck` 也会。
+- **代理。** 客户端遵守 `HTTPS_PROXY` / `HTTP_PROXY`；中央在内网时给它加进 `NO_PROXY`。
+  HPC 计算节点通常没有出网：投递器和 Recorder 放在登录节点或有出网的节点上跑，hook 本身不联网。
+- **密钥怎么到每台机器。** `trace-login --url … --token` 把密钥存进本机凭证文件，投递器、Recorder、
+  MCP、`trace-project` 都从那里读，不用再在每个 shell 里 `export TRACE_TOKEN`，插件配置里的 `token`
+  也可以留空（它只喂 MCP）。显式 `TRACE_TOKEN` / `--token` 仍然优先，且会盖住凭证文件——
+  `trace-project status` 会说出哪一份在生效。
+- **反向代理的两个数字。** 投递器一个 POST 最多 6 MiB / 400 个文件，附件（含代码取证 zip）
+  上限 100 MiB、base64 后约 133 MB：Nginx 要 `client_max_body_size 150m;`，并把
+  `proxy_read_timeout` 放到 300 s 以上。大文件上传的客户端超时会按体积自动放大
+  （100 MiB 约 7 分钟），`trace-deliver --timeout` 是下限。
+- **暴露面。** `--host 0.0.0.0` 且读没锁时启动会打印醒目警告：那时**所有读端点对能连到端口的人
+  公开**（原始 transcript、附件）。第 0 节的内网档（`--init` → `TRACE_PROTECT_READS=true`）或 OAuth
+  都能锁上；再不然 `--host 127.0.0.1` 只经 SSH 隧道访问。
+- **验证顺序**：客户端机器上 `python trace_mcp.py --selfcheck --url https://…` → `trace-deliver`
+  跑一次看 `delivered_events` → 网页 `/api/health`。
+
 ## 5. 投递：`trace-deliver`
 
 投递是一个独立进程，它是唯一有权把文件从 `pending/` 搬到 `sent/` 的角色，而且只在中央返回
@@ -432,7 +523,7 @@ session。所以「那次崩掉的会话」的残留有确定的重放路径，�
 
 三种部署方式，按机器选一种：
 
-- **什么都不配**：hook 会在 SessionStart 和 SessionEnd 各分离启动一次投递器（fire-and-forget，
+- **什么都不配**：hook 会在 SessionStart、Stop 和 SessionEnd 分离启动投递器（fire-and-forget，
   不等待、不看返回码，同一 session 60 秒内不重复拉起）。对日常工作站够用。
 - **常驻**：`trace-deliver --watch --interval 300`，适合长期开机、希望积压更快清空的机器。
 - **外部调度**：cron / systemd `--user` timer / SLURM 定时任务里跑 `trace-deliver`，
@@ -465,96 +556,16 @@ outbox 与 Recorder 两格里。
 `conflicts` 非零表示中央按 `event_id` / `chunk_id` 去重时发现同一个 id 但内容不同，保留了
 它已经存下的那一份。这不是正常重放，说明发送端复用了 id，应当排查。
 
-## 6. 配置每日私有 Git 备份
+## 6. 手动导出记录（可选）
 
-先在服务器上克隆一个专用的 private repository，并配置好无需交互的 push 凭据。然后给
-服务增加参数：
-
-```bash
-trace-server --data-dir /srv/research-trace/data \
-  --backup-repo /srv/research-trace/private-backup \
-  --backup-branch main --backup-interval-hours 24
-```
-
-服务启动后会先执行一次，随后按间隔导出、校验、仅在内容变化时 commit，并用普通 push
-上传；不会 force-push。失败不会阻断记录服务，状态可在 `/api/health` 查看。
-
-### 和项目代码同仓
-
-备份仓库不必是专用的空仓库 —— 指向项目自己的代码仓，记录和实现就住在一起，
-`git clone` 一次同时拿到「怎么做的」和「为什么这么做」：
+GitHub 每日备份已移除。需要本地副本时按需执行，不会联网推送：
 
 ```bash
-trace-server --data-dir /srv/research-trace/data \
-  --backup-repo /srv/checkouts/my-project \
-  --backup-subdirectory research-trace-backup --backup-branch main
+trace-backup export --data-dir /srv/research-trace/data --target /srv/research-trace/export
 ```
 
-两件事让它成立：
-
-- **只有 `--backup-subdirectory` 那一个目录会被 stage 和 commit**，所以这个工作副本里
-  别的改动不会被卷进备份提交（子目录等于仓库根时直接拒绝）。
-- **push 之前会 `fetch` 并把本轮备份 commit rebase 到远端之上**，所以别的机器往同一个
-  分支推代码不会让备份从此推不上去。真的发生冲突（有人手改了备份文件）时，rebase 会被
-  中止、这一轮报错、本地 commit 保留 —— 宁可晚一轮备份，也不把别人的提交搅乱。
-
-**代码仓必须是私有的。** 导出里带完整原始 transcript；推进一个公开仓库是不可逆的。
-不确定的话就用专用私有仓库，别和公开代码混在一起。
-
-也可以交给 cron/SLURM 定时任务单独执行：
-
-```bash
-trace-backup sync-git --data-dir /srv/research-trace/data \
-  --repo /srv/research-trace/private-backup --branch main
-```
-
-### 6.1 分卷与容量阈值
-
-导出树**先按年分卷、年内再按容量切分片**：
-
-```text
-research-trace-backup/
-├── index.json                     每卷的 manifest 校验和、字节数、最大文件与行数
-├── .gitattributes
-└── volumes/
-    ├── base/                      没有 created_at 的行（schema_meta）
-    ├── 2025/
-    │   ├── manifest.json
-    │   ├── tables/events.0000.jsonl
-    │   ├── tables/events.0001.jsonl
-    │   ├── transcripts/<chunk_id>.zlib
-    │   └── objects/<sha 前缀路径>
-    └── 2026/…
-```
-
-按年切是为了让去年的卷写定之后**再也不被重写**：一行的 `created_at` 永不改变，所以 Git 不必
-每天重新打包全部历史，而且某一年太大时可以整卷搬走。年内再按字节切分片，是因为托管方的限制
-有两个量级：单文件 50 MiB 警告 / 100 MiB 拒绝 push，仓库 1 GiB 建议 / 5 GiB 附近受限；只按年
-切压得住仓库增速，压不住「某一年的 events 表本身 300 MB」。分片预算默认 32 MiB。
-
-容量告警随每次 `export` / `sync-git` 的结果返回（`capacity`），服务端把它写进 `/api/health`
-的 `backup.capacity`，level 是 `warn` / `critical` 时另打一行 stderr。它**只报不拦**——容量
-到顶时最不该做的事就是停止备份。
-
-| 环境变量 | 默认 | 作用 |
-|---|---|---|
-| `TRACE_BACKUP_PART_BYTES` | `33554432`（32 MiB） | 卷内每个分片文件的字节预算，也可用 `--part-bytes` |
-| `TRACE_BACKUP_FILE_WARN_BYTES` | `52428800`（50 MiB） | 单文件告警线 |
-| `TRACE_BACKUP_FILE_CRITICAL_BYTES` | `94371840`（90 MiB） | 单文件严重线（离 GitHub 的 100 MiB 硬拒留 10% 余量） |
-| `TRACE_BACKUP_REPO_WARN_BYTES` | `1073741824`（1 GiB） | 仓库总量告警线（`git count-objects -v`，含历史） |
-| `TRACE_BACKUP_REPO_CRITICAL_BYTES` | `4294967296`（4 GiB） | 仓库总量严重线 |
-
-`trace-server` 没有单独的 `--backup-part-bytes` 参数，给服务进程设 `TRACE_BACKUP_PART_BYTES`
-即可，备份模块自己读它。
-
-**升级提示**：从旧的全量树升上来之后，第一次 sync 会删掉整棵旧树、写出分卷树，因此产生一个
-体量很大的 commit（内容等价、路径全变）。这是一次性的；之后只有当年的卷会变。旧的备份仓库
-不需要重建，旧 commit 里的旧格式树用当前代码 restore 依然可读。
-
-备份包含确定性 JSONL、zlib transcript chunks、小附件、GitHub 用户/角色、设备名称与设备
-凭证哈希、manifest 和 SHA-256。大产物只保存机器、路径、大小和校验和等引用，不复制产物
-本身。运行中的 `trace.sqlite3`、WAL、待批准 device code、网页 session、设备凭证原文、
-GitHub access token 和所有 secret 都不会进入备份。
+导出包含记录、修订、压缩会话和附件，外部大数据只保存引用；不复制运行中的 SQLite/WAL。
+文件按年份/容量分卷。`trace-backup sync-git` 仅保留为旧部署的手动兼容命令，服务不会调用它。
 
 ## 7. 验证与从空库恢复
 
@@ -589,7 +600,7 @@ Restore 只接受空数据目录，并在事务内检查外键。它先把**所�
 
 导出时如果某个附件对象在数据卷上已经不存在，导出不会中止：缺口记进卷 manifest 与 `index.json`
 的 `missing_objects` 并继续（restore 同样跳过并报出来）。否则从那天起所有新增历史都永远进不了
-备份。这个列表也会出现在 `/api/health` 的 `backup.missing_objects` 里。
+备份。导出和校验命令的结果会列出这些缺失对象。
 
 ## 8. 紧急清除敏感内容
 
@@ -675,8 +686,7 @@ batch 都要拉的热路径，多数项目这张图是空的，不该为它付�
 - 网页已有 Project、Overview、Comment/Correction、Chapter、Node、Chapter 内结构图/记录列表、
   存在 artifact 关系时的数据流视图、附件显示、原始历史按需展开、修订历史、全文搜索、
   GitHub OAuth 与团队角色。
-- 网页“状态”面板显示中央存储、GitHub 备份（含远端落后几个 commit、容量告警与导出时缺失的
-  附件对象数）、以及各机器上报的 outbox 与 Recorder 未处理量。从来没有机器上报过时显示“未上报”，不画假绿灯；
+- 网页“状态”面板显示中央存储、组件连接、各机器 outbox 和 Recorder 未处理量。
   本机情况随时可以用 `trace-deliver --status` 或 `outbox/delivery-status.json` 直接看。
 - 网页 OAuth 与设备凭证均来自同一 GitHub 白名单和实时角色；设备凭证有到期时间；旧的共享
   `TRACE_TOKEN` 只为迁移兼容，建议新部署不再配置。
@@ -685,10 +695,7 @@ batch 都要拉的热路径，多数项目这张图是空的，不该为它付�
 - 默认永久保存可能包含命令、路径或 transcript 中的敏感信息。现在已经有三层控制（不绑定、
   `trace-project disable`、`capture=off`）、`sent/` 的保留期与磁盘告警，以及管理员紧急 purge
   （CLI 与 `POST /api/admin/purge`）。
-- 备份已按年份/容量分卷并带容量阈值告警（第 6.1 节）。仍然没有的：把某一整卷搬去另一个仓库的
-  搬迁工具（`index.json` 的结构允许，但没有 CLI），以及对已有备份仓库做历史瘦身——旧 commit
-  里的全量树仍占仓库体积，唯一能重写历史的路径仍然只有 purge 之后的 `rewrite-history`。
-  容量告警在 `/api/health`、服务日志和网页备份卡片上都能看到。
+- 手动导出保留分卷和旧格式读取；定时备份、GitHub 状态卡片已移除。
 - 数据流已实现（第 9 节），网页上作为项目视图的第三种呈现方式出现。存量数据大多没有可比对的
   键，所以多数项目现在仍然是空图；`stats.unkeyed` 与 `stats.unlabeled_direction` 用来区分
   「没有产物」「登记时忘了给键」「键给对了但方向还是默认的 reference」三件事。

@@ -3,6 +3,7 @@
 渲染器本身的断言在 tests/md.test.js（要 node）。这里守两件 Python 侧能守的事：
 ① 那份 JS 测试确实能跑起来；② 页面确实调了渲染器 —— 渲染器再对，接线断了也白搭。
 """
+
 import re
 import shutil
 import subprocess
@@ -21,7 +22,7 @@ def test_the_renderer_is_embedded_between_markers_the_js_tests_slice_on():
     assert BEGIN in WEBAPP and END in WEBAPP
     body = WEBAPP.split(BEGIN, 1)[1].split(END, 1)[0]
     assert "globalThis" in body or "global.md" in body
-    assert len(body) > 5000, "抠出来的渲染器太短，标记多半错位了"
+    assert "global.markdownit" in body, "the upstream renderer must be connected"
 
 
 def test_prose_goes_through_the_renderer():
@@ -56,10 +57,13 @@ def test_empty_state_copy_is_not_run_through_the_renderer():
 def test_markdown_renderer_assertions_pass_under_node():
     result = subprocess.run(
         [shutil.which("node"), "--test", str(ROOT / "tests" / "md.test.js")],
-        capture_output=True, text=True, cwd=ROOT,
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
     )
     assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-2000:]
-    assert "# fail 0" in result.stdout
+    # Node 18 的 TAP 摘要是 `# fail 0`，Node 20+ 的 spec reporter 是 `ℹ fail 0`
+    assert re.search(r"(#|ℹ) fail 0\b", result.stdout), result.stdout[-2000:]
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="没装 node")
@@ -67,10 +71,13 @@ def test_rail_lane_assertions_pass_under_node():
     """列表装订线的车道分配。算错不会抛异常，只会画出一张读不懂的图。"""
     result = subprocess.run(
         [shutil.which("node"), "--test", str(ROOT / "tests" / "rail.test.js")],
-        capture_output=True, text=True, cwd=ROOT,
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
     )
     assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-2000:]
-    assert "# fail 0" in result.stdout
+    # Node 18 的 TAP 摘要是 `# fail 0`，Node 20+ 的 spec reporter 是 `ℹ fail 0`
+    assert re.search(r"(#|ℹ) fail 0\b", result.stdout), result.stdout[-2000:]
 
 
 def test_the_rail_row_height_is_shared_between_css_and_js():

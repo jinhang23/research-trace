@@ -1,0 +1,18 @@
+[
+  {
+    "package": "markdown-it",
+    "version": "14.1.0",
+    "url": "https://registry.npmjs.org/markdown-it/-/markdown-it-14.1.0.tgz",
+    "integrity": "sha512-a54IwgWPaeBCAAsv13YgmALOF1elABB08FxO9i+r4VFk5Vl4pKokRPeX8u5TCgSsPi6ec1otfLjdOpVcgbpshg==",
+    "file": "markdown-it.min.js",
+    "sha256": "38c70a1e7ca91ab40e2d9e6e60129851a717ed1c7d4acbbdd41bf9503791cf68"
+  },
+  {
+    "package": "@dagrejs/dagre",
+    "version": "1.1.8",
+    "url": "https://registry.npmjs.org/@dagrejs/dagre/-/dagre-1.1.8.tgz",
+    "integrity": "sha512-5SEDlndt4W/LaVzPYJW+bSmSEZc9EzTf8rJ20WCKvjS5EAZAN0b+x0Yww7VMT4R3Wootkg+X9bUfUxazYw6Blw==",
+    "file": "dagre.min.js",
+    "sha256": "c35b8d6f410ce7bdd302fc00cad27331184e52b2e738609e55ae3bbb4fb4849f"
+  }
+]

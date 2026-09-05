@@ -28,15 +28,16 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from collections.abc import Iterable, Iterator
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any
 
 from .device_login import (
     default_credential_file,
     load_device_credential,
     normalize_server_url,
+    open_url,
 )
-
 
 MARKER_NAME = ".research-trace.json"
 MARKER_SCHEMA = "research-trace.project.v1"
@@ -50,9 +51,7 @@ MAX_BATCH_FILES = 400
 # 负数 age（系统时钟回拨）同样按过期处理，否则这台机器会永久拒绝投递。
 DELIVER_LOCK_STALE = 900.0
 
-_CHUNK_NAME_RE = re.compile(
-    r"^(?P<key>[0-9a-f]+)_(?P<start>\d{16})_(?P<end>\d{16})_(?P<digest>[0-9a-f]{8,})\.jsonl$"
-)
+_CHUNK_NAME_RE = re.compile(r"^(?P<key>[0-9a-f]+)_(?P<start>\d{16})_(?P<end>\d{16})_(?P<digest>[0-9a-f]{8,})\.jsonl$")
 
 # 路径形态的 workspace key。§7 的第一句就是「绝对 cwd 不能作为中央项目身份」，
 # 而在此之前没有任何一层做过形态校验：`/home/alice/proj` 和 `C:\Users\bob\proj`
@@ -181,11 +180,9 @@ def project_binding(cwd: str | os.PathLike[str] | None = None) -> dict[str, Any]
         "workspace_key": keys[0] if keys else None,
         "project_id": project_id,
         "project_name": str(value.get("project_name") or "").strip() or None,
-        # 每处理几个批次重新 fork 一次 Recorder。放 marker 而不是插件配置项：插件配置项走
-        # hooks.json 的 `${user_config.…}` 展开，而**未设置的选项会让整个 hook 执行失败** ——
-        # 老安装升级上来时 settings 里根本没有这个键，结果是采集全停。marker 缺这个键就用
-        # 默认值，不会有任何东西展开失败。顺带它也确实该按项目走。
-        "recorder_fork_window": str(value.get("recorder_fork_window") or "").strip() or None,
+        # 独立 Recorder 是项目级 opt-in。extra_usage_disabled 是操作者对 Claude 账户设置的
+        # 一次性确认；CLI 没有读取这个账户开关的接口，所以没确认就只排队、不调用模型。
+        "recorder": dict(value.get("recorder") or {}) if isinstance(value.get("recorder"), dict) else {},
     }
 
 
@@ -204,7 +201,10 @@ def git_remote_key(directory: str | os.PathLike[str]) -> str | None:
     try:
         result = subprocess.run(
             ["git", "-C", str(directory), "remote", "get-url", "origin"],
-            capture_output=True, text=True, timeout=10, check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -229,6 +229,7 @@ def write_marker(
     project_id: str | None = None,
     project_name: str | None = None,
     capture: bool | None = None,
+    recorder: dict[str, Any] | None = None,
 ) -> Path:
     """创建/更新 marker。已有字段只在显式传入时覆盖，绝不丢掉别人写的键。"""
     target = marker_path_for(directory)
@@ -252,11 +253,11 @@ def write_marker(
         value["project_name"] = project_name
     if capture is not None:
         value["capture"] = bool(capture)
+    if recorder is not None:
+        value["recorder"] = dict(recorder)
     target.parent.mkdir(parents=True, exist_ok=True)
     temp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
-    temp.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(temp, target)
     return target
 
@@ -266,9 +267,7 @@ def write_marker(
 # --------------------------------------------------------------------------------------
 
 
-def _post_json(
-    url: str, path: str, value: dict[str, Any], token: str, timeout: float
-) -> tuple[int, dict[str, Any]]:
+def _post_json(url: str, path: str, value: dict[str, Any], token: str, timeout: float) -> tuple[int, dict[str, Any]]:
     """返回 (status, body)。只有 2xx 算送达；其余都让调用方保留 pending/。"""
     data = json.dumps(value, ensure_ascii=False).encode("utf-8")
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
@@ -276,7 +275,7 @@ def _post_json(
         headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(url + path, data=data, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with open_url(request, timeout=timeout) as response:
             raw = response.read().decode("utf-8", errors="replace")
             try:
                 body = json.loads(raw)
@@ -297,9 +296,7 @@ def _post_json(
         raise DeliveryError(f"Research Trace unavailable at {url}: {exc}") from exc
 
 
-def auth_source(
-    url: str, token: str = "", credential_file: str | os.PathLike[str] | None = None
-) -> tuple[str, str]:
+def auth_source(url: str, token: str = "", credential_file: str | os.PathLike[str] | None = None) -> tuple[str, str]:
     """返回 (bearer, 人能看懂的来源说明)。
 
     显式 token 优先于设备凭证 —— 这是**静默**的：`TRACE_TOKEN` 还留在环境里时，
@@ -308,20 +305,23 @@ def auth_source(
     """
     target = Path(credential_file).expanduser() if credential_file else default_credential_file()
     stored = ""
+    stored_kind = "device credential"
     try:
         value = load_device_credential(target, url)
         stored = str(value.get("credential") or "") if value else ""
+        if value and value.get("kind") == "token":
+            stored_kind = "shared access key"
     except Exception:
         stored = ""
     if token:
         if stored:
             return token, (
                 f"explicit token (TRACE_TOKEN or --token); it takes precedence, so the "
-                f"device credential in {target} is NOT being used"
+                f"{stored_kind} in {target} is NOT being used"
             )
         return token, "explicit token (TRACE_TOKEN or --token)"
     if stored:
-        return stored, f"device credential in {target}"
+        return stored, f"{stored_kind} in {target}"
     return "", f"none (no explicit token, and no device credential for {url} in {target})"
 
 
@@ -345,8 +345,7 @@ def iter_session_dirs(outbox: Path) -> Iterator[Path]:
             sessions = sorted(p for p in workspace.iterdir() if p.is_dir())
         except OSError:
             continue
-        for session in sessions:
-            yield session
+        yield from sessions
 
 
 def recover_awaiting_upload(session_dir: Path) -> int:
@@ -458,9 +457,7 @@ def _load_events(paths: list[Path]) -> tuple[list[dict[str, Any]], list[Path], l
     return events, good, bad
 
 
-def _load_chunks(
-    session_dir: Path, paths: list[Path]
-) -> tuple[list[dict[str, Any]], list[Path], list[Path]]:
+def _load_chunks(session_dir: Path, paths: list[Path]) -> tuple[list[dict[str, Any]], list[Path], list[Path]]:
     meta_dir = session_dir / "transcripts" / "meta"
     chunks: list[dict[str, Any]] = []
     good: list[Path] = []
@@ -519,8 +516,11 @@ def session_identity(session_dir: Path) -> dict[str, Any]:
 
 
 def _batch_payload(
-    session_dir: Path, events: list[dict[str, Any]], chunks: list[dict[str, Any]],
-    names: list[str], identity: dict[str, Any] | None = None,
+    session_dir: Path,
+    events: list[dict[str, Any]],
+    chunks: list[dict[str, Any]],
+    names: list[str],
+    identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     # batch_id 由内容集合决定：同一批文件重投得到同一个 batch_id，中央的 batch 去重
     # 因此对「已存但响应丢了」这种情况立即命中，不会重复插入。
@@ -553,7 +553,9 @@ def _batch_payload(
             "source": "claude-code",
             "cwd": cwd,
             "metadata": {"outbox": str(session_dir)},
-        } if session_id else None,
+        }
+        if session_id
+        else None,
         "agents": [agent for agent in agents.values() if agent.get("session_id")],
         "events": events,
         "transcript_chunks": chunks,
@@ -573,9 +575,7 @@ def _archive(paths: list[Path], destination: Path) -> None:
             print(f"research-trace deliver: cannot archive {path}: {exc}", file=sys.stderr)
 
 
-def deliver_session(
-    session_dir: Path, url: str, token: str, timeout: float, report: dict[str, Any]
-) -> None:
+def deliver_session(session_dir: Path, url: str, token: str, timeout: float, report: dict[str, Any]) -> None:
     recovered = recover_awaiting_upload(session_dir)
     report["recovered"] += recovered
 
@@ -590,9 +590,9 @@ def deliver_session(
     if not events and not chunks:
         return
     identity = session_identity(session_dir)
-    groups: list[tuple[list[Path], list[Path]]] = [
-        (group, []) for group in _group_files(events)
-    ] + [([], group) for group in _group_files(chunks)]
+    groups: list[tuple[list[Path], list[Path]]] = [(group, []) for group in _group_files(events)] + [
+        ([], group) for group in _group_files(chunks)
+    ]
     for event_paths, chunk_paths in groups:
         loaded_events, good_events, bad_events = _load_events(event_paths)
         loaded_chunks, good_chunks, bad_chunks = _load_chunks(session_dir, chunk_paths)
@@ -601,10 +601,20 @@ def deliver_session(
             continue
         names = [p.name for p in good_events] + [p.name for p in good_chunks]
         payload = _batch_payload(session_dir, loaded_events, loaded_chunks, names, identity)
+        # Evidence uploads are idempotent and precede the event acknowledgement.
+        # Any failure keeps the original event pending for independent retry.
+        if any(
+            isinstance(e.get('payload'), dict) and ('research_run' in e['payload'] or 'code_snapshot' in e['payload'])
+            for e in loaded_events
+        ):
+            from .run_evidence import publish_evidence
+
+            publish_evidence(payload, url, token, timeout)
         status, body = _post_json(url, "/api/ingest", payload, token, timeout)
         if status in {401, 403}:
             raise DeliveryError(
-                f"Research Trace rejected this device ({status}); run trace-login and retry"
+                f"Research Trace rejected this device ({status}); check TRACE_TOKEN/--token for a token deployment, "
+                "or run trace-login and retry"
             )
         if status >= 400 and payload.get("project_id"):
             # marker 里的 project_id 可能已经在中央被删除/改名。原始历史不能因此永久卡住，
@@ -615,8 +625,7 @@ def deliver_session(
             report["failed_batches"] += 1
             report["last_error"] = f"HTTP {status}: {str(body)[:200]}"
             print(
-                f"research-trace deliver: {session_dir.name} batch kept in pending/ "
-                f"({report['last_error']})",
+                f"research-trace deliver: {session_dir.name} batch kept in pending/ ({report['last_error']})",
                 file=sys.stderr,
             )
             continue
@@ -628,15 +637,13 @@ def deliver_session(
         # 2xx 不等于「干净地存下了」：中央按 event_id / chunk_id 去重，如果我们
         # 复用了一个 id 但内容不同，第二份会被丢弃并在这里报回来。文件照样进
         # sent/（那一条确实已在中央），但这不是正常重放，必须说出来。
-        conflicts = (
-            list(body.get("conflicting_event_ids") or [])
-            + list(body.get("conflicting_transcript_chunk_ids") or [])
+        conflicts = list(body.get("conflicting_event_ids") or []) + list(
+            body.get("conflicting_transcript_chunk_ids") or []
         )
         if conflicts:
             report["conflicts"] += len(conflicts)
-            report["last_error"] = (
-                f"central kept its stored copy for {len(conflicts)} reused id(s): "
-                + ", ".join(str(item) for item in conflicts[:5])
+            report["last_error"] = f"central kept its stored copy for {len(conflicts)} reused id(s): " + ", ".join(
+                str(item) for item in conflicts[:5]
             )
             print(f"research-trace deliver: {report['last_error']}", file=sys.stderr)
 
@@ -746,22 +753,23 @@ def outbox_stats(outbox: Path) -> dict[str, Any]:
                 except OSError:
                     continue
                 oldest = stamp if oldest is None else min(oldest, stamp)
-        for directory, suffix in (
-            (session / "sent", "*.json"), (session / "transcripts" / "sent", "*.jsonl")
-        ):
+        for directory, suffix in ((session / "sent", "*.json"), (session / "transcripts" / "sent", "*.jsonl")):
             try:
                 sent += len(list(directory.glob(suffix)))
             except OSError:
                 pass
+    recorder_state = _read_json(outbox / "recorder-status.json")
     return {
         "pending": pending,
         "sent": sent,
-        "oldest_pending_at": (
-            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(oldest)) if oldest else None
-        ),
+        "oldest_pending_at": (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(oldest)) if oldest else None),
         # 语义层的游标：`batches/` 里还开着的 manifest 就是 Recorder 还没处理的批次
         # （处理完会被归档进 `batches/done`）。§11 要求界面能看见这个数。
         "recorder_pending_batches": recorder_backlog(outbox),
+        "recorder_status": recorder_state.get("status"),
+        "recorder_last_processed_at": recorder_state.get("last_processed_at"),
+        "recorder_last_error": recorder_state.get("last_error"),
+        "recorder_pause_until": recorder_state.get("pause_until"),
     }
 
 
@@ -792,9 +800,7 @@ def disk_warning(outbox: Path, free_ratio: float = 0.05, free_bytes: int = 512 *
     )
 
 
-def report_outbox_status(
-    url: str, token: str, stats: dict[str, Any], report: dict[str, Any], timeout: float
-) -> bool:
+def report_outbox_status(url: str, token: str, stats: dict[str, Any], report: dict[str, Any], timeout: float) -> bool:
     """把本机 outbox 健康报给中央（§10 的 outbox 面板）。
 
     纯遥测：失败不影响投递，也不改变任何文件的去向。
@@ -807,6 +813,10 @@ def report_outbox_status(
         "last_delivered_at": report.get("finished_at") if report.get("delivered_batches") else None,
         "last_error": report.get("last_error"),
         "recorder_pending_batches": stats.get("recorder_pending_batches"),
+        "recorder_status": stats.get("recorder_status"),
+        "recorder_last_processed_at": stats.get("recorder_last_processed_at"),
+        "recorder_last_error": stats.get("recorder_last_error"),
+        "recorder_pause_until": stats.get("recorder_pause_until"),
     }
     try:
         status, _ = _post_json(url, "/api/telemetry/outbox", payload, token, timeout)
@@ -826,11 +836,21 @@ def deliver_once(
 ) -> dict[str, Any]:
     outbox = long_path(Path(data_dir).expanduser() / "outbox")
     report: dict[str, Any] = {
-        "outbox": str(Path(data_dir).expanduser() / "outbox"), "url": url,
-        "sessions": 0, "recovered": 0,
-        "delivered_batches": 0, "delivered_events": 0, "delivered_chunks": 0,
-        "failed_batches": 0, "unreadable": 0, "conflicts": 0, "reclaimed": 0,
-        "last_error": None, "finished_at": None, "skipped": False, "ok": True,
+        "outbox": str(Path(data_dir).expanduser() / "outbox"),
+        "url": url,
+        "sessions": 0,
+        "recovered": 0,
+        "delivered_batches": 0,
+        "delivered_events": 0,
+        "delivered_chunks": 0,
+        "failed_batches": 0,
+        "unreadable": 0,
+        "conflicts": 0,
+        "reclaimed": 0,
+        "last_error": None,
+        "finished_at": None,
+        "skipped": False,
+        "ok": True,
     }
     if not outbox.is_dir():
         report["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -913,20 +933,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--watch", action="store_true", help="keep running and retry on an interval")
     parser.add_argument("--interval", type=float, default=300.0)
     parser.add_argument(
-        "--retain-sent-days", type=float,
+        "--retain-sent-days",
+        type=float,
         default=float(os.environ.get("TRACE_RETAIN_SENT_DAYS", "30")),
         help="delete central-confirmed sent/ files older than this; 0 keeps them forever",
     )
     parser.add_argument(
-        "--status", action="store_true",
+        "--status",
+        action="store_true",
         help="print how much this machine has not delivered yet and exit (no network)",
     )
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
     if not args.data_dir:
-        print(
-            "no outbox: pass --data-dir or set TRACE_DATA_DIR/CLAUDE_PLUGIN_DATA", file=sys.stderr
-        )
+        print("no outbox: pass --data-dir or set TRACE_DATA_DIR/CLAUDE_PLUGIN_DATA", file=sys.stderr)
         return 2
     if args.status:
         # 卸载前 / 出门前的那个问题：「还有多少没传上去」。不联网，所以中央挂着
@@ -942,8 +962,11 @@ def main(argv: list[str] | None = None) -> int:
     while True:
         try:
             report = deliver_once(
-                args.data_dir, args.url, token=args.token,
-                credential_file=args.credential_file, timeout=args.timeout,
+                args.data_dir,
+                args.url,
+                token=args.token,
+                credential_file=args.credential_file,
+                timeout=args.timeout,
                 retain_sent_days=args.retain_sent_days,
             )
         except Exception as exc:  # 投递器自身崩溃不能变成用户可见的失败循环
@@ -951,7 +974,10 @@ def main(argv: list[str] | None = None) -> int:
             # --quiet，所以「投递从来没成功过」和「投递一启动就死」在 --status 里
             # 长得一模一样（last_delivery 都是 null）。排查会因此卡住很久。
             report = {
-                "ok": False, "last_error": str(exc), "failed_batches": 1, "url": args.url,
+                "ok": False,
+                "last_error": str(exc),
+                "failed_batches": 1,
+                "url": args.url,
                 "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }
             print(f"research-trace deliver failed: {exc}", file=sys.stderr)
@@ -964,14 +990,21 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _resolve_project(
-    url: str, keys: list[str], name: str | None, create: bool, token: str,
-    credential_file: str | os.PathLike[str] | None, timeout: float,
+    url: str,
+    keys: list[str],
+    name: str | None,
+    create: bool,
+    token: str,
+    credential_file: str | os.PathLike[str] | None,
+    timeout: float,
 ) -> dict[str, Any]:
     bearer = auth_token(url, token, credential_file)
     status, body = _post_json(
-        url, "/api/context",
+        url,
+        "/api/context",
         {"workspace_keys": keys, "create_if_missing": create, "project_name": name},
-        bearer, timeout,
+        bearer,
+        timeout,
     )
     if not (200 <= status < 300):
         raise DeliveryError(f"HTTP {status}: {str(body)[:300]}")
@@ -1006,6 +1039,23 @@ def project_main(argv: list[str] | None = None) -> int:
     disable = sub.add_parser("disable", help="keep the marker but exclude the project from capture")
     disable.add_argument("path", nargs="?", default=".")
 
+    recorder_enable = sub.add_parser(
+        "recorder-enable", help="enable the independent subscription-only Recorder for this project"
+    )
+    recorder_enable.add_argument("path", nargs="?", default=".")
+    recorder_enable.add_argument("--model", choices=["sonnet", "haiku"], default="sonnet")
+    recorder_enable.add_argument("--claude", default="claude", help="Claude Code CLI executable")
+    recorder_enable.add_argument(
+        "--confirm-extra-usage-disabled",
+        action="store_true",
+        help="confirm that extra usage is disabled in the Claude account before model calls",
+    )
+
+    recorder_disable = sub.add_parser(
+        "recorder-disable", help="pause semantic Recorder calls while retaining queued batches"
+    )
+    recorder_disable.add_argument("path", nargs="?", default=".")
+
     args = parser.parse_args(argv)
     directory = Path(args.path).expanduser().resolve()
 
@@ -1030,6 +1080,43 @@ def project_main(argv: list[str] | None = None) -> int:
         print(f"capture disabled for {directory} (marker: {target})")
         return 0
 
+    if args.command in {"recorder-enable", "recorder-disable"}:
+        marker = find_marker(directory)
+        if marker is None:
+            print(
+                f"not bound: run `trace-project bind {directory}` before configuring the Recorder",
+                file=sys.stderr,
+            )
+            return 2
+        current = read_marker(marker)
+        recorder = dict(current.get("recorder") or {}) if isinstance(current.get("recorder"), dict) else {}
+        if args.command == "recorder-disable":
+            recorder["enabled"] = False
+            target = write_marker(marker.parent, recorder=recorder)
+            print(f"independent Recorder paused; queued batches were retained (marker: {target})")
+            return 0
+        if not args.confirm_extra_usage_disabled:
+            print(
+                "refusing to enable model calls: disable Extra usage in the Claude account, then "
+                "repeat with --confirm-extra-usage-disabled",
+                file=sys.stderr,
+            )
+            return 2
+        recorder.update(
+            {
+                "enabled": True,
+                "mode": "independent",
+                "model": args.model,
+                "claude_executable": args.claude,
+                "extra_usage_disabled": True,
+            }
+        )
+        target = write_marker(marker.parent, recorder=recorder)
+        print(f"independent Recorder enabled with {args.model} (marker: {target})")
+        print("This only enables the project; hooks will not start a model.")
+        print("Run trace-recorder --watch separately against the same plugin data directory.")
+        return 0
+
     existing = read_marker(marker_path_for(directory))
     keys = _marker_keys(existing)
     requested_key = args.workspace_key.strip()
@@ -1049,9 +1136,7 @@ def project_main(argv: list[str] | None = None) -> int:
     if not project_id and not args.offline:
         try:
             url = normalize_server_url(args.url)
-            body = _resolve_project(
-                url, [key, *extra], name, args.create, args.token, args.credential_file, 30.0
-            )
+            body = _resolve_project(url, [key, *extra], name, args.create, args.token, args.credential_file, 30.0)
             for dropped in body.get("rejected_workspace_keys") or []:
                 print(
                     f"ignored workspace key {dropped.get('workspace_key')!r}: {dropped.get('reason')}",
@@ -1062,8 +1147,8 @@ def project_main(argv: list[str] | None = None) -> int:
                 # 团队映射命中了不止一个项目，谁也不知道是哪个——这时候唯一正确的
                 # 行为是把候选摊开让人选，而不是挑一个或者新建一个。
                 print(
-                    f"the team mapping matches more than one central project for {key}; "
-                    "nothing was created or bound.", file=sys.stderr,
+                    f"the team mapping matches more than one central project for {key}; nothing was created or bound.",
+                    file=sys.stderr,
                 )
                 for item in body.get("candidates") or []:
                     print(
@@ -1099,8 +1184,12 @@ def project_main(argv: list[str] | None = None) -> int:
         except DeliveryError as exc:
             print(f"central not reachable ({exc}); writing an offline marker", file=sys.stderr)
     target = write_marker(
-        directory, workspace_key=key, workspace_keys=extra,
-        project_id=project_id or None, project_name=name, capture=True,
+        directory,
+        workspace_key=key,
+        workspace_keys=extra,
+        project_id=project_id or None,
+        project_name=name,
+        capture=True,
     )
     print(f"bound {directory} -> {target}")
     print(json.dumps(read_marker(target), ensure_ascii=False, indent=2))

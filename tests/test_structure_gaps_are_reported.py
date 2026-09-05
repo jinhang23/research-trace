@@ -7,6 +7,7 @@
 协议文档在 fork 时读一次，tool schema 在调用时看一眼，两者都发生在「这一条到底填没填」
 之前。这里补的是写完之后、下一条之前的那一次：说的是已经发生的事，不是规则。
 """
+
 from __future__ import annotations
 
 import pytest
@@ -48,7 +49,11 @@ def test_setting_a_parent_silences_it(store):
     pid = _project(store)
     first = store.record_node(pid, idempotency_key="k0", title="第一步", source_event_ids=["ev1"])
     node = store.record_node(
-        pid, idempotency_key="k1", title="第二步", parent_id=first["id"], source_event_ids=["ev2"],
+        pid,
+        idempotency_key="k1",
+        title="第二步",
+        parent_id=first["id"],
+        source_event_ids=["ev2"],
     )
     assert "root" not in " ".join(node.get("structure_gaps", []))
 

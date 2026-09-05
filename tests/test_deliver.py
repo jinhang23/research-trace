@@ -14,16 +14,22 @@ def make_session(data: Path, workspace: str, session: str, events: int = 1, chun
         (root / name).mkdir(parents=True, exist_ok=True)
     for index in range(events):
         (root / "pending" / f"{index:019d}_claude-{session}-{index}.json").write_text(
-            json.dumps({
-                "event_id": f"claude-{session}-{index}", "session_id": session,
-                "project_dir": "/work/x", "project_id": "prj_1", "agent_id": None,
-                "hook_event": "UserPromptSubmit", "payload": {"prompt": "hi"},
-            }),
+            json.dumps(
+                {
+                    "event_id": f"claude-{session}-{index}",
+                    "session_id": session,
+                    "project_dir": "/work/x",
+                    "project_id": "prj_1",
+                    "agent_id": None,
+                    "hook_event": "UserPromptSubmit",
+                    "payload": {"prompt": "hi"},
+                }
+            ),
             encoding="utf-8",
         )
     for index in range(chunks):
         name = f"{'a' * 20}_{index:016d}_{index + 1:016d}_{'b' * 16}.jsonl"
-        (root / "transcripts" / "pending" / name).write_text('{"message":"x"}\n', encoding="utf-8")
+        D.long_path(root / "transcripts" / "pending" / name).write_text('{"message":"x"}\n', encoding="utf-8")
     return root
 
 
@@ -94,7 +100,7 @@ def test_legacy_awaiting_upload_is_recovered_into_pending(tmp_path: Path, monkey
     )
     (root / "transcripts" / "awaiting_upload").mkdir(parents=True)
     name = f"{'c' * 20}_{0:016d}_{16:016d}_{'d' * 16}.jsonl"
-    (root / "transcripts" / "awaiting_upload" / name).write_text('{"m":"old"}\n', encoding="utf-8")
+    D.long_path(root / "transcripts" / "awaiting_upload" / name).write_text('{"m":"old"}\n', encoding="utf-8")
 
     accept = recorder(200)
     monkeypatch.setattr(D, "_post_json", accept)
@@ -124,9 +130,7 @@ def test_an_unreachable_central_keeps_everything_pending(tmp_path: Path, monkeyp
     assert status["pending_events"] == 2
 
 
-def test_a_stale_project_id_falls_back_to_unassigned_instead_of_blocking_forever(
-    tmp_path: Path, monkeypatch
-):
+def test_a_stale_project_id_falls_back_to_unassigned_instead_of_blocking_forever(tmp_path: Path, monkeypatch):
     data = tmp_path / "plugin-data"
     root = make_session(data, "ws-a", "session-1", events=1)
     seen: list[str | None] = []
@@ -162,7 +166,7 @@ def test_transcript_only_batches_still_carry_the_session_and_project(tmp_path: P
     accept = recorder(200)
     monkeypatch.setattr(D, "_post_json", accept)
     D.deliver_once(data, "http://127.0.0.1:8765", token="t")
-    chunk_payload = [c["value"] for c in accept.calls if c["value"]["transcript_chunks"]][0]
+    chunk_payload = next(c["value"] for c in accept.calls if c["value"]["transcript_chunks"])
     assert chunk_payload["events"] == []
     assert chunk_payload["project_id"] == "prj_1"
     assert chunk_payload["session"]["id"] == "session-1"
@@ -235,9 +239,39 @@ def test_write_marker_merges_instead_of_clobbering(tmp_path: Path):
     assert value["workspace_key"] == "rt-ws-1"
     assert value["workspace_keys"] == ["https://github.com/t/r"]
     assert value["project_id"] == "prj_9"
-    assert D.project_binding(project)["workspace_keys"] == [
-        "rt-ws-1", "https://github.com/t/r"
-    ]
+    assert D.project_binding(project)["workspace_keys"] == ["rt-ws-1", "https://github.com/t/r"]
+
+
+def test_independent_recorder_requires_extra_usage_confirmation(tmp_path: Path, capsys):
+    project = tmp_path / "repo"
+    project.mkdir()
+    D.write_marker(project, workspace_key="rt-ws-1", project_id="prj_9", capture=True)
+    assert D.project_main(["recorder-enable", str(project)]) == 2
+    assert "Extra usage" in capsys.readouterr().err
+    assert not D.project_binding(project)["recorder"]
+
+    assert (
+        D.project_main(
+            [
+                "recorder-enable",
+                str(project),
+                "--model",
+                "sonnet",
+                "--confirm-extra-usage-disabled",
+            ]
+        )
+        == 0
+    )
+    config = D.project_binding(project)["recorder"]
+    assert config == {
+        "enabled": True,
+        "mode": "independent",
+        "model": "sonnet",
+        "claude_executable": "claude",
+        "extra_usage_disabled": True,
+    }
+    assert D.project_main(["recorder-disable", str(project)]) == 0
+    assert D.project_binding(project)["recorder"]["enabled"] is False
 
 
 def test_a_2xx_that_reports_reused_ids_is_not_a_clean_success(tmp_path: Path, monkeypatch):
@@ -274,7 +308,7 @@ def test_sent_is_reclaimed_by_age_but_pending_is_never_touched(tmp_path: Path, m
 
     old = time.time() - 40 * 86400
     for path in list((root / "sent").glob("*")) + list((root / "transcripts" / "sent").glob("*")):
-        os.utime(path, (old, old))
+        os.utime(D.long_path(path), (old, old))
     # 同时放一条还没投出去的、同样"很旧"的 pending，确认回收碰不到它
     stale_pending = root / "pending" / "0000000000000000000_claude-never-sent.json"
     stale_pending.write_text('{"event_id":"claude-never-sent"}', encoding="utf-8")
@@ -288,12 +322,21 @@ def test_sent_is_reclaimed_by_age_but_pending_is_never_touched(tmp_path: Path, m
     assert not stale_pending.exists()
 
 
-def test_status_answers_without_the_network_and_deliver_reports_health(
-    tmp_path: Path, monkeypatch, capsys
-):
+def test_status_answers_without_the_network_and_deliver_reports_health(tmp_path: Path, monkeypatch, capsys):
     """§12 的「卸载前显示未同步数量」与 §10 的 outbox 健康上报。"""
     data = tmp_path / "plugin-data"
     make_session(data, "ws-a", "session-1", events=3)
+    (data / "outbox" / "recorder-status.json").write_text(
+        json.dumps(
+            {
+                "status": "quota",
+                "last_processed_at": "2026-09-04T10:00:00Z",
+                "last_error": "subscription quota exhausted",
+                "pause_until": 2_000_000_000,
+            }
+        ),
+        encoding="utf-8",
+    )
 
     # --status 不联网：中央挂着也答得出还有多少没传
     assert D.main(["--data-dir", str(data), "--status"]) == 1
@@ -312,6 +355,8 @@ def test_status_answers_without_the_network_and_deliver_reports_health(
     assert report["reported"] is True
     assert telemetry[0]["pending"] == 0 and telemetry[0]["sent"] == 3
     assert telemetry[0]["machine"]
+    assert telemetry[0]["recorder_status"] == "quota"
+    assert telemetry[0]["recorder_pause_until"] == 2_000_000_000
 
     assert D.main(["--data-dir", str(data), "--status"]) == 0
     after = json.loads(capsys.readouterr().out)
@@ -336,9 +381,7 @@ def test_bind_writes_the_resolved_project_id_into_the_marker(tmp_path: Path, mon
     assert D.project_binding(project)["project_id"] == "prj_42"
 
 
-def test_an_ambiguous_team_mapping_stops_the_bind_instead_of_creating_a_duplicate(
-    tmp_path: Path, monkeypatch, capsys
-):
+def test_an_ambiguous_team_mapping_stops_the_bind_instead_of_creating_a_duplicate(tmp_path: Path, monkeypatch, capsys):
     """§7：「映射不确定时进入待确认状态，不能静默创建多个重复项目。」
 
     --create 也不能把它推过去：候选摊开给人选，marker 一个字都不写。"""
@@ -347,12 +390,24 @@ def test_an_ambiguous_team_mapping_stops_the_bind_instead_of_creating_a_duplicat
 
     def ambiguous(url, path, value, token, timeout):
         return 200, {
-            "matched": False, "pending_confirmation": True, "reason": "team_mapping_ambiguous",
+            "matched": False,
+            "pending_confirmation": True,
+            "reason": "team_mapping_ambiguous",
             "candidates": [
-                {"project_id": "prj_a", "project_name": "Alpha", "pattern": "https://github.com/lab/*",
-                 "created_by": "alice", "created_at": "2026-08-19T00:00:00Z"},
-                {"project_id": "prj_b", "project_name": "Beta", "pattern": "https://github.com/*/shared",
-                 "created_by": "bob", "created_at": "2026-08-19T01:00:00Z"},
+                {
+                    "project_id": "prj_a",
+                    "project_name": "Alpha",
+                    "pattern": "https://github.com/lab/*",
+                    "created_by": "alice",
+                    "created_at": "2026-08-19T00:00:00Z",
+                },
+                {
+                    "project_id": "prj_b",
+                    "project_name": "Beta",
+                    "pattern": "https://github.com/*/shared",
+                    "created_by": "bob",
+                    "created_at": "2026-08-19T01:00:00Z",
+                },
             ],
         }
 
@@ -367,18 +422,26 @@ def test_an_ambiguous_team_mapping_stops_the_bind_instead_of_creating_a_duplicat
 def test_a_filesystem_path_is_never_accepted_as_a_workspace_key(tmp_path: Path, monkeypatch):
     """审计复核：绝对 cwd 以前可以直接当项目身份，于是同一个仓库在两台机器上
     会各自长出一个中央项目（§7 禁止的「静默创建重复项目」）。"""
-    for bad in ("/home/alice/rna", "C:\\Users\\bob\\rna", "~/rna", "./rna",
-                "\\\\fileserver\\share\\rna", "file:///home/alice/rna"):
+    for bad in (
+        "/home/alice/rna",
+        "C:\\Users\\bob\\rna",
+        "~/rna",
+        "./rna",
+        "\\\\fileserver\\share\\rna",
+        "file:///home/alice/rna",
+    ):
         assert D.workspace_key_problem(bad), bad
-    for good in ("rt-ws-0123456789ab", "https://github.com/lab/rna",
-                 "git@github.com:lab/rna.git", "batch-effect-correction"):
+    for good in (
+        "rt-ws-0123456789ab",
+        "https://github.com/lab/rna",
+        "git@github.com:lab/rna.git",
+        "batch-effect-correction",
+    ):
         assert D.workspace_key_problem(good) is None, good
 
     project = tmp_path / "repo"
     project.mkdir()
-    assert D.project_main(
-        ["bind", str(project), "--no-git", "--offline", "--workspace-key", str(project)]
-    ) == 2
+    assert D.project_main(["bind", str(project), "--no-git", "--offline", "--workspace-key", str(project)]) == 2
     assert not (project / D.MARKER_NAME).exists()
 
     # 本机路径的 Git remote 同样不能变成第二个 key
@@ -396,9 +459,7 @@ def test_a_filesystem_path_is_never_accepted_as_a_workspace_key(tmp_path: Path, 
     assert D.git_remote_key(project) == "https://github.com/lab/rna"
 
 
-def test_events_staged_before_the_marker_had_a_project_id_still_arrive_assigned(
-    tmp_path: Path, monkeypatch
-):
+def test_events_staged_before_the_marker_had_a_project_id_still_arrive_assigned(tmp_path: Path, monkeypatch):
     """§7 说 `project_id` 要等中央映射完成后才写进 marker，而 hook 从 marker 存在
     那一刻就开始采集。中间那批 pending 事件带着 None；按快照投出去就永久孤立，
     因为 storage.ingest 只对 sessions 行 COALESCE 回填，events 是 INSERT OR IGNORE。"""
@@ -408,10 +469,16 @@ def test_events_staged_before_the_marker_had_a_project_id_still_arrive_assigned(
     root = data / "outbox" / "ws-a" / "session-1"
     (root / "pending").mkdir(parents=True)
     (root / "pending" / "0000000000000000000_claude-e1.json").write_text(
-        json.dumps({
-            "event_id": "claude-e1", "session_id": "session-1", "project_dir": str(repo),
-            "project_id": None, "hook_event": "UserPromptSubmit", "payload": {"prompt": "hi"},
-        }),
+        json.dumps(
+            {
+                "event_id": "claude-e1",
+                "session_id": "session-1",
+                "project_dir": str(repo),
+                "project_id": None,
+                "hook_event": "UserPromptSubmit",
+                "payload": {"prompt": "hi"},
+            }
+        ),
         encoding="utf-8",
     )
     D.write_marker(repo, workspace_key="rt-ws-late", project_id="prj_late", capture=True)
@@ -421,18 +488,23 @@ def test_events_staged_before_the_marker_had_a_project_id_still_arrive_assigned(
     other = data / "outbox" / "ws-b" / "session-2"
     (other / "pending").mkdir(parents=True)
     (other / "pending" / "0000000000000000000_claude-e2.json").write_text(
-        json.dumps({
-            "event_id": "claude-e2", "session_id": "session-2", "project_dir": str(repo),
-            "project_id": "prj_original", "hook_event": "Stop", "payload": {},
-        }),
+        json.dumps(
+            {
+                "event_id": "claude-e2",
+                "session_id": "session-2",
+                "project_dir": str(repo),
+                "project_id": "prj_original",
+                "hook_event": "Stop",
+                "payload": {},
+            }
+        ),
         encoding="utf-8",
     )
 
     accept = recorder(200)
     monkeypatch.setattr(D, "_post_json", accept)
     D.deliver_once(data, "http://127.0.0.1:8765", token="t")
-    delivered = {call["value"]["session"]["id"]: call["value"]["project_id"]
-                 for call in accept.calls}
+    delivered = {call["value"]["session"]["id"]: call["value"]["project_id"] for call in accept.calls}
     assert delivered == {"session-1": "prj_late", "session-2": "prj_original"}
 
 
@@ -449,7 +521,7 @@ def test_a_skipped_run_says_so_instead_of_looking_like_an_empty_outbox(tmp_path)
     from research_trace import deliver
 
     data = tmp_path / "d"
-    (data / "outbox" / ".deliver-lock").mkdir(parents=True)     # 假装别人正握着
+    (data / "outbox" / ".deliver-lock").mkdir(parents=True)  # 假装别人正握着
     report = deliver.deliver_once(data, "http://127.0.0.1:1", timeout=1)
 
     assert report["skipped"] is True

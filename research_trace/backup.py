@@ -11,12 +11,12 @@ import shutil
 import sqlite3
 import subprocess
 import zlib
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from .storage import SCHEMA_VERSION, Store, ValidationError
-
 
 FORMAT_VERSION = 3
 # 3 之前是「一棵全量树 + 根 manifest.json」。写入端已经退役，但读取端**永远不退役**：
@@ -265,9 +265,7 @@ def _capacity(
         "file_warn": _env_int("TRACE_BACKUP_FILE_WARN_BYTES", FILE_WARN_BYTES),
         "file_critical": _env_int("TRACE_BACKUP_FILE_CRITICAL_BYTES", FILE_CRITICAL_BYTES),
         "repository_warn": _env_int("TRACE_BACKUP_REPO_WARN_BYTES", REPO_WARN_BYTES),
-        "repository_critical": _env_int(
-            "TRACE_BACKUP_REPO_CRITICAL_BYTES", REPO_CRITICAL_BYTES
-        ),
+        "repository_critical": _env_int("TRACE_BACKUP_REPO_CRITICAL_BYTES", REPO_CRITICAL_BYTES),
     }
     export_bytes = sum(int(entry.get("bytes") or 0) for entry in volume_entries)
     export_bytes += sum(int(item.get("size") or 0) for item in root_files.values())
@@ -364,7 +362,8 @@ def _previous_paths(root: Path) -> set[str]:
 def _prune_empty_dirs(root: Path) -> None:
     for path in sorted(
         (item for item in root.rglob("*") if item.is_dir()),
-        key=lambda item: len(item.parts), reverse=True,
+        key=lambda item: len(item.parts),
+        reverse=True,
     ):
         try:
             next(path.iterdir())
@@ -374,9 +373,7 @@ def _prune_empty_dirs(root: Path) -> None:
             pass
 
 
-def export_backup(
-    store: Store, target: str | Path, *, part_bytes: int | None = None
-) -> dict[str, Any]:
+def export_backup(store: Store, target: str | Path, *, part_bytes: int | None = None) -> dict[str, Any]:
     """Export one logical snapshot into per-year volumes.
 
     Repeated exports without data changes are byte-identical.
@@ -488,9 +485,7 @@ def export_backup(
             "volume": name,
             "purge_generation": purge_generation,
             "tables": current.table_counts,
-            "table_files": {
-                table: current.table_files[table] for table in sorted(current.table_files)
-            },
+            "table_files": {table: current.table_files[table] for table in sorted(current.table_files)},
             "missing_objects": sorted(current.missing_objects),
             "files": files,
         }
@@ -505,17 +500,19 @@ def export_backup(
         for rel, item in files.items():
             if int(item["size"]) > largest_bytes:
                 largest_name, largest_bytes = f"{current.rel}/{rel}", int(item["size"])
-        volume_entries.append({
-            "volume": name,
-            "path": current.rel,
-            "manifest": manifest_rel,
-            "manifest_sha256": _sha256(_inside(root, manifest_rel)),
-            "files": len(files),
-            "bytes": sum(int(item["size"]) for item in files.values()) + manifest_bytes,
-            "largest_file": largest_name,
-            "largest_file_bytes": largest_bytes,
-            "tables": current.table_counts,
-        })
+        volume_entries.append(
+            {
+                "volume": name,
+                "path": current.rel,
+                "manifest": manifest_rel,
+                "manifest_sha256": _sha256(_inside(root, manifest_rel)),
+                "files": len(files),
+                "bytes": sum(int(item["size"]) for item in files.values()) + manifest_bytes,
+                "largest_file": largest_name,
+                "largest_file_bytes": largest_bytes,
+                "tables": current.table_counts,
+            }
+        )
 
     _prune_empty_dirs(root)
     root_files = {
@@ -602,17 +599,17 @@ def _verify_index(root: Path) -> dict[str, Any]:
     if not entries:
         raise ValidationError("backup index lists no volumes")
     listed = {str(entry.get("volume") or "") for entry in entries}
-    present = {
-        path.name for path in (root / VOLUMES_DIR).iterdir() if path.is_dir()
-    } if (root / VOLUMES_DIR).is_dir() else set()
+    present = (
+        {path.name for path in (root / VOLUMES_DIR).iterdir() if path.is_dir()}
+        if (root / VOLUMES_DIR).is_dir()
+        else set()
+    )
     # 一个卷被整个删掉、或者多出一个没被索引的卷，都必须响亮地失败。否则 verify
     # 会对着剩下的卷说"备份完好"——备份最坏的失败模式就是系统说它是好的。
     if listed != present:
         missing = sorted(listed - present)
         extra = sorted(present - listed)
-        raise ValidationError(
-            f"backup volumes do not match the index (missing: {missing}, unlisted: {extra})"
-        )
+        raise ValidationError(f"backup volumes do not match the index (missing: {missing}, unlisted: {extra})")
 
     totals: dict[str, int] = {}
     for entry in entries:
@@ -711,7 +708,8 @@ def restore_backup(source: str | Path, store: Store) -> dict[str, Any]:
     with store._lock:
         occupied = {
             table: store._db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            for table in TABLES if table != "schema_meta"
+            for table in TABLES
+            if table != "schema_meta"
         }
     if any(occupied.values()):
         raise ValidationError("restore destination must be an empty Store")
@@ -809,12 +807,17 @@ class GitCommandError(subprocess.CalledProcessError):
 def _run_git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     command = ["git", "-C", str(repo), *args]
     completed = subprocess.run(
-        command, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        command,
+        check=False,
+        text=True,
+        capture_output=True,
     )
     if check and completed.returncode != 0:
         raise GitCommandError(
-            completed.returncode, [_redact(item) for item in command],
-            output=_redact(completed.stdout or ""), stderr=_redact(completed.stderr or ""),
+            completed.returncode,
+            [_redact(item) for item in command],
+            output=_redact(completed.stdout or ""),
+            stderr=_redact(completed.stderr or ""),
         )
     return completed
 
@@ -838,12 +841,12 @@ def _rebase_onto_remote(repo: Path, remote: str, branch: str, result: dict[str, 
     tracking = f"{remote}/{branch}"
     known = _run_git(repo, "rev-parse", "--verify", "--quiet", tracking, check=False)
     if known.returncode != 0:
-        return                      # 远端还没有这个分支：第一次推，没什么可 rebase 的
+        return  # 远端还没有这个分支：第一次推，没什么可 rebase 的
     behind = _run_git(repo, "rev-list", "--count", f"HEAD..{tracking}", check=False)
     if behind.returncode != 0 or not behind.stdout.strip().isdigit():
         return
     if int(behind.stdout.strip()) == 0:
-        return                      # 没落后，直接推
+        return  # 没落后，直接推
     rebased = _run_git(repo, "rebase", tracking, check=False)
     if rebased.returncode != 0:
         _run_git(repo, "rebase", "--abort", check=False)
@@ -908,9 +911,7 @@ def _assert_staged(repo: Path, subdirectory: str, target: Path) -> None:
     if listed.returncode != 0:
         return
     tracked = {item for item in listed.stdout.split("\0") if item}
-    missing = sorted(
-        rel for rel in backup_file_paths(target) if f"{prefix}/{rel}" not in tracked
-    )
+    missing = sorted(rel for rel in backup_file_paths(target) if f"{prefix}/{rel}" not in tracked)
     if missing:
         raise ValidationError(
             f"{len(missing)} backup files were not staged by git (check the repository "
@@ -950,7 +951,8 @@ def sync_git_backup(
     if has_new_content:
         _run_git(repo_path, "commit", "-m", "research-trace: update verified backup", "--", subdirectory)
     capacity = _capacity(
-        list(index.get("volumes") or []), dict(index.get("files") or {}),
+        list(index.get("volumes") or []),
+        dict(index.get("files") or {}),
         repository_bytes=_repository_bytes(repo_path),
     )
     pending = _unpushed_commits(repo_path, remote, branch)
@@ -1010,7 +1012,9 @@ def rewrite_backup_history(
     _run_git(repo_path, "add", "-A")
     _assert_staged(repo_path, subdirectory, target)
     _run_git(
-        repo_path, "commit", "-m",
+        repo_path,
+        "commit",
+        "-m",
         f"research-trace: rebuild backup after emergency purge ({reason.strip()})",
     )
     _run_git(repo_path, "branch", "-M", branch)
@@ -1030,8 +1034,9 @@ def main(argv: list[str] | None = None) -> int:
     export = sub.add_parser("export")
     export.add_argument("--data-dir", required=True)
     export.add_argument("--target", required=True)
-    export.add_argument("--part-bytes", type=int, default=None,
-                        help="per-file byte budget inside a volume (default 32 MiB)")
+    export.add_argument(
+        "--part-bytes", type=int, default=None, help="per-file byte budget inside a volume (default 32 MiB)"
+    )
     verify = sub.add_parser("verify")
     verify.add_argument("--source", required=True)
     verify.add_argument("--volume", default=None, help="verify one volume instead of the whole backup")
@@ -1074,20 +1079,32 @@ def main(argv: list[str] | None = None) -> int:
                 result = restore_backup(args.source, store)
             elif args.command == "purge":
                 result = store.purge(
-                    actor_id=args.actor, reason=args.reason,
-                    project_ids=args.project_id, session_ids=args.session_id,
-                    node_ids=args.node_id, event_ids=args.event_id,
+                    actor_id=args.actor,
+                    reason=args.reason,
+                    project_ids=args.project_id,
+                    session_ids=args.session_id,
+                    node_ids=args.node_id,
+                    event_ids=args.event_id,
                     transcript_chunk_ids=args.transcript_chunk_id,
                 )
             elif args.command == "rewrite-history":
                 result = rewrite_backup_history(
-                    store, args.repo, subdirectory=args.subdirectory, remote=args.remote,
-                    branch=args.branch, confirm=args.confirm, reason=args.reason,
+                    store,
+                    args.repo,
+                    subdirectory=args.subdirectory,
+                    remote=args.remote,
+                    branch=args.branch,
+                    confirm=args.confirm,
+                    reason=args.reason,
                 )
             else:
                 result = sync_git_backup(
-                    store, args.repo, subdirectory=args.subdirectory,
-                    remote=args.remote, branch=args.branch, part_bytes=args.part_bytes,
+                    store,
+                    args.repo,
+                    subdirectory=args.subdirectory,
+                    remote=args.remote,
+                    branch=args.branch,
+                    part_bytes=args.part_bytes,
                 )
         finally:
             store.close()
