@@ -1,10 +1,11 @@
 """Lifecycle-only intervals do not spend an independent Recorder turn."""
+
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
-from tests.test_trace_hook import H, PROTOCOL, bind, event, session_root
+from tests.test_trace_hook import PROTOCOL, H, bind, event, session_root
 
 
 def batches(data: Path) -> list[Path]:
@@ -42,7 +43,7 @@ def test_the_skipped_events_are_not_lost_but_ride_the_next_batch(tmp_path: Path)
     """跳过时不推进游标：那些事件留到下一批一起带上，一条都不丢。"""
     cwd = bind(tmp_path)
     data = tmp_path / "plugin-data"
-    H.handle(event("Stop", cwd, stop_hook_active=False), data, PROTOCOL)   # 只有生命周期
+    H.handle(event("Stop", cwd, stop_hook_active=False), data, PROTOCOL)  # 只有生命周期
     assert not batches(data)
 
     H.handle(event("UserPromptSubmit", cwd, prompt="现在有事了"), data, PROTOCOL)

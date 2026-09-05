@@ -15,10 +15,10 @@ waits for and processes those batches. Each model call receives only:
 2. a concise Project Overview, human-defined Chapters and unresolved human corrections;
 3. a small set of recent and query-related older Nodes and known runs.
 
-Each project reuses its own Recorder session for a bounded window, then starts a new one. This can
-reuse that Recorder's prefix and conversation cache, but it never claims to reuse the main agent's
-cache. Correctness does not depend on cache hits because the complete current packet is supplied on
-every turn.
+Every call is a fresh, stateless `claude --print --no-session-persistence` invocation: the complete
+current packet is the whole input, and nothing from an earlier call is carried over. The fixed system
+prompt and schema are a byte-identical prefix on every call, which is all a prompt cache keys on; the
+Recorder never claims to reuse the main agent's cache, and correctness does not depend on cache hits.
 
 The model starts with `--setting-sources ""`, `--tools ""`, an empty strict MCP configuration and
 `dontAsk` permissions. It cannot inspect files, submit SLURM jobs, edit code, contact agents or write
@@ -48,9 +48,11 @@ the Recorder never reconstructs hidden reasoning or guesses missing facts.
 ## Subscription-only execution
 
 The worker calls the official `claude --print` CLI using its normal Claude subscription login. It
-refuses to start a model request when API-key, Bedrock, Vertex or Foundry credential environments
-are present, when `claude auth status` does not report a subscription/OAuth login, or when the model
-is outside the allowed subscription set.
+refuses to start a model request when API-key, Bedrock, Vertex, Foundry or custom base-URL
+environments are present, when `claude auth status` reports anything other than a first-party
+subscription/OAuth login, or when the model is outside the allowed subscription set. A CLI that has
+no `auth status` subcommand (older releases) passes the preflight as `unverified`; the model call
+itself then reports an authentication failure as the `auth` state.
 
 Claude Code does not expose an API that proves the account-level Extra usage switch is disabled.
 The project therefore requires a one-time explicit marker written by:
@@ -65,6 +67,11 @@ There is no API-key, provider or fallback-model path. `trace-project recorder-di
 calls without deleting queued evidence. After fixing authentication/configuration or disabling Extra
 usage following an overage signal, run
 `trace-recorder --retry-blocked --data-dir <plugin-data>` once. Overage is never retried automatically.
+
+Every retry of an empty, malformed, format or timeout failure is a real model call. A batch gets at
+most four such attempts; it then rests in `attempts_exhausted` with its material intact until the
+operator runs `--retry-blocked`. Preflight failures (authentication, configuration, paid credentials)
+cost no quota and retry on a fixed interval.
 
 ## Selecting durable meaning
 
@@ -101,8 +108,27 @@ Only identifiers present in the packet are accepted:
 - `parent_id` must be a known same-Chapter predecessor. Omit an unknown or independent relation.
 - `run_ids` must already exist in the project and match the discussion. W&B remains a curve link;
   code is not uploaded to W&B.
+- `artifact_refs` register external artifacts the record produced, consumed or points at: a W&B run
+  page, a checkpoint or dataset URL, a result file with a scheme. Each needs a `name`, an absolute
+  `uri` copied verbatim from NEW EVIDENCE, and optionally `direction` (`output`, `input`; omitted
+  means `reference`). A URI that does not appear in the batch is rejected as a guess. The program
+  registers accepted refs on the written Node through the attachment API with an idempotent
+  `capture_key`, so the link becomes a dataflow key rather than prose.
 - Selected code evidence can name a known repository, commit, file, symbol and short snippet/diff.
   Shared working trees use `ambiguous` attribution unless contribution is established.
+
+A Chapter summary or the Overview is the standing answer to that research line's question, not a
+log of steps. Every curation names a `reason`: `first_summary` (the target has none yet),
+`result_changed`, `plan_changed`, `direction_closed`, `correction_absorbed` or `milestone` — what a
+reader of the old summary would now be misled about. Submitting a job, editing code, or adding a
+Node the summary would merely repeat is `progress_only`; the program discards such curations (and
+a `first_summary` for a Chapter that already has one) before any write. Most batches curate nothing.
+
+A curation's `resolve_comment_ids` may list only corrections on that same Overview or Chapter whose
+content the new body absorbs. A correction on a Node is context for records — use the corrected
+figure and say it was corrected — and is never listed on a summary; the program drops such ids
+silently because the server's correction gate is per target, while an id that is not in the packet
+at all is rejected as fabricated.
 
 The program assigns `semantic:<batch_id>:<index>` idempotency keys and persists the validated plan
 before the first write. A crash after a partial write resumes the same plan and skips completed
@@ -115,8 +141,8 @@ a request to fabricate them.
 ## Completion and status
 
 A schema-valid `status=skip` result is a successful zero-record batch. Empty output, malformed JSON,
-unknown IDs, unavailable storage, authentication failure, quota exhaustion and overage are different
-states. None may be mislabeled as a successful skip.
+unknown IDs, unavailable storage, authentication failure, quota exhaustion, overage and an exhausted
+attempt budget are different states. None may be mislabeled as a successful skip.
 
 Only after every planned Node write succeeds does the worker move the manifest and its processing
 state to `batches/done/`. Local `trace-recorder --status`, `trace-deliver --status` and central health

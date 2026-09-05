@@ -26,15 +26,20 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
-
+from typing import Any
 
 SCHEMA = "research-trace.event.v1"
 RECORDER_TRACE_TOOLS = {
-    "trace_context", "trace_ingest", "trace_record", "trace_curate", "trace_attach", "trace_search",
+    "trace_context",
+    "trace_ingest",
+    "trace_record",
+    "trace_curate",
+    "trace_attach",
+    "trace_search",
 }
 
 MARKER_NAME = ".research-trace.json"
@@ -42,12 +47,23 @@ MARKER_NAME = ".research-trace.json"
 #: 这些 hook 事件本身不携带任何研究材料，它们只说「一轮结束了」「会话开始了」。
 #: Lifecycle notifications and recorder diagnostics never independently justify model work.
 #: Their raw evidence remains available; transcript growth alone is not a dispatch trigger.
-LIFECYCLE_EVENTS = frozenset({
-    "Stop", "StopFailure", "SessionStart", "SessionEnd", "PreCompact", "PostCompact",
-})
-RECORDING_DIAGNOSTICS = frozenset({
-    "TranscriptCaptureError", "CodeCaptureError", "RecorderDispatchPaused",
-})
+LIFECYCLE_EVENTS = frozenset(
+    {
+        "Stop",
+        "StopFailure",
+        "SessionStart",
+        "SessionEnd",
+        "PreCompact",
+        "PostCompact",
+    }
+)
+RECORDING_DIAGNOSTICS = frozenset(
+    {
+        "TranscriptCaptureError",
+        "CodeCaptureError",
+        "RecorderDispatchPaused",
+    }
+)
 
 # outbox 里装着完整对话和带令牌的命令原文。在多用户 HPC 节点上默认 0755/0644 等于
 # 同机任何人可读；凭证文件早就是 0600，这里照抄同一个标准。Windows 上 chmod 基本无效，
@@ -157,8 +173,12 @@ def _read_json(path: Path, default: Any) -> Any:
 # --------------------------------------------------------------------------------------
 
 
-def _inline_binding(cwd: str | None) -> dict[str, Any] | None:
-    """`research_trace` 不可导入时的退化实现：只认 marker 在不在、capture 开不开。"""
+def _inline_binding(cwd: str | None, *, include_disabled: bool = False) -> dict[str, Any] | None:
+    """`research_trace` 不可导入时的退化实现：只认 marker 在不在、capture 开不开。
+
+    `include_disabled=True` 时 `"capture": false` 的 marker 也返回（带 `capture_disabled`），
+    给暂停路径用：它需要知道这个项目的 outbox 在哪，才能把游标推过暂停期。
+    """
     try:
         current = Path(cwd or os.getcwd()).expanduser().resolve()
     except OSError:
@@ -170,7 +190,8 @@ def _inline_binding(cwd: str | None) -> dict[str, Any] | None:
                 value = _read_json(candidate, {})
                 if not isinstance(value, dict):
                     value = {}
-                if value.get("capture") is False:
+                disabled = value.get("capture") is False
+                if disabled and not include_disabled:
                     return None
                 keys = [
                     str(item).strip()
@@ -184,6 +205,7 @@ def _inline_binding(cwd: str | None) -> dict[str, Any] | None:
                     "workspace_key": keys[0] if keys else None,
                     "project_id": str(value.get("project_id") or "").strip() or None,
                     "project_name": str(value.get("project_name") or "").strip() or None,
+                    "capture_disabled": disabled,
                 }
         except OSError:
             return None
@@ -193,29 +215,43 @@ def _inline_binding(cwd: str | None) -> dict[str, Any] | None:
     return None
 
 
-def binding_for(payload: dict[str, Any]) -> dict[str, Any] | None:
+def binding_for(payload: dict[str, Any], *, include_disabled: bool = False) -> dict[str, Any] | None:
     cwd = payload.get("cwd")
     cwd = str(cwd) if isinstance(cwd, str) and cwd.strip() else None
+    binding = None
     if _package_binding is not None:
         try:
-            return _package_binding(cwd)
+            binding = _package_binding(cwd)
         except Exception:
-            pass
-    return _inline_binding(cwd)
+            binding = None
+    else:
+        binding = _inline_binding(cwd)
+    if binding is not None or not include_disabled:
+        return binding
+    # 包实现对 capture:false 返回 None（和「没绑定」同义）。暂停路径需要区分这两种。
+    disabled = _inline_binding(cwd, include_disabled=True)
+    return disabled if disabled is not None and disabled.get("capture_disabled") else None
+
+
+def _session_root_path(data_dir: Path, payload: dict[str, Any], binding: dict[str, Any]) -> Path:
+    # 目录用 workspace key 做 hash：同一个项目在不同路径/worktree 下打开时共用一个 outbox
+    # 分支（§7：绝对 cwd 不是项目身份）。没有 key 的 marker 退回 cwd。
+    identity = binding.get("workspace_key") or os.path.normcase(str(payload.get("cwd") or os.getcwd()))
+    workspace = hashlib.sha256(str(identity).encode("utf-8")).hexdigest()[:16]
+    session = _safe(payload.get("session_id"), "unknown-session")
+    return data_dir / "outbox" / workspace / session
 
 
 def _session_root(data_dir: Path, payload: dict[str, Any], binding: dict[str, Any]) -> Path:
-    # 目录用 workspace key 做 hash：同一个项目在不同路径/worktree 下打开时共用一个 outbox
-    # 分支（§7：绝对 cwd 不是项目身份）。没有 key 的 marker 退回 cwd。
-    identity = binding.get("workspace_key") or os.path.normcase(
-        str(payload.get("cwd") or os.getcwd())
-    )
-    workspace = hashlib.sha256(str(identity).encode("utf-8")).hexdigest()[:16]
-    session = _safe(payload.get("session_id"), "unknown-session")
-    root = data_dir / "outbox" / workspace / session
+    root = _session_root_path(data_dir, payload, binding)
     for name in (
-        "pending", "sent", "batches", "batches/done",
-        "transcripts/pending", "transcripts/sent", "transcripts/meta",
+        "pending",
+        "sent",
+        "batches",
+        "batches/done",
+        "transcripts/pending",
+        "transcripts/sent",
+        "transcripts/meta",
     ):
         _mkdir(root / name)
     _chmod(root, DIR_MODE)
@@ -370,7 +406,7 @@ def _drop_thinking(value: Any, depth: int = 0) -> tuple[Any, bool]:
 NOISE_TYPES = ("file-history-snapshot", "queue-operation", "bridge-session", "custom-title", "mode")
 #: 用完整的 `"type":"..."` 形态匹配，而不是裸类型名——"mode" 这种词在正文里太常见。
 #: 写法带空格时会匹配不上，那时这一行被保留：失败方向故意选「多存点噪声」而不是「误删内容」。
-NOISE_MARKERS = tuple(f'"type":"{name}"'.encode("utf-8") for name in NOISE_TYPES)
+NOISE_MARKERS = tuple(f'"type":"{name}"'.encode() for name in NOISE_TYPES)
 
 
 #: Claude Code 给工具输出留了第二份结构化拷贝 `toolUseResult`。读图片时它里面的
@@ -407,10 +443,7 @@ def _strip_duplicate_base64(value: dict[str, Any]) -> bool:
 
 
 def _is_ui_noise(line: bytes) -> bool:
-    for marker in NOISE_MARKERS:
-        if marker in line:
-            return True
-    return False
+    return any(marker in line for marker in NOISE_MARKERS)
 
 
 def _scrub_line(line: bytes, recorder_ids: frozenset[str] = frozenset()) -> bytes | None:
@@ -437,11 +470,11 @@ def _scrub_line(line: bytes, recorder_ids: frozenset[str] = frozenset()) -> byte
     # 无 hook 的独立 cwd，不会再进入这份 transcript。
     for agent_id in recorder_ids:
         if agent_id.encode("utf-8") not in line:
-            continue                      # 快路径：id 的字节都不在这行里，不必解析
+            continue  # 快路径：id 的字节都不在这行里，不必解析
         try:
             value = json.loads(line.decode("utf-8"))
         except (UnicodeDecodeError, ValueError):
-            break                         # 解析不了就交给下面的 thinking 逻辑处理
+            break  # 解析不了就交给下面的 thinking 逻辑处理
         if isinstance(value, dict) and str(value.get("agentId") or "") == agent_id:
             return None
         break
@@ -450,15 +483,19 @@ def _scrub_line(line: bytes, recorder_ids: frozenset[str] = frozenset()) -> byte
     try:
         value = json.loads(line.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
-        return json.dumps(
-            {
-                "type": "research-trace.redacted",
-                "reason": "unparsable transcript line containing hidden-reasoning markers",
-                "bytes": len(line),
-                "sha256": hashlib.sha256(line).hexdigest(),
-            },
-            ensure_ascii=False, separators=(",", ":"),
-        ).encode("utf-8") + b"\n"
+        return (
+            json.dumps(
+                {
+                    "type": "research-trace.redacted",
+                    "reason": "unparsable transcript line containing hidden-reasoning markers",
+                    "bytes": len(line),
+                    "sha256": hashlib.sha256(line).hexdigest(),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
+        )
     scrubbed, changed = _drop_thinking(value)
     if scrubbed is None:
         return None
@@ -500,7 +537,7 @@ def _entire_capture_stream(root, repository, session_id):
             destination = root / metadata['path']
             _mkdir(destination.parent)
             os.replace(_long(temporary), _long(destination))
-            _atomic_json(root / 'transcripts' / 'meta' / (destination.name+'.json'), metadata)
+            _atomic_json(root / 'transcripts' / 'meta' / (destination.name + '.json'), metadata)
     finally:
         for temporary, _ in staged:
             _long(temporary).unlink(missing_ok=True)
@@ -518,6 +555,7 @@ def _capture_entire_transcript(root, payload, state, binding, config, chunk_size
     if package_root not in sys.path:
         sys.path.insert(0, package_root)
     from research_trace.entire_evidence import EntireRepository, EvidenceError
+
     sid = str(payload.get('session_id') or '')
     key = hashlib.sha256(('entire:' + sid).encode()).hexdigest()[:20]
     source = str(payload.get('transcript_path') or '')
@@ -530,7 +568,7 @@ def _capture_entire_transcript(root, payload, state, binding, config, chunk_size
         skipped = 0
         last = b''
         while skipped < start:
-            raw = stream.read(min(65536, start-skipped))
+            raw = stream.read(min(65536, start - skipped))
             if not raw:
                 raise EvidenceError('Entire export is shorter than its saved cursor; old history was not reimported')
             skipped += len(raw)
@@ -544,7 +582,7 @@ def _capture_entire_transcript(root, payload, state, binding, config, chunk_size
         while not eof:
             begin = offset
             parts = []
-            while offset-begin < chunk_size:
+            while offset - begin < chunk_size:
                 line = stream.readline(16 * 1024 * 1024 + 1)
                 if not line:
                     eof = True
@@ -561,10 +599,18 @@ def _capture_entire_transcript(root, payload, state, binding, config, chunk_size
                 raw = b''.join(parts)
                 sha = hashlib.sha256(raw).hexdigest()
                 filename = f'{key}_{begin:016d}_{offset:016d}_{sha[:16]}.jsonl'
-                metadata = {'path':f'transcripts/pending/{filename}', 'chunk_id':f'claude-transcript-{sha}',
-                            'session_id':sid, 'agent_id':None, 'source_path':'entire:session:'+sid,
-                            'provider':'entire', 'start_offset':begin, 'end_offset':offset, 'sha256':sha}
-                temporary=root / 'transcripts' / 'staging' / (uuid.uuid4().hex+'.tmp')
+                metadata = {
+                    'path': f'transcripts/pending/{filename}',
+                    'chunk_id': f'claude-transcript-{sha}',
+                    'session_id': sid,
+                    'agent_id': None,
+                    'source_path': 'entire:session:' + sid,
+                    'provider': 'entire',
+                    'start_offset': begin,
+                    'end_offset': offset,
+                    'sha256': sha,
+                }
+                temporary = root / 'transcripts' / 'staging' / (uuid.uuid4().hex + '.tmp')
                 _atomic_bytes(temporary, raw)
                 staged.append((temporary, metadata))
                 captured.append(metadata)
@@ -615,8 +661,7 @@ def _capture_transcripts(
                 stream.seek(start)
                 offset = start
                 while offset < size:
-                    consumed, raw = _read_scrubbed(
-                        stream, size - offset, chunk_size, recorder_ids)
+                    consumed, raw = _read_scrubbed(stream, size - offset, chunk_size, recorder_ids)
                     if consumed == 0:
                         break
                     end = offset + consumed
@@ -750,10 +795,10 @@ def _has_material(root: Path, events: list[tuple[str, str]]) -> bool:
     跳过时**不推进游标**：这些事件会留到下一批真有内容时一起带上，什么都不会丢。
     原始投递跟这里无关——它由投递器按中央 2xx 决定，本来就不经过 batch。
     """
-    for name, rel in events:
+    for _name, rel in events:
         record = _read_json(root / rel, {})
         if not isinstance(record, dict):
-            return True     # 读不出来就当它有内容：宁可多派一次，也不要静默漏记
+            return True  # 读不出来就当它有内容：宁可多派一次，也不要静默漏记
         if str(record.get("hook_event") or "") not in LIFECYCLE_EVENTS | RECORDING_DIAGNOSTICS:
             return True
     return False
@@ -792,8 +837,11 @@ def _spawn_deliver(data_dir: Path, url: str, state: dict[str, Any]) -> bool:
     env = dict(os.environ)
     env["PYTHONPATH"] = str(_PLUGIN_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     options: dict[str, Any] = {
-        "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
-        "cwd": str(_PLUGIN_ROOT), "env": env,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "cwd": str(_PLUGIN_ROOT),
+        "env": env,
     }
     if os.name == "nt":
         options["creationflags"] = 0x00000008 | 0x08000000  # DETACHED_PROCESS | CREATE_NO_WINDOW
@@ -807,13 +855,63 @@ def _spawn_deliver(data_dir: Path, url: str, state: dict[str, Any]) -> bool:
         return False
 
 
+def _skip_paused_transcript(data_dir: Path, payload: dict[str, Any], binding: dict[str, Any]) -> None:
+    """暂停期间不补采：把 transcript 游标推到当前文件末尾，内容一个字节都不读。
+
+    只在这个 session 的 outbox 目录**已经存在**时才动手（不为暂停中的项目建任何目录）。
+    代价是在暂停期间才开始的会话没有游标，重新开启后会从头采——这条边界写在
+    REQUIREMENTS §13 里，不在这里悄悄扩大采集范围。
+    """
+    root = _session_root_path(data_dir, payload, binding)
+    if not root.is_dir():
+        return
+    state_path = root / "state.json"
+    with _state_lock(root) as acquired:
+        if not acquired:
+            return
+        state = _read_json(state_path, {})
+        if not isinstance(state, dict):
+            state = {}
+        cursors = state.setdefault("transcript_offsets", {})
+        if not isinstance(cursors, dict):
+            cursors = {}
+            state["transcript_offsets"] = cursors
+        moved = False
+        for field in ("transcript_path", "agent_transcript_path"):
+            source_text = payload.get(field)
+            if not isinstance(source_text, str) or not source_text.strip():
+                continue
+            source = Path(source_text).expanduser()
+            key = hashlib.sha256(os.path.normcase(str(source)).encode("utf-8")).hexdigest()[:20]
+            try:
+                size = source.stat().st_size
+            except OSError:
+                continue
+            if size > int(cursors.get(key, 0) or 0):
+                cursors[key] = size
+                moved = True
+        if moved:
+            state["paused_through"] = _now()
+            _atomic_json(state_path, state)
+
+
 def handle(
-    payload: dict[str, Any], data_dir: Path, protocol_path: Path, url: str = "",
+    payload: dict[str, Any],
+    data_dir: Path,
+    protocol_path: Path,
+    url: str = "",
+    *,
+    paused: bool = False,
 ) -> dict[str, Any] | None:
     """Handle one hook input. Exposed separately for deterministic tests."""
-    binding = binding_for(payload)
+    binding = binding_for(payload, include_disabled=True)
     if binding is None:
         # 未绑定的项目：不建目录、不写文件、不看 transcript。采集是 opt-in 的。
+        return None
+    if paused or binding.get("capture_disabled"):
+        # 全局 capture=off 或 marker capture:false：不写事件、不读 transcript，
+        # 只把已有会话的游标推过暂停期，重新开启后不补采暂停期间的内容。
+        _skip_paused_transcript(data_dir, payload, binding)
         return None
     root = _session_root(data_dir, payload, binding)
     state_path = root / "state.json"
@@ -826,30 +924,41 @@ def handle(
         state = _read_json(state_path, {})
         if not isinstance(state, dict):
             state = {}
-        capture_config=_read_json(Path(binding['marker_path']),{}).get('code_capture') or {}
+        capture_config = _read_json(Path(binding['marker_path']), {}).get('code_capture') or {}
         if capture_config.get('enabled') and not state.get('code_capture_started'):
             # Enabling on a resumed conversation establishes a forward-only
             # boundary. The current hook payload is still recorded below.
-            transcript=payload.get('transcript_path')
+            transcript = payload.get('transcript_path')
             if transcript:
-                source=Path(transcript).expanduser()
+                source = Path(transcript).expanduser()
                 if source.is_file():
-                    key=hashlib.sha256(os.path.normcase(str(source)).encode('utf-8')).hexdigest()[:20]
-                    state.setdefault('transcript_offsets',{}).setdefault(key,source.stat().st_size)
-            state['code_capture_started']=_now()
+                    key = hashlib.sha256(os.path.normcase(str(source)).encode('utf-8')).hexdigest()[:20]
+                    state.setdefault('transcript_offsets', {}).setdefault(key, source.stat().st_size)
+            state['code_capture_started'] = _now()
         if capture_config.get('entire_executable'):
             try:
                 _capture_entire_transcript(root, payload, state, binding, capture_config)
             except Exception as exc:
-                _write_event(root, {**payload, 'hook_event_name':'TranscriptCaptureError',
-                                   'transcript_capture_error':str(exc)[:1000], 'provider':'entire'}, binding)
-            _capture_transcripts(root, {**payload, 'transcript_path':None}, state)
+                _write_event(
+                    root,
+                    {
+                        **payload,
+                        'hook_event_name': 'TranscriptCaptureError',
+                        'transcript_capture_error': str(exc)[:1000],
+                        'provider': 'entire',
+                    },
+                    binding,
+                )
+            _capture_transcripts(root, {**payload, 'transcript_path': None}, state)
         else:
             _capture_transcripts(root, payload, state)
         internal = _is_internal_trace_event(payload)
         if not internal:
-            if (payload.get("hook_event_name") in {"Stop", "SessionEnd"} and not payload.get("stop_hook_active")
-                    and (_read_json(Path(binding['marker_path']), {}).get('code_capture') or {}).get('enabled')):
+            if (
+                payload.get("hook_event_name") in {"Stop", "SessionEnd"}
+                and not payload.get("stop_hook_active")
+                and (_read_json(Path(binding['marker_path']), {}).get('code_capture') or {}).get('enabled')
+            ):
                 try:
                     # The hook remains offline. Git/Entire evidence is queued;
                     # the existing delivery worker uploads the retained bytes.
@@ -857,13 +966,19 @@ def handle(
                     if package_root not in sys.path:
                         sys.path.insert(0, package_root)
                     from research_trace.workspace import capture_phase
+
                     snapshot = capture_phase(binding, payload.get("session_id"))
                     if snapshot and snapshot['commit_hash'] != state.get('last_code_commit'):
-                        _write_event(root, {**payload, 'hook_event_name':'CodeCheckpoint', 'code_snapshot':snapshot}, binding)
+                        _write_event(
+                            root, {**payload, 'hook_event_name': 'CodeCheckpoint', 'code_snapshot': snapshot}, binding
+                        )
                         state['last_code_commit'] = snapshot['commit_hash']
                 except Exception as exc:
-                    _write_event(root, {**payload, 'hook_event_name':'CodeCaptureError',
-                                       'code_capture_error':str(exc)[:1000]}, binding)
+                    _write_event(
+                        root,
+                        {**payload, 'hook_event_name': 'CodeCaptureError', 'code_capture_error': str(exc)[:1000]},
+                        binding,
+                    )
             _write_event(root, payload, binding)
 
         # Stop 也要拉一次：一轮对话刚结束，batch 正好写完。只挂在 SessionStart/SessionEnd
@@ -873,19 +988,29 @@ def handle(
             _spawn_deliver(data_dir, url, state)
 
         result = None
-        if (result is None and payload.get('hook_event_name')=='SessionStart'
-                and (_read_json(Path(binding['marker_path']),{}).get('code_capture') or {}).get('enabled')):
-            result={'hookSpecificOutput':{'hookEventName':'SessionStart','additionalContext':
-                'Research Trace passively records this project. Continue using your normal training and sbatch commands. '
-                'The research agent is responsible for keeping submitted experiment directories and their referenced '
-                'shared code unchanged. Research Trace does not submit jobs, create execution directories, rewrite paths '
-                'or enforce that rule. It preserves observed commands, outputs, conversations and code evidence. '
-                'When recording a meaningful experiment group, use source_event_ids for observed commands/results and '
-                'code checkpoints; use run_ids only for run records that actually exist. '
-                'Keep W&B as a curve link in the research record; never upload code to W&B. '
-                'Untried ideas and unknown predecessor relationships are valid; keep summaries short and mark uncertainty.'}}
-        if (not internal and payload.get("hook_event_name") in {"Stop", "SessionEnd"}
-                and not payload.get("stop_hook_active")):
+        if (
+            result is None
+            and payload.get('hook_event_name') == 'SessionStart'
+            and (_read_json(Path(binding['marker_path']), {}).get('code_capture') or {}).get('enabled')
+        ):
+            result = {
+                'hookSpecificOutput': {
+                    'hookEventName': 'SessionStart',
+                    'additionalContext': 'Research Trace passively records this project. Continue using your normal training and sbatch commands. '
+                    'The research agent is responsible for keeping submitted experiment directories and their referenced '
+                    'shared code unchanged. Research Trace does not submit jobs, create execution directories, rewrite paths '
+                    'or enforce that rule. It preserves observed commands, outputs, conversations and code evidence. '
+                    'When recording a meaningful experiment group, use source_event_ids for observed commands/results and '
+                    'code checkpoints; use run_ids only for run records that actually exist. '
+                    'Keep W&B as a curve link in the research record; never upload code to W&B. '
+                    'Untried ideas and unknown predecessor relationships are valid; keep summaries short and mark uncertainty.',
+                }
+            }
+        if (
+            not internal
+            and payload.get("hook_event_name") in {"Stop", "SessionEnd"}
+            and not payload.get("stop_hook_active")
+        ):
             # Recorder execution has a separate lifecycle. The hook only seals
             # durable input; a separately started `trace-recorder --watch`
             # process discovers it. This boundary keeps model startup, quota
@@ -903,14 +1028,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--capture-enabled", default="on")
     parser.add_argument("--url", default=os.environ.get("TRACE_URL", ""))
     args = parser.parse_args(argv)
-    if str(args.capture_enabled).strip().lower() in {"0", "false", "off", "no"}:
-        return 0
+    paused = str(args.capture_enabled).strip().lower() in {"0", "false", "off", "no"}
     try:
         raw = sys.stdin.read()
         payload = json.loads(raw)
         if not isinstance(payload, dict):
             return 0
-        output = handle(payload, Path(args.data_dir), Path(args.protocol), str(args.url or ""))
+        output = handle(
+            payload,
+            Path(args.data_dir),
+            Path(args.protocol),
+            str(args.url or ""),
+            paused=paused,
+        )
         if output:
             print(json.dumps(output, ensure_ascii=False, separators=(",", ":")))
     except Exception as exc:  # fail-open by design; stderr is debug-only on exit 0

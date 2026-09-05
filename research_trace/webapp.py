@@ -1186,6 +1186,10 @@ details[open] > summary .chevron { transform: rotate(180deg); }
   text-align: center;
 }
 .empty-inner { max-width: 560px; }
+.form-stack { display: grid; gap: 8px; max-width: 360px; margin: 16px auto 0; text-align: left; }
+.form-stack label { font-size: 13px; color: var(--muted, #666); }
+.form-stack input { padding: 8px 10px; font: inherit; }
+.form-stack .btn { margin-top: 4px; justify-self: start; }
 .empty h2 { margin: 0; color: var(--ink); font-size: 25px; letter-spacing: -.03em; }
 .empty p { margin: 10px 0 0; }
 .empty .btn { margin-top: 20px; }
@@ -2567,6 +2571,7 @@ const S = {
   token: stored('token'),
   actor: stored('actor') || 'human',
   authEnabled: false,
+  authMode: 'open',
   user: null,
   csrf: ''
 };
@@ -2760,6 +2765,10 @@ async function api(path, options = {}) {
     catch { value = {error: raw}; }
   }
   if (response.status === 401 && S.authEnabled) {
+    if (S.authMode === 'token') {
+      location.reload();
+      throw Error('登录已过期，请重新输入访问密钥');
+    }
     location.href = BASE + '/auth/github/login?return_to=' +
       encodeURIComponent(location.pathname + location.search);
     throw Error('登录已过期，正在重新登录');
@@ -4283,7 +4292,11 @@ function recorderHealthHtml(value) {
   const recorderStates = {
     idle: '空闲', quota: '订阅额度暂停', overage: '额外用量已阻止', auth: '等待登录',
     paid_credentials: '检测到 API/云凭证', config: '配置错误', blocked_config: '等待启用确认',
-    storage_or_network_error: '中央暂不可用', retry_requested: '已请求重试'
+    storage_or_network_error: '中央暂不可用', retry_requested: '已请求重试',
+    attempts_exhausted: '模型输出多次无法解析，等待人工重试', cli: 'Claude CLI 无法启动',
+    disabled: '项目已关闭整理', deferred: '等待重试时间', waiting_project: '等待项目绑定',
+    timeout: '模型调用超时，稍后重试', format: '模型输出未通过校验，稍后重试',
+    malformed: '模型输出不是 JSON，稍后重试', empty: '模型无输出，稍后重试', error: '模型调用出错，稍后重试'
   };
   lines.push(`状态 ${esc(recorderStates[recorder.status] || recorder.status || '—')} · 未处理 batch ${esc(recorder.pending_batches ?? '—')} · 最近处理 ${fmt(recorder.last_processed_at)}`);
   if (recorder.pause_until) {
@@ -4458,13 +4471,15 @@ function showAccount() {
         <div><strong>${esc(name)}</strong><div class="meta">@${esc(S.user.login)} · ${esc(S.user.role)}</div></div>
       </div>
       <div class="toolbar">
-        <button class="btn" type="button" id="manageDevices">${icon('device')}管理已登录设备</button>
-        ${S.user.role === 'admin' ? `<button class="btn" type="button" id="manageUsers">${icon('team')}管理团队用户</button>` : ''}
+        ${S.authMode === 'oauth' ? `<button class="btn" type="button" id="manageDevices">${icon('device')}管理已登录设备</button>` : ''}
+        ${S.authMode === 'oauth' && S.user.role === 'admin' ? `<button class="btn" type="button" id="manageUsers">${icon('team')}管理团队用户</button>` : ''}
+        ${S.authMode === 'token' ? `<p class="meta">访问密钥登录：这台服务用一个共享密钥守读写；改名字重新登录即可。</p>` : ''}
         <button class="btn warn" type="button" id="logoutBtn">${icon('logout')}退出登录</button>
       </div>
     `
   );
-  $('#manageDevices').onclick = () => showDevices().catch(error => notify(error.message));
+  const manageDevices = $('#manageDevices');
+  if (manageDevices) manageDevices.onclick = () => showDevices().catch(error => notify(error.message));
   const manageUsers = $('#manageUsers');
   if (manageUsers) manageUsers.onclick = () => showUsers().catch(error => notify(error.message));
   $('#logoutBtn').onclick = async () => {
@@ -4618,8 +4633,50 @@ document.addEventListener('keydown', event => {
 async function bootstrap() {
   const config = await api('/api/auth/config');
   S.authEnabled = config.enabled;
+  S.authMode = config.mode || (config.enabled ? 'oauth' : 'open');
   if (S.authEnabled) {
     const response = await fetch(BASE + '/api/auth/me', {headers: {Accept: 'application/json'}});
+    if (!response.ok && S.authMode === 'token') {
+      setAccountLabel('输入访问密钥');
+      $('#tokenBtn').onclick = () => $('#accessKey').focus();
+      $('#sidebar').hidden = true;
+      $('.layout').style.gridTemplateColumns = '1fr';
+      $('#main').style.margin = 'auto';
+      $('#main').innerHTML = `
+        <div class="empty">
+          <div class="empty-inner">
+            <span class="section-icon login-icon">${icon('user')}</span>
+            <h2>登录 Research Trace</h2>
+            <p>这台服务用一个共享访问密钥守住读写。输入密钥和你的名字（记录里的纠正、确认会署这个名）。</p>
+            <form id="keyLogin" class="form-stack" autocomplete="off">
+              <label for="accessKey">访问密钥</label>
+              <input id="accessKey" type="password" autocomplete="current-password" required>
+              <label for="accessName">你的名字</label>
+              <input id="accessName" autocomplete="username" value="${esc(stored('actor') || '')}" required>
+              <button class="btn primary" type="submit">登录</button>
+              <p class="meta" id="keyLoginError" role="alert"></p>
+            </form>
+          </div>
+        </div>
+      `;
+      $('#keyLogin').onsubmit = async event => {
+        event.preventDefault();
+        const reply = await fetch(BASE + '/api/auth/token-login', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json', Accept: 'application/json'},
+          body: JSON.stringify({key: $('#accessKey').value, name: $('#accessName').value})
+        });
+        if (!reply.ok) {
+          let detail = reply.statusText;
+          try { detail = (await reply.json()).detail || detail; } catch {}
+          $('#keyLoginError').textContent = reply.status === 401 ? '密钥不对' : detail;
+          return;
+        }
+        localStorage.setItem('trace.actor', $('#accessName').value);
+        location.reload();
+      };
+      return;
+    }
     if (!response.ok) {
       setAccountLabel('GitHub 登录');
       $('#tokenBtn').onclick = () => {

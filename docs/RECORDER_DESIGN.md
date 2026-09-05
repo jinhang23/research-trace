@@ -4,6 +4,11 @@ alpha.25 改进现有 Recorder 的提示词和派发指导。用户希望学习 
 适合的实现思路；保留现有 Web、MCP 写入接口、原始证据、人工修订和被动记录边界。
 alpha.26 在此基础上增加程序级的 Recorder 反馈循环限制。
 
+> **历史说明。** alpha.27 起 Recorder 不再由主会话派发，下面「alpha.26 的防循环边界」里的派发
+> 预算、三次上限和 `RecorderDispatchPaused` 诊断已随派发机制一起删除，只作为当时的设计记录保留；
+> 仍在生效的只有内部事件过滤（Research Trace 自己的 MCP 调用不进事件层）。现行边界见
+> [Recorder 协议](../hooks/RECORDER_PROTOCOL.md)，提示词借鉴部分（下文「核对的源码」起）仍然有效。
+
 ## alpha.26 的防循环边界
 
 fork 本身不等于递归。实际风险是 Recorder 的工具事件混入研究材料，它完成后唤起主

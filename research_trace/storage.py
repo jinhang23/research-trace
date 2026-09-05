@@ -16,11 +16,11 @@ import sqlite3
 import threading
 import uuid
 import zlib
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator, Sequence
-
+from typing import Any
 
 SCHEMA_VERSION = 4
 REVIEW_STATES = {"unreviewed", "confirmed", "corrected"}
@@ -108,6 +108,14 @@ def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
 
 
+_ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def _ascii_lower(value: str) -> str:
+    """Fold ASCII letters only — exactly what SQLite's built-in lower() does."""
+    return value.translate(_ASCII_LOWER)
+
+
 def _like_escape(value: str) -> str:
     """LIKE 里 % 和 _ 是通配符。搜 "50%" 或 "batch_id" 时用户要的是字面量，
     不转义会让这两个查询退化成"匹配任何东西"，命中越多越像正常结果，最难被发现。"""
@@ -115,47 +123,61 @@ def _like_escape(value: str) -> str:
 
 
 def _hit_time(item: dict[str, Any]) -> str:
-    return (
-        item.get("occurred_at")
-        or item.get("captured_at")
-        or item.get("created_at")
-        or item.get("updated_at")
-        or ""
-    )
+    return item.get("occurred_at") or item.get("captured_at") or item.get("created_at") or item.get("updated_at") or ""
 
 
 # 每个搜索来源的取数说明。project_column 单列出来是因为 projects 表的项目主键叫 id，
 # 其余表叫 project_id。
 _SEARCH_SOURCES: tuple[dict[str, Any], ...] = (
     {
-        "scope": "node", "layer": "semantic", "table": "nodes",
+        "scope": "node",
+        "layer": "semantic",
+        "table": "nodes",
         "columns": "id,project_id,chapter_id,title,body,occurred_at",
         "where": "(lower(title) LIKE ? ESCAPE '\\' OR lower(body) LIKE ? ESCAPE '\\')",
-        "patterns": 2, "project_column": "project_id", "time_column": "occurred_at",
+        "patterns": 2,
+        "project_column": "project_id",
+        "time_column": "occurred_at",
     },
     {
-        "scope": "comment", "layer": "semantic", "table": "comments",
+        "scope": "comment",
+        "layer": "semantic",
+        "table": "comments",
         "columns": "id,project_id,target_type,target_id,kind,body,created_at",
         "where": "lower(body) LIKE ? ESCAPE '\\'",
-        "patterns": 1, "project_column": "project_id", "time_column": "created_at",
+        "patterns": 1,
+        "project_column": "project_id",
+        "time_column": "created_at",
     },
     {
-        "scope": "overview", "layer": "semantic", "table": "projects",
+        "scope": "overview",
+        "layer": "semantic",
+        "table": "projects",
         "columns": "id project_id,id,name,overview,updated_at",
         "where": "lower(overview) LIKE ? ESCAPE '\\'",
-        "patterns": 1, "project_column": "id", "time_column": "updated_at",
+        "patterns": 1,
+        "project_column": "id",
+        "time_column": "updated_at",
     },
     {
-        "scope": "event", "layer": "raw", "table": "events",
+        "scope": "event",
+        "layer": "raw",
+        "table": "events",
         "columns": "event_id id,project_id,session_id,agent_id,event_type,payload_json body,captured_at",
         "where": "lower(payload_json) LIKE ? ESCAPE '\\'",
-        "patterns": 1, "project_column": "project_id", "time_column": "captured_at",
+        "patterns": 1,
+        "project_column": "project_id",
+        "time_column": "captured_at",
     },
     {
-        "scope": "transcript", "layer": "raw", "table": "transcript_chunks",
+        "scope": "transcript",
+        "layer": "raw",
+        "table": "transcript_chunks",
         "columns": "chunk_id id,project_id,session_id,agent_id,search_text body,created_at",
         "where": "lower(search_text) LIKE ? ESCAPE '\\'",
-        "patterns": 1, "project_column": "project_id", "time_column": "created_at",
+        "patterns": 1,
+        "project_column": "project_id",
+        "time_column": "created_at",
     },
 )
 
@@ -316,7 +338,7 @@ def artifact_path_key(machine: Any, external_path: Any) -> str | None:
         return None  # 相对路径没有锚点
     # POSIX 把连续斜杠当一个，只有恰好两个前导斜杠是实现定义的，所以留着它。
     lead = "//" if path.startswith("//") else ""
-    normalized = lead + re.sub(r"/{2,}", "/", path[len(lead):])
+    normalized = lead + re.sub(r"/{2,}", "/", path[len(lead) :])
     # 文件系统里 /a/b/ 与 /a/b 就是同一个东西（POSIX 尾斜杠只要求它是目录），
     # 这一点和对象存储的 URI 不同，所以这边删尾斜杠、URI 那边不删。
     normalized = normalized.rstrip("/") or "/"
@@ -349,6 +371,7 @@ class Store:
         self.attachment_limit = int(attachment_limit)
         self._lock = threading.RLock()
         from .database import open_database
+
         self._engine = open_database(self.db_path)
         # SQLAlchemy owns the pool; SQLite's row/transaction API preserves the
         # domain operations and IMMEDIATE locking used by the existing Store.
@@ -370,7 +393,6 @@ class Store:
                 raise
             else:
                 self._db.commit()
-
 
     def _unique_slug(self, db: sqlite3.Connection, table: str, base: str, project_id: str | None = None) -> str:
         slug = slugify(base)
@@ -415,8 +437,7 @@ class Store:
             )
             chapter_id = _id("ch")
             db.execute(
-                "INSERT INTO chapters(id,project_id,slug,name,is_inbox,created_at,updated_at) "
-                "VALUES(?,?,?,?,1,?,?)",
+                "INSERT INTO chapters(id,project_id,slug,name,is_inbox,created_at,updated_at) VALUES(?,?,?,?,1,?,?)",
                 (chapter_id, project_id, "inbox", "Inbox", timestamp, timestamp),
             )
             for key in normalized_keys:
@@ -425,8 +446,16 @@ class Store:
                     (key, project_id, "explicit", timestamp),
                 )
             self._save_revision_locked(
-                db, project_id, "overview", project_id, 1,
-                {"body": str(overview or "")}, "human", None, [], False,
+                db,
+                project_id,
+                "overview",
+                project_id,
+                1,
+                {"body": str(overview or "")},
+                "human",
+                None,
+                [],
+                False,
             )
         return self.get_project(project_id, include_nodes=False)
 
@@ -455,7 +484,8 @@ class Store:
             ).fetchall()
             result = dict(project)
             result["workspace_keys"] = [
-                dict(row) for row in self._db.execute(
+                dict(row)
+                for row in self._db.execute(
                     "SELECT workspace_key,kind,confirmed FROM workspace_keys WHERE project_id=? ORDER BY workspace_key",
                     (pid,),
                 ).fetchall()
@@ -486,9 +516,7 @@ class Store:
             if project_id:
                 resolved.add(self._project_row(self._db, project_id)["id"])
             for key in keys:
-                row = self._db.execute(
-                    "SELECT project_id FROM workspace_keys WHERE workspace_key=?", (key,)
-                ).fetchone()
+                row = self._db.execute("SELECT project_id FROM workspace_keys WHERE workspace_key=?", (key,)).fetchone()
                 if row:
                     resolved.add(row["project_id"])
         if len(resolved) > 1:
@@ -510,8 +538,7 @@ class Store:
             ).fetchall()
             detail["recent_nodes"] = [self._expand_node_locked(self._db, row) for row in rows]
             detail["unresolved_corrections"] = [
-                item for item in detail["comments"]
-                if item["kind"] == "correction" and not item["resolved_at"]
+                item for item in detail["comments"] if item["kind"] == "correction" and not item["resolved_at"]
             ]
             cursor = self._db.execute(
                 "SELECT COUNT(*) event_count, MAX(captured_at) last_event_at FROM events WHERE project_id=?",
@@ -540,7 +567,8 @@ class Store:
             (project_id,),
         ).fetchone()
         artifacts = self._db.execute(
-            "SELECT COUNT(*) n FROM attachments WHERE project_id=? AND target_type='node'", (project_id,),
+            "SELECT COUNT(*) n FROM attachments WHERE project_id=? AND target_type='node'",
+            (project_id,),
         ).fetchone()["n"]
         nodes = int(totals["nodes"] or 0)
         return {
@@ -583,8 +611,16 @@ class Store:
                 (chapter_id, pid, slug, name, str(summary or ""), timestamp, timestamp),
             )
             self._save_revision_locked(
-                db, pid, "chapter", chapter_id, 1,
-                {"name": name, "summary": str(summary or "")}, "human", None, [], False,
+                db,
+                pid,
+                "chapter",
+                chapter_id,
+                1,
+                {"name": name, "summary": str(summary or "")},
+                "human",
+                None,
+                [],
+                False,
             )
             return dict(db.execute("SELECT * FROM chapters WHERE id=?", (chapter_id,)).fetchone())
 
@@ -592,9 +628,7 @@ class Store:
         self, db: sqlite3.Connection, project_id: str, chapter_id: str | None, chapter_name: str | None
     ) -> sqlite3.Row:
         if chapter_id:
-            row = db.execute(
-                "SELECT * FROM chapters WHERE id=? AND project_id=?", (chapter_id, project_id)
-            ).fetchone()
+            row = db.execute("SELECT * FROM chapters WHERE id=? AND project_id=?", (chapter_id, project_id)).fetchone()
             if not row:
                 raise NotFound(f"chapter not found: {chapter_id}")
             return row
@@ -605,12 +639,8 @@ class Store:
             ).fetchone()
             if row:
                 return row
-            raise ValidationError(
-                "chapter_name must match an existing human-created Chapter; omit it to use Inbox"
-            )
-        return db.execute(
-            "SELECT * FROM chapters WHERE project_id=? AND is_inbox=1", (project_id,)
-        ).fetchone()
+            raise ValidationError("chapter_name must match an existing human-created Chapter; omit it to use Inbox")
+        return db.execute("SELECT * FROM chapters WHERE project_id=? AND is_inbox=1", (project_id,)).fetchone()
 
     def record_node(
         self,
@@ -650,18 +680,24 @@ class Store:
             ).fetchone()
             node_id = existing["id"] if existing else _id("node")
             if run_ids:
-                requested=set(run_ids)
-                if len(requested)>500 or any(not isinstance(item,str) for item in requested):
+                requested = set(run_ids)
+                if len(requested) > 500 or any(not isinstance(item, str) for item in requested):
                     raise ValidationError('Use at most 500 run IDs')
-                runs=self.research_runs(pid,run_ids=requested,limit=500)
-                if {run['id'] for run in runs}!=requested:
+                runs = self.research_runs(pid, run_ids=requested, limit=500)
+                if {run['id'] for run in runs} != requested:
                     raise ValidationError('Run IDs must already belong to this project')
-                previous_sources=self._source_events(pid,_loads(existing['source_event_ids_json'],[])) if existing else []
-                known={item['payload']['research_run']['id']:item['id'] for item in previous_sources
-                       if isinstance(item['payload'].get('research_run'),dict) and item['payload']['research_run'].get('id')}
+                previous_sources = (
+                    self._source_events(pid, _loads(existing['source_event_ids_json'], [])) if existing else []
+                )
+                known = {
+                    item['payload']['research_run']['id']: item['id']
+                    for item in previous_sources
+                    if isinstance(item['payload'].get('research_run'), dict)
+                    and item['payload']['research_run'].get('id')
+                }
                 # A status change must not manufacture a new semantic revision
                 # when the Recorder retries the same research group.
-                source_ids=sorted(set(source_ids)|{known.get(run['id'],run['source_event_id']) for run in runs})
+                source_ids = sorted(set(source_ids) | {known.get(run['id'], run['source_event_id']) for run in runs})
             if existing and not chapter_id and not chapter_name:
                 chapter = db.execute("SELECT * FROM chapters WHERE id=?", (existing["chapter_id"],)).fetchone()
             else:
@@ -684,8 +720,15 @@ class Store:
                     "source_event_ids": source_ids,
                 }
                 compare_keys = {
-                    "chapter_id", "parent_id", "title", "body", "labels", "review_state",
-                    "occurred_at", "created_by", "source_event_ids",
+                    "chapter_id",
+                    "parent_id",
+                    "title",
+                    "body",
+                    "labels",
+                    "review_state",
+                    "occurred_at",
+                    "created_by",
+                    "source_event_ids",
                 }
                 current_codes = [_code_signature(item) for item in self._code_evidence_locked(db, node_id)]
                 desired_codes = [_code_signature(item) for item in code_evidence]
@@ -701,16 +744,24 @@ class Store:
                         (node_id,),
                     ).fetchone()
                     if latest and latest["actor_type"] != "recorder":
-                        raise Conflict(
-                            "node has a newer human revision; recorder cannot overwrite it"
-                        )
+                        raise Conflict("node has a newer human revision; recorder cannot overwrite it")
                 version = int(existing["version"]) + 1
                 db.execute(
                     "UPDATE nodes SET chapter_id=?,parent_id=?,title=?,body=?,labels_json=?,review_state=?,"
                     "occurred_at=?,created_by=?,source_event_ids_json=?,version=?,updated_at=? WHERE id=?",
                     (
-                        chapter["id"], parent_id, title.strip(), str(body or ""), _json(clean_labels),
-                        review_state, occurred_at, created_by, _json(source_ids), version, timestamp, node_id,
+                        chapter["id"],
+                        parent_id,
+                        title.strip(),
+                        str(body or ""),
+                        _json(clean_labels),
+                        review_state,
+                        occurred_at,
+                        created_by,
+                        _json(source_ids),
+                        version,
+                        timestamp,
+                        node_id,
                     ),
                 )
                 db.execute("DELETE FROM code_evidence WHERE node_id=?", (node_id,))
@@ -721,9 +772,20 @@ class Store:
                     "occurred_at,created_by,idempotency_key,source_event_ids_json,created_at,updated_at) "
                     "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
-                        node_id, pid, chapter["id"], parent_id, title.strip(), str(body or ""),
-                        _json(clean_labels), review_state, occurred_at, created_by, idempotency_key,
-                        _json(source_ids), timestamp, timestamp,
+                        node_id,
+                        pid,
+                        chapter["id"],
+                        parent_id,
+                        title.strip(),
+                        str(body or ""),
+                        _json(clean_labels),
+                        review_state,
+                        occurred_at,
+                        created_by,
+                        idempotency_key,
+                        _json(source_ids),
+                        timestamp,
+                        timestamp,
                     ),
                 )
             self._insert_code_evidence_locked(db, node_id, code_evidence, timestamp)
@@ -731,7 +793,16 @@ class Store:
             snapshot = self._node_snapshot(row)
             snapshot["code_evidence"] = self._code_evidence_locked(db, node_id)
             self._save_revision_locked(
-                db, pid, "node", node_id, version, snapshot, created_by, None, source_ids, False,
+                db,
+                pid,
+                "node",
+                node_id,
+                version,
+                snapshot,
+                created_by,
+                None,
+                source_ids,
+                False,
             )
             return self._with_structure_gaps_locked(db, pid, row)
 
@@ -751,11 +822,12 @@ class Store:
         """
         node = self._expand_node_locked(db, row)
         if node.get("created_by") == "human":
-            return node   # 人写的根节点是个决定，不是遗漏
+            return node  # 人写的根节点是个决定，不是遗漏
         gaps: list[str] = []
         if not node.get("parent_id"):
             siblings = db.execute(
-                "SELECT COUNT(*) n FROM nodes WHERE project_id=? AND id<>?", (project_id, node["id"]),
+                "SELECT COUNT(*) n FROM nodes WHERE project_id=? AND id<>?",
+                (project_id, node["id"]),
             ).fetchone()["n"]
             if siblings:
                 gaps.append(
@@ -770,11 +842,13 @@ class Store:
                 "so its 原始历史 button reports an explicit evidence gap, without substituting recent events."
             )
         artifacts = db.execute(
-            "SELECT COUNT(*) n FROM attachments WHERE target_type='node' AND target_id=?", (node["id"],),
+            "SELECT COUNT(*) n FROM attachments WHERE target_type='node' AND target_id=?",
+            (node["id"],),
         ).fetchone()["n"]
         if not artifacts:
             total = db.execute(
-                "SELECT COUNT(*) n FROM attachments WHERE project_id=? AND target_type='node'", (project_id,),
+                "SELECT COUNT(*) n FROM attachments WHERE project_id=? AND target_type='node'",
+                (project_id,),
             ).fetchone()["n"]
             if not total:
                 gaps.append(
@@ -817,9 +891,7 @@ class Store:
                     (node_id,),
                 ).fetchone()
                 if latest and latest["actor_type"] == "human":
-                    raise Conflict(
-                        "node has a newer human revision; a machine credential cannot overwrite it"
-                    )
+                    raise Conflict("node has a newer human revision; a machine credential cannot overwrite it")
             values = dict(current)
             for key, value in patch.items():
                 if key == "labels":
@@ -836,26 +908,39 @@ class Store:
             if not chapter:
                 raise ValidationError("chapter must belong to the same project")
             if values.get("parent_id"):
-                self._assert_parent_locked(
-                    db, node_id, current["project_id"], chapter["id"], values["parent_id"]
-                )
+                self._assert_parent_locked(db, node_id, current["project_id"], chapter["id"], values["parent_id"])
             version = int(current["version"]) + 1
             timestamp = now_utc()
             db.execute(
                 "UPDATE nodes SET chapter_id=?,parent_id=?,title=?,body=?,labels_json=?,review_state=?,"
                 "occurred_at=?,version=?,updated_at=? WHERE id=?",
                 (
-                    values["chapter_id"], values.get("parent_id"), str(values["title"]).strip(),
-                    str(values["body"] or ""), values["labels_json"], values["review_state"],
-                    values["occurred_at"], version, timestamp, node_id,
+                    values["chapter_id"],
+                    values.get("parent_id"),
+                    str(values["title"]).strip(),
+                    str(values["body"] or ""),
+                    values["labels_json"],
+                    values["review_state"],
+                    values["occurred_at"],
+                    version,
+                    timestamp,
+                    node_id,
                 ),
             )
             row = db.execute("SELECT * FROM nodes WHERE id=?", (node_id,)).fetchone()
             snapshot = self._node_snapshot(row)
             snapshot["code_evidence"] = self._code_evidence_locked(db, node_id)
             self._save_revision_locked(
-                db, current["project_id"], "node", node_id, version, snapshot,
-                actor_type, actor_id, [], False,
+                db,
+                current["project_id"],
+                "node",
+                node_id,
+                version,
+                snapshot,
+                actor_type,
+                actor_id,
+                [],
+                False,
             )
             return self._expand_node_locked(db, row)
 
@@ -867,9 +952,7 @@ class Store:
         chapter_id: str,
         parent_id: str,
     ) -> None:
-        parent = db.execute(
-            "SELECT project_id,chapter_id FROM nodes WHERE id=?", (parent_id,)
-        ).fetchone()
+        parent = db.execute("SELECT project_id,chapter_id FROM nodes WHERE id=?", (parent_id,)).fetchone()
         if not parent or parent["project_id"] != project_id or parent["chapter_id"] != chapter_id:
             raise ValidationError("parent must belong to the same project and chapter")
         if parent_id == node_id:
@@ -894,57 +977,82 @@ class Store:
         value = self._node_snapshot(row)
         value["code_evidence"] = self._code_evidence_locked(db, row["id"])
         value["attachments"] = [
-            self._expand_attachment(item) for item in db.execute(
+            self._expand_attachment(item)
+            for item in db.execute(
                 "SELECT * FROM attachments WHERE target_type='node' AND target_id=? ORDER BY created_at,id",
                 (row["id"],),
             ).fetchall()
         ]
         value["comments"] = self._comments_locked(db, row["project_id"], "node", row["id"])
         sources = self._source_events(row['project_id'], value['source_event_ids'])
-        run_ids = {item['payload']['research_run']['id'] for item in sources
-                   if isinstance(item['payload'].get('research_run'), dict) and item['payload']['research_run'].get('id')}
-        value['runs'] = self.research_runs(row['project_id'], run_ids=run_ids,limit=len(run_ids)) if run_ids else []
-        value['code_snapshots'] = [item['payload']['code_snapshot'] for item in sources
-                                   if isinstance(item['payload'].get('code_snapshot'), dict)]
+        run_ids = {
+            item['payload']['research_run']['id']
+            for item in sources
+            if isinstance(item['payload'].get('research_run'), dict) and item['payload']['research_run'].get('id')
+        }
+        value['runs'] = self.research_runs(row['project_id'], run_ids=run_ids, limit=len(run_ids)) if run_ids else []
+        value['code_snapshots'] = [
+            item['payload']['code_snapshot']
+            for item in sources
+            if isinstance(item['payload'].get('code_snapshot'), dict)
+        ]
         return value
 
     def _source_events(self, project_id, source_ids):
-        items=[]
-        source_ids=list(dict.fromkeys(source_ids))
+        items = []
+        source_ids = list(dict.fromkeys(source_ids))
         with self._lock:
-            for offset in range(0,len(source_ids),400):
-                group=source_ids[offset:offset+400]
-                rows=self._db.execute('SELECT event_id id,event_type,captured_at,payload_json,session_id,agent_id FROM events WHERE project_id=? AND event_id IN ('+','.join('?' for _ in group)+')', [project_id,*group]).fetchall()
+            for offset in range(0, len(source_ids), 400):
+                group = source_ids[offset : offset + 400]
+                rows = self._db.execute(
+                    'SELECT event_id id,event_type,captured_at,payload_json,session_id,agent_id FROM events WHERE project_id=? AND event_id IN ('
+                    + ','.join('?' for _ in group)
+                    + ')',
+                    [project_id, *group],
+                ).fetchall()
                 for row in rows:
-                    item=dict(row); item['payload']=_loads(item.pop('payload_json'),{})
-                    item.update(kind='event',at=item['captured_at']); items.append(item)
-        return sorted(items,key=lambda item:(item['at'],item['id']))
+                    item = dict(row)
+                    item['payload'] = _loads(item.pop('payload_json'), {})
+                    item.update(kind='event', at=item['captured_at'])
+                    items.append(item)
+        return sorted(items, key=lambda item: (item['at'], item['id']))
 
     def node_sources(self, node_id):
         with self._lock:
-            row=self._db.execute('SELECT project_id,source_event_ids_json FROM nodes WHERE id=?',(node_id,)).fetchone()
-            if not row: raise NotFound('node not found')
-            ids=_loads(row['source_event_ids_json'],[])
-            items=self._source_events(row['project_id'],ids)
-            found={item['id'] for item in items}
-            return {'items':items,'missing_event_ids':[item for item in ids if item not in found]}
+            row = self._db.execute(
+                'SELECT project_id,source_event_ids_json FROM nodes WHERE id=?', (node_id,)
+            ).fetchone()
+            if not row:
+                raise NotFound('node not found')
+            ids = _loads(row['source_event_ids_json'], [])
+            items = self._source_events(row['project_id'], ids)
+            found = {item['id'] for item in items}
+            return {'items': items, 'missing_event_ids': [item for item in ids if item not in found]}
 
     def research_runs(self, project_id, *, run_ids=None, limit=50):
         with self._lock:
-            pid=self._project_row(self._db,project_id)['id']
-            clauses=["project_id=?", "json_type(payload_json,'$.research_run')='object'"]
-            args=[pid]
+            pid = self._project_row(self._db, project_id)['id']
+            clauses = ["project_id=?", "json_type(payload_json,'$.research_run')='object'"]
+            args = [pid]
             if run_ids is not None:
-                if not run_ids: return []
-                clauses.append("json_extract(payload_json,'$.research_run.id') IN ("+','.join('?' for _ in run_ids)+')')
+                if not run_ids:
+                    return []
+                clauses.append(
+                    "json_extract(payload_json,'$.research_run.id') IN (" + ','.join('?' for _ in run_ids) + ')'
+                )
                 args.extend(sorted(run_ids))
-            rows=self._db.execute('SELECT * FROM (SELECT event_id,payload_json,captured_at, ROW_NUMBER() OVER (PARTITION BY json_extract(payload_json,\'$.research_run.id\') ORDER BY CAST(json_extract(payload_json,\'$.research_run.revision\') AS INTEGER) DESC,captured_at DESC,event_id DESC) latest FROM events WHERE '+' AND '.join(clauses)+') WHERE latest=1 ORDER BY captured_at DESC LIMIT ?', [*args,max(1,min(int(limit),500))]).fetchall()
-            result=[]
+            rows = self._db.execute(
+                'SELECT * FROM (SELECT event_id,payload_json,captured_at, ROW_NUMBER() OVER (PARTITION BY json_extract(payload_json,\'$.research_run.id\') ORDER BY CAST(json_extract(payload_json,\'$.research_run.revision\') AS INTEGER) DESC,captured_at DESC,event_id DESC) latest FROM events WHERE '
+                + ' AND '.join(clauses)
+                + ') WHERE latest=1 ORDER BY captured_at DESC LIMIT ?',
+                [*args, max(1, min(int(limit), 500))],
+            ).fetchall()
+            result = []
             for row in rows:
-                run=_loads(row['payload_json'],{}).get('research_run') or {}
-                run['source_event_id']=row['event_id']
-                snapshot=run.get('snapshot') or {}
-                run['code_file_count']=len(snapshot.pop('files',{}))
+                run = _loads(row['payload_json'], {}).get('research_run') or {}
+                run['source_event_id'] = row['event_id']
+                snapshot = run.get('snapshot') or {}
+                run['code_file_count'] = len(snapshot.pop('files', {}))
                 result.append(run)
             return result
 
@@ -964,11 +1072,21 @@ class Store:
                 "snippet,diff,annotation,content_sha256,attribution,contributor_agent_ids_json,created_at) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
-                    _id("code"), node_id, normalized["repo_url"], normalized["commit_hash"], path,
-                    normalized["symbol"], normalized["start_line"], normalized["end_line"],
-                    normalized["snippet"], normalized["diff"], normalized["annotation"],
-                    normalized["content_sha256"], attribution,
-                    _json(normalized["contributor_agent_ids"]), timestamp,
+                    _id("code"),
+                    node_id,
+                    normalized["repo_url"],
+                    normalized["commit_hash"],
+                    path,
+                    normalized["symbol"],
+                    normalized["start_line"],
+                    normalized["end_line"],
+                    normalized["snippet"],
+                    normalized["diff"],
+                    normalized["annotation"],
+                    normalized["content_sha256"],
+                    attribution,
+                    _json(normalized["contributor_agent_ids"]),
+                    timestamp,
                 ),
             )
 
@@ -998,8 +1116,17 @@ class Store:
             "INSERT INTO semantic_revisions(id,project_id,target_type,target_id,version,snapshot_json,actor_type,"
             "actor_id,source_event_ids_json,milestone,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (
-                _id("rev"), project_id, target_type, target_id, int(version), _json(snapshot), actor_type,
-                actor_id, _json(list(source_event_ids)), 1 if milestone else 0, now_utc(),
+                _id("rev"),
+                project_id,
+                target_type,
+                target_id,
+                int(version),
+                _json(snapshot),
+                actor_type,
+                actor_id,
+                _json(list(source_event_ids)),
+                1 if milestone else 0,
+                now_utc(),
             ),
         )
 
@@ -1077,8 +1204,16 @@ class Store:
                         (timestamp, actor_id or actor_type, *sorted(acknowledged), pid),
                     )
             self._save_revision_locked(
-                db, pid, target_type, actual_target, version, snapshot, actor_type, actor_id,
-                source_event_ids, milestone,
+                db,
+                pid,
+                target_type,
+                actual_target,
+                version,
+                snapshot,
+                actor_type,
+                actor_id,
+                source_event_ids,
+                milestone,
             )
             return {
                 "project_id": pid,
@@ -1125,7 +1260,9 @@ class Store:
             pid = self._project_row(db, project_id)["id"]
             actual_target = pid if target_type == "overview" else str(target_id or "")
             if target_type == "chapter":
-                exists = db.execute("SELECT 1 FROM chapters WHERE id=? AND project_id=?", (actual_target, pid)).fetchone()
+                exists = db.execute(
+                    "SELECT 1 FROM chapters WHERE id=? AND project_id=?", (actual_target, pid)
+                ).fetchone()
             elif target_type == "node":
                 exists = db.execute("SELECT 1 FROM nodes WHERE id=? AND project_id=?", (actual_target, pid)).fetchone()
             else:
@@ -1137,8 +1274,16 @@ class Store:
                 "INSERT INTO comments(id,project_id,target_type,target_id,anchor_json,kind,body,author_type,"
                 "author_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
-                    comment_id, pid, target_type, actual_target, _json(anchor or {}), kind,
-                    body.strip(), author_type, author_id, timestamp,
+                    comment_id,
+                    pid,
+                    target_type,
+                    actual_target,
+                    _json(anchor or {}),
+                    kind,
+                    body.strip(),
+                    author_type,
+                    author_id,
+                    timestamp,
                 ),
             )
             if target_type == "node" and kind in {"correction", "confirmation"}:
@@ -1153,8 +1298,16 @@ class Store:
                 snapshot = self._node_snapshot(updated)
                 snapshot["code_evidence"] = self._code_evidence_locked(db, actual_target)
                 self._save_revision_locked(
-                    db, pid, "node", actual_target, version, snapshot,
-                    author_type, author_id, [], False,
+                    db,
+                    pid,
+                    "node",
+                    actual_target,
+                    version,
+                    snapshot,
+                    author_type,
+                    author_id,
+                    [],
+                    False,
                 )
             return self._comment_row(db.execute("SELECT * FROM comments WHERE id=?", (comment_id,)).fetchone())
 
@@ -1226,9 +1379,17 @@ class Store:
                     "ended_at=COALESCE(excluded.ended_at,sessions.ended_at),metadata_json=excluded.metadata_json,"
                     "updated_at=excluded.updated_at",
                     (
-                        session_id, pid, session.get("source") or "unknown", session.get("host"),
-                        session.get("cwd"), session.get("parent_session_id"), session.get("started_at"),
-                        session.get("ended_at"), _json(session.get("metadata") or {}), timestamp, timestamp,
+                        session_id,
+                        pid,
+                        session.get("source") or "unknown",
+                        session.get("host"),
+                        session.get("cwd"),
+                        session.get("parent_session_id"),
+                        session.get("started_at"),
+                        session.get("ended_at"),
+                        _json(session.get("metadata") or {}),
+                        timestamp,
+                        timestamp,
                     ),
                 )
             for agent in agents:
@@ -1245,8 +1406,13 @@ class Store:
                     "INSERT OR IGNORE INTO agents(id,session_id,parent_agent_id,agent_type,name,metadata_json,created_at) "
                     "VALUES(?,?,?,?,?,?,?)",
                     (
-                        agent_id, agent_session, agent.get("parent_agent_id"), agent.get("agent_type"),
-                        agent.get("name"), _json(agent.get("metadata") or {}), timestamp,
+                        agent_id,
+                        agent_session,
+                        agent.get("parent_agent_id"),
+                        agent.get("agent_type"),
+                        agent.get("name"),
+                        _json(agent.get("metadata") or {}),
+                        timestamp,
                     ),
                 )
             inserted_events = 0
@@ -1261,9 +1427,15 @@ class Store:
                     "INSERT OR IGNORE INTO events(event_id,batch_id,project_id,session_id,agent_id,event_type,"
                     "captured_at,payload_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                     (
-                        event_id, batch_id, pid, event.get("session_id") or session_id,
-                        event.get("agent_id"), event.get("event_type") or event.get("hook_event") or "unknown",
-                        event.get("captured_at") or timestamp, _json(payload), timestamp,
+                        event_id,
+                        batch_id,
+                        pid,
+                        event.get("session_id") or session_id,
+                        event.get("agent_id"),
+                        event.get("event_type") or event.get("hook_event") or "unknown",
+                        event.get("captured_at") or timestamp,
+                        _json(payload),
+                        timestamp,
                     ),
                 )
                 if cursor.rowcount > 0:
@@ -1272,9 +1444,7 @@ class Store:
                 # 同一个 event_id 再来一次是 at-least-once 的正常重放，静默去重即可；
                 # 但内容变了说明发送端在复用 id，那是数据丢失而不是去重——必须报出来。
                 duplicate_events += 1
-                stored = db.execute(
-                    "SELECT payload_json FROM events WHERE event_id=?", (event_id,)
-                ).fetchone()
+                stored = db.execute("SELECT payload_json FROM events WHERE event_id=?", (event_id,)).fetchone()
                 if stored and stored["payload_json"] != _json(payload):
                     conflicting_event_ids.append(event_id)
             inserted_chunks = 0
@@ -1292,18 +1462,25 @@ class Store:
                     "source_path,start_offset,end_offset,sha256,compressed_content,search_text,created_at) "
                     "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
-                        chunk_id, batch_id, pid, chunk.get("session_id") or session_id, chunk.get("agent_id"),
-                        chunk.get("source_path"), chunk.get("start_offset"), chunk.get("end_offset"), digest,
-                        sqlite3.Binary(zlib.compress(raw, level=9)), content, timestamp,
+                        chunk_id,
+                        batch_id,
+                        pid,
+                        chunk.get("session_id") or session_id,
+                        chunk.get("agent_id"),
+                        chunk.get("source_path"),
+                        chunk.get("start_offset"),
+                        chunk.get("end_offset"),
+                        digest,
+                        sqlite3.Binary(zlib.compress(raw, level=9)),
+                        content,
+                        timestamp,
                     ),
                 )
                 if cursor.rowcount > 0:
                     inserted_chunks += 1
                 else:
                     duplicate_chunks += 1
-                    stored = db.execute(
-                        "SELECT sha256 FROM transcript_chunks WHERE chunk_id=?", (chunk_id,)
-                    ).fetchone()
+                    stored = db.execute("SELECT sha256 FROM transcript_chunks WHERE chunk_id=?", (chunk_id,)).fetchone()
                     if stored and stored["sha256"] != digest:
                         conflicting_chunk_ids.append(chunk_id)
             if pid and session_id:
@@ -1324,8 +1501,14 @@ class Store:
                 "INSERT INTO ingest_batches"
                 "(batch_id,project_id,event_count,transcript_chunk_count,created_at,delivered_by) "
                 "VALUES(?,?,?,?,?,?)",
-                (batch_id, pid, inserted_events, inserted_chunks, timestamp,
-                 str(delivered_by)[:200] if delivered_by else None),
+                (
+                    batch_id,
+                    pid,
+                    inserted_events,
+                    inserted_chunks,
+                    timestamp,
+                    str(delivered_by)[:200] if delivered_by else None,
+                ),
             )
             return {
                 "batch_id": batch_id,
@@ -1396,7 +1579,9 @@ class Store:
             pid = self._project_row(db, project_id)["id"]
             actual_target = pid if target_type == "overview" else target_id
             if target_type == "chapter":
-                exists = db.execute("SELECT 1 FROM chapters WHERE id=? AND project_id=?", (actual_target, pid)).fetchone()
+                exists = db.execute(
+                    "SELECT 1 FROM chapters WHERE id=? AND project_id=?", (actual_target, pid)
+                ).fetchone()
             elif target_type == "node":
                 exists = db.execute("SELECT 1 FROM nodes WHERE id=? AND project_id=?", (actual_target, pid)).fetchone()
             else:
@@ -1405,8 +1590,10 @@ class Store:
                 raise NotFound(f"attachment target not found: {actual_target}")
             capture_key = (metadata or {}).get('capture_key')
             if capture_key:
-                previous = db.execute("SELECT * FROM attachments WHERE project_id=? AND target_type=? AND target_id=? AND json_extract(metadata_json,'$.capture_key')=?",
-                                      (pid,target_type,actual_target,str(capture_key))).fetchone()
+                previous = db.execute(
+                    "SELECT * FROM attachments WHERE project_id=? AND target_type=? AND target_id=? AND json_extract(metadata_json,'$.capture_key')=?",
+                    (pid, target_type, actual_target, str(capture_key)),
+                ).fetchone()
                 if previous:
                     if previous['sha256'] != sha256 or previous['uri'] != uri:
                         raise Conflict('Capture key already refers to different evidence')
@@ -1416,8 +1603,21 @@ class Store:
                 "INSERT INTO attachments(id,project_id,target_type,target_id,direction,name,mime_type,size,sha256,"
                 "object_path,uri,machine,external_path,metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
-                    attachment_id, pid, target_type, actual_target, direction, name.strip(), mime_type, size,
-                    sha256, object_path, uri, machine, external_path, _json(metadata or {}), timestamp,
+                    attachment_id,
+                    pid,
+                    target_type,
+                    actual_target,
+                    direction,
+                    name.strip(),
+                    mime_type,
+                    size,
+                    sha256,
+                    object_path,
+                    uri,
+                    machine,
+                    external_path,
+                    _json(metadata or {}),
+                    timestamp,
                 ),
             )
             return self._expand_attachment(
@@ -1496,17 +1696,26 @@ class Store:
         keyed = 0
         for row in rows:
             item = dict(row)
-            node_index.setdefault(item["node_id"], {
-                "id": item["node_id"], "title": item["title"],
-                "chapter_id": item["chapter_id"], "occurred_at": item["occurred_at"],
-            })
+            node_index.setdefault(
+                item["node_id"],
+                {
+                    "id": item["node_id"],
+                    "title": item["title"],
+                    "chapter_id": item["chapter_id"],
+                    "occurred_at": item["occurred_at"],
+                },
+            )
             keys = artifact_keys(item)
             if not keys:
-                unkeyed.append({
-                    "attachment_id": item["id"], "node_id": item["node_id"],
-                    "name": item["name"], "direction": item["direction"],
-                    "reason": "no sha256, no absolute uri, no machine+external_path",
-                })
+                unkeyed.append(
+                    {
+                        "attachment_id": item["id"],
+                        "node_id": item["node_id"],
+                        "name": item["name"],
+                        "direction": item["direction"],
+                        "reason": "no sha256, no absolute uri, no machine+external_path",
+                    }
+                )
                 continue
             keyed += 1
             side = producers if item["direction"] == "output" else consumers
@@ -1536,23 +1745,28 @@ class Store:
                     if len(edges) >= build_cap:
                         overflowed = True
                         break
-                    edges.append({
-                        "from_node_id": from_id,
-                        "to_node_id": to_id,
-                        "key": key,
-                        "key_kind": kind,
-                        "name": out_items[0]["name"],
-                        "output_attachment_ids": [x["id"] for x in out_items],
-                        "input_attachment_ids": [x["id"] for x in in_items],
-                    })
+                    edges.append(
+                        {
+                            "from_node_id": from_id,
+                            "to_node_id": to_id,
+                            "key": key,
+                            "key_kind": kind,
+                            "name": out_items[0]["name"],
+                            "output_attachment_ids": [x["id"] for x in out_items],
+                            "input_attachment_ids": [x["id"] for x in in_items],
+                        }
+                    )
 
         def edge_order(edge: dict[str, Any]) -> tuple[str, ...]:
             source = node_index[edge["from_node_id"]]
             target = node_index[edge["to_node_id"]]
             return (
-                str(source["occurred_at"] or ""), edge["from_node_id"],
-                str(target["occurred_at"] or ""), edge["to_node_id"],
-                edge["key_kind"], edge["key"],
+                str(source["occurred_at"] or ""),
+                edge["from_node_id"],
+                str(target["occurred_at"] or ""),
+                edge["to_node_id"],
+                edge["key_kind"],
+                edge["key"],
             )
 
         edges.sort(key=edge_order)
@@ -1598,7 +1812,9 @@ class Store:
         if scope not in {"all", "semantic", "raw"}:
             raise ValidationError("scope must be all, semantic, or raw")
         limit = max(1, min(int(limit), 200))
-        pattern = f"%{_like_escape(query.lower())}%"
+        # SQLite 的 lower() 只折叠 ASCII；Python 的 str.lower() 会把 "10Å" 变成 "10å"，
+        # 于是含非 ASCII 大写字母的查询永远匹配不上 lower(title)。两边按同一规则折叠。
+        pattern = f"%{_like_escape(_ascii_lower(query))}%"
         semantic: list[dict[str, Any]] = []
         raw: list[dict[str, Any]] = []
         totals: dict[str, int] = {}
@@ -1712,11 +1928,13 @@ class Store:
             if Store._is_plumbing(body):
                 continue
             who = "助手" if value.get("type") == "assistant" else ("工具" if is_tool_result else "你")
-            turns.append({
-                "who": who,
-                "sidechain": bool(value.get("isSidechain")),
-                "text": " ".join(body.split())[:200],
-            })
+            turns.append(
+                {
+                    "who": who,
+                    "sidechain": bool(value.get("isSidechain")),
+                    "text": " ".join(body.split())[:200],
+                }
+            )
         return turns
 
     def raw_timeline(self, project_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
@@ -1766,9 +1984,7 @@ class Store:
 
     def auth_user_by_github_id(self, github_id: int) -> dict[str, Any] | None:
         with self._lock:
-            row = self._db.execute(
-                "SELECT * FROM auth_users WHERE github_id=?", (int(github_id),)
-            ).fetchone()
+            row = self._db.execute("SELECT * FROM auth_users WHERE github_id=?", (int(github_id),)).fetchone()
         return self._auth_user_value(row)
 
     def upsert_github_user(
@@ -1790,9 +2006,7 @@ class Store:
             raise ValidationError("invalid auth role")
         timestamp = now_utc()
         with self.transaction() as db:
-            existing = db.execute(
-                "SELECT * FROM auth_users WHERE github_id=?", (github_id,)
-            ).fetchone()
+            existing = db.execute("SELECT * FROM auth_users WHERE github_id=?", (github_id,)).fetchone()
             if existing:
                 role = "admin" if force_admin else existing["role"]
                 db.execute(
@@ -1843,8 +2057,7 @@ class Store:
                 raise ValidationError("auth user is disabled")
             db.execute("DELETE FROM web_sessions WHERE expires_at<=?", (timestamp,))
             db.execute(
-                "INSERT INTO web_sessions(session_hash,user_id,expires_at,created_at,last_seen_at) "
-                "VALUES(?,?,?,?,?)",
+                "INSERT INTO web_sessions(session_hash,user_id,expires_at,created_at,last_seen_at) VALUES(?,?,?,?,?)",
                 (session_hash, user_id, expires_at, timestamp, timestamp),
             )
 
@@ -1876,17 +2089,13 @@ class Store:
         with self.transaction() as db:
             db.execute("DELETE FROM web_sessions WHERE session_hash=?", (session_hash,))
 
-    def start_device_authorization(
-        self, device_name: str, *, lifetime_seconds: int = 600
-    ) -> dict[str, Any]:
+    def start_device_authorization(self, device_name: str, *, lifetime_seconds: int = 600) -> dict[str, Any]:
         name = str(device_name or "").strip()[:120]
         if not name or any(ord(character) < 32 or ord(character) == 127 for character in name):
             raise ValidationError("device name is required")
         lifetime = min(max(int(lifetime_seconds), 120), 900)
         timestamp = now_utc()
-        expires = (datetime.now(timezone.utc) + timedelta(seconds=lifetime)).isoformat(
-            timespec="milliseconds"
-        )
+        expires = (datetime.now(timezone.utc) + timedelta(seconds=lifetime)).isoformat(timespec="milliseconds")
         alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
         raw_code = secrets.token_urlsafe(48)
         code_hash = hashlib.sha256(raw_code.encode("utf-8")).hexdigest()
@@ -1945,28 +2154,24 @@ class Store:
             if row["status"] == "approved" and row["user_id"] != user_id:
                 raise Conflict("device authorization was already approved by another user")
             db.execute(
-                "UPDATE device_authorizations SET status='approved',user_id=?,approved_at=? "
-                "WHERE user_code=?",
+                "UPDATE device_authorizations SET status='approved',user_id=?,approved_at=? WHERE user_code=?",
                 (user_id, timestamp, normalized),
             )
             value = db.execute(
                 "SELECT user_code,device_name,status,expires_at,created_at,approved_at "
-                "FROM device_authorizations WHERE user_code=?", (normalized,),
+                "FROM device_authorizations WHERE user_code=?",
+                (normalized,),
             ).fetchone()
         return _row(value) or {}
 
-    def exchange_device_authorization(
-        self, raw_device_code: str, *, credential_days: int = 90
-    ) -> dict[str, Any]:
+    def exchange_device_authorization(self, raw_device_code: str, *, credential_days: int = 90) -> dict[str, Any]:
         code = str(raw_device_code or "")
         if len(code) < 32:
             return {"status": "invalid"}
         code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
         timestamp = now_utc()
         with self.transaction() as db:
-            row = db.execute(
-                "SELECT * FROM device_authorizations WHERE device_code_hash=?", (code_hash,)
-            ).fetchone()
+            row = db.execute("SELECT * FROM device_authorizations WHERE device_code_hash=?", (code_hash,)).fetchone()
             if not row:
                 return {"status": "invalid"}
             if row["expires_at"] <= timestamp:
@@ -1974,9 +2179,7 @@ class Store:
                 return {"status": "expired"}
             if row["status"] != "approved" or not row["user_id"]:
                 return {"status": "pending", "interval": 3}
-            user = db.execute(
-                "SELECT * FROM auth_users WHERE id=? AND disabled=0", (row["user_id"],)
-            ).fetchone()
+            user = db.execute("SELECT * FROM auth_users WHERE id=? AND disabled=0", (row["user_id"],)).fetchone()
             if not user:
                 db.execute("DELETE FROM device_authorizations WHERE device_code_hash=?", (code_hash,))
                 return {"status": "denied"}
@@ -1987,12 +2190,9 @@ class Store:
             # 现算的，于是运维把 TRACE_DEVICE_CREDENTIAL_DAYS 调小再调回去，
             # 已经"过期"的凭证会集体复活。
             days = max(1, min(int(credential_days or 90), 3650))
-            expires_at = (
-                datetime.now(timezone.utc) + timedelta(days=days)
-            ).isoformat(timespec="milliseconds")
+            expires_at = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat(timespec="milliseconds")
             db.execute(
-                "INSERT INTO device_credentials(id,user_id,name,token_hash,created_at,expires_at) "
-                "VALUES(?,?,?,?,?,?)",
+                "INSERT INTO device_credentials(id,user_id,name,token_hash,created_at,expires_at) VALUES(?,?,?,?,?,?)",
                 (device_id, row["user_id"], row["device_name"], token_hash, timestamp, expires_at),
             )
             db.execute("DELETE FROM device_authorizations WHERE device_code_hash=?", (code_hash,))
@@ -2001,7 +2201,9 @@ class Store:
             "status": "authorized",
             "credential": raw_credential,
             "device": {
-                "id": device_id, "name": row["device_name"], "created_at": timestamp,
+                "id": device_id,
+                "name": row["device_name"],
+                "created_at": timestamp,
                 "expires_at": expires_at,
             },
             "expires_at": expires_at,
@@ -2032,24 +2234,36 @@ class Store:
                 )
         if not row:
             return None
-        user = {key: row[key] for key in (
-            "id", "github_id", "login", "display_name", "avatar_url", "role", "disabled",
-            "created_at", "updated_at", "last_login_at",
-        )}
+        user = {
+            key: row[key]
+            for key in (
+                "id",
+                "github_id",
+                "login",
+                "display_name",
+                "avatar_url",
+                "role",
+                "disabled",
+                "created_at",
+                "updated_at",
+                "last_login_at",
+            )
+        }
         user["disabled"] = bool(user["disabled"])
         return {
             "kind": "device",
             "user": user,
             "device": {
-                "id": row["device_id"], "user_id": row["user_id"], "name": row["device_name"],
-                "created_at": row["device_created_at"], "last_used_at": row["last_used_at"],
+                "id": row["device_id"],
+                "user_id": row["user_id"],
+                "name": row["device_name"],
+                "created_at": row["device_created_at"],
+                "last_used_at": row["last_used_at"],
                 "expires_at": row["device_expires_at"],
             },
         }
 
-    def list_device_credentials(
-        self, *, user_id: str | None = None, include_all: bool = False
-    ) -> list[dict[str, Any]]:
+    def list_device_credentials(self, *, user_id: str | None = None, include_all: bool = False) -> list[dict[str, Any]]:
         query = (
             "SELECT d.id,d.user_id,d.name,d.created_at,d.last_used_at,d.revoked_at,"
             "d.expires_at,u.login "
@@ -2075,12 +2289,11 @@ class Store:
             if not row or (row["user_id"] != requester_user_id and not is_admin):
                 raise NotFound("device credential not found")
             if not row["revoked_at"]:
-                db.execute(
-                    "UPDATE device_credentials SET revoked_at=? WHERE id=?", (timestamp, device_id)
-                )
+                db.execute("UPDATE device_credentials SET revoked_at=? WHERE id=?", (timestamp, device_id))
             value = db.execute(
                 "SELECT id,user_id,name,created_at,last_used_at,revoked_at,expires_at "
-                "FROM device_credentials WHERE id=?", (device_id,),
+                "FROM device_credentials WHERE id=?",
+                (device_id,),
             ).fetchone()
         return _row(value) or {}
 
@@ -2093,16 +2306,13 @@ class Store:
         """
         timestamp = now_utc()
         with self.transaction() as db:
-            sessions = db.execute(
-                "DELETE FROM web_sessions WHERE user_id=?", (str(user_id),)
-            ).rowcount
+            sessions = db.execute("DELETE FROM web_sessions WHERE user_id=?", (str(user_id),)).rowcount
             devices = db.execute(
                 "UPDATE device_credentials SET revoked_at=COALESCE(revoked_at,?) "
                 "WHERE user_id=? AND revoked_at IS NULL",
                 (timestamp, str(user_id)),
             ).rowcount
-        return {"user_id": str(user_id), "sessions_removed": max(0, sessions),
-                "devices_revoked": max(0, devices)}
+        return {"user_id": str(user_id), "sessions_removed": max(0, sessions), "devices_revoked": max(0, devices)}
 
     def list_auth_users(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -2127,8 +2337,7 @@ class Store:
             next_role = role if role is not None else current["role"]
             next_disabled = int(bool(disabled)) if disabled is not None else current["disabled"]
             removes_active_admin = (
-                current["role"] == "admin" and not current["disabled"]
-                and (next_role != "admin" or next_disabled)
+                current["role"] == "admin" and not current["disabled"] and (next_role != "admin" or next_disabled)
             )
             if removes_active_admin:
                 active_admins = db.execute(
@@ -2152,9 +2361,7 @@ class Store:
     def purge_generation(self) -> int:
         """每次紧急 purge +1。备份用它判断"这份导出是在第几次清除之后做的"。"""
         with self._lock:
-            row = self._db.execute(
-                "SELECT value FROM schema_meta WHERE key='purge_generation'"
-            ).fetchone()
+            row = self._db.execute("SELECT value FROM schema_meta WHERE key='purge_generation'").fetchone()
         try:
             return int(row["value"]) if row else 0
         except (TypeError, ValueError):
@@ -2217,6 +2424,7 @@ class Store:
             return ",".join("?" for _ in values)
 
         with self.transaction() as db:
+
             def drop(table: str, where: str, args: Sequence[Any]) -> None:
                 cursor = db.execute(f"DELETE FROM {table} WHERE {where}", list(args))
                 if cursor.rowcount > 0:
@@ -2235,12 +2443,14 @@ class Store:
             if projects:
                 placeholders = marks(projects)
                 nodes += [
-                    row["id"] for row in db.execute(
+                    row["id"]
+                    for row in db.execute(
                         f"SELECT id FROM nodes WHERE project_id IN ({placeholders})", projects
                     ).fetchall()
                 ]
                 sessions += [
-                    row["id"] for row in db.execute(
+                    row["id"]
+                    for row in db.execute(
                         f"SELECT id FROM sessions WHERE project_id IN ({placeholders})", projects
                     ).fetchall()
                 ]
@@ -2283,9 +2493,7 @@ class Store:
 
             orphaned = []
             for path in sorted(objects):
-                still_used = db.execute(
-                    "SELECT 1 FROM attachments WHERE object_path=? LIMIT 1", (path,)
-                ).fetchone()
+                still_used = db.execute("SELECT 1 FROM attachments WHERE object_path=? LIMIT 1", (path,)).fetchone()
                 if not still_used:
                     orphaned.append(path)
 
@@ -2306,8 +2514,14 @@ class Store:
                 "INSERT INTO purge_audit(id,actor_id,reason,selector_json,removed_json,objects_removed,"
                 "generation,created_at) VALUES(?,?,?,?,?,?,?,?)",
                 (
-                    purge_id, actor_id, reason, _json(selector), _json(removed),
-                    len(orphaned), generation, timestamp,
+                    purge_id,
+                    actor_id,
+                    reason,
+                    _json(selector),
+                    _json(removed),
+                    len(orphaned),
+                    generation,
+                    timestamp,
                 ),
             )
 
@@ -2337,13 +2551,20 @@ class Store:
         with self._lock:
             counts = {}
             for table in (
-                "projects", "chapters", "nodes", "comments", "events", "transcript_chunks",
-                "attachments", "auth_users", "device_credentials",
+                "projects",
+                "chapters",
+                "nodes",
+                "comments",
+                "events",
+                "transcript_chunks",
+                "attachments",
+                "auth_users",
+                "device_credentials",
             ):
                 counts[table] = self._db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            last_batch = _row(self._db.execute(
-                "SELECT * FROM ingest_batches ORDER BY created_at DESC LIMIT 1"
-            ).fetchone())
+            last_batch = _row(
+                self._db.execute("SELECT * FROM ingest_batches ORDER BY created_at DESC LIMIT 1").fetchone()
+            )
         purges = self.purge_log(limit=1)
         return {
             "ok": True,

@@ -22,7 +22,7 @@ alpha.28 已按用户再次确认的边界拆开生命周期：Stop hook 只落�
 | `src/sdk/parser.ts` | `parseAgentXml` 解析 observation/summary/skip_summary；依赖 ModeManager 和 logger | 未复制宽松 XML parser；改用官方 CLI `--json-schema`，再由 Python 严格验证来源、Chapter、parent、run 和 curation 版本 |
 | `src/sdk/output-classifier.ts` | 区分 XML、空响应、普通文字及额度/认证/上下文错误 | 已适配为 `classify_cli_output`；空输出、格式错误、认证、quota、overage 与成功 skip 分开处理 |
 | `src/services/worker/RateLimitStore.ts` | 接受新旧限流事件形状，按额度窗口维护状态并提供暂停判断 | 已适配新旧字段、reset 时间及 overage 检测到持久 batch/global 状态；正常 allowed 事件不会被误判为耗尽 |
-| `src/services/worker/ClaudeProvider.ts` | 独立 SDK observer，通过消息生成器接收增量，有模型选择、用量统计与上下文轮换 | 已适配为官方 Claude Code CLI 的项目级独立会话、12 批轮换和 cache/input/output token 计数；未引入其多后端凭据层 |
+| `src/services/worker/ClaudeProvider.ts` | 独立 SDK observer，通过消息生成器接收增量，有模型选择、用量统计与上下文轮换 | 已适配为官方 Claude Code CLI 的无状态调用（`--no-session-persistence`）和 cache/input/output token 计数；未引入其多后端凭据层，也未采用会话轮换（每轮都带完整 packet，续接只会重复旧 packet） |
 | `src/sdk/hardened-options.ts` | observer 没有工具、没有 MCP、不加载用户项目设置；文本输出交给程序处理 | 已映射为 `--tools ""`、`--setting-sources ""`、空 strict MCP、`dontAsk` 和独立 cwd；程序负责写入 |
 | `src/services/worker/agents/ResponseProcessor.ts` | 解析后耦合上游数据库、广播、文件更新及通知 | 拆出解析/转换接缝，对接现有 Node/Overview/来源校验与人工修订规则，不能整体直接调用 |
 
