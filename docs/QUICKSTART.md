@@ -214,7 +214,9 @@ trace-login --url https://trace.example.org --logout
 
 ```bash
 # 0) pip 包（trace-login / trace-project / trace-deliver 都来自它；插件不提供这三个命令）
-python -m pip install "research-trace @ git+https://github.com/jinhang23/research-trace"
+#    升级时加 --force-reinstall --no-deps：pip 只比版本号，看到同版本号就报 already satisfied，
+#    新提交一个字节都不装、也不报错（UF 联调时正是这样跑在旧代码上）
+python -m pip install --force-reinstall --no-deps "research-trace @ git+https://github.com/jinhang23/research-trace"
 
 # 1) 确认没有显式 token 在挡路 —— 见下面的「最常见的一个坑」
 unset TRACE_TOKEN

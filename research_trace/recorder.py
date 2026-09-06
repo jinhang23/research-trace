@@ -941,7 +941,15 @@ def validate_plan(output: dict[str, Any], packet: dict[str, Any]) -> list[dict[s
         if parent and parent not in node_chapters:
             raise RecorderError(f"record {index} uses an unknown parent_id", kind="format")
         if parent and node_chapters[parent] != chapter:
-            raise RecorderError(f"record {index} parent is not in the selected Chapter", kind="format")
+            # UF 第 4 批：模型按提示词把 chapter_id 留空（Inbox），parent 却是一条已在 Inbox 里的
+            # Node——它的 chapter_id 是 Inbox 的真实 id。这在语义上完全一致，以前却按 format
+            # 失败整批重试（每次都是一次真实模型调用）。协议说「缺链接允许、别编链接」：
+            # 没选 Chapter 就跟着 parent 走；选了别的 Chapter 就丢掉 parent，Chapter 由模型的
+            # 显式选择说了算。两种都不再让整批失败。
+            if chapter is None:
+                chapter = node_chapters[parent]
+            else:
+                parent = None
         requested_runs = sorted({str(x) for x in item.get("run_ids") or [] if str(x)})
         if not set(requested_runs) <= run_ids:
             raise RecorderError(f"record {index} uses an unknown run_id", kind="format")

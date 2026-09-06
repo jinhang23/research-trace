@@ -1,6 +1,6 @@
 # 待办与交付边界
 
-状态（2.0.0a30）：方案 3 的独立 Recorder 已接入，hook 只保存、独立 watcher 消费；在本机把
+状态（2.0.0a31）：方案 3 的独立 Recorder 已接入，hook 只保存、独立 watcher 消费；在本机把
 真 hook → 投递 → Recorder → 网页整条链路跑通，安全分三档，包与格式已标准化。做过什么、
 修过什么在 [CHANGELOG](../CHANGELOG.md)。这里只放还没做的。
 

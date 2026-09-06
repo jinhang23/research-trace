@@ -815,3 +815,25 @@ def test_watch_logs_one_line_per_batch_and_nothing_when_idle():
     assert "batch=b1 status=complete records=2 curations=0" in lines[0]
     assert "batch=b2 status=quota" in lines[1] and "error='rate limited'" in lines[1] and "retry_at=1234.0" in lines[1]
     assert lines[2].endswith("pending=1")
+
+
+def test_a_parent_in_inbox_makes_the_record_follow_it_instead_of_failing_the_batch():
+    """UF 第 4 批：模型按提示词把 chapter_id 留空，parent 却是 Inbox 里的 Node（带 Inbox 的真实
+    chapter_id），以前按 format 整批失败并烧掉 4 次模型调用。现在跟着 parent 走；显式选了别的
+    Chapter 时改为丢掉 parent。"""
+    packet = {
+        "new_evidence": {"events": [{"event_id": "e1"}]},
+        "existing_memory": {
+            "chapters": [{"id": "ch-inbox", "name": "Inbox"}, {"id": "ch-main", "name": "主实验"}],
+            "recent_nodes": [{"id": "n1", "scope": "node", "chapter_id": "ch-inbox"}],
+            "related_old_records": [],
+            "recent_runs": [],
+        },
+    }
+    record = {"title": "T", "body": "B", "source_event_ids": ["e1"], "chapter_id": None, "parent_id": "n1"}
+    plan = R.validate_plan({"status": "record", "records": [record]}, packet)
+    assert plan[0]["chapter_id"] == "ch-inbox" and plan[0]["parent_id"] == "n1"
+
+    record["chapter_id"] = "ch-main"
+    plan = R.validate_plan({"status": "record", "records": [record]}, packet)
+    assert plan[0]["chapter_id"] == "ch-main" and plan[0]["parent_id"] is None

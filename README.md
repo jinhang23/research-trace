@@ -106,7 +106,8 @@ trace-server --env-file /srv/research-trace/data/server.env --host 0.0.0.0 --por
 
 ```bash
 # ③ 先装客户端包，记下解释器的绝对路径（conda/HPC 上尤其别用裸 python3）
-python -m pip install "research-trace @ git+https://github.com/jinhang23/research-trace"
+#    升级时加 --force-reinstall --no-deps：pip 只比版本号，同版本号的新提交会被静默跳过
+python -m pip install --force-reinstall --no-deps "research-trace @ git+https://github.com/jinhang23/research-trace"
 python -c "import sys; print(sys.executable)"
 
 # ② 装插件，把 ③ 的解释器和中央地址写进插件配置（这两项必须显式传：插件系统不会替未设置的选项填默认值，缺一个每个 hook 都会失败）
