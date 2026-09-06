@@ -7,8 +7,11 @@
   全新安装同样不填 default。修法：hooks.json 不再引用 `capture`，全局暂停改为环境变量 `TRACE_CAPTURE=off`
   （`--capture-enabled` 命令行参数保留给测试与脚本）；plugin.json 删除 `capture` 选项；`python`/`url`
   的说明写明必须显式 `--config`；守卫测试的 SAFE_TO_REFERENCE 缩到这两项。
+- `trace-recorder --watch` 的日志是空的。stdout 重定向到文件时 Python 整块缓冲，每轮 `run_once` 的 JSON 报告
+  一直留在缓冲区里；而且空转也打印整份报告，对日志来说全是噪音。改为每处理一个 batch 打一行并 flush，
+  队列空时不写；非 watch 模式仍打印完整 JSON。文档写明「日志为空不等于没干活，看 `--status`」。
 - UF HiperGator → https://aidd.rc.ufl.edu/trace（HTTPS 反代 + `/trace` 前缀 + OAuth 设备码）整条
-  hook → outbox → 投递 → 中央链路首次在真实环境跑通；细节见 docs/TODO.md。
+  hook → outbox → 投递 → 中央 → Recorder（3 次真实 sonnet 调用，2 条 Node）链路首次在真实环境闭环；细节见 docs/TODO.md。
 
 # 2.0.0a29 — 让独立 Recorder 在真实 CLI 上跑通；安全三档；包与格式标准化
 

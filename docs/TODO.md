@@ -6,10 +6,9 @@
 
 ## 还没验证的（P1）
 
-- [ ] **UF 真实环境。** 在 HiperGator 新建一个测试项目，按顺序确认：`claude --version`（2.1.30 与
-  2.1.261 行为不同，代码已兼容但没在旧版真跑）；`claude setup-token` → `CLAUDE_CODE_OAUTH_TOKEN`
-  无头登录；`REAL_WATCH=1 python scripts/ops_battery.py`（一次验掉版本、登录、watcher）；再用真项目
-  跑 `trace-recorder --watch`。
+- [x] **UF 真实环境。** 2026-09-06 在 HiperGator 登录节点（CLI 2.1.261，已登录，不需要 setup-token）
+  绑定测试项目，`trace-recorder --watch` 用 setsid 常驻：3 个 batch 各一次真实 sonnet 调用，写出 2 条 Node，
+  标题准确、没有拆成噪音 Node。没跑 `REAL_WATCH=1 ops_battery.py`；2.1.30 旧版仍未真跑。
 - [x] **UF ↔ 服务器链路。** 2026-09-06 在 HiperGator 登录节点 → https://aidd.rc.ufl.edu/trace（HTTPS 反代，
   `/trace` 前缀，OAuth 设备码）跑通：selfcheck → bind → 真 `claude -p` → 投递 12 events + 8 chunks 零失败。
   顺手抓到 a29 的 `capture` 选项事故（见 CHANGELOG a30）。Recorder 在 UF 上还没启用。

@@ -328,7 +328,9 @@ Claude CLI 无法读取账户的 Extra usage 开关，所以启用命令要求�
 trace-project recorder-disable .
 ```
 
-查看本机状态用 `trace-recorder --status --data-dir <插件数据目录>`。停止 watcher 不会删除积压；
+查看本机状态用 `trace-recorder --status --data-dir <插件数据目录>`。`--watch` 的 stdout 每处理一个
+batch 才写一行（`batch=… status=complete records=1`），队列空时一个字都不写——所以把它重定向到日志
+文件后长期为空是正常的，看 `--status` 才知道它有没有在干活。停止 watcher 不会删除积压；
 以后重新启动会继续处理。后台整理的实际规则和
 状态含义见 [Recorder 协议](../hooks/RECORDER_PROTOCOL.md)。
 ## 4. 安装 Claude Code 插件

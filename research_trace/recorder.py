@@ -1457,6 +1457,25 @@ def _clear_blocked(outbox: Path) -> int:
     return cleared
 
 
+def watch_lines(report: dict[str, Any]) -> list[str]:
+    """`--watch` 的日志行：每处理一个 batch 一行，队列空时什么都不写。"""
+    lines = []
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    for result in report.get("results") or []:
+        status = str(result.get("status") or "unknown")
+        parts = [stamp, f"batch={result.get('batch_id')}", f"status={status}"]
+        if status == "complete":
+            parts.append(f"records={result.get('records', 0)} curations={result.get('curations', 0)}")
+        if result.get("error"):
+            parts.append(f"error={str(result['error'])[:200]!r}")
+        if result.get("retry_at"):
+            parts.append(f"retry_at={result['retry_at']}")
+        lines.append(" ".join(parts))
+    if lines:
+        lines.append(f"{stamp} pending={report.get('pending_batches', 0)}")
+    return lines
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Process Research Trace semantic batches with an isolated Claude subscription session"
@@ -1518,7 +1537,13 @@ def main(argv: list[str] | None = None) -> int:
         while True:
             report = worker.run_once()
             if not args.quiet:
-                print(json.dumps(report, ensure_ascii=False, indent=2))
+                if args.watch:
+                    # 常驻模式一行一批、空转不打印；stdout 通常是重定向到日志文件的，不 flush 的话
+                    # Python 会整块缓冲，运维看到的就是一个空日志（UF 首次联调时正是这样）。
+                    for line in watch_lines(report):
+                        print(line, flush=True)
+                else:
+                    print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
             if not args.watch:
                 return 0 if not report["pending_batches"] else 1
             status = str(worker.state.get("status") or "")

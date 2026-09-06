@@ -795,3 +795,23 @@ def test_watch_is_a_separate_long_lived_consumer_even_when_queue_is_empty(monkey
     )
     assert result == 130
     assert sleeps == [7.0]
+
+
+def test_watch_logs_one_line_per_batch_and_nothing_when_idle():
+    """UF 首次联调：`--watch >> recorder.log` 跑了三个 batch，日志还是空文件——每轮的 JSON 报告
+    被整块缓冲，而且空转也打印整份报告。现在一批一行、空转不写。"""
+    assert R.watch_lines({"pending_batches": 0, "counts": {}, "results": []}) == []
+    lines = R.watch_lines(
+        {
+            "pending_batches": 1,
+            "counts": {"complete": 1, "quota": 1},
+            "results": [
+                {"batch_id": "b1", "status": "complete", "records": 2, "curations": 0},
+                {"batch_id": "b2", "status": "quota", "error": "rate limited", "retry_at": 1234.0},
+            ],
+        }
+    )
+    assert len(lines) == 3
+    assert "batch=b1 status=complete records=2 curations=0" in lines[0]
+    assert "batch=b2 status=quota" in lines[1] and "error='rate limited'" in lines[1] and "retry_at=1234.0" in lines[1]
+    assert lines[2].endswith("pending=1")
