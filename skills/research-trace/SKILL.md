@@ -226,8 +226,9 @@ Recorder 稍后又登记一遍，数据流图上就是同一个键下两条来�
 
 1. 让用户在项目目录跑 `trace-project status`——只读，直接打印 `not bound`（这一路向上没有 marker）、
    `excluded`（marker 里 `capture: false`）或完整的绑定详情。
-2. 让他确认插件设置里的 `capture` 开关。它是全局暂停开关，设成 off 时连已绑定的项目也停，
-   而且暂停期间不补采。
+2. 让他看启动 Claude Code 的 shell 里有没有 `TRACE_CAPTURE=off`。它是全局暂停开关，设了连已绑定的
+   项目也停，而且暂停期间不补采。再让他看会话结束时 stderr 有没有 `Plugin option "…" isn't set`：
+   那是插件的 `python`/`url` 没用 `--config` 显式设置，每个 hook 都在失败，重跑一遍 `claude plugin install --config …` 即可。
 3. 调一次 `trace_login`（`action: "status"`）确认这台机器还连着——没登录时投递器一直 401，
    文件会一直堆在 `pending/`。
 4. 三条都正常，就告诉他原始历史在本机队列里、投递器会重试；语义记录要等 Recorder 处理完那一批。

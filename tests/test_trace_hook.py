@@ -132,7 +132,8 @@ def test_plugin_hooks_cover_the_loss_boundaries_and_reuse_configured_python():
                 assert hook["command"] == "${user_config.python}"
                 assert "${CLAUDE_PLUGIN_DATA}" in hook["args"]
                 assert "${CLAUDE_PLUGIN_ROOT}/scripts/trace_hook.py" in hook["args"]
-                assert "${user_config.capture}" in hook["args"]
+                # 全局暂停走 TRACE_CAPTURE 环境变量：capture 不再是插件选项，未设置就会让 hook 失败
+                assert "${user_config.capture}" not in hook["args"]
                 assert "${user_config.url}" in hook["args"]
 
 
@@ -640,6 +641,10 @@ def test_bad_stdin_never_blocks_the_main_task(tmp_path: Path, monkeypatch, capsy
     assert not data.exists()
     monkeypatch.setattr(H.sys, "stdin", FakeStdin("{}"))
     assert H.main([*argv, "--capture-enabled", "off"]) == 0
+    monkeypatch.setenv("TRACE_CAPTURE", "off")
+    monkeypatch.setattr(H.sys, "stdin", FakeStdin("{}"))
+    assert H.main(argv) == 0
+    assert not data.exists()
 
 
 def test_a_long_windows_outbox_path_does_not_silently_swallow_events(tmp_path: Path):

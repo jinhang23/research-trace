@@ -1025,7 +1025,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--data-dir", required=True)
     parser.add_argument("--protocol", default=str(_PLUGIN_ROOT / "hooks" / "RECORDER_PROTOCOL.md"))
-    parser.add_argument("--capture-enabled", default="on")
+    # 全局暂停开关走环境变量，不走插件配置：hooks.json 里的 ${user_config.X} 在选项没设置时
+    # 会让整个 hook 失败（plugin.json 的 default 不算数），而这个开关多数人永远不会去设。
+    parser.add_argument("--capture-enabled", default=os.environ.get("TRACE_CAPTURE", "on"))
     parser.add_argument("--url", default=os.environ.get("TRACE_URL", ""))
     args = parser.parse_args(argv)
     paused = str(args.capture_enabled).strip().lower() in {"0", "false", "off", "no"}

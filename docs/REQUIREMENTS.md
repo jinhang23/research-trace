@@ -23,7 +23,7 @@
   （§6.3）；hook 只封 batch。记录可附带 `artifact_refs`，URI 必须在本批证据里原样出现。
 - 访问分三档：单机（读公开）、内网（`TRACE_PROTECT_READS`，一把访问密钥守读写，网页密钥登录算
   `human`）、团队（GitHub OAuth）。机器侧 `trace-login --token` 把密钥存进凭证文件，所有客户端共用。
-- `capture=off` / `trace-project disable` 暂停期间推进 transcript 游标，不补采（§13）。
+- `TRACE_CAPTURE=off` / `trace-project disable` 暂停期间推进 transcript 游标，不补采（§13）。
 
 ## 1. 产品目标
 
@@ -152,7 +152,8 @@ marker `.research-trace.json`（§7）：
 - 找不到 marker，或 marker 写着 `"capture": false`，hook 立即返回，**不建目录、不写字节、
   不读 transcript**；
 - 找到 marker 才进入下面的采集流程；
-- 插件配置里的 `capture=off` 是一个额外的全局暂停开关，与 marker 是「与」关系。
+- 环境变量 `TRACE_CAPTURE=off` 是一个额外的全局暂停开关，与 marker 是「与」关系。它故意不是插件选项：
+  hook 命令里未设置的 `${user_config.X}` 会让整个 hook 失败（a29 在 UF 首次联调时就是这样静默停采的）。
 
 这同时是 §13 的项目排除默认态和 §7 的「不能静默创建重复项目」的前提。
 
@@ -445,7 +446,7 @@ outbox/
 
 1. **默认不采集**：没有 marker 的项目从一开始就不被记录（§6.0）；
 2. **项目排除**：`trace-project disable` 写 `"capture": false`，保留绑定但停止采集；
-3. **全局暂停**：插件配置 `capture=off`，暂停期间不补采。
+3. **全局暂停**：环境变量 `TRACE_CAPTURE=off`，暂停期间不补采。
 
 第 2、3 条走同一条暂停路径：hook 不写事件、不读 transcript 正文，只把**已有会话**的 transcript
 游标推到当前位置，因此重新开启后不会把暂停期间写进 transcript 的内容补采上传。边界：暂停期间才
@@ -487,7 +488,7 @@ CLI（`trace-backup purge` / `rewrite-history`）与管理员 REST（`POST /api/
 - 【已实现】Recorder 可以对无价值 batch 选择不建 Node。
 - 【已实现】Stop 不再唤起主 agent 派发 fork；独立 `trace-recorder` 使用订阅登录、无工具、无状态
   CLI 调用和持久计划，额度/overage/格式/写入失败均保留 batch，格式类失败有尝试上限。
-- 【已实现】`capture=off` 与 `trace-project disable` 暂停期间推进 transcript 游标，重新开启后
+- 【已实现】`TRACE_CAPTURE=off` 与 `trace-project disable` 暂停期间推进 transcript 游标，重新开启后
   不补采暂停期间的内容（§13）。
 - 【已实现】访问三档：`TRACE_PROTECT_READS` 让同一把密钥守读写、网页密钥登录、`TRACE_ALLOWED_NETWORKS`
   网段放行、`trace-server --init` 生成 0600 的 env 文件、`trace-login --token` 一次登录全客户端共用。

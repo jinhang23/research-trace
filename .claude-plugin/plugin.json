@@ -1,7 +1,7 @@
 {
   "name": "research-trace",
   "displayName": "Research Trace",
-  "version": "2.0.0-alpha.29",
+  "version": "2.0.0-alpha.30",
   "description": "团队研究与项目记忆：采集按项目绑定（`trace-project bind`），只记录你显式绑定过的项目。永久保存可见的 agent 历史，由 Recorder 精选想法、论文、数据理解、实验、失败和关键实现为 Project / Overview / Chapter / Node。提供 7 个 MCP 工具：6 个研究工具和 trace_login 账号设备登录。",
   "author": {
     "name": "Jinhang Wei"
@@ -20,7 +20,7 @@
     "url": {
       "type": "string",
       "title": "中央 Research Trace 地址",
-      "description": "所有机器连接同一中央服务，例如 https://trace.example.org。未配置或离线时，原始 batch 仍留在插件持久 outbox。",
+      "description": "所有机器连接同一中央服务，例如 https://trace.example.org。安装时必须用 --config url=… 显式给出：hook 命令引用这个值，插件系统不会替未设置的选项填 default，缺了它每个 hook 都会失败、什么都不采集。未配置或离线时，原始 batch 仍留在插件持久 outbox。",
       "default": "http://127.0.0.1:8765"
     },
     "token": {
@@ -29,16 +29,10 @@
       "description": "通常留空：在这台机器上跑一次 `trace-login --url <中央> --token`（内网访问密钥）或 `trace-login`（OAuth 设备码），MCP、投递器、Recorder 会一起读本机凭证文件。这里填值只喂 MCP 进程，显式 token 优先于设备凭证：这里（或环境变量 TRACE_TOKEN）只要有值，trace-login 存下的凭证就不会被读取，而且不会报错，只会在某次写入时莫名 401。另注意这个值只注入 MCP 进程；独立投递器 trace-deliver 读的是设备凭证文件或环境变量 TRACE_TOKEN，只填这里不会让它通过鉴权。",
       "sensitive": true
     },
-    "capture": {
-      "type": "string",
-      "title": "原始历史采集",
-      "description": "全局暂停开关。采集本身是按项目 opt-in 的：先在项目根运行 `trace-project bind`，没有 .research-trace.json 的目录一个字节都不会被记录。这里设成 off 时连已绑定的项目也暂停：不写事件、不读 transcript，并把已开着的会话的游标推过暂停期，重新开启后不会补采暂停期间的内容（暂停期间才新开的会话没有游标可推，重新开启后会从头采）。适合临时处理令牌或其它敏感内容。",
-      "default": "on"
-    },
     "python": {
       "type": "string",
       "title": "Python 解释器",
-      "description": "Python 3.10+ 的绝对路径最可靠。Windows/conda/HPC 上运行 `python -c \"import sys; print(sys.executable)\"` 获取当前环境的绝对路径；配置后用这个解释器跑 trace_mcp.py --selfcheck 验证：它检查该解释器装了 mcp SDK 且能连上中央；用错解释器时 Claude Code 只会显示 CONNECTION_CLOSED。",
+      "description": "装了 research-trace 包的 Python 3.10+ 解释器的绝对路径；安装时必须用 --config python=… 显式给出（插件系统不会替未设置的选项填 default）。Windows/conda/HPC 上运行 `python -c \"import sys; print(sys.executable)\"` 获取当前环境的绝对路径；配置后用这个解释器跑 trace_mcp.py --selfcheck 验证：它检查该解释器装了 mcp SDK 且能连上中央；用错解释器时 Claude Code 只会显示 CONNECTION_CLOSED。",
       "default": "python3"
     }
   },

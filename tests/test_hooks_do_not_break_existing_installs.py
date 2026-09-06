@@ -4,6 +4,11 @@
 不是降级、不是用默认值，是采集直接全停。plugin.json 里写了 `default` 也不算数：
 那只影响安装时的取值，而升级上来的机器 settings 里根本没有这个键。
 
+第二次事故（2.0.0a29，UF 首次联调）：全新安装 `claude plugin install --config python=… --config url=…`
+没传 capture，plugin.json 里 `"default": "on"` 同样不算数——每个 hook 都报
+`Plugin option "capture" isn't set`，outbox 一个字节都没有，而 `claude -p` 本身 exit 0。
+所以**default 在任何路径下都不算数**，hooks.json 只能引用安装命令里必须显式传的那两项。
+
 真实事故：2.0.0-alpha.9 往 hooks.json 里加了 `${user_config.recorder_fork_window}`，
 所有升级上来又没手工配置的机器每次 hook 都失败：
 
@@ -23,7 +28,7 @@ MANIFEST = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encodi
 
 #: 冻结的名单。往里加一项 = 让每一台已经装了插件的机器采集停摆，直到它手工配置。
 #: 改这个集合之前，先确认新选项对**老安装**也一定有值。
-SAFE_TO_REFERENCE = {"python", "capture", "url"}
+SAFE_TO_REFERENCE = {"python", "url"}
 
 
 def referenced_options() -> set[str]:
@@ -55,3 +60,11 @@ def test_the_fork_window_is_not_a_plugin_option_any_more():
     """它是这条规矩的由来 —— 别让它悄悄回到 hooks.json 里。"""
     assert "recorder_fork_window" not in referenced_options()
     assert "recorder_fork_window" not in (MANIFEST.get("userConfig") or {})
+
+
+def test_the_global_pause_is_not_a_plugin_option_any_more():
+    """a29 在 UF 上的事故：capture 没显式设置就让所有 hook 失败。现在它是 TRACE_CAPTURE 环境变量。"""
+    assert "capture" not in referenced_options()
+    assert "capture" not in (MANIFEST.get("userConfig") or {})
+    hook_source = (ROOT / "scripts" / "trace_hook.py").read_text(encoding="utf-8")
+    assert 'os.environ.get("TRACE_CAPTURE"' in hook_source

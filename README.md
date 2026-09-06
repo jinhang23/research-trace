@@ -109,7 +109,7 @@ trace-server --env-file /srv/research-trace/data/server.env --host 0.0.0.0 --por
 python -m pip install "research-trace @ git+https://github.com/jinhang23/research-trace"
 python -c "import sys; print(sys.executable)"
 
-# ② 装插件，把 ③ 的解释器和中央地址写进插件配置
+# ② 装插件，把 ③ 的解释器和中央地址写进插件配置（这两项必须显式传：插件系统不会替未设置的选项填默认值，缺一个每个 hook 都会失败）
 claude plugin marketplace add jinhang23/research-trace
 claude plugin install research-trace@research-trace \
   --config python=/abs/path/to/python --config url=https://trace.example.org
@@ -167,7 +167,7 @@ trace-backup restore --source <备份目录> --data-dir <一个空目录>
 
 - 只适配了 Claude Code；Codex CLI / Desktop 尚未适配。
 - 原始历史默认永久保存，可能含命令、路径和对话里的敏感信息。三层控制：不绑定项目、`trace-project disable`、
-  `capture=off`；紧急删除见 `trace-backup purge`。
+  启动 Claude Code 的 shell 里设 `TRACE_CAPTURE=off`（全局暂停）；紧急删除见 `trace-backup purge`。
 - 单机档下网页写入只算 `recorder`，不能产生 `human` 记录或确认；要 `human` 身份就用内网密钥档或 OAuth 档。
 - 数据流视图的边只来自明确登记的 `sha256` / `uri` / `machine+path` 键，从不从文字推断；存量数据大多没有这个键，空图是正常状态。
 - 团队配置映射目前只能通过 REST 或直接编辑配置文件维护，没有网页管理界面。

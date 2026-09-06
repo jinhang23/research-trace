@@ -357,8 +357,12 @@ claude plugin install research-trace@research-trace \
   /abs/path/to/python "${CLAUDE_PLUGIN_ROOT}/trace_mcp.py" --selfcheck --url https://trace.example.org
   ```
 
-- `capture`：全局暂停开关，默认 `on`；改成 `off` 会让所有项目都停止采集，暂停期间不补采。
-  它**不是**采集的开关来源：采集本身要先绑定项目，见下一小节。
+- 全局暂停不是插件选项：在启动 Claude Code 的 shell 里设 `TRACE_CAPTURE=off`，所有项目都停止采集，
+  暂停期间不补采。它**不是**采集的开关来源：采集本身要先绑定项目，见下一小节。
+
+`python` 和 `url` 安装时**必须**用 `--config` 显式传：Claude Code 展开 hook 命令里的 `${user_config.X}`
+时不会替未设置的选项填 plugin.json 的 default，缺一个每个 hook 都报 `Plugin option "…" isn't set`，
+对话照常返回但 outbox 一个字节都没有。事后补：`claude plugin install research-trace@research-trace --config …` 重跑一遍即可。
 
 升级：`claude plugin update research-trace`，它只在版本号变化时重新拷贝。
 格式与目录的完整清单见[格式清单](FORMATS.md)。
@@ -693,7 +697,7 @@ batch 都要拉的热路径，多数项目这张图是空的，不该为它付�
 - 未配置 OAuth 时读取是完全公开的（含原始 transcript 和附件下载），启动时会打印醒目警告；
   此时网页自身的写入也只能算 `recorder`，无法产生 `human` 记录或确认。
 - 默认永久保存可能包含命令、路径或 transcript 中的敏感信息。现在已经有三层控制（不绑定、
-  `trace-project disable`、`capture=off`）、`sent/` 的保留期与磁盘告警，以及管理员紧急 purge
+  `trace-project disable`、`TRACE_CAPTURE=off`）、`sent/` 的保留期与磁盘告警，以及管理员紧急 purge
   （CLI 与 `POST /api/admin/purge`）。
 - 手动导出保留分卷和旧格式读取；定时备份、GitHub 状态卡片已移除。
 - 数据流已实现（第 9 节），网页上作为项目视图的第三种呈现方式出现。存量数据大多没有可比对的

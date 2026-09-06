@@ -1,3 +1,15 @@
+# 2.0.0a30 — UF 首次联调：全新安装的 hook 全部静默失败
+
+- **全新安装一个字节都不采集。** `claude plugin install --config python=… --config url=…` 没传 `capture`，
+  Claude Code 展开 hooks.json 里的 `${user_config.capture}` 时并不用 plugin.json 的 `"default": "on"`，
+  每个 hook 都报 `Plugin option "capture" isn't set`；`claude -p` 照常 exit 0，只有 stderr 末尾一行，
+  outbox 空目录。a24 为 `recorder_fork_window` 立的规矩「default 不算数」只考虑了升级安装，没考虑
+  全新安装同样不填 default。修法：hooks.json 不再引用 `capture`，全局暂停改为环境变量 `TRACE_CAPTURE=off`
+  （`--capture-enabled` 命令行参数保留给测试与脚本）；plugin.json 删除 `capture` 选项；`python`/`url`
+  的说明写明必须显式 `--config`；守卫测试的 SAFE_TO_REFERENCE 缩到这两项。
+- UF HiperGator → https://aidd.rc.ufl.edu/trace（HTTPS 反代 + `/trace` 前缀 + OAuth 设备码）整条
+  hook → outbox → 投递 → 中央链路首次在真实环境跑通；细节见 docs/TODO.md。
+
 # 2.0.0a29 — 让独立 Recorder 在真实 CLI 上跑通；安全三档；包与格式标准化
 
 ## Recorder 管线（真实 CLI 上的修复）

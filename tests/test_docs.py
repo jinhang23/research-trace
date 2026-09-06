@@ -127,9 +127,11 @@ def test_every_rest_path_the_docs_mention_exists_in_the_server():
 
 
 def test_the_plugin_manifest_does_not_promise_global_capture():
+    """全局暂停不再是插件选项（未设置会让 hook 失败）；manifest 里也不能再出现它，
+    否则读者会去 /plugin manage 里找一个不存在的开关。"""
     manifest = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
-    capture = manifest["userConfig"]["capture"]["description"]
-    assert "opt-in" in capture or "trace-project bind" in capture, capture
+    assert "capture" not in manifest["userConfig"]
+    assert "trace-project bind" in manifest["description"]
 
 
 def test_the_marker_shape_is_the_same_everywhere():
