@@ -1,14 +1,14 @@
 # 待办与交付边界
 
-状态（2.0.0a37）：方案 3 的独立 Recorder 已接入，hook 只保存、独立 watcher 消费；在本机把
+状态（2.0.0a38）：方案 3 的独立 Recorder 已接入，hook 只保存、独立 watcher 消费；在本机把
 真 hook → 投递 → Recorder → 网页整条链路跑通，安全分三档，包与格式已标准化。做过什么、
 修过什么在 [CHANGELOG](../CHANGELOG.md)。这里只放还没做的。
 
 ## 已拍板、待真实环境复验
 
-- [ ] **跨章 parent（a36）。** 用户决定放开：parent 可以在另一个 Chapter，环检测全项目范围；网页在本章图里把
-  别章的前驱画成占位块。UF 联调项目里现成一对样本（PXR-2k 消融 → PXR-2k 基线）可回填，回填由人在网页上
-  确认，不自动猜。要复验：Recorder 真的写进跨章 parent；A 章→B 章→A 章被拦；`dropped_parents` 保持 0。
+- [x] **跨章 parent（a36）。** 2026-09-06 UF 复验：Recorder 自己写出跨章 parent（消融 → 基线，正文同时点名基线及
+  其数字）；回填样本生效；基线 → 消融的跨章环 400 且 version 不动；不存在的 parent 400 且现有链不受损；
+  `dropped_parents` 为 0。网页里别章前驱的占位块只有 node 驱动的渲染测试，还没人在浏览器里看过。
 
 ## 还没验证的（P1）
 

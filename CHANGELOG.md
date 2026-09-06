@@ -1,3 +1,8 @@
+# 2.0.0a38 — 不存在的 parent 说「not found」，不说「别的项目」
+
+- `parent not found: <id>` 与 `parent must belong to the same project` 分开：同一句文案会让人去查权限和归属，
+  而 UF 复验里那只是一个打错的 id。a36 跨章 parent 在 UF 复验通过（见 docs/TODO.md）。
+
 # 2.0.0a37 — 空 patch 不再是一次"成功修订"
 
 - `PATCH /api/nodes/{id}` 的字段放在 body 顶层而不是 `patch` 里时，以前按空 patch 处理：200、version+1、

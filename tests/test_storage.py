@@ -1023,8 +1023,10 @@ def test_a_parent_may_sit_in_another_chapter_but_cycles_are_refused_project_wide
     with pytest.raises(ValidationError):
         store.update_node(base["id"], {"parent_id": abl["id"]}, expect_version=1)
     other = store.create_project("Q", workspace_keys=["rt-ws-other"])
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError, match="same project"):
         store.record_node(other["id"], idempotency_key="x", title="x", body="b", parent_id=base["id"])
+    with pytest.raises(ValidationError, match="parent not found"):
+        store.record_node(project["id"], idempotency_key="y", title="y", body="b", parent_id="node_nope")
 
 
 def test_a_patch_that_changes_nothing_writes_nothing(tmp_path):

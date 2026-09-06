@@ -9,7 +9,7 @@ __all__ = ["PLUGIN_VERSION", "Conflict", "NotFound", "Store", "__version__"]
 # 唯一的版本来源（PEP 440）。pyproject 通过 dynamic version 读这一行；
 # server.py / mcp.py 引用它；插件清单里的 semver 写法由 PLUGIN_VERSION 给出，
 # tests/test_version_is_consistent.py 守着 .claude-plugin/*.json 与它一致。
-__version__ = "2.0.0a37"
+__version__ = "2.0.0a38"
 
 
 def plugin_version(value: str = __version__) -> str:

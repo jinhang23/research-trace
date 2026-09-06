@@ -978,7 +978,10 @@ class Store:
         才能沿链遍历。Chapter 是归档维度，不是链的边界。环检测一直是全项目范围的递归，跨章后
         A 章→B 章→A 章同样被拦。"""
         parent = db.execute("SELECT project_id FROM nodes WHERE id=?", (parent_id,)).fetchone()
-        if not parent or parent["project_id"] != project_id:
+        if not parent:
+            # 和「别的项目的 Node」分开说：同一句文案会让人去查权限/归属，而这只是 id 打错了。
+            raise ValidationError(f"parent not found: {parent_id}")
+        if parent["project_id"] != project_id:
             raise ValidationError("parent must belong to the same project")
         if parent_id == node_id:
             raise ValidationError("node cannot parent itself")
