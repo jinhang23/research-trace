@@ -938,6 +938,83 @@ def default_data_dir() -> str:
     return os.environ.get("TRACE_DATA_DIR") or os.environ.get("CLAUDE_PLUGIN_DATA") or ""
 
 
+def _claude_config_dir() -> Path:
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude")).expanduser()
+
+
+def guess_plugin_data_dirs() -> list[Path]:
+    """人在 shell 里跑 `trace-project status` 时没有 CLAUDE_PLUGIN_DATA；按宿主的固定布局猜。"""
+    explicit = default_data_dir()
+    if explicit:
+        return [Path(explicit).expanduser()]
+    root = _claude_config_dir() / "plugins" / "data"
+    try:
+        return sorted(p for p in root.glob("research-trace-*") if p.is_dir())
+    except OSError:
+        return []
+
+
+def capture_health(data_dirs: list[Path] | None = None) -> dict[str, Any]:
+    """「采集还活着吗」的本机自检，不联网。
+
+    UF 联调里四次静默故障的共同点：hook 根本没跑（插件选项缺失、settings.json 被别的进程
+    整体覆盖）时，`claude -p` 照常返回，`trace-deliver --status` pending=0，`trace-recorder --status`
+    idle——每个健康指标都正常，只有 outbox 里不再出现新文件。这里把两件事直接摆出来：
+    插件在 settings.json 里还配着吗；本机最近一次采到事件是什么时候。
+    """
+    report: dict[str, Any] = {"problems": []}
+    settings_path = _claude_config_dir() / "settings.json"
+    settings = _read_json(settings_path) if settings_path.is_file() else {}
+    enabled = settings.get("enabledPlugins") if isinstance(settings, dict) else None
+    key = next(
+        (k for k, v in (enabled or {}).items() if isinstance(k, str) and k.startswith("research-trace@") and v),
+        None,
+    )
+    plugin: dict[str, Any] = {"settings_file": str(settings_path), "enabled": key is not None, "id": key}
+    if key is None:
+        report["problems"].append(
+            f"plugin not enabled in {settings_path}: hooks never run, nothing is captured "
+            "(re-run `claude plugin install research-trace@<marketplace> --config python=… --config url=…`)"
+        )
+    else:
+        options = ((settings.get("pluginConfigs") or {}).get(key) or {}).get("options") or {}
+        for name in ("python", "url"):
+            plugin[name] = options.get(name)
+            if not options.get(name):
+                report["problems"].append(
+                    f'plugin option "{name}" is not set in {settings_path}: every hook fails before it starts '
+                    "(Claude Code does not fill plugin.json defaults); re-run `claude plugin install … --config "
+                    f"{name}=…`"
+                )
+    report["plugin"] = plugin
+
+    newest: float | None = None
+    sessions = 0
+    dirs = data_dirs if data_dirs is not None else guess_plugin_data_dirs()
+    for data_dir in dirs:
+        outbox = Path(data_dir) / "outbox"
+        for session in iter_session_dirs(outbox):
+            sessions += 1
+            for directory in (session / "pending", session / "sent"):
+                try:
+                    for path in directory.glob("*.json"):
+                        stamp = path.stat().st_mtime
+                        newest = stamp if newest is None else max(newest, stamp)
+                except OSError:
+                    continue
+    report["outbox"] = {
+        "data_dirs": [str(d) for d in dirs],
+        "sessions": sessions,
+        "last_event_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(newest)) if newest else None,
+        "last_event_age_seconds": int(time.time() - newest) if newest else None,
+    }
+    if not dirs:
+        report["problems"].append("no plugin data directory found (set TRACE_DATA_DIR or CLAUDE_PLUGIN_DATA)")
+    elif newest is None:
+        report["problems"].append("no captured event in any outbox yet: run one Claude Code turn in a bound project")
+    return report
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Deliver every staged Research Trace outbox batch to the central service"
@@ -1047,8 +1124,11 @@ def project_main(argv: list[str] | None = None) -> int:
     bind.add_argument("--offline", action="store_true", help="write the marker without contacting central")
     bind.add_argument("--no-git", action="store_true", help="do not add the Git remote as a second key")
 
-    status = sub.add_parser("status", help="show the binding that applies to a directory")
+    status = sub.add_parser("status", help="show the binding that applies to a directory and whether capture is alive")
     status.add_argument("path", nargs="?", default=".")
+    status.add_argument(
+        "--data-dir", default=default_data_dir(), help="plugin data dir (default: guessed from ~/.claude)"
+    )
     status.add_argument("--url", default=os.environ.get("TRACE_URL", "http://127.0.0.1:8765"))
     status.add_argument("--token", default=os.environ.get("TRACE_TOKEN", ""))
     status.add_argument("--credential-file", default=os.environ.get("TRACE_CREDENTIAL_FILE"))
@@ -1082,7 +1162,13 @@ def project_main(argv: list[str] | None = None) -> int:
         binding = project_binding(directory)
         if binding:
             print(json.dumps(binding, ensure_ascii=False, indent=2))
-            return 0
+            health = capture_health([Path(args.data_dir)] if args.data_dir else None)
+            age = health["outbox"]["last_event_age_seconds"]
+            when = health["outbox"]["last_event_at"]
+            print(f"capture: last event {when} ({age // 60} min ago)" if when else "capture: no event captured yet")
+            for problem in health["problems"]:
+                print(f"!!! {problem}")
+            return 0 if not health["problems"] else 1
         marker = find_marker(directory)
         if marker is not None:  # marker 在，只是被显式排除了；别让它看起来像「没绑定过」
             print(f'excluded: {marker} sets "capture": false, so nothing is recorded')

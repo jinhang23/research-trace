@@ -225,7 +225,8 @@ Recorder 稍后又登记一遍，数据流图上就是同一个键下两条来�
 三个各自独立的原因，都有只读的查法。**仍然不要去翻 outbox。**
 
 1. 让用户在项目目录跑 `trace-project status`——只读，直接打印 `not bound`（这一路向上没有 marker）、
-   `excluded`（marker 里 `capture: false`）或完整的绑定详情。
+   `excluded`（marker 里 `capture: false`）或完整的绑定详情，末尾的 `capture:` 行是本机最近一次采到事件的
+   时间；插件在 settings.json 里没配时它会 `!!!` 标出——那是 hook 根本没跑，其他状态命令看不出来。
 2. 让他看启动 Claude Code 的 shell 里有没有 `TRACE_CAPTURE=off`。它是全局暂停开关，设了连已绑定的
    项目也停，而且暂停期间不补采。再让他看会话结束时 stderr 有没有 `Plugin option "…" isn't set`：
    那是插件的 `python`/`url` 没用 `--config` 显式设置，每个 hook 都在失败，重跑一遍 `claude plugin install --config …` 即可。

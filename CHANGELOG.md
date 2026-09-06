@@ -1,3 +1,11 @@
+# 2.0.0a33 — `trace-project status` 能回答「采集还活着吗」
+
+- UF 第 6 轮：另一个 Claude Code 进程用旧视图整体覆盖了 `~/.claude/settings.json`，插件的三个配置段全没了，
+  三轮对话一个事件都没采到——`claude -p` 照常返回，`trace-deliver --status` pending=0，`trace-recorder --status`
+  idle，全绿。这是联调里第四个「所有健康指标都正常」的静默故障。`trace-project status` 现在末尾打印
+  `capture: last event <时间> (<n> min ago)`，并检查 settings.json 里插件是否启用、`python`/`url` 是否都设了；
+  有问题 `!!!` 标出并返回 1。`--data-dir` 可指定插件数据目录，默认从 `~/.claude/plugins/data/research-trace-*` 猜。
+
 # 2.0.0a32 — UF 第 5 轮：短会话的内容躺在 pending/ 里没人投
 
 - **SessionEnd 的投递被 60 秒节流吞掉。** `claude -p` 从 SessionStart 到 SessionEnd 不到一分钟：SessionStart

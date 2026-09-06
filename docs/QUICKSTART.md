@@ -401,7 +401,7 @@ marker 跟着项目目录走，所以换一台机器、换一个绝对路径、�
 （`--no-git` 关闭）。
 
 ```bash
-trace-project status                 # 看这个目录到底绑没绑、绑到哪个项目
+trace-project status                 # 看这个目录到底绑没绑、绑到哪个项目，以及采集还活着吗
 trace-project disable                # 保留 marker，但停止采集（项目排除）
 trace-project bind                   # 想重新开启时再 bind 一次
 ```
@@ -701,7 +701,9 @@ batch 都要拉的热路径，多数项目这张图是空的，不该为它付�
 - 未配置 OAuth 时读取是完全公开的（含原始 transcript 和附件下载），启动时会打印醒目警告；
   此时网页自身的写入也只能算 `recorder`，无法产生 `human` 记录或确认。
 - 默认永久保存可能包含命令、路径或 transcript 中的敏感信息。现在已经有三层控制（不绑定、
-  `trace-project disable`、`TRACE_CAPTURE=off`）、`sent/` 的保留期与磁盘告警，以及管理员紧急 purge
+  `trace-project disable`、`TRACE_CAPTURE=off`）；`trace-project status` 末尾的 `capture:` 行报告本机最近一次采到
+  事件的时间，插件在 settings.json 里没配（或被别的进程覆盖掉）时它会 `!!!` 标出并返回 1——
+  hook 没跑时 deliver/recorder 的 --status 都是绿的，只有这一行能看出采集已经死了、`sent/` 的保留期与磁盘告警，以及管理员紧急 purge
   （CLI 与 `POST /api/admin/purge`）。
 - 手动导出保留分卷和旧格式读取；定时备份、GitHub 状态卡片已移除。
 - 数据流已实现（第 9 节），网页上作为项目视图的第三种呈现方式出现。存量数据大多没有可比对的

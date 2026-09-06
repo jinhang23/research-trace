@@ -131,7 +131,8 @@ trace-project recorder-enable . --model sonnet --confirm-extra-usage-disabled
 trace-recorder --watch --data-dir /path/to/claude-plugin-data --url https://trace.example.org
 ```
 
-不确定当前状态就跑 `trace-project status --url <地址>`，它会直接说明哪份凭据在生效、投递和 Recorder 各停在哪。
+不确定当前状态就跑 `trace-project status --url <地址>`：它说明哪份凭据在生效、本机最近一次采到事件是什么时候，
+插件配置缺失（hook 根本没跑，其他状态命令全绿）时会 `!!!` 标出。
 完整步骤、HPC 无头登录和远端网络检查清单见[快速开始](docs/QUICKSTART.md)。
 
 ## 日常使用
