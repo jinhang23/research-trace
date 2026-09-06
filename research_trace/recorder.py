@@ -273,7 +273,9 @@ research question. Routine edits, listings, installs, repeated status checks and
 usually produce no record. Zero records is a valid successful result.
 
 Write concise connected prose in the evidence's original language; labels are short, in that same
-language, and reuse labels already present in existing memory. Name the concrete variant,
+language, and reuse labels already present in existing memory. A title names the finding or
+decision itself; drop session, round or test labels the user prefixed ("第四轮联调：", "round 3:")
+— they mean nothing to a reader months later. Name the concrete variant,
 dataset, metric, split and configuration when known. Keep observation, inference, hypothesis, user
 decision, proposed work and agreed work distinguishable. A submitted job is not a result; one failed
 run does not disprove a scientific hypothesis. Never manufacture a result, causal explanation,

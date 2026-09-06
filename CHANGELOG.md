@@ -1,13 +1,14 @@
 # 2.0.0a31 — UF 第 4 批：Inbox 里的 parent 被当成格式错误
 
-- **`parent is not in the selected Chapter` 整批失败。** 提示词让模型「Inbox 时 chapter_id 留空」，而
+- **`parent is not in the selected Chapter` 让整批按 format 重试。** 提示词让模型「Inbox 时 chapter_id 留空」，而
   Inbox 里已有的 Node 带着 Inbox 的真实 chapter_id，模型选它做 parent 时校验判定章不一致，按 format
-  失败重试——每次重试都是一次真实模型调用，4 次后 `attempts_exhausted`。UF 第 4 批（batch 64 重跑）
-  就卡在这里。现在：没选 Chapter 就跟着 parent 的 Chapter 走；选了别的 Chapter 就丢掉 parent（协议
+  退避重试——每次重试都是一次真实模型调用。它是间歇性的：模型不是每次都选那个 parent，UF 第 4 批
+  第一次被拒、两分钟后重试就过了（多花一次调用；若模型每次都选，4 次后就是 `attempts_exhausted`）。现在：没选 Chapter 就跟着 parent 的 Chapter 走；选了别的 Chapter 就丢掉 parent（协议
   本来就允许缺链接），两种都不再让整批失败。
 - **同版本号的新提交 pip 装不上。** `pip install --upgrade "research-trace @ git+…"` 看到本地已是
   2.0.0a30 就 `already satisfied`，新代码一个字节不装也不报错。规矩改为：每次推 main 都 bump 版本
   （a30 → a31 起执行）；安装说明加 `--force-reinstall --no-deps`。
+- 提示词：标题不带用户加的会话/轮次前缀（「第四轮联调：」）——UF 第 3 条 Node 的标题原样带上了。
 
 # 2.0.0a30 — UF 首次联调：全新安装的 hook 全部静默失败
 
