@@ -1045,3 +1045,26 @@ if (phrase !== '延续「PXR-2k 基线」（基线配置）') throw Error('unexp
 if (parentPhrase(S.project.nodes[0], ordinal) !== '新的起点') throw Error('a root stays a root');
 """,
     )
+
+
+def test_node_patch_rejects_missing_or_misplaced_fields(tmp_path):
+    """字段放在 body 顶层而不是 patch 里，以前是无声的 200。"""
+    app = create_app(tmp_path, token="secret")
+    with TestClient(app) as client:
+        headers = {"Authorization": "Bearer secret"}
+        project = client.post("/api/projects", json={"name": "P"}, headers=headers).json()
+        node = client.post(
+            "/api/record",
+            json={"project_id": project["id"], "idempotency_key": "n", "title": "T", "body": "B"},
+            headers=headers,
+        ).json()
+        wrong = client.patch(f"/api/nodes/{node['id']}", json={"parent_id": "x", "expect_version": 1}, headers=headers)
+        assert wrong.status_code == 400 and "under \"patch\"" in wrong.json()["detail"]
+        empty = client.patch(f"/api/nodes/{node['id']}", json={"patch": {}, "expect_version": 1}, headers=headers)
+        assert empty.status_code == 400
+        missing = client.patch(f"/api/nodes/{node['id']}", json={"expect_version": 1}, headers=headers)
+        assert missing.status_code == 400
+        ok = client.patch(
+            f"/api/nodes/{node['id']}", json={"patch": {"body": "B2"}, "expect_version": 1}, headers=headers
+        )
+        assert ok.status_code == 200 and ok.json()["version"] == 2

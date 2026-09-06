@@ -1269,12 +1269,24 @@ $('approve').onclick=async()=>{{
             run_ids=body.get('run_ids') or [],
         )
 
+    NODE_PATCH_FIELDS = {"title", "body", "parent_id", "labels", "review_state", "occurred_at", "chapter_id"}
+
     @app.patch("/api/nodes/{node_id}")
     async def update_node(node_id: str, request: Request, identity: dict[str, Any] = Depends(require_write)):
         body = await request.json()
         actor_type, actor_id = principal(identity, request)
-        patch = body.get("patch") or {}
-        if actor_type != "human" and isinstance(patch, dict) and "review_state" in patch:
+        patch = body.get("patch")
+        # 字段放错层（body 顶层而不是 patch 里）以前是无声的：空 patch 照样 200、version+1、
+        # 写一条一字不变的修订。UF a36 复验时正好这样"通过"了一次。
+        misplaced = sorted(NODE_PATCH_FIELDS & set(body))
+        if misplaced:
+            raise HTTPException(
+                status_code=400,
+                detail=f"put {', '.join(misplaced)} under \"patch\": {{\"patch\": {{...}}, \"expect_version\": N}}",
+            )
+        if not isinstance(patch, dict) or not patch:
+            raise HTTPException(status_code=400, detail="patch must be a non-empty object")
+        if actor_type != "human" and "review_state" in patch:
             # 确认/纠正是人的动作。Recorder 不能自我确认（REQUIREMENTS §15），
             # 而 PATCH 里的 review_state 曾经是绕过它最直接的一条路。
             raise HTTPException(status_code=403, detail="only a signed-in human may change review_state")

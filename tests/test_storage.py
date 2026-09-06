@@ -1025,3 +1025,13 @@ def test_a_parent_may_sit_in_another_chapter_but_cycles_are_refused_project_wide
     other = store.create_project("Q", workspace_keys=["rt-ws-other"])
     with pytest.raises(ValidationError):
         store.record_node(other["id"], idempotency_key="x", title="x", body="b", parent_id=base["id"])
+
+
+def test_a_patch_that_changes_nothing_writes_nothing(tmp_path):
+    """UF a36 复验：空 patch 曾经 200、version+1、写一条一字不变的修订，被当成"通过"。"""
+    store = Store(tmp_path)
+    project = store.create_project("P", workspace_keys=["rt-ws-noop"])
+    node = store.record_node(project["id"], idempotency_key="n", title="T", body="B")
+    same = store.update_node(node["id"], {"title": "T", "body": "B"}, expect_version=1)
+    assert same["version"] == 1
+    assert store.update_node(node["id"], {"body": "B2"}, expect_version=1)["version"] == 2

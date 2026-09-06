@@ -919,6 +919,19 @@ class Store:
                 raise ValidationError("chapter must belong to the same project")
             if values.get("parent_id"):
                 self._assert_parent_locked(db, node_id, current["project_id"], values["parent_id"])
+            effective = {
+                "chapter_id": values["chapter_id"],
+                "parent_id": values.get("parent_id"),
+                "title": str(values["title"]).strip(),
+                "body": str(values["body"] or ""),
+                "labels_json": values["labels_json"],
+                "review_state": values["review_state"],
+                "occurred_at": values["occurred_at"],
+            }
+            if all(current[key] == value for key, value in effective.items()):
+                # 什么都没变就什么都不写：不 bump version、不留一条与上一版逐字相同的修订。
+                # 网页"打开编辑框直接保存"和机器重放同一 patch 都走到这里，返回当前值即可。
+                return self._expand_node_locked(db, current)
             version = int(current["version"]) + 1
             timestamp = now_utc()
             db.execute(
