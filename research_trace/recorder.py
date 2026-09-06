@@ -148,8 +148,10 @@ OUTPUT_SCHEMA: dict[str, Any] = {
                     "parent_id": {
                         "type": ["string", "null"],
                         "description": (
-                            "Id of a recent_nodes/related_old_records Node in the same Chapter that this record "
-                            "directly continues or revises. Null for a new line of work or when unknown."
+                            "Id of a recent_nodes/related_old_records Node that this record directly continues, "
+                            "builds on or revises — including the first record of a new sub-line when the evidence "
+                            "says it starts from an existing result (an ablation run on the fixed baseline continues "
+                            "the baseline Node). Null only for a genuinely new line of work or when unknown."
                         ),
                     },
                     "labels": {"type": "array", "maxItems": 12, "items": {"type": "string"}},
@@ -284,7 +286,10 @@ predecessor, code version, run, or reason an idea was deferred.
 Use only chapter IDs, parent IDs, run IDs and event IDs listed in the packet. Place a record in the
 human-defined Chapter whose name or summary matches its research line — a baseline belongs in the
 baseline Chapter, an ablation in the ablation Chapter, the main experiment in the main Chapter; leave
-chapter_id null for Inbox only when no Chapter fits or two fit equally. Omit an unknown parent.
+chapter_id null for Inbox only when no Chapter fits or two fit equally. Omit an unknown parent, but
+when the evidence says the work starts from a result already in memory ("after the baseline was
+fixed, the first ablation…"), that existing Node is the parent — a new sub-line still hangs off
+what it builds on; a second root in the same Chapter loses the answer to "on which baseline?".
 A body is usually 300–1200 characters: the raw history keeps the details, the record keeps the meaning. Every record needs at least one event ID from NEW EVIDENCE that
 directly supports it. Existing memory and corrections are context, never new evidence. Human
 corrections have highest authority: never restate a figure or claim a human has corrected, use the
