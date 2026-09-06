@@ -179,6 +179,7 @@ def test_web_ui_keeps_structure_and_record_detail_together(tmp_path):
     assert 'id="fieldReview"' in page
     assert '独立探索或前序关系待核实' in page
     assert "function layoutGraphNodes" in page
+    assert "function externalParent" in page and "function parentPhrase" in page
     assert 'data-select-node="' in page
     assert "连线仅表示明确的 parent 关系" in page
     assert "dagre.layout(graph)" in page
@@ -1009,5 +1010,38 @@ const html = graphSectionHtml({id: 'c1', name: '主实验'}, nodes);
 const size = 'width:' + layout.cardWidth + 'px;height:' + layout.cardHeight + 'px';
 if ((html.split(size).length - 1) !== 2)
   throw Error('every structure card must carry the size its layout computed');
+""",
+    )
+
+
+def test_chapter_graph_draws_a_cross_chapter_parent_as_an_external_stub():
+    """a36：parent 可以在别的 Chapter。本章图里它是一个双线框占位（章名 + 标题，可跳转），
+    边照画，但不把整条外部链拉进来；列表和详情里写「延续「标题」（章名）」而不是裸 id。"""
+    if not shutil.which("node"):
+        pytest.skip("node is not installed")
+    _run_js(
+        "var S = {project: {chapters: [{id: 'c0', name: '基线配置'}, {id: 'c1', name: '消融实验'}],"
+        " nodes: [{id: 'base', chapter_id: 'c0', parent_id: null, title: 'PXR-2k 基线', occurred_at: '2026-01-01', review_state: 'unreviewed', comments: []},"
+        " {id: 'abl', chapter_id: 'c1', parent_id: 'base', title: 'one-hot 消融', occurred_at: '2026-01-02', review_state: 'unreviewed', comments: []}]},"
+        " selectedNodeId: null};\n"
+        + _js_slice("const esc = value =>", "function file64")
+        + _js_function(INDEX_HTML, "nodeOrder")
+        + _js_function(INDEX_HTML, "nodeReview")
+        + _js_slice("const TREE_NODE_W", "\n/* 缩放。")
+        + _js_function(INDEX_HTML, "externalParent")
+        + _js_function(INDEX_HTML, "parentPhrase"),
+        r"""
+const chapterNodes = S.project.nodes.filter(n => n.chapter_id === 'c1');
+const html = graphSectionHtml({id: 'c1', name: '消融实验'}, chapterNodes);
+if (!html.includes('class="graph-node external"')) throw Error('the external parent must appear as a stub card');
+if (!html.includes('data-select-node="base"')) throw Error('the stub must jump to the parent node');
+if (!html.includes('基线配置')) throw Error('the stub must say which Chapter the parent lives in');
+if ((html.match(/<path class="tree-edge/g) || []).length !== 1) throw Error('the cross-chapter edge must be drawn');
+const own = html.split('class="graph-node ').length - 1;
+if (own !== 2) throw Error('one stub + one own card expected, got ' + own);
+const ordinal = new Map([['abl', '01']]);
+const phrase = parentPhrase(S.project.nodes[1], ordinal);
+if (phrase !== '延续「PXR-2k 基线」（基线配置）') throw Error('unexpected phrase: ' + phrase);
+if (parentPhrase(S.project.nodes[0], ordinal) !== '新的起点') throw Error('a root stays a root');
 """,
     )

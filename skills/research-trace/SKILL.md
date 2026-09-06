@@ -155,9 +155,9 @@ Recorder 稍后又登记一遍，数据流图上就是同一个键下两条来�
 - `chapter_id` 只能填 `trace_context` 里已有的那个 id。**不确定就省略，落进 Inbox，不要猜归属。**
   Chapter 是人定义的，你不能创建，也没有 `chapter_name` 这种参数（传了会在发出前被丢掉）。
   填一个不存在的 `chapter_id` 是 404，不会自动建章。
-- `parent_id` 只在"**同一个 Chapter 内、这条是上一条的直接续做或修正**"时才填。新想法就是根节点，
-  不确定就省略。**不要拿它去搭一棵步骤树或时间/因果链**——Node 列表不是 pipeline，
-  服务端还会要求 parent 与本节点同 Chapter。
+- `parent_id` 只在"**这条是那条的直接续做、修正或所依据的结果**"时才填，parent 可以在另一个 Chapter
+  （消融挂在它所依据的基线下）。新想法就是根节点，不确定就省略。**不要拿它去搭一棵步骤树或
+  时间/因果链**——Node 列表不是 pipeline；服务端拦环，不拦跨章。
 - 另外两个可选项：`occurred_at` 是 ISO-8601（不传取当前时间）；`labels` 是自由文本，
   先照抄这个项目里已经在用的词，别自己发明一套。
 - 你建的 Node 一律是 `created_by: "recorder"` / `review_state: "unreviewed"`。这不是 bug：

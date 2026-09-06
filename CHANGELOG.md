@@ -1,3 +1,17 @@
+# 2.0.0a36 — parent 可以跨 Chapter
+
+用户拍板：「这个结论依赖哪些基线」要能沿链遍历，而不只是正文里的一句话。Chapter 是归档维度，不是链的边界。
+
+- 服务端 `_assert_parent_locked` 只要求同项目；环检测本来就是全项目范围的递归，A 章→B 章→A 章照样拦。
+  没有 schema 迁移（parent_id 列一直在，约束只在代码里）。
+- Recorder：跨章 parent 不再丢；没选 Chapter 时归档仍跟着 parent 走。提示词改成「跨章照填 parent，并在正文
+  点名前驱及其关键数字」——指针给机器，句子给人，改标题也不断。`dropped_parents` 的日志行和计数保留为回归
+  探测器（现在应恒为 0）。MCP `trace_record` 与 skill 的说明同步。
+- 网页：编辑「延续自」时别章的 Node 按章分组可选；本章结构图把别章的前驱画成一个双线框占位（章名 + 标题，
+  点它跳过去），不把整条外部链拉进来；列表和详情写「延续「标题」（章名）」而不是裸 id。
+- REQUIREMENTS / DESIGN / RECORDER_PROTOCOL 改口：Node 之间的 parent 可以跨 Chapter，Chapter 之间仍无顺序。
+- 已有数据不自动回填：被 a31–a35 丢掉的跨章 parent 由人在网页上补，避免把猜测写成事实。
+
 # 2.0.0a35 — 分章项目里 Chapter 规则和 parent 规则打架
 
 - a34 的提示词让「消融放消融章」和「消融的 parent 是基线 Node」同时成立，而数据模型要求 parent 同章

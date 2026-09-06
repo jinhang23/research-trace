@@ -820,7 +820,7 @@ def test_watch_logs_one_line_per_batch_and_nothing_when_idle():
 def test_a_parent_in_inbox_makes_the_record_follow_it_instead_of_failing_the_batch():
     """UF 第 4 批：模型按提示词把 chapter_id 留空，parent 却是 Inbox 里的 Node（带 Inbox 的真实
     chapter_id），以前按 format 整批失败并烧掉 4 次模型调用。现在跟着 parent 走；显式选了别的
-    Chapter 时改为丢掉 parent。"""
+    Chapter 时（a36 起）两者并存。"""
     packet = {
         "new_evidence": {"events": [{"event_id": "e1"}]},
         "existing_memory": {
@@ -836,9 +836,9 @@ def test_a_parent_in_inbox_makes_the_record_follow_it_instead_of_failing_the_bat
 
     record["chapter_id"] = "ch-main"
     plan = R.validate_plan({"status": "record", "records": [record]}, packet)
-    assert plan[0]["chapter_id"] == "ch-main" and plan[0]["parent_id"] is None
-    # 丢掉不能无声：process() 把它写进 batch 状态、日志行和 --status（UF 第五个静默故障的教训）
-    assert plan[0]["_dropped_parent"] == "n1"
+    # a36：parent 可以跨章，两者并存；dropped_parents 的日志/计数只作回归探测器保留
+    assert plan[0]["chapter_id"] == "ch-main" and plan[0]["parent_id"] == "n1"
+    assert "_dropped_parent" not in plan[0]
     lines = R.watch_lines(
         {
             "pending_batches": 0,
