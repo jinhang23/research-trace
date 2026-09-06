@@ -2082,6 +2082,8 @@ main.workspace-mode {
 
 /* v1 的状态语言：颜色和线型**同时**给，所以黑白打印或看不清颜色时也读得出来。
    已确认 = 绿实线，未确认 = 琥珀虚线，已纠正/有待处理 = 红点线。 */
+.graph-node.external { border-style: double; border-width: 3px; opacity: .82; }
+.graph-node.external .graph-node-state { font-weight: 600; }
 .graph-node.confirmed { border-style: solid; border-color: var(--st-done); }
 .graph-node.unreviewed { border-style: dashed; border-color: var(--st-wip); }
 .graph-node.corrected,
@@ -3121,7 +3123,7 @@ function nodeHtml(node) {
   return `
     <article class="node">
       <div class="node-card">
-        <div class="meta"><time datetime="${esc(node.occurred_at)}">${fmt(node.occurred_at)}</time>${node.parent_id ? ' · 延续 ' + esc(node.parent_id) : ''}</div>
+        <div class="meta"><time datetime="${esc(node.occurred_at)}">${fmt(node.occurred_at)}</time>${node.parent_id ? ' · ' + esc(parentPhrase(node, null)) : ''}</div>
         <div class="chapter-head">
           <h3>${esc(node.title)}</h3>
           <div class="toolbar node-actions">
@@ -3162,16 +3164,28 @@ function nodeReview(node) {
   return labels[node.review_state] || ['unreviewed', node.review_state || '未确认'];
 }
 
+/* parent 可以跨 Chapter（消融挂在它所依据的基线下）：本章的候选排前面，别章的按章分组。 */
 function parentOptionsHtml(chapterId, selectedId = '', excludeId = '') {
-  const candidates = S.project.nodes
-    .filter(node => node.chapter_id === chapterId && node.id !== excludeId)
-    .sort(nodeOrder);
+  const option = node => `<option value="${esc(node.id)}" ${node.id === selectedId ? 'selected' : ''}>${esc(node.title)}</option>`;
+  const own = S.project.nodes.filter(node => node.chapter_id === chapterId && node.id !== excludeId).sort(nodeOrder);
+  const others = S.project.chapters
+    .filter(chapter => chapter.id !== chapterId)
+    .map(chapter => [chapter, S.project.nodes.filter(node => node.chapter_id === chapter.id && node.id !== excludeId).sort(nodeOrder)])
+    .filter(([, nodes]) => nodes.length);
   return [
     `<option value="" ${selectedId ? '' : 'selected'}>独立探索或前序关系待核实</option>`,
-    ...candidates.map(node =>
-      `<option value="${esc(node.id)}" ${node.id === selectedId ? 'selected' : ''}>${esc(node.title)}</option>`
-    )
+    ...own.map(option),
+    ...others.map(([chapter, nodes]) => `<optgroup label="${esc(chapter.name)}">${nodes.map(option).join('')}</optgroup>`)
   ].join('');
+}
+
+/* 别章的 parent：给图和列表一个「外部前驱」的说法。找不到（已删除）就当根。 */
+function externalParent(parentId) {
+  const pool = (typeof S !== 'undefined' && S.project && S.project.nodes) || [];
+  const node = pool.find(item => item.id === parentId);
+  if (!node) return null;
+  const chapter = ((S.project && S.project.chapters) || []).find(item => item.id === node.chapter_id);
+  return {id: node.id, title: node.title, chapterName: chapter ? chapter.name : '', occurred_at: node.occurred_at};
 }
 
 /* Dagre owns layered graph placement. Only explicitly supported parent/artifact edges are drawn. */
@@ -3201,6 +3215,14 @@ function layoutGraphNodes(nodes) {
   return dagreLayout(nodes,nodes.filter(n=>n.parent_id).map(n=>[n.parent_id,n.id]),TREE_NODE_W,TREE_NODE_H,TREE_H_GAP,TREE_V_GAP,TREE_PAD);
 }
 
+/* 列表和详情里「延续自什么」的一句话：本章的按序号，别章的带章名，都找不到就是根。 */
+function parentPhrase(node, ordinal) {
+  if (!node.parent_id) return '新的起点';
+  if (ordinal && ordinal.has(node.parent_id)) return '延续记录 ' + ordinal.get(node.parent_id);
+  const external = externalParent(node.parent_id);
+  return external ? '延续「' + external.title + '」（' + (external.chapterName || '别章') + '）' : '新的起点';
+}
+
 /* 一条记录在图上用哪套线型。有没解决的纠正压过一切：那是「这里还有事没完」，
    比「已确认 / 未确认」更该先被看见。 */
 function graphState(node) {
@@ -3219,8 +3241,29 @@ function graphSectionHtml(chapter, nodes, showChapter = false) {
       <div class="structure-empty">这个 Chapter 还没有记录。</div>
     </section>
   `;
-  const layout = layoutGraphNodes(ordered);
+  const own = new Set(ordered.map(node => node.id));
+  /* 别章的前驱只画一个占位块（标题 + 章名，可点跳转），不把整条外部链拉进来：
+     本章视图仍然只讲本章的事，但承接关系不再隐形。 */
+  const stubs = [];
+  ordered.forEach(node => {
+    if (node.parent_id && !own.has(node.parent_id) && !stubs.some(stub => stub.id === node.parent_id)) {
+      const external = externalParent(node.parent_id);
+      if (external) stubs.push({...external, external: true, parent_id: null});
+    }
+  });
+  const layout = layoutGraphNodes([...stubs, ...ordered]);
   const ordinal = new Map(ordered.map((node, index) => [node.id, String(index + 1).padStart(2, '0')]));
+  const stubCards = stubs.map(stub => {
+    const position = layout.positions[stub.id];
+    return `
+      <button class="graph-node external" type="button" data-select-node="${esc(stub.id)}"
+        title="${esc(stub.chapterName)} · ${esc(stub.title)}" aria-label="外部前驱：${esc(stub.chapterName)} · ${esc(stub.title)}"
+        style="left:${position.left}px;top:${position.top}px;width:${layout.cardWidth}px;height:${layout.cardHeight}px">
+        <span class="graph-node-meta"><span class="graph-idx">↗</span><span class="graph-node-state">${esc(stub.chapterName || '别章前驱')}</span><time>${fmt(stub.occurred_at)}</time></span>
+        <span class="graph-node-title">${esc(stub.title)}</span>
+      </button>
+    `;
+  }).join('');
   const edges = ordered.map(node => {
     const child = layout.positions[node.id];
     const parent = node.parent_id && layout.positions[node.parent_id];
@@ -3257,7 +3300,7 @@ function graphSectionHtml(chapter, nodes, showChapter = false) {
         <div class="graph-zoomwrap">
           <div class="graph-canvas" style="width:${layout.width}px;height:${layout.height}px">
             <svg class="graph-edges" viewBox="0 0 ${layout.width} ${layout.height}" width="${layout.width}" height="${layout.height}" aria-hidden="true">${edges}</svg>
-            ${cards}
+            ${stubCards}${cards}
           </div>
         </div>
       </div>
@@ -3359,7 +3402,7 @@ function listSectionHtml(chapter, nodes, showChapter = false) {
           <button class="record-row ${reviewClass} ${selected ? 'selected' : ''}" type="button"
             data-select-node="${esc(node.id)}" aria-pressed="${selected}">
             <span class="record-index">${String(index + 1).padStart(2, '0')}</span>
-            <span class="record-copy"><strong>${esc(node.title)}</strong><small>${node.parent_id && ordinal.has(node.parent_id) ? '延续记录 ' + ordinal.get(node.parent_id) : '新的起点'} · ${fmt(node.occurred_at)}</small></span>
+            <span class="record-copy"><strong>${esc(node.title)}</strong><small>${parentPhrase(node, ordinal)} · ${fmt(node.occurred_at)}</small></span>
             <span class="record-state">${esc(reviewLabel)}</span>
           </button>
         `;
@@ -3600,7 +3643,7 @@ function workspaceHtml() {
   const flow = S.dataflow || {};
   const flowStats = flow.stats || {};
   const viewHint = {
-    graph: '连线仅表示明确的 parent 关系',
+    graph: '连线仅表示明确的 parent 关系；双线框是别章的前驱，点它跳过去',
     list: '按发生时间排列',
     dataflow: '连线只来自登记过的 artifact 键，可跨 Chapter；Chapter 之间仍无顺序'
   }[view];

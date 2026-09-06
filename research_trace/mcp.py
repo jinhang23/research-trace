@@ -147,7 +147,8 @@ TOOLS: list[dict[str, Any]] = [
                 "parent_id": {
                     "type": "string",
                     "description": (
-                        "Known same-Chapter predecessor, if supported by the evidence. "
+                        "Known predecessor this record directly builds on, in this or another Chapter, if supported "
+                        "by the evidence. "
                         "Omit for an independent idea or when the relation is unknown; omission does "
                         "not assert that nothing preceded it. Do not infer links from time or similar names."
                     ),

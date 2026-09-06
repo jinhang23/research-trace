@@ -58,7 +58,7 @@ Project
 │   ├── 内联 Comments / Corrections
 │   └── revisions / milestones
 ├── Chapters（用户定义的并列研究线/实验组，彼此没有时间顺序）
-│   └── Nodes（Chapter 内按时间排列，可选 parent）
+│   └── Nodes（按时间排列，可选 parent；parent 可以在另一个 Chapter）
 │       ├── 内联 Comments / Corrections
 │       ├── Code Evidence
 │       └── Attachments / Artifact References
@@ -78,7 +78,8 @@ Project
 
 - Chapter 是用户定义的并列研究线或实验组，例如“主实验”“消融实验”“基线复现”“补充实验”。
 - Chapter 不是“数据理解”“实现”“评估”等内容类型，也不是线性 pipeline 阶段；这些内容仍是其所服务研究线中的 Node。
-- Chapter 之间没有时间、父子或 pipeline 顺序。
+- Chapter 之间没有时间、父子或 pipeline 顺序。Node 之间的 `parent` 可以跨 Chapter（消融挂在它所依据的基线下），
+  那是记录之间的承接，不是 Chapter 之间的顺序。
 - Chapter 有一份当前摘要；摘要是其 Nodes 的可编辑、带版本视图。
 - `Inbox` 是每个项目的内建 Chapter，用于 Recorder 暂时无法可靠分类的内容。
 - Chapter 的创建、改名和范围由人管理；Recorder 只能选择已有 `chapter_id`，不得自行发明 Chapter。
@@ -87,7 +88,8 @@ Project
 
 - Node 是唯一的通用语义记录实体。
 - 论文搜索、想法讨论、数据理解、实验、失败方案、关键实现和结果都使用同一个 Node 模型。
-- Node 在 Chapter 内按发生时间排列；只有确实是前一节点延续时才设置 `parent_id`。
+- Node 在 Chapter 内按发生时间排列；只有确实是前一节点的延续、修正或所依据的结果时才设置 `parent_id`，
+  parent 可以在另一个 Chapter；环在全项目范围内拒绝。
 - 一段对话可以产生零个、一个或多个 Node，也可以更新既有 Node。
 - 不建立 Experiment、Entry、Insight、Mistake、Pipeline 等平行实体。
 - 内容分类只用可选、可编辑的 labels；分类错误不能造成数据丢失。
@@ -361,7 +363,8 @@ Comments 的人工操作走网页 REST；不为每个网页动作增加 MCP 工�
 - Overview 内联评论、确认和纠正。
 - 无序 Chapter 导航；每章显示当前摘要和按时间排列的 Node。
 - 结构图与记录详情必须并存：桌面端使用 master-detail 分栏，选择节点只更新详情，不丢失图上的位置。
-- 项目视图把各 Chapter 显示为互不相连的独立图；Chapter 视图只画本章 Node。不得把 Chapter 之间画成时间或父子关系。
+- 项目视图把各 Chapter 显示为独立图；Chapter 视图只画本章 Node，别章的 parent 画成一个「外部前驱」占位
+  （标题 + 章名，可跳转），不把整条外部链拉进来。不得把 Chapter 之间画成时间或父子关系。
 - Node 可切换明确 parent 的树图与按发生时间排列的记录列表；没有 parent 的 Node 作为根保留，不根据时间或语义猜边。
 - 详情区显示代码证据、图片、产物引用、评论和纠正；移动端允许图与详情上下排列。
 - Node 内联评论和修订历史。

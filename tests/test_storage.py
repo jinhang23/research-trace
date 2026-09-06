@@ -1007,3 +1007,21 @@ def test_context_carries_each_chapters_newest_nodes_as_parent_candidates(tmp_pat
     heads = context["chapter_heads"]
     assert old["id"] in {x["id"] for x in heads}
     assert sum(1 for x in heads if x["chapter_id"] == busy["id"]) == 2
+
+
+def test_a_parent_may_sit_in_another_chapter_but_cycles_are_refused_project_wide(tmp_path):
+    """a36：消融挂在它所依据的基线下，即使基线在另一个 Chapter；环检测跨章仍然拦。"""
+    store = Store(tmp_path)
+    project = store.create_project("P", workspace_keys=["rt-ws-cross"])
+    baseline = store.create_chapter(project["id"], "基线配置")
+    ablation = store.create_chapter(project["id"], "消融实验")
+    base = store.record_node(project["id"], idempotency_key="b", chapter_id=baseline["id"], title="基线", body="b")
+    abl = store.record_node(
+        project["id"], idempotency_key="a", chapter_id=ablation["id"], title="消融", body="b", parent_id=base["id"]
+    )
+    assert abl["parent_id"] == base["id"] and abl["chapter_id"] == ablation["id"]
+    with pytest.raises(ValidationError):
+        store.update_node(base["id"], {"parent_id": abl["id"]}, expect_version=1)
+    other = store.create_project("Q", workspace_keys=["rt-ws-other"])
+    with pytest.raises(ValidationError):
+        store.record_node(other["id"], idempotency_key="x", title="x", body="b", parent_id=base["id"])

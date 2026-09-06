@@ -148,11 +148,11 @@ OUTPUT_SCHEMA: dict[str, Any] = {
                     "parent_id": {
                         "type": ["string", "null"],
                         "description": (
-                            "Id of a recent_nodes/chapter_heads/related_old_records Node in the SAME Chapter that "
-                            "this record directly continues, builds on or revises — including the first record of a "
-                            "new sub-line when the evidence says it starts from an existing result. A Node in another "
-                            "Chapter cannot be the parent: leave null and name it in the body. Null only for a "
-                            "genuinely new line of work or when unknown."
+                            "Id of a recent_nodes/chapter_heads/related_old_records Node, in this or another Chapter, "
+                            "that this record directly continues, builds on or revises — including the first record of "
+                            "a new sub-line when the evidence says it starts from an existing result (an ablation on the "
+                            "fixed baseline continues the baseline Node). Null only for a genuinely new line of work or "
+                            "when unknown."
                         ),
                     },
                     "labels": {"type": "array", "maxItems": 12, "items": {"type": "string"}},
@@ -290,14 +290,14 @@ baseline Chapter, an ablation in the ablation Chapter, the main experiment in th
 chapter_id null for Inbox only when no Chapter fits or two fit equally.
 
 chapter_id and parent_id answer different questions: the Chapter is where the record is filed,
-the parent is what the work directly builds on. A parent must be a Node in the same Chapter (the
-data model keeps each Chapter's chain inside it). When the evidence says the work starts from a
-result already in memory ("after the baseline was fixed, the first ablation…"), find that Node in
-recent_nodes / chapter_heads / related_old_records: if it is in the record's Chapter it is the
-parent — a new sub-line still hangs off what it builds on, and a second root loses the answer to
-"on which baseline?". If it sits in another Chapter, leave parent_id null and name it in the body
-("基于「batch 64 + warmup 1000 基线」的结果") so the link stays readable; a cross-Chapter parent
-is dropped by the program. Omit the parent only when nothing in memory is what this work builds on.
+the parent is what the work directly builds on, and the parent may sit in another Chapter — an
+ablation filed in the ablation Chapter hangs off the baseline Node in the baseline Chapter. When
+the evidence says the work starts from a result already in memory ("after the baseline was fixed,
+the first ablation…"), find that Node in recent_nodes / chapter_heads / related_old_records and
+name it as parent_id; a second root loses the answer to "on which baseline?". Also name it in the
+body with its key figures ("基于「PXR-2k 正式基线」（ESM-2 650M，Spearman 0.58）") — the pointer is
+for machines, the sentence is for readers and survives a retitle. Omit the parent only when nothing
+in memory is what this work builds on.
 
 A body is usually 300–1200 characters: the raw history keeps the details, the record keeps the meaning. Every record needs at least one event ID from NEW EVIDENCE that
 directly supports it. Existing memory and corrections are context, never new evidence. Human
@@ -966,18 +966,12 @@ def validate_plan(output: dict[str, Any], packet: dict[str, Any]) -> list[dict[s
         parent = _clean_optional(item.get("parent_id"))
         if parent and parent not in node_chapters:
             raise RecorderError(f"record {index} uses an unknown parent_id", kind="format")
-        dropped_parent = None
-        if parent and node_chapters[parent] != chapter:
-            # UF 第 4 批：模型按提示词把 chapter_id 留空（Inbox），parent 却是一条已在 Inbox 里的
-            # Node——它的 chapter_id 是 Inbox 的真实 id。这在语义上完全一致，以前却按 format
-            # 失败整批重试（每次都是一次真实模型调用）。协议说「缺链接允许、别编链接」：
-            # 没选 Chapter 就跟着 parent 走；选了别的 Chapter 就丢掉 parent——服务端的数据模型
-            # 是「parent 必须同章」（storage._assert_parent_locked），这里改不了它。但丢掉不能
-            # 无声：记在 _dropped_parent 里，process() 把它写进 batch 状态、日志行和 --status。
-            if chapter is None:
-                chapter = node_chapters[parent]
-            else:
-                dropped_parent, parent = parent, None
+        if parent and chapter is None and node_chapters.get(parent):
+            # 没选 Chapter 时归档跟着 parent 走（UF 第 4 批：Inbox 里的 parent + chapter 留空）。
+            # 选了别的 Chapter 则两者并存：parent 自 a36 起可以跨章（消融挂在它所依据的基线下），
+            # 服务端不再要求同章。process() 里的 dropped_parents 计数保留为回归探测器——
+            # 理论上永远是 0，一旦非零说明某处约束又回来了。
+            chapter = node_chapters[parent]
         requested_runs = sorted({str(x) for x in item.get("run_ids") or [] if str(x)})
         if not set(requested_runs) <= run_ids:
             raise RecorderError(f"record {index} uses an unknown run_id", kind="format")
@@ -997,7 +991,6 @@ def validate_plan(output: dict[str, Any], packet: dict[str, Any]) -> list[dict[s
                 "occurred_at": _clean_optional(item.get("occurred_at")),
                 "code_evidence": code,
                 "artifact_refs": artifacts,
-                **({"_dropped_parent": dropped_parent} if dropped_parent else {}),
             }
         )
     return clean

@@ -714,7 +714,7 @@ class Store:
                 chapter = self._chapter_locked(db, pid, chapter_id, chapter_name)
             occurred_at = occurred_at or (existing["occurred_at"] if existing else timestamp)
             if parent_id:
-                self._assert_parent_locked(db, node_id, pid, chapter["id"], parent_id)
+                self._assert_parent_locked(db, node_id, pid, parent_id)
             if existing:
                 existing_signature = self._node_snapshot(existing)
                 desired_signature = {
@@ -918,7 +918,7 @@ class Store:
             if not chapter:
                 raise ValidationError("chapter must belong to the same project")
             if values.get("parent_id"):
-                self._assert_parent_locked(db, node_id, current["project_id"], chapter["id"], values["parent_id"])
+                self._assert_parent_locked(db, node_id, current["project_id"], values["parent_id"])
             version = int(current["version"]) + 1
             timestamp = now_utc()
             db.execute(
@@ -959,12 +959,14 @@ class Store:
         db: sqlite3.Connection,
         node_id: str,
         project_id: str,
-        chapter_id: str,
         parent_id: str,
     ) -> None:
-        parent = db.execute("SELECT project_id,chapter_id FROM nodes WHERE id=?", (parent_id,)).fetchone()
-        if not parent or parent["project_id"] != project_id or parent["chapter_id"] != chapter_id:
-            raise ValidationError("parent must belong to the same project and chapter")
+        """parent 可以在另一个 Chapter（a36 起）：消融挂在它所依据的基线下，「这个结论依赖哪些基线」
+        才能沿链遍历。Chapter 是归档维度，不是链的边界。环检测一直是全项目范围的递归，跨章后
+        A 章→B 章→A 章同样被拦。"""
+        parent = db.execute("SELECT project_id FROM nodes WHERE id=?", (parent_id,)).fetchone()
+        if not parent or parent["project_id"] != project_id:
+            raise ValidationError("parent must belong to the same project")
         if parent_id == node_id:
             raise ValidationError("node cannot parent itself")
         cycle = db.execute(

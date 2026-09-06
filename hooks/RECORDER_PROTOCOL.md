@@ -107,11 +107,11 @@ Only identifiers present in the packet are accepted:
 - Every Node needs one or more `source_event_ids` from this batch that directly support it.
 - `chapter_id` must name an existing human-defined Chapter. Omit it for Inbox when placement is
   uncertain. The Recorder cannot create Chapters.
-- `parent_id` must be a known same-Chapter predecessor (the data model keeps each Chapter's chain
-  inside it). When the work builds on a Node in another Chapter, leave it null and name that Node in
-  the body. A cross-Chapter parent is dropped by the program — not silently: the batch state, the
-  `--watch` log line (`dropped_parents=… reason=cross-chapter`) and `--status` (`dropped_parents`) all
-  say so. Omit an unknown or independent relation.
+- `parent_id` must be a known predecessor from the packet; it may sit in another Chapter (an
+  ablation hangs off the baseline it was run on). Name it in the body too, with its key figures, so
+  the link survives a retitle. Cycles are refused project-wide. Omit an unknown or independent
+  relation. (`dropped_parents` in the batch state, log line and `--status` stays as a regression
+  detector: it should always be 0 now.)
 - `run_ids` must already exist in the project and match the discussion. W&B remains a curve link;
   code is not uploaded to W&B.
 - `artifact_refs` register external artifacts the record produced, consumed or points at: a W&B run
