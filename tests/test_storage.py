@@ -975,3 +975,35 @@ def test_search_matches_non_ascii_uppercase_like_sqlite_lower_does(tmp_path):
     for query in ("10Å", "消融", "esm-2", "WARMUP"):
         hits = store.search(query, project_id=project["id"], scope="semantic", limit=5)
         assert [hit["scope"] for hit in hits] == ["node"], f"{query!r} should hit exactly one node"
+
+
+def test_context_carries_each_chapters_newest_nodes_as_parent_candidates(tmp_path):
+    """recent_nodes 按项目排窗口；一条安静的线的头很快滑出去，Recorder 就找不到 parent 了。
+    chapter_heads 每章各给最新两条，无论窗口。"""
+    store = Store(tmp_path)
+    project = store.create_project("P", workspace_keys=["rt-ws-heads"])
+    quiet = store.create_chapter(project["id"], "消融")
+    busy = store.create_chapter(project["id"], "主实验")
+    old = store.record_node(
+        project["id"],
+        idempotency_key="q0",
+        chapter_id=quiet["id"],
+        title="old ablation",
+        body="b",
+        occurred_at="2026-01-01T00:00:00Z",
+    )
+    for i in range(6):
+        store.record_node(
+            project["id"],
+            idempotency_key=f"m{i}",
+            chapter_id=busy["id"],
+            title=f"main {i}",
+            body="b",
+            occurred_at=f"2026-02-0{i + 1}T00:00:00Z",
+        )
+    context = store.context(workspace_keys=["rt-ws-heads"], recent_limit=3)["project"]
+    recent = {x["id"] for x in context["recent_nodes"]}
+    assert old["id"] not in recent, "the quiet chapter's head has left the recent window"
+    heads = context["chapter_heads"]
+    assert old["id"] in {x["id"] for x in heads}
+    assert sum(1 for x in heads if x["chapter_id"] == busy["id"]) == 2

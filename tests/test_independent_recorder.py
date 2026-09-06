@@ -837,3 +837,34 @@ def test_a_parent_in_inbox_makes_the_record_follow_it_instead_of_failing_the_bat
     record["chapter_id"] = "ch-main"
     plan = R.validate_plan({"status": "record", "records": [record]}, packet)
     assert plan[0]["chapter_id"] == "ch-main" and plan[0]["parent_id"] is None
+    # 丢掉不能无声：process() 把它写进 batch 状态、日志行和 --status（UF 第五个静默故障的教训）
+    assert plan[0]["_dropped_parent"] == "n1"
+    lines = R.watch_lines(
+        {
+            "pending_batches": 0,
+            "results": [{"batch_id": "b", "status": "complete", "records": 1, "dropped_parents": ["n1"]}],
+        }
+    )
+    assert "dropped_parents=n1 reason=cross-chapter" in lines[0]
+
+
+def test_chapter_heads_are_valid_parents_even_outside_the_recent_window():
+    """一条安静的线的头很快滑出 recent_nodes；服务端的 chapter_heads 保证它仍在候选里。"""
+    packet = {
+        "new_evidence": {"events": [{"event_id": "e1"}]},
+        "existing_memory": {
+            "chapters": [{"id": "ch-abl", "name": "消融"}],
+            "recent_nodes": [],
+            "chapter_heads": [{"id": "n-head", "scope": "node", "chapter_id": "ch-abl"}],
+            "related_old_records": [],
+            "recent_runs": [],
+        },
+    }
+    record = {"title": "T", "body": "B", "source_event_ids": ["e1"], "chapter_id": "ch-abl", "parent_id": "n-head"}
+    plan = R.validate_plan({"status": "record", "records": [record]}, packet)
+    assert plan[0]["parent_id"] == "n-head" and "_dropped_parent" not in plan[0]
+    context = {
+        "project": {"id": "p", "recent_nodes": [{"id": "n-head"}], "chapter_heads": [{"id": "n-head"}, {"id": "n2"}]}
+    }
+    packet2 = R._context_packet(context, [])
+    assert [x["id"] for x in packet2["chapter_heads"]] == ["n2"], "heads already in recent_nodes are not repeated"

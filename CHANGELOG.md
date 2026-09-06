@@ -1,3 +1,15 @@
+# 2.0.0a35 — 分章项目里 Chapter 规则和 parent 规则打架
+
+- a34 的提示词让「消融放消融章」和「消融的 parent 是基线 Node」同时成立，而数据模型要求 parent 同章
+  （`storage._assert_parent_locked`）：模型两条都照做时，校验器无声丢掉 parent，日志 status=complete。
+  rt-demo 只有 Inbox 一章所以没触发，真实分章项目必然触发（UF 会话读源码发现）。现在：
+  - 提示词单独一段说清 chapter_id 与 parent_id 是两个问题，parent 必须同章；承接的 Node 在别的章时
+    parent 留空、在正文里点名它；parent_id 的 schema 说明同步。
+  - 跨章 parent 仍由程序丢掉（改数据模型是另一件事），但不再无声：batch 状态 `dropped_parents`、
+    `--watch` 日志行 `dropped_parents=… reason=cross-chapter`、`--status` 计数。
+  - 服务端 `/api/context` 新增 `chapter_heads`：每个 Chapter 最新两条 Node，无论是否在 recent 窗口内，
+    进 packet 作为 parent 候选（一条安静的线的头很快滑出 recent_nodes）；旧服务端没有这个键，列表为空。
+
 # 2.0.0a34 — 提示词：新子线要挂到它所依据的已有 Node 上
 
 - UF 消融三轮：「基线定了之后，第一个消融…」被写成同一 Inbox 里的第二条根，和基线链断开，「这个消融是在

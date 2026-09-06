@@ -537,6 +537,16 @@ class Store:
                 (pid, max(1, min(int(recent_limit), 100))),
             ).fetchall()
             detail["recent_nodes"] = [self._expand_node_locked(self._db, row) for row in rows]
+            # 每个 Chapter 最新的两条：Recorder 选 parent 时最常承接的是某条线的最新进展，
+            # 而 recent_nodes 的窗口按项目排，一条安静的线的头很快就滑出去了。
+            heads: list[dict[str, Any]] = []
+            for chapter in detail.get("chapters") or []:
+                head_rows = self._db.execute(
+                    "SELECT * FROM nodes WHERE project_id=? AND chapter_id=? ORDER BY occurred_at DESC,id DESC LIMIT 2",
+                    (pid, chapter["id"]),
+                ).fetchall()
+                heads.extend(self._expand_node_locked(self._db, row) for row in head_rows)
+            detail["chapter_heads"] = heads
             detail["unresolved_corrections"] = [
                 item for item in detail["comments"] if item["kind"] == "correction" and not item["resolved_at"]
             ]

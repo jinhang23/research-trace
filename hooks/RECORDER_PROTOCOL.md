@@ -13,7 +13,9 @@ waits for and processes those batches. Each model call receives only:
 
 1. the new durable batch;
 2. a concise Project Overview, human-defined Chapters and unresolved human corrections;
-3. a small set of recent and query-related older Nodes and known runs.
+3. a small set of recent Nodes, each Chapter's newest one or two Nodes (`chapter_heads`, so a quiet
+   line's head stays a parent candidate after it leaves the recent window), query-related older Nodes
+   and known runs.
 
 Every call is a fresh, stateless `claude --print --no-session-persistence` invocation: the complete
 current packet is the whole input, and nothing from an earlier call is carried over. The fixed system
@@ -105,7 +107,11 @@ Only identifiers present in the packet are accepted:
 - Every Node needs one or more `source_event_ids` from this batch that directly support it.
 - `chapter_id` must name an existing human-defined Chapter. Omit it for Inbox when placement is
   uncertain. The Recorder cannot create Chapters.
-- `parent_id` must be a known same-Chapter predecessor. Omit an unknown or independent relation.
+- `parent_id` must be a known same-Chapter predecessor (the data model keeps each Chapter's chain
+  inside it). When the work builds on a Node in another Chapter, leave it null and name that Node in
+  the body. A cross-Chapter parent is dropped by the program — not silently: the batch state, the
+  `--watch` log line (`dropped_parents=… reason=cross-chapter`) and `--status` (`dropped_parents`) all
+  say so. Omit an unknown or independent relation.
 - `run_ids` must already exist in the project and match the discussion. W&B remains a curve link;
   code is not uploaded to W&B.
 - `artifact_refs` register external artifacts the record produced, consumed or points at: a W&B run

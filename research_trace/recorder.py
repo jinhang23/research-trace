@@ -148,10 +148,11 @@ OUTPUT_SCHEMA: dict[str, Any] = {
                     "parent_id": {
                         "type": ["string", "null"],
                         "description": (
-                            "Id of a recent_nodes/related_old_records Node that this record directly continues, "
-                            "builds on or revises — including the first record of a new sub-line when the evidence "
-                            "says it starts from an existing result (an ablation run on the fixed baseline continues "
-                            "the baseline Node). Null only for a genuinely new line of work or when unknown."
+                            "Id of a recent_nodes/chapter_heads/related_old_records Node in the SAME Chapter that "
+                            "this record directly continues, builds on or revises — including the first record of a "
+                            "new sub-line when the evidence says it starts from an existing result. A Node in another "
+                            "Chapter cannot be the parent: leave null and name it in the body. Null only for a "
+                            "genuinely new line of work or when unknown."
                         ),
                     },
                     "labels": {"type": "array", "maxItems": 12, "items": {"type": "string"}},
@@ -286,10 +287,18 @@ predecessor, code version, run, or reason an idea was deferred.
 Use only chapter IDs, parent IDs, run IDs and event IDs listed in the packet. Place a record in the
 human-defined Chapter whose name or summary matches its research line — a baseline belongs in the
 baseline Chapter, an ablation in the ablation Chapter, the main experiment in the main Chapter; leave
-chapter_id null for Inbox only when no Chapter fits or two fit equally. Omit an unknown parent, but
-when the evidence says the work starts from a result already in memory ("after the baseline was
-fixed, the first ablation…"), that existing Node is the parent — a new sub-line still hangs off
-what it builds on; a second root in the same Chapter loses the answer to "on which baseline?".
+chapter_id null for Inbox only when no Chapter fits or two fit equally.
+
+chapter_id and parent_id answer different questions: the Chapter is where the record is filed,
+the parent is what the work directly builds on. A parent must be a Node in the same Chapter (the
+data model keeps each Chapter's chain inside it). When the evidence says the work starts from a
+result already in memory ("after the baseline was fixed, the first ablation…"), find that Node in
+recent_nodes / chapter_heads / related_old_records: if it is in the record's Chapter it is the
+parent — a new sub-line still hangs off what it builds on, and a second root loses the answer to
+"on which baseline?". If it sits in another Chapter, leave parent_id null and name it in the body
+("基于「batch 64 + warmup 1000 基线」的结果") so the link stays readable; a cross-Chapter parent
+is dropped by the program. Omit the parent only when nothing in memory is what this work builds on.
+
 A body is usually 300–1200 characters: the raw history keeps the details, the record keeps the meaning. Every record needs at least one event ID from NEW EVIDENCE that
 directly supports it. Existing memory and corrections are context, never new evidence. Human
 corrections have highest authority: never restate a figure or claim a human has corrected, use the
@@ -712,6 +721,12 @@ def _context_packet(context: dict[str, Any], related: list[dict[str, Any]]) -> d
             if isinstance(x, dict)
         ],
         "recent_nodes": [_semantic_hit(x) for x in (project.get("recent_nodes") or []) if isinstance(x, dict)],
+        # 每个 Chapter 最新的两条（服务端 a35+ 提供；旧服务端没有这个键，列表为空）
+        "chapter_heads": [
+            _semantic_hit(x)
+            for x in (project.get("chapter_heads") or [])
+            if isinstance(x, dict) and x.get("id") not in {y.get("id") for y in (project.get("recent_nodes") or [])}
+        ],
         "related_old_records": [_semantic_hit(x) for x in related if isinstance(x, dict)],
         "unresolved_human_corrections": [
             {
@@ -921,7 +936,11 @@ def validate_plan(output: dict[str, Any], packet: dict[str, Any]) -> list[dict[s
     evidence_text = json.dumps(packet["new_evidence"], ensure_ascii=False, default=str)
     memory = packet["existing_memory"]
     chapter_ids = {str(x.get("id")) for x in memory.get("chapters") or [] if x.get("id")}
-    nodes = [*(memory.get("recent_nodes") or []), *(memory.get("related_old_records") or [])]
+    nodes = [
+        *(memory.get("recent_nodes") or []),
+        *(memory.get("chapter_heads") or []),
+        *(memory.get("related_old_records") or []),
+    ]
     # Only Node ids can be parents.  A search hit with another scope (comment,
     # overview) has no chapter and must be reported as unknown, not as
     # "outside the selected Chapter".
@@ -947,16 +966,18 @@ def validate_plan(output: dict[str, Any], packet: dict[str, Any]) -> list[dict[s
         parent = _clean_optional(item.get("parent_id"))
         if parent and parent not in node_chapters:
             raise RecorderError(f"record {index} uses an unknown parent_id", kind="format")
+        dropped_parent = None
         if parent and node_chapters[parent] != chapter:
             # UF 第 4 批：模型按提示词把 chapter_id 留空（Inbox），parent 却是一条已在 Inbox 里的
             # Node——它的 chapter_id 是 Inbox 的真实 id。这在语义上完全一致，以前却按 format
             # 失败整批重试（每次都是一次真实模型调用）。协议说「缺链接允许、别编链接」：
-            # 没选 Chapter 就跟着 parent 走；选了别的 Chapter 就丢掉 parent，Chapter 由模型的
-            # 显式选择说了算。两种都不再让整批失败。
+            # 没选 Chapter 就跟着 parent 走；选了别的 Chapter 就丢掉 parent——服务端的数据模型
+            # 是「parent 必须同章」（storage._assert_parent_locked），这里改不了它。但丢掉不能
+            # 无声：记在 _dropped_parent 里，process() 把它写进 batch 状态、日志行和 --status。
             if chapter is None:
                 chapter = node_chapters[parent]
             else:
-                parent = None
+                dropped_parent, parent = parent, None
         requested_runs = sorted({str(x) for x in item.get("run_ids") or [] if str(x)})
         if not set(requested_runs) <= run_ids:
             raise RecorderError(f"record {index} uses an unknown run_id", kind="format")
@@ -976,6 +997,7 @@ def validate_plan(output: dict[str, Any], packet: dict[str, Any]) -> list[dict[s
                 "occurred_at": _clean_optional(item.get("occurred_at")),
                 "code_evidence": code,
                 "artifact_refs": artifacts,
+                **({"_dropped_parent": dropped_parent} if dropped_parent else {}),
             }
         )
     return clean
@@ -1295,6 +1317,7 @@ class RecorderWorker:
                 prompt, packet = build_prompt(manifest, material, context, related)
                 output = self._invoke(prompt, config, project_id)
                 batch["plan"] = validate_plan(output, packet)
+                batch["dropped_parents"] = [r.pop("_dropped_parent") for r in batch["plan"] if r.get("_dropped_parent")]
                 batch["curations"] = validate_curations(output, packet)
                 batch["dropped_curations"] = len(output.get("curations") or []) - len(batch["curations"])
                 batch["project_id"] = project_id
@@ -1370,12 +1393,16 @@ class RecorderWorker:
             self.state["written_curations"] = int(self.state.get("written_curations") or 0) + len(
                 batch.get("curations") or []
             )
+            dropped_parents = list(batch.get("dropped_parents") or [])
+            if dropped_parents:
+                self.state["dropped_parents"] = int(self.state.get("dropped_parents") or 0) + len(dropped_parents)
             self._set_status("idle")
             return {
                 "batch_id": batch_id,
                 "status": "complete",
                 "records": len(batch.get("plan") or []),
                 "curations": len(batch.get("curations") or []),
+                **({"dropped_parents": dropped_parents} if dropped_parents else {}),
             }
         except RecorderError as exc:
             status = exc.kind
@@ -1481,6 +1508,8 @@ def watch_lines(report: dict[str, Any]) -> list[str]:
         parts = [stamp, f"batch={result.get('batch_id')}", f"status={status}"]
         if status == "complete":
             parts.append(f"records={result.get('records', 0)} curations={result.get('curations', 0)}")
+            if result.get("dropped_parents"):
+                parts.append("dropped_parents=" + ",".join(result["dropped_parents"]) + " reason=cross-chapter")
         if result.get("error"):
             parts.append(f"error={str(result['error'])[:200]!r}")
         if result.get("retry_at"):
