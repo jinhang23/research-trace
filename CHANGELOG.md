@@ -1,3 +1,12 @@
+# 2.0.0a32 — UF 第 5 轮：短会话的内容躺在 pending/ 里没人投
+
+- **SessionEnd 的投递被 60 秒节流吞掉。** `claude -p` 从 SessionStart 到 SessionEnd 不到一分钟：SessionStart
+  拉起的投递器跑在事件写入之前，Stop/SessionEnd 那两次被节流；这一轮的内容一直躺在 `pending/`，直到下一次
+  会话或有人手动 `trace-deliver`，而 `--status` 全程 idle、`last_error=null`。现在节流只管 SessionStart，
+  Stop / SessionEnd 一定拉起。
+- **投递器撞锁不再立刻放弃。** 抢不到 outbox 锁时先等最多 15 秒（`DELIVER_LOCK_WAIT`）：hook 在 Stop 拉起的
+  那个经常撞上 SessionStart 那个还没跑完的，以前直接退出，效果和上一条一样是静默残留。
+
 # 2.0.0a31 — UF 第 4 批：Inbox 里的 parent 被当成格式错误
 
 - **`parent is not in the selected Chapter` 让整批按 format 重试。** 提示词让模型「Inbox 时 chapter_id 留空」，而

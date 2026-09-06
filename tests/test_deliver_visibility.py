@@ -56,12 +56,13 @@ def test_a_clean_run_reports_ok(tmp_path):
     assert report["ok"] is True
 
 
-def test_losing_the_lock_is_recorded_too(tmp_path):
+def test_losing_the_lock_is_recorded_too(tmp_path, monkeypatch):
     """抢不到锁原本只往 stderr 说一句，而那条路上 stderr 是 DEVNULL。"""
     target = outbox(tmp_path)
-    from research_trace.deliver import _DeliverLock
+    import research_trace.deliver as D
 
-    with _DeliverLock(target) as acquired:
+    monkeypatch.setattr(D, "DELIVER_LOCK_WAIT", 0.0)
+    with D._DeliverLock(target) as acquired:
         assert acquired
         report = deliver_once(tmp_path, "https://example.org")
     assert report["skipped"] is True

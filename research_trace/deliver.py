@@ -648,27 +648,44 @@ def deliver_session(session_dir: Path, url: str, token: str, timeout: float, rep
             print(f"research-trace deliver: {report['last_error']}", file=sys.stderr)
 
 
-class _DeliverLock:
-    """整个 outbox 一把锁：多个 session 的 SessionStart 可能同时拉起投递器。"""
+DELIVER_LOCK_WAIT = 15.0
 
-    def __init__(self, outbox: Path):
+
+class _DeliverLock:
+    """整个 outbox 一把锁：多个 session 的 SessionStart 可能同时拉起投递器。
+
+    抢不到时先等最多 `wait` 秒再放弃：hook 在 Stop/SessionEnd 拉起的投递器经常撞上
+    SessionStart 那个还没跑完的，立刻放弃就意味着这一轮刚写完的事件要等下一次会话。
+    投递器是分离进程，等几秒不花任何人的时间。
+    """
+
+    def __init__(self, outbox: Path, wait: float | None = None):
         self.path = outbox / ".deliver-lock"
         self.acquired = False
+        self.wait = DELIVER_LOCK_WAIT if wait is None else wait
 
-    def __enter__(self) -> bool:
+    def _try(self) -> bool:
         try:
             self.path.mkdir(parents=True)
-            self.acquired = True
+            return True
         except FileExistsError:
             if _lock_is_stale(self.path, DELIVER_LOCK_STALE):
                 _remove_lock(self.path)
                 try:
                     self.path.mkdir(parents=True)
-                    self.acquired = True
+                    return True
                 except OSError:
-                    self.acquired = False
+                    return False
+            return False
         except OSError:
-            self.acquired = False
+            return False
+
+    def __enter__(self) -> bool:
+        deadline = time.time() + max(0.0, self.wait)
+        self.acquired = self._try()
+        while not self.acquired and time.time() < deadline:
+            time.sleep(0.5)
+            self.acquired = self._try()
         if self.acquired:
             try:
                 (self.path / "owner").write_text(str(os.getpid()), encoding="utf-8")
@@ -867,8 +884,8 @@ def deliver_once(
             report["skipped"] = True
             report["last_error"] = (
                 "another deliver run holds the outbox lock; nothing was attempted. "
-                "This is usually the one the SessionStart hook just launched — "
-                "wait a few seconds and run it again."
+                f"This is usually the one a hook just launched; waited {DELIVER_LOCK_WAIT:.0f}s — "
+                "run it again in a moment."
             )
             report["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             report["ok"] = False

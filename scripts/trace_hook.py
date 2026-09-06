@@ -817,18 +817,22 @@ def _is_internal_trace_event(payload: dict[str, Any]) -> bool:
     return event == "Stop" and bool(payload.get("stop_hook_active"))
 
 
-def _spawn_deliver(data_dir: Path, url: str, state: dict[str, Any]) -> bool:
+def _spawn_deliver(data_dir: Path, url: str, state: dict[str, Any], *, force: bool = False) -> bool:
     """Fire-and-forget 拉起一次 `trace-deliver`。
 
     hook 自己绝不发网络请求：DNS 挂掉或中央不可达时，重试成本必须落在这个分离进程上，
     而不是落在用户的每一次工具调用上。启动失败同样无所谓 —— 内容已经在 pending/ 里，
     下一次 SessionStart、手动 `trace-deliver` 或 `--watch` 常驻都能把它带走。
+
+    `force` 跳过 60 秒节流。UF 联调：`claude -p` 从 SessionStart 到 SessionEnd 不到一分钟，
+    SessionStart 拉起的那次投递跑在事件写入之前，SessionEnd 的那次被节流掉——这一轮的内容
+    就一直躺在 pending/ 里，直到下一次会话或有人手动投递，而 --status 全程 idle、无错误。
     """
     if os.environ.get("TRACE_HOOK_NO_SPAWN"):
         return False
     now = time.time()
     last = float(state.get("deliver_spawned_at") or 0.0)
-    if 0 <= now - last < DELIVER_SPAWN_INTERVAL:
+    if not force and 0 <= now - last < DELIVER_SPAWN_INTERVAL:
         return False
     state["deliver_spawned_at"] = now
     command = [sys.executable, "-m", "research_trace.deliver", "--data-dir", str(data_dir), "--quiet"]
@@ -983,9 +987,12 @@ def handle(
 
         # Stop 也要拉一次：一轮对话刚结束，batch 正好写完。只挂在 SessionStart/SessionEnd
         # 上的话，HPC 上那种一开就是几小时、从不正常结束的会话可以攒到几百个批次都不投。
-        # 有 DELIVER_SPAWN_INTERVAL 的 60 秒节流兜着，不会变成每轮一个进程。
-        if payload.get("hook_event_name") in {"SessionStart", "SessionEnd", "Stop"}:
-            _spawn_deliver(data_dir, url, state)
+        # 节流只管 SessionStart（那次只是顺手清扫）；Stop / SessionEnd 是这一轮材料刚写完的
+        # 时刻，必须真的拉起，否则短会话的内容会一直躺在 pending/ 里。投递器自己有锁，
+        # 撞上正在跑的那个会等它几秒再接着扫，所以多拉一次不会丢也不会重。
+        name = payload.get("hook_event_name")
+        if name in {"SessionStart", "SessionEnd", "Stop"}:
+            _spawn_deliver(data_dir, url, state, force=name != "SessionStart")
 
         result = None
         if (

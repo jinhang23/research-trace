@@ -701,3 +701,26 @@ def test_the_deliverer_can_see_what_the_hook_wrote_at_the_same_depth(tmp_path: P
         monkey.undo()
     assert report["delivered_events"] == 1, report
     assert sent and sent[0]["events"][0]["hook_event"] == "UserPromptSubmit"
+
+
+def test_stop_and_session_end_deliver_even_inside_the_spawn_throttle(tmp_path: Path, monkeypatch):
+    """UF 第 5 轮：`claude -p` 一分钟内跑完，SessionStart 那次投递跑在事件之前，Stop/SessionEnd 的
+    被 60 秒节流吞掉，这一轮内容一直躺在 pending/ 里，--status 全程 idle。"""
+    cwd = bind(tmp_path)
+    data = tmp_path / "plugin-data"
+    monkeypatch.delenv("TRACE_HOOK_NO_SPAWN", raising=False)
+    monkeypatch.setattr(H, "DELIVER_SPAWN_INTERVAL", 3600.0)
+    calls: list[list[str]] = []
+
+    class FakePopen:
+        def __init__(self, command, **options):
+            calls.append(command)
+
+    monkeypatch.setattr(H.subprocess, "Popen", FakePopen)
+    H.handle(event("SessionStart", cwd, source="startup"), data, PROTOCOL, "http://central:8765")
+    H.handle(event("SessionStart", cwd, source="resume"), data, PROTOCOL, "http://central:8765")
+    assert len(calls) == 1, "SessionStart is throttled"
+    H.handle(event("UserPromptSubmit", cwd, prompt="x"), data, PROTOCOL, "http://central:8765")
+    H.handle(event("Stop", cwd, stop_hook_active=False), data, PROTOCOL, "http://central:8765")
+    H.handle(event("SessionEnd", cwd, reason="exit"), data, PROTOCOL, "http://central:8765")
+    assert len(calls) == 3, "Stop and SessionEnd must launch the deliverer regardless of the throttle"
