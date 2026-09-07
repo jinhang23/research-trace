@@ -15,6 +15,15 @@
   parent 的 Node 成功（node_4665…，消融章 → 基线章），返回 structure_gaps 提示无来源事件。`trace_curate` /
   `trace_attach` / `trace_ingest` / `trace_login` 仍只有单元与契约测试。
 
+## 有意不做的
+
+- **启用之前的历史不补录。** `~/.claude/projects/` 里旧会话的 transcript 没有导入命令（`trace_ingest` 是给别的
+  来源的，`trace-code` 是代码证据）。用户 2026-09-07 决定不做 `trace-project backfill`：在已绑定的项目里让 agent
+  分主题、带日期地把旧工作总结一遍，这轮对话被 hook 正常采到、Recorder 提炼成 Node。理由：不把几个月原始对话
+  无差别永久化（密钥、路径、私有数据），不烧额度，人工策展质量更高。代价是这些 Node 的来源是「总结那次会话」，
+  不是当时的原始对话；要查当时的命令原文仍要回旧 transcript。对别的用户这仍是一个真实缺口，将来要做就是
+  按每 K 轮切批放进 outbox、时间戳用当时的、走正常投递与 Recorder。
+
 ## 还没验证的（P1）
 
 - [x] **UF 真实环境。** 2026-09-06 在 HiperGator 登录节点（CLI 2.1.261，已登录，不需要 setup-token）
