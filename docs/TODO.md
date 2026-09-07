@@ -9,6 +9,11 @@
 - [x] **跨章 parent（a36）。** 2026-09-06 UF 复验：Recorder 自己写出跨章 parent（消融 → 基线，正文同时点名基线及
   其数字）；回填样本生效；基线 → 消融的跨章环 400 且 version 不动；不存在的 parent 400 且现有链不受损；
   `dropped_parents` 为 0。网页里别章前驱的占位块只有 node 驱动的渲染测试，还没人在浏览器里看过。
+- [x] **MCP 七个工具的交互式端到端。** UF 联调全程用 `claude -p`（非交互下 MCP 工具无授权），所以主 agent 侧
+  一直没实测。2026-09-07 在 Mac 的交互式会话里（插件 MCP 连本机 a38）：`trace_context` 返回 chapters /
+  recent_nodes / chapter_heads / structure；`trace_search` scope=semantic 命中；`trace_record` 写入一条跨章
+  parent 的 Node 成功（node_4665…，消融章 → 基线章），返回 structure_gaps 提示无来源事件。`trace_curate` /
+  `trace_attach` / `trace_ingest` / `trace_login` 仍只有单元与契约测试。
 
 ## 还没验证的（P1）
 
