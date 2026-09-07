@@ -32,6 +32,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 os.environ["TRACE_HOOK_NO_SPAWN"] = "1"
+os.environ.setdefault("TRACE_BATCH_MIN_CHARS", "0")  # 情境脚本按轮验证，恢复一轮一批
 os.environ.pop("ANTHROPIC_BASE_URL", None)
 
 import uvicorn  # noqa: E402

@@ -1143,6 +1143,19 @@ def project_main(argv: list[str] | None = None) -> int:
     recorder_enable.add_argument("--model", choices=["sonnet", "haiku"], default="sonnet")
     recorder_enable.add_argument("--claude", default="claude", help="Claude Code CLI executable")
     recorder_enable.add_argument(
+        "--batch-min-chars",
+        type=int,
+        default=20_000,
+        help="seal a semantic batch (= one Recorder model call) only once this many characters of new material "
+        "have accumulated (0 = one batch per turn); the last batch is sealed at SessionEnd regardless",
+    )
+    recorder_enable.add_argument(
+        "--batch-max-age-minutes",
+        type=int,
+        default=20,
+        help="…or once the oldest unsealed material is this old, checked at each turn end",
+    )
+    recorder_enable.add_argument(
         "--confirm-extra-usage-disabled",
         action="store_true",
         help="confirm that extra usage is disabled in the Claude account before model calls",
@@ -1212,10 +1225,16 @@ def project_main(argv: list[str] | None = None) -> int:
                 "model": args.model,
                 "claude_executable": args.claude,
                 "extra_usage_disabled": True,
+                "batch_min_chars": max(0, int(args.batch_min_chars)),
+                "batch_max_age_minutes": max(0, int(args.batch_max_age_minutes)),
             }
         )
         target = write_marker(marker.parent, recorder=recorder)
         print(f"independent Recorder enabled with {args.model} (marker: {target})")
+        print(
+            f"batches seal after {recorder['batch_min_chars']} chars of new material or "
+            f"{recorder['batch_max_age_minutes']} min, and at session end; each batch is one model call"
+        )
         print("This only enables the project; hooks will not start a model.")
         print("Run trace-recorder --watch separately against the same plugin data directory.")
         return 0

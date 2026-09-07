@@ -311,10 +311,18 @@ CLI 没有这个子命令，Recorder 会按 `unverified` 放行，由第一次�
     "enabled": true,
     "mode": "independent",
     "model": "sonnet",
-    "extra_usage_disabled": true
+    "extra_usage_disabled": true,
+    "batch_min_chars": 20000,
+    "batch_max_age_minutes": 20
   }
 }
 ```
+
+后两项是**封批策略**：一个 batch 就是一次 Recorder 模型调用，所以 hook 不再一轮一批，而是在每轮结束时看
+攒下的材料——够 `batch_min_chars` 个字符（约为 token 数的 2–3 倍）、或最老一条超过 `batch_max_age_minutes`、
+或会话结束（SessionEnd）才封。想改就重跑 `recorder-enable --batch-min-chars … --batch-max-age-minutes …`；
+`--batch-min-chars 0` 回到一轮一批。环境变量 `TRACE_BATCH_MIN_CHARS` / `TRACE_BATCH_MAX_AGE_MINUTES` 优先于 marker。
+未封的材料只是还没派给 Recorder，原始投递照常进行，不受影响。
 
 之后每轮 Stop 只把材料写进持久批次；hook 不启动 Recorder，主 agent 也不会收到阻塞、
 Agent 或 SendMessage 指令。独立 watcher 读取新增材料、简短项目背景和少量相关旧记录，每次都是

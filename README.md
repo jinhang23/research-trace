@@ -31,8 +31,9 @@ flowchart LR
 一轮 Claude Code 对话结束之后：
 
 1. **Hook**（`scripts/trace_hook.py`）已经把这一轮的每个事件和可见 transcript 增量写进本机待发目录
-   `${CLAUDE_PLUGIN_DATA}/outbox/…/pending/`，隐藏推理在落盘前剥掉；对话结束（Stop）时把本轮材料封成一个 batch。
-   它不联网、不启动模型，出错也不影响你的会话。
+   `${CLAUDE_PLUGIN_DATA}/outbox/…/pending/`，隐藏推理在落盘前剥掉；每轮结束（Stop）时看一眼攒下的材料，
+   **攒够约 2 万字符、或最老一条超过 20 分钟、或会话结束**才封成一个 batch——一个 batch 就是下面一次模型调用，
+   一轮一批太浪费额度。它不联网、不启动模型，出错也不影响你的会话。
 2. **投递器**（`trace-deliver`）把 `pending/` 里的文件 POST 到中央 `/api/ingest`，**只有 2xx 才搬进 `sent/`**；
    失败原样留着下次再传。上传故意不交给模型——「东西有没有存好」不该取决于模型记不记得调用一个工具。
 3. **Recorder**（`trace-recorder --watch`，另行启动的后台进程）看到新 batch：向中央拉 Overview / Chapter /

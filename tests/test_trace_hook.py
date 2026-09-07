@@ -724,3 +724,56 @@ def test_stop_and_session_end_deliver_even_inside_the_spawn_throttle(tmp_path: P
     H.handle(event("Stop", cwd, stop_hook_active=False), data, PROTOCOL, "http://central:8765")
     H.handle(event("SessionEnd", cwd, reason="exit"), data, PROTOCOL, "http://central:8765")
     assert len(calls) == 3, "Stop and SessionEnd must launch the deliverer regardless of the throttle"
+
+
+def test_batches_seal_by_accumulated_material_not_per_turn(tmp_path: Path, monkeypatch):
+    """一轮一批 = 一轮一次 Recorder 模型调用。a39：攒够 batch_min_chars 或最老材料超龄或会话结束才封。"""
+    cwd = bind(tmp_path, recorder={"enabled": True, "batch_min_chars": 3000, "batch_max_age_minutes": 60})
+    data = tmp_path / "plugin-data"
+    monkeypatch.delenv("TRACE_BATCH_MIN_CHARS", raising=False)
+    monkeypatch.setattr(H, "_spawn_deliver", lambda *a, **k: False)
+    batches = lambda: sorted((session_root(data) / "batches").glob("*.json"))  # noqa: E731
+
+    for i in range(2):
+        H.handle(event("UserPromptSubmit", cwd, prompt=f"short {i}"), data, PROTOCOL)
+        H.handle(event("Stop", cwd, stop_hook_active=False), data, PROTOCOL)
+    assert batches() == [], "two short turns are below the threshold: no batch, no model call"
+    state = json.loads((session_root(data) / "state.json").read_text(encoding="utf-8"))
+    assert state.get("unsealed_chars", 0) > 0 and "batched_through" not in state
+
+    H.handle(event("UserPromptSubmit", cwd, prompt="x" * 4000), data, PROTOCOL)
+    H.handle(event("Stop", cwd, stop_hook_active=False), data, PROTOCOL)
+    assert len(batches()) == 1, "the turn that crosses the threshold seals everything accumulated"
+    manifest = json.loads(batches()[0].read_text(encoding="utf-8"))
+    assert manifest["event_count"] >= 5, "all three turns' events are in the one batch"
+
+    H.handle(event("UserPromptSubmit", cwd, prompt="tail"), data, PROTOCOL)
+    H.handle(event("Stop", cwd, stop_hook_active=False), data, PROTOCOL)
+    assert len(batches()) == 1
+    H.handle(event("SessionEnd", cwd, reason="exit"), data, PROTOCOL)
+    assert len(batches()) == 2, "SessionEnd seals whatever is left regardless of size"
+
+
+def test_old_unsealed_material_is_sealed_by_age(tmp_path: Path, monkeypatch):
+    cwd = bind(tmp_path, recorder={"enabled": True, "batch_min_chars": 10**6, "batch_max_age_minutes": 30})
+    data = tmp_path / "plugin-data"
+    monkeypatch.delenv("TRACE_BATCH_MIN_CHARS", raising=False)
+    monkeypatch.setattr(H, "_spawn_deliver", lambda *a, **k: False)
+    H.handle(event("UserPromptSubmit", cwd, prompt="early"), data, PROTOCOL)
+    H.handle(event("Stop", cwd, stop_hook_active=False), data, PROTOCOL)
+    assert not list((session_root(data) / "batches").glob("*.json"))
+    old = time.time() - 31 * 60
+    for path in (session_root(data) / "pending").glob("*.json"):
+        os.utime(path, (old, old))
+    H.handle(event("Stop", cwd, stop_hook_active=False), data, PROTOCOL)
+    assert len(list((session_root(data) / "batches").glob("*.json"))) == 1
+
+
+def test_env_zero_restores_one_batch_per_turn(tmp_path: Path, monkeypatch):
+    cwd = bind(tmp_path, recorder={"enabled": True, "batch_min_chars": 10**6})
+    data = tmp_path / "plugin-data"
+    monkeypatch.setenv("TRACE_BATCH_MIN_CHARS", "0")
+    monkeypatch.setattr(H, "_spawn_deliver", lambda *a, **k: False)
+    H.handle(event("UserPromptSubmit", cwd, prompt="one"), data, PROTOCOL)
+    H.handle(event("Stop", cwd, stop_hook_active=False), data, PROTOCOL)
+    assert len(list((session_root(data) / "batches").glob("*.json"))) == 1

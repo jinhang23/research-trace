@@ -1,3 +1,12 @@
+# 2.0.0a39 — 语义批次按材料量切，不再一轮一批
+
+- 一轮一批意味着一轮一次 Recorder 模型调用，200 轮就是 200 次 sonnet，多数还是「跳过」。现在 hook 在每轮结束时
+  看攒下的材料：够 `batch_min_chars`（默认 20 000 字符，约 token 数的 2–3 倍）、或最老一条超过
+  `batch_max_age_minutes`（默认 20）、或会话结束才封一批；没封时游标不动，下一轮一起带上。原始投递不经过
+  批次，不受影响。`trace-project recorder-enable --batch-min-chars/--batch-max-age-minutes` 写进 marker，环境变量
+  `TRACE_BATCH_MIN_CHARS`/`TRACE_BATCH_MAX_AGE_MINUTES` 优先；`0` 回到一轮一批（测试与 battery 用它）。
+  插件包（hook）变了，需要 `claude plugin update`。
+
 # 2.0.0a38 — 不存在的 parent 说「not found」，不说「别的项目」
 
 - `parent not found: <id>` 与 `parent must belong to the same project` 分开：同一句文案会让人去查权限和归属，

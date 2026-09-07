@@ -77,6 +77,11 @@ THINKING_HINT = b"thinking"
 
 # 同一个 session 两次 SessionStart 之间不重复拉起投递器（/clear 会连发）。
 DELIVER_SPAWN_INTERVAL = 60.0
+#: 语义批次按材料量切，不按轮切：一轮一批意味着一轮一次 Recorder 模型调用，多数还是「跳过」。
+#: 攒够这么多字符（约为 token 数的 2–3 倍）、或最老的未封材料超过这么久、或会话结束，才封一批。
+#: 项目 marker 的 recorder.batch_min_chars / batch_max_age_minutes 可改，环境变量优先（测试和 battery 用 0 恢复一轮一批）。
+BATCH_MIN_CHARS_DEFAULT = 20_000
+BATCH_MAX_AGE_MINUTES_DEFAULT = 20
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 if str(_PLUGIN_ROOT) not in sys.path:
@@ -720,13 +725,62 @@ def _chunk_bounds(name: str) -> tuple[str, int]:
         return name, 0
 
 
+def _batch_policy(binding: dict[str, Any]) -> tuple[int, float]:
+    """(min_chars, max_age_seconds)。环境变量 > marker 的 recorder 段 > 默认。"""
+    recorder = binding.get("recorder") if isinstance(binding.get("recorder"), dict) else {}
+
+    def pick(env: str, key: str, default: float) -> float:
+        for raw in (os.environ.get(env), recorder.get(key)):
+            if raw is None or raw == "":
+                continue
+            try:
+                return max(0.0, float(raw))
+            except (TypeError, ValueError):
+                continue
+        return float(default)
+
+    return int(pick("TRACE_BATCH_MIN_CHARS", "batch_min_chars", BATCH_MIN_CHARS_DEFAULT)), 60.0 * pick(
+        "TRACE_BATCH_MAX_AGE_MINUTES", "batch_max_age_minutes", BATCH_MAX_AGE_MINUTES_DEFAULT
+    )
+
+
+def _accumulated(
+    root: Path, events: list[tuple[str, str]], chunks: list[tuple[str, dict[str, Any]]]
+) -> tuple[int, float]:
+    """未封材料的 (字符数近似, 最老一条的 mtime)。事件按文件大小，transcript 块按偏移差。"""
+    size = 0
+    oldest: float | None = None
+    for _name, rel in events:
+        try:
+            stat = (root / rel).stat()
+        except OSError:
+            continue
+        size += stat.st_size
+        oldest = stat.st_mtime if oldest is None else min(oldest, stat.st_mtime)
+    for _name, metadata in chunks:
+        try:
+            size += max(0, int(metadata.get("end_offset") or 0) - int(metadata.get("start_offset") or 0))
+        except (TypeError, ValueError):
+            continue
+    return size, (oldest if oldest is not None else time.time())
+
+
 def _ensure_batch(
-    root: Path, payload: dict[str, Any], state: dict[str, Any], binding: dict[str, Any]
+    root: Path,
+    payload: dict[str, Any],
+    state: dict[str, Any],
+    binding: dict[str, Any],
+    *,
+    force: bool = False,
 ) -> tuple[Path, dict[str, Any]] | None:
     """给 Recorder 组一个待处理 batch。
 
     候选来自 `pending/` **和** `sent/`：投递器随时可能把文件搬进 sent/，语义层的取材范围
     不能因此塌掉。用单调游标而不是「谁还在 pending 里」来判断哪些已经派过工。
+
+    按量封批：材料没攒够 `batch_min_chars` 且最老一条没超过 `batch_max_age_minutes` 时不封，
+    游标不动，下一次 Stop 把这些一起带上；`force`（SessionEnd）不看阈值。一批就是一次
+    Recorder 模型调用，所以这里省下的是真实额度；原始投递不经过这里，不受影响。
     """
     cursor = str(state.get("batched_through") or "")
     events: list[tuple[str, str]] = []
@@ -757,6 +811,13 @@ def _ensure_batch(
 
     open_batches = _open_manifests(root)
     if _has_material(root, events):
+        if not force:
+            min_chars, max_age = _batch_policy(binding)
+            size, oldest = _accumulated(root, events, chunks)
+            if size < min_chars and (time.time() - oldest) < max_age:
+                state["unsealed_chars"] = size
+                return open_batches[0] if open_batches else None
+        state.pop("unsealed_chars", None)
         batch_id = f"{int(time.time())}-{uuid.uuid4().hex[:10]}"
         manifest = {
             "schema": "research-trace.batch.v1",
@@ -1022,7 +1083,7 @@ def handle(
             # durable input; a separately started `trace-recorder --watch`
             # process discovers it. This boundary keeps model startup, quota
             # waits and failures completely outside the observed agent session.
-            _ensure_batch(root, payload, state, binding)
+            _ensure_batch(root, payload, state, binding, force=payload.get("hook_event_name") == "SessionEnd")
         state["updated_at"] = _now()
         _atomic_json(state_path, state)
         return result

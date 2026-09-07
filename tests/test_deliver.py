@@ -269,6 +269,8 @@ def test_independent_recorder_requires_extra_usage_confirmation(tmp_path: Path, 
         "model": "sonnet",
         "claude_executable": "claude",
         "extra_usage_disabled": True,
+        "batch_min_chars": 20000,
+        "batch_max_age_minutes": 20,
     }
     assert D.project_main(["recorder-disable", str(project)]) == 0
     assert D.project_binding(project)["recorder"]["enabled"] is False

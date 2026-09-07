@@ -8,7 +8,10 @@ remain untested. It describes the research rather than its own recording work.
 
 The Recorder is an independent Claude Code CLI conversation. It does not fork or wake the main
 agent and does not inherit the main conversation. The capture hook only seals durable batches; it
-never starts or manages the model process. A separately launched `trace-recorder --watch` consumer
+never starts or manages the model process. A batch is sealed by amount, not per turn: at each turn
+end the hook seals only once the unsealed material reaches `batch_min_chars` (default 20 000
+characters) or its oldest piece is older than `batch_max_age_minutes` (default 20); SessionEnd
+seals whatever is left. One batch is one model call. A separately launched `trace-recorder --watch` consumer
 waits for and processes those batches. Each model call receives only:
 
 1. the new durable batch;

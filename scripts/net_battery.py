@@ -42,6 +42,7 @@ BIN = Path(sys.executable).parent
 FAKE = REPO / "scripts" / "fake_claude.py"
 sys.path.insert(0, str(REPO))
 os.environ["TRACE_HOOK_NO_SPAWN"] = "1"
+os.environ.setdefault("TRACE_BATCH_MIN_CHARS", "0")  # battery 按轮验证，恢复一轮一批
 for key in (
     "ANTHROPIC_BASE_URL",
     "HTTPS_PROXY",
