@@ -61,16 +61,22 @@ run 存成带来源的证据快照，**Basic Memory** 给记录建检索索引�
 ```text
 Project                     长期项目容器
 ├── Overview                当前认识、阶段结果、重要洞察与错误
-├── Chapter: 主实验          人定义的并列研究线（Chapter 之间没有先后）
-│   ├── Node 01             有长期价值的记录，章内按时间组织
-│   └── Node 02 ─ parent → Node 01
+├── Chapter: 基线配置        人定义的并列研究线（Chapter 之间没有先后）
+│   └── Node 01             有长期价值的记录，章内按时间组织
 ├── Chapter: 消融实验
+│   ├── Node 02 ─ parent → Node 01      parent 可以跨 Chapter
+│   └── Node 03 ─ parent → Node 02
 ├── Inbox                   Recorder 无法可靠归类时的安全落点
 └── Raw history             完整底层证据，默认永久保留，按需加载
 ```
 
 Node 不区分「实验 / 论文 / 想法 / 实现」——都是 Node，免得 agent 先猜内容类型再决定写去哪。
 Chapter 表达并列的研究线，不是流程阶段。取舍与理由见[设计理念](docs/DESIGN.md)。
+
+**parent 可以跨 Chapter。** 消融记录归在「消融实验」章，parent 仍指向「基线配置」章里它所依据的那条基线，
+「这个结论依赖哪些基线」因此是沿链可遍历的结构化查询，而不只是正文里的一句话。Recorder 写记录时同时做两件事：
+填 parent，并在正文点名前驱和关键数字——指针给机器遍历，正文给人阅读，任一失效另一个仍然成立。
+环检测是全项目范围的递归查询，跨章成环同样被拒绝。
 
 ## 安装
 
@@ -150,6 +156,10 @@ trace-recorder --watch --data-dir /path/to/claude-plugin-data --url https://trac
 | `trace_login` | 使用 GitHub 账号批准当前设备 |
 
 Recorder 自己不用这些工具。一次 batch 创建零个 Node 完全正常——目标不是「每轮都写」，而是不遗漏以后值得回看的认识。
+反过来一轮对话里谈了两条不相干的线，也会写成两条记录分进各自的 Chapter，不用为了归档刻意拆对话。
+
+`claude -p` 这种非交互模式下 MCP 工具拿不到授权，主 agent 调不了它们；但 hook 采集、投递和 Recorder 都不经过
+MCP，照常工作。上面那张表只在交互式会话里生效。
 
 ## 数据与备份
 
