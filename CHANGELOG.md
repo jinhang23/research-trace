@@ -1,3 +1,10 @@
+# 2.0.0a40 — Stop / SessionEnd 的 hook 超时放宽到 30 秒
+
+- UF 上 a39 两次 `SessionEnd hook … failed: Hook cancelled`：一次是 2.6 万字符的 transcript 增量要扫描、脱敏、
+  哈希，一次只是一句话——登录节点的网络文件系统偶发停顿就够吃掉 10 秒。被取消的那次封批和投递没做成，
+  只能靠下一次会话兜住。Stop / SessionEnd 是这一轮材料刚写完、必须落盘的时刻，超时从 10 秒放到 30 秒；
+  其余 hook 仍是 10 秒。hook 清单变了，需要 `claude plugin update`。
+
 # 2.0.0a39 — 语义批次按材料量切，不再一轮一批
 
 - 一轮一批意味着一轮一次 Recorder 模型调用，200 轮就是 200 次 sonnet，多数还是「跳过」。现在 hook 在每轮结束时

@@ -777,3 +777,14 @@ def test_env_zero_restores_one_batch_per_turn(tmp_path: Path, monkeypatch):
     H.handle(event("UserPromptSubmit", cwd, prompt="one"), data, PROTOCOL)
     H.handle(event("Stop", cwd, stop_hook_active=False), data, PROTOCOL)
     assert len(list((session_root(data) / "batches").glob("*.json"))) == 1
+
+
+def test_stop_and_session_end_get_a_longer_hook_timeout():
+    """UF 上 a39 的 SessionEnd 被 10 秒超时取消过两次（网络文件系统 + 大 transcript 增量）；
+    这两个事件是材料刚写完必须落盘的时刻，给 30 秒；其余 hook 仍是 10 秒别拖住用户。"""
+    config = json.loads((Path(__file__).resolve().parent.parent / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+    for name, groups in config["hooks"].items():
+        for group in groups:
+            for hook in group["hooks"]:
+                expected = 30 if name in {"Stop", "SessionEnd"} else 10
+                assert hook["timeout"] == expected, (name, hook["timeout"])
